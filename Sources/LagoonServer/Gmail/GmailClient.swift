@@ -33,7 +33,7 @@ public enum GmailClientError: Error { case unauthorized, http(Int, String) }
 public final class GmailClient: Sendable {
     private let session: URLSession
 
-    public init(session: URLSession = .shared) {
+    public init(session: URLSession = .direct) {
         self.session = session
     }
 
@@ -50,6 +50,8 @@ public final class GmailClient: Sendable {
         c.queryItems = items
         var req = URLRequest(url: c.url!)
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        try OutboundGuard.validate(req.url!)
+
         let (data, resp) = try await session.data(for: req)
         try Self.assertOK(resp, data)
         return try JSONDecoder().decode(RawGmailList.self, from: data)
@@ -70,6 +72,8 @@ public final class GmailClient: Sendable {
         ]
         var req = URLRequest(url: c.url!)
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        try OutboundGuard.validate(req.url!)
+
         let (data, resp) = try await session.data(for: req)
         try Self.assertOK(resp, data)
         return try JSONDecoder().decode(RawGmailMessage.self, from: data)
@@ -78,6 +82,8 @@ public final class GmailClient: Sendable {
     public func getProfileEmail(accessToken: String) async throws -> String {
         var req = URLRequest(url: URL(string: "https://gmail.googleapis.com/gmail/v1/users/me/profile")!)
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        try OutboundGuard.validate(req.url!)
+
         let (data, resp) = try await session.data(for: req)
         try Self.assertOK(resp, data)
         struct R: Codable { let emailAddress: String }

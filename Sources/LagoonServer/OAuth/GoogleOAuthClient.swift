@@ -30,6 +30,7 @@ public final class GoogleOAuthClient: Sendable {
     public let clientSecret: String
     public let redirectURI: String
     public let scopes: [String]
+    private let session: URLSession
 
     public init(
         clientID: String,
@@ -39,12 +40,14 @@ public final class GoogleOAuthClient: Sendable {
             "https://www.googleapis.com/auth/gmail.readonly",
             "https://www.googleapis.com/auth/userinfo.email",
             "openid"
-        ]
+        ],
+        session: URLSession = .direct
     ) {
         self.clientID = clientID
         self.clientSecret = clientSecret
         self.redirectURI = redirectURI
         self.scopes = scopes
+        self.session = session
     }
 
     public func authorizeURL(state: String, codeChallenge: String) -> URL {
@@ -76,13 +79,14 @@ public final class GoogleOAuthClient: Sendable {
             "code_verifier": codeVerifier
         ]
         var req = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
+        try OutboundGuard.validate(req.url!)
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
             .map { "\($0.key)=\(Self.percentEncode($0.value))" }
             .joined(separator: "&")
             .data(using: .utf8)
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await session.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw OAuthClientError.http(
                 (resp as? HTTPURLResponse)?.statusCode ?? 0,
@@ -94,8 +98,9 @@ public final class GoogleOAuthClient: Sendable {
 
     public func fetchUserInfo(accessToken: String) async throws -> GoogleUserInfo {
         var req = URLRequest(url: URL(string: "https://openidconnect.googleapis.com/v1/userinfo")!)
+        try OutboundGuard.validate(req.url!)
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await session.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw OAuthClientError.http(
                 (resp as? HTTPURLResponse)?.statusCode ?? 0,
