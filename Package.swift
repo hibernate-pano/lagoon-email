@@ -23,15 +23,26 @@ let package = Package(
             .product(name: "NIOSSL", package: "swift-nio-ssl"),
             .product(name: "Logging", package: "swift-log")
         ], exclude: ["Migrations"]),
+        .target(name: "LagoonAI", dependencies: [
+            "LagoonKit",
+            .product(name: "Logging", package: "swift-log")
+        ], exclude: ["README.md"]),
         .executableTarget(name: "LagoonServer", dependencies: [
             "LagoonKit",
+            "LagoonAI",
             .product(name: "Hummingbird", package: "hummingbird"),
             .product(name: "PostgresNIO", package: "postgres-nio"),
-            .product(name: "NIOSSL", package: "swift-nio-ssl")
+            .product(name: "NIOSSL", package: "swift-nio-ssl"),
+            .product(name: "Crypto", package: "swift-crypto")
         ]),
         .executableTarget(name: "Lagoon", dependencies: ["LagoonKit"]),
         .testTarget(name: "LagoonKitTests", dependencies: ["LagoonKit"]),
-        .testTarget(name: "LagoonServerTests", dependencies: ["LagoonServer", "LagoonKit"]),
-        .testTarget(name: "LagoonTests", dependencies: ["Lagoon"])
+        .testTarget(name: "LagoonServerTests", dependencies: [
+            "LagoonServer",
+            "LagoonKit",
+            .product(name: "HummingbirdTesting", package: "hummingbird")
+        ]),
+        .testTarget(name: "LagoonTests", dependencies: ["Lagoon"]),
+        .testTarget(name: "LagoonAITests", dependencies: ["LagoonAI", "LagoonKit"])
     ]
 )

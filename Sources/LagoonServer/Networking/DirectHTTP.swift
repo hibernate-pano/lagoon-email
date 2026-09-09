@@ -31,12 +31,52 @@ public extension URLSession {
         } else {
             cfg.connectionProxyDictionary = [:]
         }
-        return URLSession(configuration: cfg)
+        // Delegate returns nil for every redirect, so the session never
+        // forwards the Authorization header to a new host.
+        return URLSession(
+            configuration: cfg,
+            delegate: OutboundNoRedirectDelegate(),
+            delegateQueue: nil
+        )
     }()
+
+    /// `data(for:)` for outbound calls that also fails closed on a 3xx.
+    func outboundData(for request: URLRequest) async throws -> (Data, URLResponse) {
+        let (data, response) = try await data(for: request)
+        if let http = response as? HTTPURLResponse, (300..<400).contains(http.statusCode) {
+            throw OutboundRedirectError.redirectBlocked
+        }
+        return (data, response)
+    }
 }
 
 public enum OutboundGuardError: Error {
     case blocked(description: String)
+}
+
+/// Prevents the outbound session from following any HTTP redirect.
+/// Google/Gmail APIs never redirect; a redirect could hand our Bearer token
+/// to a host outside `OutboundGuard.allowedHosts`, so we refuse to follow it.
+final class OutboundNoRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
+/// Surfaced when the `.outbound` session sees a 3xx instead of the expected
+/// API response (see `OutboundNoRedirectDelegate`).
+public enum OutboundRedirectError: Error {
+    public static let redirectBlocked = NSError(
+        domain: "Lagoon.OutboundRedirect",
+        code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "outbound HTTP redirect blocked"]
+    )
 }
 
 /// Server-side outbound host allowlist (spec §6.6 rule 2).

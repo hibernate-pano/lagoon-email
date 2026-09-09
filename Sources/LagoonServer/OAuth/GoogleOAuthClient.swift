@@ -2,7 +2,9 @@ import Foundation
 
 public struct GoogleTokenResult: Codable, Sendable {
     public let accessToken: String
-    public let refreshToken: String
+    /// Google omits this on refresh_token grants; only the initial
+    /// authorization_code exchange is guaranteed to return one.
+    public let refreshToken: String?
     public let expiresIn: Int
     public let scope: String
     public let tokenType: String
@@ -86,7 +88,37 @@ public final class GoogleOAuthClient: Sendable {
             .map { "\($0.key)=\(Self.percentEncode($0.value))" }
             .joined(separator: "&")
             .data(using: .utf8)
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await session.outboundData(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw OAuthClientError.http(
+                (resp as? HTTPURLResponse)?.statusCode ?? 0,
+                String(data: data, encoding: .utf8) ?? ""
+            )
+        }
+        let tokens = try JSONDecoder().decode(GoogleTokenResult.self, from: data)
+        // The code exchange must hand us a refresh token, otherwise we cannot
+        // keep the account syncing after the access token expires.
+        guard tokens.refreshToken != nil else { throw OAuthClientError.missingRefreshToken }
+        return tokens
+    }
+
+    /// Exchange a stored refresh token for a fresh access token.
+    public func refresh(refreshToken: String) async throws -> GoogleTokenResult {
+        let body = [
+            "grant_type": "refresh_token",
+            "client_id": clientID,
+            "client_secret": clientSecret,
+            "refresh_token": refreshToken
+        ]
+        var req = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
+        try OutboundGuard.validate(req.url!)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+            .map { "\($0.key)=\(Self.percentEncode($0.value))" }
+            .joined(separator: "&")
+            .data(using: .utf8)
+        let (data, resp) = try await session.outboundData(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw OAuthClientError.http(
                 (resp as? HTTPURLResponse)?.statusCode ?? 0,
@@ -100,7 +132,7 @@ public final class GoogleOAuthClient: Sendable {
         var req = URLRequest(url: URL(string: "https://openidconnect.googleapis.com/v1/userinfo")!)
         try OutboundGuard.validate(req.url!)
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await session.outboundData(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw OAuthClientError.http(
                 (resp as? HTTPURLResponse)?.statusCode ?? 0,
@@ -119,4 +151,5 @@ public final class GoogleOAuthClient: Sendable {
 
 public enum OAuthClientError: Error {
     case http(Int, String)
+    case missingRefreshToken
 }

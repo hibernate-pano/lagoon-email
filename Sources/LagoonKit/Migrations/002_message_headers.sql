@@ -1,4 +1,4 @@
-CREATE TABLE message_headers (
+CREATE TABLE IF NOT EXISTS message_headers (
     id            UUID PRIMARY KEY,
     account_id    UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     gmail_id      TEXT NOT NULL,
@@ -13,7 +13,7 @@ CREATE TABLE message_headers (
     fetched_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (account_id, gmail_id)
 );
-CREATE INDEX message_headers_account_received_idx
+CREATE INDEX IF NOT EXISTS message_headers_account_received_idx
     ON message_headers (account_id, received_at DESC);
-CREATE INDEX message_headers_thread_idx
+CREATE INDEX IF NOT EXISTS message_headers_thread_idx
     ON message_headers (account_id, thread_id);

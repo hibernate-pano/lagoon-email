@@ -2,6 +2,14 @@ import Foundation
 import PostgresNIO
 import NIOSSL
 
+public enum PostgresConfigError: Error, CustomStringConvertible {
+    case malformedDatabaseURL
+
+    public var description: String {
+        "DATABASE_URL is missing or malformed; expected postgres://user:pass@host:port/db (see .env.example)"
+    }
+}
+
 public struct PostgresConfig {
     public let host: String
     public let port: Int
@@ -26,14 +34,14 @@ public struct PostgresConfig {
         )
     }
 
-    public static func load() -> PostgresConfig {
+    public static func load() throws -> PostgresConfig {
         guard let url = ProcessInfo.processInfo.environment["DATABASE_URL"],
               let parsed = URL(string: url),
               let host = parsed.host,
               let port = parsed.port,
               let user = parsed.user,
               let pass = parsed.password
-        else { fatalError("DATABASE_URL malformed; see .env.example") }
+        else { throw PostgresConfigError.malformedDatabaseURL }
         let pathParts = parsed.path.split(separator: "/").map(String.init)
         let db = pathParts.last ?? ""
         let tls = parsed.query?.contains("sslmode=require") ?? false

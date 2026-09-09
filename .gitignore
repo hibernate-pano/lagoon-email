@@ -7,13 +7,13 @@
 *.p12
 secrets/
 
-# Build artifacts
+# Build artifacts (Package.resolved IS committed: this is an app, not a
+# library, and exact dependency pins must be reproducible)
 .build/
 .swiftpm/
 DerivedData/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
-Package.resolved
 xcuserdata/
 
 # OS noise
@@ -21,10 +21,11 @@ xcuserdata/
 *.swp
 *.swo
 
-# SwiftPM
-.build/
-.swiftpm/
-Package.resolved
-
 # Docker
 .docker-data/
+
+# Local agent / tooling scratch (never part of the product)
+.mimosa/
+.pi/
+.v2c/
+.video_agent/

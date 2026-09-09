@@ -1,48 +1,130 @@
 import XCTest
 import PostgresNIO
-import NIOCore
 @testable import LagoonServer
 @testable import LagoonKit
 
 final class MessageStoreTests: XCTestCase {
-    func test_upsert_and_recent() async throws {
-        let cfg = PostgresConfig.load()
-        let elg = LagoonPostgres.makeEventLoopGroup()
-        defer { elg.shutdownGracefully { _ in } }
-        let conn = try await LagoonPostgres.connect(cfg, on: elg.any())
-        defer { Task { try? await conn.close() } }
-        try await MessageStore.deleteAll(db: conn)
-        try await AccountStore.deleteAll(db: conn)
-
-        let account = Account(
+    private func makeAccount(oauthUser: String) -> Account {
+        Account(
             id: UUID(),
             provider: .gmail,
-            oauthUser: "m-\(UUID().uuidString)",
+            oauthUser: oauthUser,
             email: "m@example.com",
             tokenExpiresAt: Date(),
             historyId: nil
         )
-        try await AccountStore.upsert(account, accessToken: Data([1]), refreshToken: Data([1]), db: conn)
-        let msg = MessageHeader(
+    }
+
+    private func makeMessage(
+        account: Account,
+        gmailId: String,
+        isRead: Bool = false,
+        isArchived: Bool = false
+    ) -> MessageHeader {
+        MessageHeader(
             id: UUID(),
             accountId: account.id,
-            gmailId: "g-\(UUID().uuidString)",
+            gmailId: gmailId,
             threadId: "t1",
             fromAddress: "alice@example.com",
             fromName: "Alice",
             subject: "Hi",
             snippet: "Hello",
             receivedAt: Date(),
-            isRead: false,
-            isArchived: false
+            isRead: isRead,
+            isArchived: isArchived
         )
-        try await MessageStore.upsert(msg, db: conn)
-        let recent = try await MessageStore.recent(forAccount: account.id, limit: 10, db: conn)
-        XCTAssertEqual(recent.count, 1)
-        XCTAssertEqual(recent.first?.gmailId, msg.gmailId)
-        // Leave no residue: the server's Gmail poller would otherwise pick this
-        // fake account up every 30 s and hammer the API with a garbage token.
-        try await MessageStore.deleteAll(db: conn)
-        try await AccountStore.deleteAll(db: conn)
+    }
+
+    /// Deletes only this test's account (by `oauth_user`); `message_headers`
+    /// rows are removed by the `ON DELETE CASCADE` FK.
+    private func cleanup(_ oauthUser: String) -> @Sendable (PostgresConnection) async -> Void {
+        { conn in
+            try? await TestDatabase.deleteAccount(oauthUser: oauthUser, provider: .gmail, db: conn)
+        }
+    }
+
+    func test_upsert_and_recent() async throws {
+        let oauthUser = "msg-\(UUID().uuidString)"
+        try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+            let account = makeAccount(oauthUser: oauthUser)
+            try await AccountStore.upsert(
+                account,
+                accessToken: Data([1]),
+                refreshToken: Data([1]),
+                db: conn
+            )
+            let msg = makeMessage(account: account, gmailId: "g-\(UUID().uuidString)")
+            try await MessageStore.upsert(msg, db: conn)
+
+            let recent = try await MessageStore.recent(forAccount: account.id, limit: 10, db: conn)
+            XCTAssertEqual(recent.count, 1)
+            XCTAssertEqual(recent.first?.gmailId, msg.gmailId)
+            XCTAssertEqual(recent.first?.isRead, false)
+        }
+    }
+
+    func test_reUpsertAfterMarkRead_keepsReadState() async throws {
+        let oauthUser = "msg-\(UUID().uuidString)"
+        try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+            let account = makeAccount(oauthUser: oauthUser)
+            try await AccountStore.upsert(
+                account,
+                accessToken: Data([1]),
+                refreshToken: Data([1]),
+                db: conn
+            )
+            let gmailId = "g-\(UUID().uuidString)"
+            try await MessageStore.upsert(
+                makeMessage(account: account, gmailId: gmailId, isRead: false),
+                db: conn
+            )
+            try await MessageStore.markRead(gmailId: gmailId, accountId: account.id, db: conn)
+
+            // Regression: the poller used to re-upsert and clobber is_read back
+            // to false. The conflict update must not touch read state.
+            try await MessageStore.upsert(
+                makeMessage(account: account, gmailId: gmailId, isRead: false),
+                db: conn
+            )
+
+            let recent = try await MessageStore.recent(forAccount: account.id, limit: 10, db: conn)
+            XCTAssertEqual(recent.count, 1)
+            XCTAssertEqual(recent.first?.isRead, true, "re-upsert must not clobber is_read")
+            let unread = try await MessageStore.unreadCount(forAccount: account.id, db: conn)
+            XCTAssertEqual(unread, 0)
+        }
+    }
+
+    func test_unreadCount_onlyUnreadNonArchived() async throws {
+        let oauthUser = "msg-\(UUID().uuidString)"
+        try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+            let account = makeAccount(oauthUser: oauthUser)
+            try await AccountStore.upsert(
+                account,
+                accessToken: Data([1]),
+                refreshToken: Data([1]),
+                db: conn
+            )
+
+            // Counted: unread + not archived.
+            try await MessageStore.upsert(
+                makeMessage(account: account, gmailId: "unread-\(UUID().uuidString)", isRead: false, isArchived: false),
+                db: conn
+            )
+            // Not counted: read.
+            try await MessageStore.upsert(
+                makeMessage(account: account, gmailId: "read-\(UUID().uuidString)", isRead: true, isArchived: false),
+                db: conn
+            )
+            // Not counted: archived (even though unread).
+            try await MessageStore.upsert(
+                makeMessage(account: account, gmailId: "archived-\(UUID().uuidString)", isRead: false, isArchived: true),
+                db: conn
+            )
+
+            let unread = try await MessageStore.unreadCount(forAccount: account.id, db: conn)
+            XCTAssertEqual(unread, 1)
+        }
     }
 }

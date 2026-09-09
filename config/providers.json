@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "name": "minimax",
+      "baseURL": "https://api.minimax.chat/v1",
+      "apiKeyEnv": "LLM_PROVIDER_PRIMARY_API_KEY",
+      "model": "MiniMax-M3",
+      "priority": 1,
+      "capabilities": ["summary", "classify", "action_item", "bundle_reason", "draft"],
+      "chatPath": "/chat/completions",
+      "costPer1kPromptUsd": null,
+      "costPer1kCompletionUsd": null
+    }
+  ],
+  "routing": {
+    "summary": "minimax",
+    "classify": "minimax",
+    "action_item": "minimax",
+    "bundle_reason": "minimax",
+    "draft": "minimax"
+  }
+}

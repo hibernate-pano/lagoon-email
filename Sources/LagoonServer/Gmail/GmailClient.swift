@@ -6,10 +6,25 @@ public struct RawGmailMessage: Codable, Sendable {
     public let threadId: String
     public let snippet: String?
     public let internalDate: String?   // ms since epoch, string from Gmail
+    /// Present on both metadata and full responses. Contains "UNREAD" when the
+    /// message is unread — this is how real read state reaches the poller.
+    public let labelIds: [String]?
     public let payload: Payload?
 
     public struct Payload: Codable, Sendable {
         public let headers: [Header]?
+        /// MIME type of this part ("text/plain", "text/html", "multipart/…").
+        public let mimeType: String?
+        public let body: Body?
+        /// Nested parts of a `multipart/*` payload.
+        public let parts: [Payload]?
+    }
+
+    public struct Body: Codable, Sendable {
+        /// base64url-encoded bytes. Absent for oversized messages, which only
+        /// carry an `attachmentId`.
+        public let data: String?
+        public let size: Int?
     }
 
     public struct Header: Codable, Sendable {
@@ -52,7 +67,7 @@ public final class GmailClient: Sendable {
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         try OutboundGuard.validate(req.url!)
 
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await session.outboundData(for: req)
         try Self.assertOK(resp, data)
         return try JSONDecoder().decode(RawGmailList.self, from: data)
     }
@@ -61,20 +76,45 @@ public final class GmailClient: Sendable {
         accessToken: String,
         gmailId: String
     ) async throws -> RawGmailMessage {
+        try await fetchMessage(
+            accessToken: accessToken,
+            gmailId: gmailId,
+            format: "metadata",
+            metadataHeaders: ["From", "Subject", "To", "List-Unsubscribe"]
+        )
+    }
+
+    /// `format=full`: returns the MIME tree so the caller can extract the body.
+    public func getMessageFull(
+        accessToken: String,
+        gmailId: String
+    ) async throws -> RawGmailMessage {
+        try await fetchMessage(
+            accessToken: accessToken,
+            gmailId: gmailId,
+            format: "full",
+            metadataHeaders: []
+        )
+    }
+
+    private func fetchMessage(
+        accessToken: String,
+        gmailId: String,
+        format: String,
+        metadataHeaders: [String]
+    ) async throws -> RawGmailMessage {
         // gmailId is a server-issued opaque token; percent-encode it so a
         // hostile value cannot alter the path (spec §6.6 rule 2).
         var c = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")!
         c.path += "/\(Self.percentEncodePath(gmailId))"
-        c.queryItems = [
-            .init(name: "format", value: "metadata"),
-            .init(name: "metadataHeaders", value: "From"),
-            .init(name: "metadataHeaders", value: "Subject")
-        ]
+        var items: [URLQueryItem] = [.init(name: "format", value: format)]
+        items += metadataHeaders.map { .init(name: "metadataHeaders", value: $0) }
+        c.queryItems = items
         var req = URLRequest(url: c.url!)
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         try OutboundGuard.validate(req.url!)
 
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await session.outboundData(for: req)
         try Self.assertOK(resp, data)
         return try JSONDecoder().decode(RawGmailMessage.self, from: data)
     }
@@ -84,7 +124,7 @@ public final class GmailClient: Sendable {
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         try OutboundGuard.validate(req.url!)
 
-        let (data, resp) = try await session.data(for: req)
+        let (data, resp) = try await session.outboundData(for: req)
         try Self.assertOK(resp, data)
         struct R: Codable { let emailAddress: String }
         return try JSONDecoder().decode(R.self, from: data).emailAddress

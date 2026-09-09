@@ -16,9 +16,9 @@ public enum SyncRoutes {
                     body: .init(byteBuffer: ByteBuffer(string: "accountId missing or malformed"))
                 )
             }
-            let limit = min(Int(req.uri.queryParameters["limit"] ?? "50") ?? 50, 200)
+            let limit = max(1, min(Int(req.uri.queryParameters["limit"] ?? "50") ?? 50, 200))
             let msgs = try await MessageStore.recent(forAccount: uuid, limit: limit, db: db)
-            let unread = msgs.filter { !$0.isRead }.count
+            let unread = try await MessageStore.unreadCount(forAccount: uuid, db: db)
             let cursor = SyncCursor(accountId: uuid, lastFetchedAt: Date(), totalUnread: unread)
             let payload = SyncResponse(cursor: cursor, messages: msgs)
             let enc = JSONEncoder()

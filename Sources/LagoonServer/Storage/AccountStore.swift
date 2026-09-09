@@ -27,7 +27,9 @@ public enum AccountStore {
                 access_token = EXCLUDED.access_token,
                 refresh_token = EXCLUDED.refresh_token,
                 token_expires_at = EXCLUDED.token_expires_at,
-                history_id = EXCLUDED.history_id,
+                history_id = CASE WHEN EXCLUDED.history_id IS NOT NULL
+                                  THEN EXCLUDED.history_id
+                                  ELSE accounts.history_id END,
                 updated_at = now()
         """
         try await db.query(sql, [
@@ -38,8 +40,43 @@ public enum AccountStore {
             PostgresData(bytes: accessToken),
             PostgresData(bytes: refreshToken),
             PostgresData(date: account.tokenExpiresAt),
-            account.historyId.map { PostgresData(string: $0) } ?? PostgresData(string: "")
+            account.historyId.map { PostgresData(string: $0) } ?? PostgresData.null
         ]).get()
+    }
+
+    /// Update only the OAuth tokens (refresh flow). Never touches read state.
+    public static func updateTokens(
+        accountId: UUID,
+        accessTokenCiphertext: Data,
+        refreshTokenCiphertext: Data,
+        expiresAt: Date,
+        db: PostgresConnection
+    ) async throws {
+        let sql = """
+            UPDATE accounts
+            SET access_token = $2,
+                refresh_token = $3,
+                token_expires_at = $4,
+                updated_at = now()
+            WHERE id = $1
+        """
+        try await db.query(sql, [
+            PostgresData(uuid: accountId),
+            PostgresData(bytes: accessTokenCiphertext),
+            PostgresData(bytes: refreshTokenCiphertext),
+            PostgresData(date: expiresAt)
+        ]).get()
+    }
+
+    /// All connected accounts, used by GET /api/accounts.
+    public static func all(db: PostgresConnection) async throws -> [Account] {
+        let sql = """
+            SELECT id, provider, oauth_user, email, token_expires_at, history_id
+            FROM accounts
+            ORDER BY email
+        """
+        let rows = try await db.query(sql, []).get()
+        return try rows.map { try Self.decode($0) }
     }
 
     public static func find(
@@ -63,8 +100,21 @@ public enum AccountStore {
         return nil
     }
 
-    public static func deleteAll(db: PostgresConnection) async throws {
-        try await db.query("DELETE FROM accounts", []).get()
+    public static func find(
+        byId id: UUID,
+        db: PostgresConnection
+    ) async throws -> Account? {
+        let sql = """
+            SELECT id, provider, oauth_user, email, token_expires_at, history_id
+            FROM accounts
+            WHERE id = $1
+            LIMIT 1
+        """
+        let rows = try await db.query(sql, [PostgresData(uuid: id)]).get()
+        for row in rows {
+            return try Self.decode(row)
+        }
+        return nil
     }
 
     public static func decode(_ row: PostgresNIO.PostgresRow) throws -> Account {

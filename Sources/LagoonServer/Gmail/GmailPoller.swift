@@ -6,11 +6,34 @@ import LagoonKit
 public actor GmailPoller {
     private let db: PostgresConnection
     private let client: GmailClient
+    private let tokens: GmailTokenService
     private let logger: Logger
 
-    public init(db: PostgresConnection, client: GmailClient, logger: Logger) {
+    public init(
+        db: PostgresConnection,
+        client: GmailClient,
+        oauth: GoogleOAuthClient,
+        logger: Logger
+    ) {
+        self.init(
+            db: db,
+            client: client,
+            tokens: GmailTokenService(db: db, oauth: oauth, logger: logger),
+            logger: logger
+        )
+    }
+
+    /// Production init: share the same `GmailTokenService` (and therefore the
+    /// same single-flight registry) with the message routes.
+    public init(
+        db: PostgresConnection,
+        client: GmailClient,
+        tokens: GmailTokenService,
+        logger: Logger
+    ) {
         self.db = db
         self.client = client
+        self.tokens = tokens
         self.logger = logger
     }
 
@@ -37,37 +60,98 @@ public actor GmailPoller {
 
     private func syncAccount(_ account: Account) async {
         do {
-            let accessToken = try await AccessTokenCipher.readToken(accountId: account.id, db: db)
-            let list = try await client.listMessageRefs(accessToken: accessToken, maxResults: 50)
-            guard let refs = list.messages else { return }
-            for ref in refs.prefix(50) {
-                let raw = try await client.getMessage(accessToken: accessToken, gmailId: ref.id)
-                let fromHeader = raw.payload?.headers?.first { $0.name.lowercased() == "from" }?.value ?? ""
-                let subject = raw.payload?.headers?.first { $0.name.lowercased() == "subject" }?.value
-                let (addr, name) = Self.parseFromHeader(fromHeader)
-                let receivedAt = raw.internalDate.flatMap { Int64($0) }
-                    .map { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) } ?? Date()
-                let msg = MessageHeader(
-                    id: UUID(),
-                    accountId: account.id,
-                    gmailId: raw.id,
-                    threadId: raw.threadId,
-                    fromAddress: addr,
-                    fromName: name,
-                    subject: subject,
-                    snippet: raw.snippet,
-                    receivedAt: receivedAt,
-                    isRead: false,
-                    isArchived: false
-                )
-                try await MessageStore.upsert(msg, db: db)
+            let token = try await tokens.validToken(for: account)
+            do {
+                try await syncMessages(account: account, accessToken: token.accessToken)
+            } catch GmailClientError.unauthorized {
+                // Google revoked the token early: refresh once, retry once,
+                // then give up (the next tick will try again). If the proactive
+                // path already refreshed, a 401 is genuine and must not trigger
+                // a second POST to Google.
+                guard !token.didRefresh else { throw GmailClientError.unauthorized }
+                let refreshed = try await tokens.forceRefresh(for: account)
+                try await syncMessages(account: account, accessToken: refreshed)
             }
-            logger.info("synced", metadata: ["account": .string(account.email), "count": .string("\(refs.count)")])
-        } catch GmailClientError.unauthorized {
-            logger.warning("token expired; refresh flow lands in M1", metadata: ["account": .string(account.email)])
         } catch {
-            logger.error("account sync failed", metadata: ["account": .string(account.email), "err": .string("\(error)")])
+            logger.error("account sync failed", metadata: [
+                "account": .string(account.email),
+                "err": .string("\(error)")
+            ])
         }
+    }
+
+    /// Gmail `messages.get` calls in flight at once. A metadata get costs 5
+    /// quota units against Gmail's ~250 units/s/user budget, so 8 concurrent
+    /// calls stay inside quota while cutting a 50-message poll from ~50 serial
+    /// round-trips to ~7 batches.
+    static let fetchConcurrency = 8
+
+    private func syncMessages(account: Account, accessToken: String) async throws {
+        let list = try await client.listMessageRefs(accessToken: accessToken, maxResults: 50)
+        guard let refs = list.messages else { return }
+        let ids = refs.prefix(50).map(\.id)
+        guard !ids.isEmpty else { return }
+
+        // Fetch concurrently in bounded batches, then upsert afterwards so the
+        // single Postgres connection stays a serial write path.
+        var fetched: [(header: MessageHeader, listUnsubscribe: Bool)] = []
+        fetched.reserveCapacity(ids.count)
+        for start in stride(from: 0, to: ids.count, by: Self.fetchConcurrency) {
+            let batch = Array(ids[start..<min(start + Self.fetchConcurrency, ids.count)])
+            let responses = try await withThrowingTaskGroup(of: RawGmailMessage.self) { group in
+                for id in batch {
+                    group.addTask { [client, accessToken] in
+                        try await client.getMessage(accessToken: accessToken, gmailId: id)
+                    }
+                }
+                var collected: [RawGmailMessage] = []
+                for try await response in group { collected.append(response) }
+                return collected
+            }
+            for raw in responses {
+                fetched.append((
+                    Self.header(from: raw, accountId: account.id),
+                    Self.hasListUnsubscribe(raw)
+                ))
+            }
+        }
+        for item in fetched {
+            try await MessageStore.upsert(item.header, listUnsubscribe: item.listUnsubscribe, db: db)
+        }
+        logger.info("synced", metadata: [
+            "account": .string(account.email),
+            "count": .string("\(fetched.count)")
+        ])
+    }
+
+    /// Map a Gmail metadata response onto the row we store.
+    static func header(from raw: RawGmailMessage, accountId: UUID) -> MessageHeader {
+        let fromHeader = raw.payload?.headers?
+            .first { $0.name.lowercased() == "from" }?.value ?? ""
+        let (address, name) = parseFromHeader(fromHeader)
+        let receivedAt = raw.internalDate.flatMap { Int64($0) }
+            .map { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) } ?? Date()
+        return MessageHeader(
+            id: UUID(),
+            accountId: accountId,
+            gmailId: raw.id,
+            threadId: raw.threadId,
+            fromAddress: address,
+            fromName: name,
+            subject: raw.payload?.headers?.first { $0.name.lowercased() == "subject" }?.value,
+            snippet: raw.snippet,
+            receivedAt: receivedAt,
+            isRead: !(raw.labelIds ?? []).contains("UNREAD"),
+            isArchived: false
+        )
+    }
+
+    /// Presence of a non-empty List-Unsubscribe header on the metadata response.
+    static func hasListUnsubscribe(_ raw: RawGmailMessage) -> Bool {
+        raw.payload?.headers?.contains {
+            $0.name.lowercased() == "list-unsubscribe"
+                && !$0.value.trimmingCharacters(in: .whitespaces).isEmpty
+        } ?? false
     }
 
     static func parseFromHeader(_ raw: String) -> (String, String?) {

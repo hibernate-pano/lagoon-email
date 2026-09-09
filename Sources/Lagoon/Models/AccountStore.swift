@@ -5,13 +5,24 @@ import LagoonKit
 public final class AccountStore: ObservableObject {
     @Published public private(set) var accountId: UUID?
     @Published public private(set) var lastSync: SyncResponse?
+    @Published public private(set) var loadError: String?
 
-    public init() {
-        self.accountId = KeychainStore.load()
+    private let service: String
+
+    public init(service: String = KeychainStore.defaultService) {
+        self.service = service
+        do {
+            self.accountId = try KeychainStore.load(service: service)
+        } catch {
+            self.accountId = nil
+            self.loadError = "Could not read saved account: \(error.localizedDescription)"
+        }
     }
 
-    public func set(accountId: UUID) {
-        try? KeychainStore.save(accountID: accountId)
+    /// Persists first, then updates state. If the keychain write fails the
+    /// in-memory account stays unchanged and the error propagates to the view.
+    public func set(accountId: UUID) throws {
+        try KeychainStore.save(accountID: accountId, service: service)
         self.accountId = accountId
     }
 
@@ -19,8 +30,10 @@ public final class AccountStore: ObservableObject {
         self.lastSync = resp
     }
 
-    public func clear() {
-        KeychainStore.clear()
+    /// Surfaces keychain failures instead of silently ignoring them. State is
+    /// only cleared after the keychain delete succeeds.
+    public func clear() throws {
+        try KeychainStore.clear(service: service)
         self.accountId = nil
         self.lastSync = nil
     }
