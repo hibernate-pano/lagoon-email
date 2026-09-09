@@ -20,8 +20,12 @@ if rg -n --pcre2 '"[^"]*(?:SELECT|INSERT|UPDATE|DELETE)[^"]*\\\\?\(|\\\(' \
   fi
 fi
 
-# Rule 3: raw to_vector() concatenation
-if rg -n --pcre2 'to_vector\(' Sources Tests 2>/dev/null > /tmp/lagoon-tovector.txt; then
+# Rule 3: raw to_vector() concatenation outside SQL comments / migrations
+# Migration .sql files are schema definitions, not query building, and are
+# allowed to call CREATE EXTENSION / define vector columns.
+if rg -n --pcre2 'to_vector\(' Sources Tests 2>/dev/null \
+   | rg -v '\.sql:' \
+   | rg -v '^\s*--' > /tmp/lagoon-tovector.txt; then
   if [ -s /tmp/lagoon-tovector.txt ]; then
     echo "FAIL: raw to_vector() call found; use \$1::vector binding" >&2
     cat /tmp/lagoon-tovector.txt >&2
