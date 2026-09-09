@@ -22,7 +22,7 @@ let package = Package(
             .product(name: "Crypto", package: "swift-crypto"),
             .product(name: "NIOSSL", package: "swift-nio-ssl"),
             .product(name: "Logging", package: "swift-log")
-        ]),
+        ], exclude: ["Migrations"]),
         .executableTarget(name: "LagoonServer", dependencies: [
             "LagoonKit",
             .product(name: "Hummingbird", package: "hummingbird"),
