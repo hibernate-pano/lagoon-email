@@ -4,11 +4,6 @@ import PostgresNIO
 import NIOCore
 import LagoonKit
 
-public struct SyncResponse: Codable, Sendable {
-    public let cursor: SyncCursor
-    public let messages: [MessageHeader]
-}
-
 public enum SyncRoutes {
     public static func register(on router: Router<BasicRequestContext>, db: PostgresConnection) {
         router.get("api/messages") { req, _ -> Response in

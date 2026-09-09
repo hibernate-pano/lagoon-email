@@ -31,6 +31,7 @@ let package = Package(
         ]),
         .executableTarget(name: "Lagoon", dependencies: ["LagoonKit"]),
         .testTarget(name: "LagoonKitTests", dependencies: ["LagoonKit"]),
-        .testTarget(name: "LagoonServerTests", dependencies: ["LagoonServer", "LagoonKit"])
+        .testTarget(name: "LagoonServerTests", dependencies: ["LagoonServer", "LagoonKit"]),
+        .testTarget(name: "LagoonTests", dependencies: ["Lagoon"])
     ]
 )
