@@ -246,6 +246,64 @@ final class AIGatewayTests: XCTestCase {
         XCTAssertEqual(summary.provider, "stub-model")
     }
 
+    /// The summary and action items must come back in the configured language,
+    /// while the JSON keys stay English (they are parsed, not displayed).
+    func test_summarize_requestsConfiguredOutputLanguage() async throws {
+        StubURLProtocol.set { _ in
+            (200, Data(#"{"choices":[{"message":{"content":"{\"summary\":\"简短。\",\"actionItems\":[\"回复\"]}"}}]}"#.utf8))
+        }
+        let resolved = try ProviderRegistry.load(
+            environment: ["STUB_LLM_KEY": "test-key"],
+            fileURL: configURL
+        )
+        let provider = try OpenAICompatibleProvider(resolved: resolved[0], session: stubSession())
+        let ai = AIGateway(
+            providers: [provider],
+            routing: ["summary": "stub", "classify": "stub"],
+            outputLanguage: "zh-Hans"
+        )
+        let body = MessageBody(
+            gmailId: "g1",
+            subject: "Invoice",
+            fromAddress: "billing@example.com",
+            fromName: "Billing",
+            toAddress: "me@example.com",
+            receivedAt: Date(),
+            text: "Please pay by Friday."
+        )
+        let summary = try await ai.summarize(body)
+        XCTAssertEqual(summary.summary, "简短。")
+        XCTAssertEqual(summary.actionItems, ["回复"])
+
+        let prompt = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
+        XCTAssertTrue(
+            prompt.contains("Simplified Chinese"),
+            "the prompt must name the output language"
+        )
+        XCTAssertTrue(
+            prompt.contains("Keep the JSON keys exactly"),
+            "JSON keys must stay English or parsing breaks"
+        )
+    }
+
+    /// Classification identifiers are parsed, so they must never be translated.
+    func test_classify_prompt_pinsIdentifiersToASCII() async throws {
+        StubURLProtocol.set { _ in
+            (200, Data(#"{"choices":[{"message":{"content":"{\"g1\":\"needsReply\"}"}}]}"#.utf8))
+        }
+        let ai = try gateway()
+        _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com")
+        let prompt = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
+        XCTAssertTrue(prompt.contains("never translated"))
+    }
+
+    func test_languageName_mapsTags() {
+        XCTAssertEqual(AIGateway.languageName(for: "zh-Hans"), "Simplified Chinese (简体中文)")
+        XCTAssertEqual(AIGateway.languageName(for: "zh-TW"), "Traditional Chinese (繁體中文)")
+        XCTAssertEqual(AIGateway.languageName(for: "en"), "English")
+        XCTAssertEqual(AIGateway.languageName(for: "xx"), "xx")
+    }
+
     func test_summarize_truncatesHugeBody() async throws {
         StubURLProtocol.set { _ in
             (200, Data(#"{"choices":[{"message":{"content":"{\"summary\":\"s\",\"actionItems\":[]}"}}]}"#.utf8))

@@ -89,7 +89,7 @@ public enum BriefingRoutes {
                     }
                 }
                 for (gmailId, group) in overrides where classified[gmailId] != nil {
-                    classified[gmailId] = (group, "AI classification")
+                    classified[gmailId] = (group, "AI 分类")
                 }
             }
 

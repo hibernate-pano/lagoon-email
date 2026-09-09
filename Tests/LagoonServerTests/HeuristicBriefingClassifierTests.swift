@@ -69,7 +69,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         let message = header("m2", from: "no-reply@example.com")
         let result = group(message, listUnsubscribe: ["m2"])
         XCTAssertEqual(result.group, .subscriptionNoise)
-        XCTAssertTrue(result.reason.contains("List-Unsubscribe"))
+        XCTAssertTrue(result.reason.contains("退订"), "the List-Unsubscribe branch must win: \(result.reason)")
     }
 
     /// The no-reply/newsletter sender regex is case-insensitive and matches

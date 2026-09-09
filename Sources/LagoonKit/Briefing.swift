@@ -13,11 +13,11 @@ public enum BriefingGroup: String, Codable, Sendable, CaseIterable, Identifiable
 
     public var title: String {
         switch self {
-        case .needsReply: "Needs reply"
-        case .awaitingReply: "Awaiting their reply"
-        case .safeToArchive: "Safe to archive"
-        case .subscriptionNoise: "Subscription noise"
-        case .pinned: "Pinned"
+        case .needsReply: "需要回复"
+        case .awaitingReply: "等待对方回复"
+        case .safeToArchive: "可归档"
+        case .subscriptionNoise: "订阅噪音"
+        case .pinned: "已置顶"
         }
     }
 

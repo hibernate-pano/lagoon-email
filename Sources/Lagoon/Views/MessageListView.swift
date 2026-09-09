@@ -17,7 +17,7 @@ struct MessageListView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
-                Text("All messages")
+                Text("全部邮件")
                     .font(.headline)
                 Spacer()
                 if isLoading {
@@ -26,11 +26,11 @@ struct MessageListView: View {
                 Button {
                     onShowBriefing()
                 } label: {
-                    Label("Briefing", systemImage: "rectangle.grid.1x2")
+                    Label("简报", systemImage: "rectangle.grid.1x2")
                 }
                 .keyboardShortcut("0", modifiers: .command)
-                .help("Back to the Briefing Feed (⌘0)")
-                Button("Refresh") {
+                .help("返回简报（⌘0）")
+                Button("刷新") {
                     Task { await refresh() }
                 }
                 .disabled(isLoading)
@@ -45,13 +45,13 @@ struct MessageListView: View {
             }
 
             if messages.isEmpty && !isLoading {
-                Text("No messages yet — the server is still syncing.")
+                Text("还没有邮件 —— 服务器仍在同步。")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(messages) { m in
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(m.subject ?? "(no subject)")
+                        Text(m.subject ?? "（无主题）")
                             .font(.body)
                             .bold(!m.isRead)
                             .lineLimit(1)
@@ -101,7 +101,7 @@ struct MessageListView: View {
             messages = resp.messages
             accounts.setLastSync(resp)
         } catch {
-            errorMessage = "Sync failed: \(error.localizedDescription). Is the server running?"
+            errorMessage = "同步失败：\(error.localizedDescription)。服务器在运行吗？"
         }
         isLoading = false
     }

@@ -9,20 +9,39 @@ import LagoonKit
 /// implemented; there is no cost accounting source yet. Add it when a second
 /// account or a metered plan exists.
 public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecked Sendable {
+    /// Language the model must write user-facing text in. Group identifiers
+    /// and JSON keys stay English because they are parsed, not displayed.
+    public static let defaultOutputLanguage = "zh-Hans"
+
     private let providers: [LLMProvider]
     private let routing: [String: String]
     private let breaker: CircuitBreaker
     private let logger: Logger
+    public let outputLanguage: String
 
     public init(
         providers: [LLMProvider],
         routing: [String: String],
+        outputLanguage: String = AIGateway.defaultOutputLanguage,
         logger: Logger = Logger(label: "lagoon.ai")
     ) {
         self.providers = providers
         self.routing = routing
+        self.outputLanguage = outputLanguage
         self.breaker = CircuitBreaker()
         self.logger = logger
+    }
+
+    /// Human-readable name for a BCP-47-ish language tag, used in prompts.
+    public static func languageName(for tag: String) -> String {
+        switch tag.lowercased() {
+        case "zh-hans", "zh-cn", "zh": "Simplified Chinese (简体中文)"
+        case "zh-hant", "zh-tw", "zh-hk": "Traditional Chinese (繁體中文)"
+        case "en", "en-us", "en-gb": "English"
+        case "ja", "ja-jp": "Japanese (日本語)"
+        case "ko", "ko-kr": "Korean (한국어)"
+        default: tag
+        }
     }
 
     /// Returns nil when no provider is configured (missing key or base URL).
@@ -38,7 +57,14 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
             guard !resolved.isEmpty else { return nil }
             let providers = try resolved.map { try OpenAICompatibleProvider(resolved: $0, session: session) }
             let routing = (try? loadRouting(environment: environment, fileURL: fileURL)) ?? [:]
-            return AIGateway(providers: providers, routing: routing, logger: logger)
+            let language = environment["LAGOON_AI_LANGUAGE"].flatMap { $0.isEmpty ? nil : $0 }
+                ?? AIGateway.defaultOutputLanguage
+            return AIGateway(
+                providers: providers,
+                routing: routing,
+                outputLanguage: language,
+                logger: logger
+            )
         } catch {
             logger.warning("AI gateway disabled", metadata: ["reason": .string("\(error)")])
             return nil
@@ -84,8 +110,9 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
             Groups: needsReply (a human is waiting on the user), awaitingReply (the \
             user sent the last message), safeToArchive (already handled / no action), \
             subscriptionNoise (newsletters, notifications, marketing).
-            Reply with STRICT JSON only: {"<id>":"<group>"}. Omit any email you are \
-            unsure about.
+            Reply with STRICT JSON only: {"<id>":"<group>"}. Use the group \
+            identifiers and message ids exactly as given (ASCII, never translated). \
+            Omit any email you are unsure about.
             Emails: \(jsonString(rows))
             """
 
@@ -112,6 +139,10 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
             Summarize this email in at most 3 sentences and extract concrete action \
             items addressed to the reader. Reply with STRICT JSON only:
             {"summary":"…","actionItems":["…"]}
+            Write the summary and every action item in \
+            \(Self.languageName(for: outputLanguage)). Keep the JSON keys exactly \
+            as given (English) — translate only the values. Leave product names, \
+            people names and code identifiers unchanged.
             From: \(body.fromAddress)
             Subject: \(body.subject ?? "(none)")
             Body:

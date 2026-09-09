@@ -60,7 +60,7 @@ struct BriefingFeedView: View {
 
     private var headerBar: some View {
         HStack(spacing: 8) {
-            Text("Briefing")
+            Text("简报")
                 .font(.headline)
             if isLoading {
                 ProgressView().controlSize(.small)
@@ -69,12 +69,12 @@ struct BriefingFeedView: View {
             Button {
                 onShowAllMessages()
             } label: {
-                Label("All messages", systemImage: "list.bullet")
+                Label("全部邮件", systemImage: "list.bullet")
             }
             .keyboardShortcut("0", modifiers: .command)
-            .help("Show the raw message list (⌘0)")
+            .help("查看全部邮件列表（⌘0）")
 
-            Button("Refresh") {
+            Button("刷新") {
                 Task { await refresh() }
             }
             .disabled(isLoading)
@@ -89,7 +89,7 @@ struct BriefingFeedView: View {
     private var content: some View {
         if items.isEmpty {
             if isLoading {
-                ProgressView("Loading briefing…")
+                ProgressView("正在加载简报…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if errorMessage != nil {
                 errorState
@@ -142,25 +142,25 @@ struct BriefingFeedView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(collapsedGroups.contains(group) ? "Expand \(group.title)" : "Collapse \(group.title)")
+        .help(collapsedGroups.contains(group) ? "展开 \(group.title)" : "收起 \(group.title)")
         .id(group)
     }
 
     private var emptyState: some View {
         ContentUnavailableView {
-            Label("No briefing yet", systemImage: "tray")
+            Label("还没有简报", systemImage: "tray")
         } description: {
-            Text("The server has not classified any messages yet. It keeps syncing in the background.")
+            Text("服务器还没有分类任何邮件，正在后台持续同步。")
         }
     }
 
     private var errorState: some View {
         ContentUnavailableView {
-            Label("Briefing unavailable", systemImage: "exclamationmark.triangle")
+            Label("简报不可用", systemImage: "exclamationmark.triangle")
         } description: {
-            Text(errorMessage ?? "Unknown error")
+            Text(errorMessage ?? "未知错误")
         } actions: {
-            Button("Retry") { Task { await refresh() } }
+            Button("重试") { Task { await refresh() } }
         }
     }
 
@@ -222,9 +222,9 @@ struct BriefingFeedView: View {
             )
         } else {
             ContentUnavailableView(
-                "Not connected",
+                "未连接",
                 systemImage: "person.crop.circle.badge.exclamationmark",
-                description: Text("Connect a Gmail account to read messages.")
+                description: Text("请先连接 Gmail 账号以阅读邮件。")
             )
         }
     }
@@ -268,7 +268,7 @@ struct BriefingFeedView: View {
             items = response.items
             errorMessage = nil
         } catch {
-            errorMessage = "Briefing failed: \(error.lagoonUIMessage)"
+            errorMessage = "简报加载失败：\(error.lagoonUIMessage)"
         }
         isLoading = false
     }
@@ -281,7 +281,7 @@ private struct BriefingRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(item.message.subject ?? "(no subject)")
+                Text(item.message.subject ?? "（无主题）")
                     .font(.body)
                     .bold(!item.message.isRead)
                     .lineLimit(1)

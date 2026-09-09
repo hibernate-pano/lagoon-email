@@ -18,9 +18,9 @@ struct ConnectGmailView: View {
             Text("Lagoon")
                 .font(.largeTitle)
                 .bold()
-            Text("Connect your Gmail to begin.")
+            Text("连接你的 Gmail 开始使用。")
                 .foregroundStyle(.secondary)
-            Button("Connect Gmail") {
+            Button("连接 Gmail") {
                 errorMessage = nil
                 NSWorkspace.shared.open(api.oauthStartURL)
                 connectAttempt += 1
@@ -32,12 +32,12 @@ struct ConnectGmailView: View {
             if isPolling && connectAttempt > 0 {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text("waiting for browser approval…")
+                    Text("等待浏览器授权…")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             } else {
-                Text("After approving in the browser, return here.")
+                Text("在浏览器中完成授权后回到这里。")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
@@ -70,7 +70,7 @@ struct ConnectGmailView: View {
         let deadline = ContinuousClock.now + Self.pollTimeout
         while !Task.isCancelled {
             if ContinuousClock.now >= deadline {
-                errorMessage = "still not connected — try again"
+                errorMessage = "仍未连接 —— 请重试"
                 return
             }
 
@@ -83,12 +83,12 @@ struct ConnectGmailView: View {
                         try accounts.set(accountId: first.id)
                         return
                     } catch {
-                        errorMessage = "Could not save account: \(error.localizedDescription)"
+                        errorMessage = "保存账号失败：\(error.localizedDescription)"
                         return
                     }
                 }
             } catch {
-                errorMessage = "Could not check connection: \(error.localizedDescription)"
+                errorMessage = "检查连接失败：\(error.localizedDescription)"
             }
 
             do {

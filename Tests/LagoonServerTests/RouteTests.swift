@@ -444,7 +444,7 @@ final class RouteTests: XCTestCase {
                         $0.message.gmailId == overridden.gmailId
                     }
                     XCTAssertEqual(overriddenItem?.group, .subscriptionNoise)
-                    XCTAssertEqual(overriddenItem?.reason, "AI classification")
+                    XCTAssertEqual(overriddenItem?.reason, "AI 分类")
                     let heuristicItem = decoded.items.first {
                         $0.message.gmailId == heuristicOnly.gmailId
                     }

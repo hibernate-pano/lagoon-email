@@ -84,22 +84,22 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
         now: Date = Date()
     ) -> (group: BriefingGroup, reason: String) {
         if pinnedGmailIds.contains(message.gmailId) {
-            return (.pinned, "Pinned by you")
+            return (.pinned, "你置顶了这封")
         }
         if listUnsubscribeGmailIds.contains(message.gmailId) {
-            return (.subscriptionNoise, "Has a List-Unsubscribe header")
+            return (.subscriptionNoise, "带有退订链接")
         }
         if matchesSubscriptionSender(message.fromAddress) {
             return (.subscriptionNoise, "Newsletter or no-reply sender")
         }
         if message.fromAddress.caseInsensitiveCompare(accountEmail) == .orderedSame {
-            return (.awaitingReply, "Sent by you — awaiting their reply")
+            return (.awaitingReply, "你发出的 —— 等待对方回复")
         }
         let sevenDays: TimeInterval = 7 * 24 * 60 * 60
         if message.isRead, now.timeIntervalSince(message.receivedAt) > sevenDays {
-            return (.safeToArchive, "Read and older than 7 days")
+            return (.safeToArchive, "已读且超过 7 天")
         }
-        return (.needsReply, "Needs your reply")
+        return (.needsReply, "需要你回复")
     }
 
     /// `(?i)(no-?reply|newsletter|notifications?@|marketing@|mailer|bounce)`

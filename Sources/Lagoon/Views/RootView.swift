@@ -8,8 +8,8 @@ import SwiftUI
 /// (⌘0) so the raw list is always reachable.
 struct RootView: View {
     enum Surface: String, CaseIterable, Identifiable {
-        case briefing = "Briefing"
-        case allMessages = "All messages"
+        case briefing = "简报"
+        case allMessages = "全部邮件"
 
         var id: String { rawValue }
     }
@@ -27,13 +27,13 @@ struct RootView: View {
         }
         .toolbar {
             ToolbarItem(placement: .navigation) {
-                Picker("Surface", selection: $surface) {
+                Picker("界面", selection: $surface) {
                     ForEach(Surface.allCases) { surface in
                         Text(surface.rawValue).tag(surface)
                     }
                 }
                 .pickerStyle(.segmented)
-                .help("Switch between the Briefing Feed and the raw message list")
+                .help("在简报和全部邮件之间切换")
             }
         }
     }

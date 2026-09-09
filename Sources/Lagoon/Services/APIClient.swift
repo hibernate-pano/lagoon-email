@@ -19,11 +19,11 @@ public enum APIError: LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .invalidURL(let description):
-            return "Invalid server URL: \(description)"
+            return "服务器地址无效：\(description)"
         case .invalidResponse:
-            return "The server returned a non-HTTP response."
+            return "服务器返回了非 HTTP 响应。"
         case .badStatus(let code, let bodySnippet):
-            return "Server returned HTTP \(code): \(bodySnippet)"
+            return "服务器返回 HTTP \(code)：\(bodySnippet)"
         }
     }
 }
