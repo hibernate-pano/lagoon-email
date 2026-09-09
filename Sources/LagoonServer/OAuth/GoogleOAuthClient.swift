@@ -19,7 +19,9 @@ public struct GoogleTokenResult: Codable, Sendable {
 }
 
 public struct GoogleUserInfo: Codable, Sendable {
-    public let id: String
+    // Google's OIDC /userinfo endpoint returns the unique subject as `sub`,
+    // not `id` (the legacy `id` field only existed on the retired v1 endpoint).
+    public let sub: String
     public let email: String
 }
 

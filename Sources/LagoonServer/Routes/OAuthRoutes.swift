@@ -36,7 +36,7 @@ public enum OAuthRoutes {
                 let account = Account(
                     id: UUID(),
                     provider: .gmail,
-                    oauthUser: info.id,
+                    oauthUser: info.sub,
                     email: info.email,
                     tokenExpiresAt: Date().addingTimeInterval(TimeInterval(tokens.expiresIn)),
                     historyId: nil
