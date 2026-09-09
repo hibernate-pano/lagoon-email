@@ -15,7 +15,8 @@ public enum BriefingRoutes {
         on router: Router<BasicRequestContext>,
         db: PostgresConnection,
         logger: Logger,
-        classifier: (any BriefingClassifying)? = nil
+        classifier: (any BriefingClassifying)? = nil,
+        cache: BriefingClassificationCache = BriefingClassificationCache()
     ) {
         router.get("api/briefing") { request, _ -> Response in
             guard let accountId = RouteParams.accountId(from: request) else {
@@ -65,20 +66,30 @@ public enum BriefingRoutes {
             )
 
             if let classifier {
-                do {
-                    let overrides = try await classifier.classify(
-                        messages,
-                        accountEmail: account.email
-                    )
-                    for (gmailId, group) in overrides where classified[gmailId] != nil {
-                        classified[gmailId] = (group, "AI classification")
+                // Only ask about messages never classified (or whose read state
+                // changed): the client refreshes every 30 s and a full
+                // 50-message classification costs ~8k prompt tokens.
+                let (known, pending) = await cache.cached(for: messages)
+                var overrides = known
+                if !pending.isEmpty {
+                    do {
+                        let fresh = try await classifier.classify(
+                            pending,
+                            accountEmail: account.email
+                        )
+                        await cache.store(fresh, for: pending)
+                        for (gmailId, group) in fresh { overrides[gmailId] = group }
+                    } catch {
+                        // Fail open: heuristic grouping is still useful, and
+                        // nothing is cached so the next refresh retries.
+                        logger.warning("briefing classifier failed; using heuristics", metadata: [
+                            "accountId": .string(accountId.uuidString),
+                            "err": .string("\(error)")
+                        ])
                     }
-                } catch {
-                    // Fail open: heuristic grouping is still useful.
-                    logger.warning("briefing classifier failed; using heuristics", metadata: [
-                        "accountId": .string(accountId.uuidString),
-                        "err": .string("\(error)")
-                    ])
+                }
+                for (gmailId, group) in overrides where classified[gmailId] != nil {
+                    classified[gmailId] = (group, "AI classification")
                 }
             }
 

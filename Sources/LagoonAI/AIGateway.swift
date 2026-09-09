@@ -200,9 +200,20 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
         return text
     }
 
-    /// Accepts a bare JSON object or one wrapped in a ```json fence.
+    /// Accepts a bare JSON object, one wrapped in a ```json fence, or one
+    /// preceded by a reasoning block.
+    ///
+    /// MiniMax-M3 and other reasoning models emit `<think>…</think>` before the
+    /// answer. The block can contain braces, so it is removed before slicing
+    /// from the first `{` to the last `}`.
     private func parseJSONObject(_ raw: String) -> [String: Any]? {
-        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var text = raw
+            .replacingOccurrences(
+                of: "(?is)<think\\b.*?</think\\s*>",
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         if let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}") {
             text = String(text[start...end])
         }
