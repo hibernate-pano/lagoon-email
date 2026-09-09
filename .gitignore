@@ -20,3 +20,11 @@ xcuserdata/
 .DS_Store
 *.swp
 *.swo
+
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# Docker
+.docker-data/

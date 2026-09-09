@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: lagoon-postgres
+    environment:
+      POSTGRES_USER: lagoon
+      POSTGRES_PASSWORD: lagoon
+      POSTGRES_DB: lagoon
+    ports:
+      - "5432:5432"
+    volumes:
+      - lagoon-pgdata:/var/lib/postgresql/data
+
+volumes:
+  lagoon-pgdata:
