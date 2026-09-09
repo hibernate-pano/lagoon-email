@@ -1,15 +1,36 @@
 import Foundation
+import CoreFoundation
 
-/// URLSession that bypasses the macOS system proxy.
-/// A local dev machine running a system proxy (e.g. Clash on 127.0.0.1:7897)
-/// broke URLSession TLS to Google endpoints (-1200 over lo0) while direct
-/// traffic verified working. M0 keeps all server-side calls on a direct path;
-/// M1 revisits when the server runs in a datacenter.
+/// URLSession for all server-side outbound calls.
+///
+/// Proxy policy (config-free by design):
+/// - `LAGOON_HTTP_PROXY` set (e.g. "http://127.0.0.1:7897"): all outbound
+///   traffic goes through that proxy explicitly. This is the normal setup on
+///   a dev machine whose network cannot reach Google directly.
+/// - Unset: the session bypasses the macOS system proxy entirely and connects
+///   directly. This is the datacenter / TUN-mode setup.
+///
+/// We never touch the OS system-proxy settings; we either bypass them or
+/// pin our own explicit proxy from env.
 public extension URLSession {
-    static let direct: URLSession = {
+    static let outbound: URLSession = {
         let cfg = URLSessionConfiguration.default
-        cfg.connectionProxyDictionary = [:]
         cfg.timeoutIntervalForRequest = 30
+        if let raw = ProcessInfo.processInfo.environment["LAGOON_HTTP_PROXY"],
+           !raw.isEmpty,
+           let parsed = URL(string: raw.trimmingCharacters(in: .whitespaces)),
+           let host = parsed.host,
+           let port = parsed.port {
+            cfg.connectionProxyDictionary = [
+                kCFNetworkProxiesHTTPEnable as String: true,
+                kCFNetworkProxiesHTTPProxy as String: host,
+                kCFNetworkProxiesHTTPPort as String: port,
+                kCFStreamPropertyHTTPSProxyHost as String: host,
+                kCFStreamPropertyHTTPSProxyPort as String: port
+            ]
+        } else {
+            cfg.connectionProxyDictionary = [:]
+        }
         return URLSession(configuration: cfg)
     }()
 }

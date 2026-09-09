@@ -41,7 +41,7 @@ public final class GoogleOAuthClient: Sendable {
             "https://www.googleapis.com/auth/userinfo.email",
             "openid"
         ],
-        session: URLSession = .direct
+        session: URLSession = .outbound
     ) {
         self.clientID = clientID
         self.clientSecret = clientSecret

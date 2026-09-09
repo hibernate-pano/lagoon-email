@@ -33,7 +33,7 @@ public enum GmailClientError: Error { case unauthorized, http(Int, String) }
 public final class GmailClient: Sendable {
     private let session: URLSession
 
-    public init(session: URLSession = .direct) {
+    public init(session: URLSession = .outbound) {
         self.session = session
     }
 
