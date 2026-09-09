@@ -40,5 +40,9 @@ final class MessageStoreTests: XCTestCase {
         let recent = try await MessageStore.recent(forAccount: account.id, limit: 10, db: conn)
         XCTAssertEqual(recent.count, 1)
         XCTAssertEqual(recent.first?.gmailId, msg.gmailId)
+        // Leave no residue: the server's Gmail poller would otherwise pick this
+        // fake account up every 30 s and hammer the API with a garbage token.
+        try await MessageStore.deleteAll(db: conn)
+        try await AccountStore.deleteAll(db: conn)
     }
 }

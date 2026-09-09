@@ -33,5 +33,8 @@ final class AccountStoreTests: XCTestCase {
             db: conn
         )
         XCTAssertEqual(back?.id, a.id)
+        // Leave no residue: the server's Gmail poller would otherwise pick this
+        // fake account up every 30 s and hammer the API with a garbage token.
+        try await AccountStore.deleteAll(db: conn)
     }
 }
