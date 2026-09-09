@@ -7,7 +7,9 @@ services:
       POSTGRES_PASSWORD: lagoon
       POSTGRES_DB: lagoon
     ports:
-      - "5432:5432"
+      # Host 5433 -> container 5432. A local Homebrew postgres owns 127.0.0.1:5432,
+      # so Lagoon's Docker instance must not collide with it.
+      - "5433:5432"
     volumes:
       - lagoon-pgdata:/var/lib/postgresql/data
 

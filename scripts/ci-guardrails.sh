@@ -8,9 +8,9 @@ cd "$(dirname "$0")/.."
 fail=0
 
 # Rule 1: SQL string interpolation outside SQLBuilder.swift.
-# Swift has no f-strings; we flag string literals containing SQL keywords
-# that also use interpolation tokens (\(...)).
-if rg -n --pcre2 '"[^"]*(?:SELECT|INSERT|UPDATE|DELETE)[^"]*\\\\?\(|\\\(' \
+# Flag only strings that contain BOTH a SQL keyword AND Swift interpolation \(
+# (plain fixture values like "u-\(uuid)" are not SQL).
+if rg -n --pcre2 '"(?=[^"]*\b(?:SELECT|INSERT|UPDATE|DELETE)\b)(?=[^"]*\\\()' \
       Sources Tests 2>/dev/null \
    | rg -v "SQLBuilder.swift" > /tmp/lagoon-sql-hits.txt; then
   if [ -s /tmp/lagoon-sql-hits.txt ]; then
