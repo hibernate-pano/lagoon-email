@@ -15,7 +15,7 @@ public final class AccountStore: ObservableObject {
             self.accountId = try KeychainStore.load(service: service)
         } catch {
             self.accountId = nil
-            self.loadError = "读取已保存账号失败：\(error.localizedDescription)"
+            self.loadError = L10n.current.readSavedAccountFailed + error.localizedDescription
         }
     }
 

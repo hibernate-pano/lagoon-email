@@ -40,6 +40,9 @@ public struct OpenAICompatibleProvider: LLMProvider {
         let body: [String: Any] = [
             "model": model,
             "temperature": capability == .classify ? 0 : 0.2,
+            // Reasoning models spend output tokens on the think block before
+            // the answer; a small cap truncates the JSON and parses as garbage.
+            "max_tokens": 4_096,
             "messages": [
                 ["role": "system", "content": system],
                 ["role": "user", "content": user]
@@ -67,12 +70,14 @@ public struct OpenAICompatibleProvider: LLMProvider {
             throw LLMError.badResponse("missing choices[0].message.content")
         }
         let usage = root["usage"] as? [String: Any]
+        let finishReason = choices.first?["finish_reason"] as? String
         return LLMCompletion(
             text: content,
             promptTokens: usage?["prompt_tokens"] as? Int,
             completionTokens: usage?["completion_tokens"] as? Int,
             model: model,
-            latencyMs: latencyMs
+            latencyMs: latencyMs,
+            finishReason: finishReason
         )
     }
 }

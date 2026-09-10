@@ -16,19 +16,24 @@ public struct LLMCompletion: Sendable {
     public let completionTokens: Int?
     public let model: String
     public let latencyMs: Int
+    /// Provider `finish_reason`. `length` means the answer was truncated and
+    /// JSON parsing may legitimately fail, so it is worth logging/retrying.
+    public let finishReason: String?
 
     public init(
         text: String,
         promptTokens: Int?,
         completionTokens: Int?,
         model: String,
-        latencyMs: Int
+        latencyMs: Int,
+        finishReason: String? = nil
     ) {
         self.text = text
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.model = model
         self.latencyMs = latencyMs
+        self.finishReason = finishReason
     }
 }
 

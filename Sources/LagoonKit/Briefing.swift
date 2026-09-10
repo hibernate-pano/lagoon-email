@@ -2,6 +2,9 @@ import Foundation
 
 /// The five Briefing Feed groups from spec §7.1. Order matters: it is the
 /// display order and the ⌘1…⌘5 shortcut order.
+///
+/// Only the identifier travels over the wire; the display name is localized by
+/// the client (spec §7.4).
 public enum BriefingGroup: String, Codable, Sendable, CaseIterable, Identifiable {
     case needsReply
     case awaitingReply
@@ -11,16 +14,7 @@ public enum BriefingGroup: String, Codable, Sendable, CaseIterable, Identifiable
 
     public var id: String { rawValue }
 
-    public var title: String {
-        switch self {
-        case .needsReply: "需要回复"
-        case .awaitingReply: "等待对方回复"
-        case .safeToArchive: "可归档"
-        case .subscriptionNoise: "订阅噪音"
-        case .pinned: "已置顶"
-        }
-    }
-
+    /// Language-independent, so it lives with the enum rather than the client.
     public var emoji: String {
         switch self {
         case .needsReply: "🔴"
@@ -35,19 +29,39 @@ public enum BriefingGroup: String, Codable, Sendable, CaseIterable, Identifiable
     public var collapsedByDefault: Bool { self == .subscriptionNoise }
 }
 
+/// Stable code explaining why a message was grouped as it was (the "Why?"
+/// affordance, spec §3 step 3).
+///
+/// The server sends this code, never display text: wording is the client's
+/// job, so adding a language never requires a server change.
+public enum BriefingReason: String, Codable, Sendable, CaseIterable {
+    case pinned
+    case listUnsubscribe = "list-unsubscribe"
+    case subscriptionSender = "subscription-sender"
+    case fromSelf = "from-self"
+    case readAndOld = "read-and-old"
+    case needsReply = "needs-reply"
+    case ai
+    case unclassified
+}
+
 /// One row in the Briefing Feed: a message plus the group the classifier put it
-/// in, plus a short human-readable reason (spec §3 step 3: "Why?").
+/// in, plus a stable reason code.
 public struct BriefingItem: Codable, Equatable, Sendable, Identifiable {
     public let message: MessageHeader
     public let group: BriefingGroup
-    public let reason: String?
+    /// Raw `BriefingReason` value. Optional so an unknown code from a newer
+    /// server degrades to "no reason" instead of failing the whole decode.
+    public let reasonCode: String?
 
     public var id: UUID { message.id }
 
-    public init(message: MessageHeader, group: BriefingGroup, reason: String?) {
+    public var reason: BriefingReason? { reasonCode.flatMap(BriefingReason.init(rawValue:)) }
+
+    public init(message: MessageHeader, group: BriefingGroup, reasonCode: String?) {
         self.message = message
         self.group = group
-        self.reason = reason
+        self.reasonCode = reasonCode
     }
 }
 
@@ -123,5 +137,7 @@ public protocol BriefingClassifying: Sendable {
 /// Produces the per-conversation summary + action items. Implemented by the AI
 /// Gateway; returns `nil`-equivalent (throws) when no provider is configured.
 public protocol MessageSummarizing: Sendable {
-    func summarize(_ body: MessageBody) async throws -> MessageSummary
+    /// - Parameter language: BCP-47-ish tag the summary must be written in.
+    ///   `nil` uses the gateway's configured default.
+    func summarize(_ body: MessageBody, language: String?) async throws -> MessageSummary
 }

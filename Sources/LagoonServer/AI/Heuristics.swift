@@ -43,13 +43,13 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
         return result
     }
 
-    /// Same precedence as `classify`, but keeps the per-item reason string the
+    /// Same precedence as `classify`, but keeps the per-item reason code the
     /// Briefing Feed renders under "Why?" (spec §3 step 3).
     public func classifyWithReasons(
         _ messages: [MessageHeader],
         accountEmail: String
-    ) -> [String: (group: BriefingGroup, reason: String)] {
-        var result: [String: (group: BriefingGroup, reason: String)] = [:]
+    ) -> [String: (group: BriefingGroup, reason: BriefingReason)] {
+        var result: [String: (group: BriefingGroup, reason: BriefingReason)] = [:]
         for message in messages {
             result[message.gmailId] = group(for: message, accountEmail: accountEmail)
         }
@@ -59,7 +59,7 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
     public func group(
         for message: MessageHeader,
         accountEmail: String
-    ) -> (group: BriefingGroup, reason: String) {
+    ) -> (group: BriefingGroup, reason: BriefingReason) {
         Self.group(
             for: message,
             accountEmail: accountEmail,
@@ -82,24 +82,24 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
         pinnedGmailIds: Set<String>,
         listUnsubscribeGmailIds: Set<String>,
         now: Date = Date()
-    ) -> (group: BriefingGroup, reason: String) {
+    ) -> (group: BriefingGroup, reason: BriefingReason) {
         if pinnedGmailIds.contains(message.gmailId) {
-            return (.pinned, "你置顶了这封")
+            return (.pinned, .pinned)
         }
         if listUnsubscribeGmailIds.contains(message.gmailId) {
-            return (.subscriptionNoise, "带有退订链接")
+            return (.subscriptionNoise, .listUnsubscribe)
         }
         if matchesSubscriptionSender(message.fromAddress) {
-            return (.subscriptionNoise, "Newsletter or no-reply sender")
+            return (.subscriptionNoise, .subscriptionSender)
         }
         if message.fromAddress.caseInsensitiveCompare(accountEmail) == .orderedSame {
-            return (.awaitingReply, "你发出的 —— 等待对方回复")
+            return (.awaitingReply, .fromSelf)
         }
         let sevenDays: TimeInterval = 7 * 24 * 60 * 60
         if message.isRead, now.timeIntervalSince(message.receivedAt) > sevenDays {
-            return (.safeToArchive, "已读且超过 7 天")
+            return (.safeToArchive, .readAndOld)
         }
-        return (.needsReply, "需要你回复")
+        return (.needsReply, .needsReply)
     }
 
     /// `(?i)(no-?reply|newsletter|notifications?@|marketing@|mailer|bounce)`

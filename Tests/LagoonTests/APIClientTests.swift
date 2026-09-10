@@ -212,7 +212,7 @@ final class APIClientTests: XCTestCase {
                 "isArchived": false
               },
               "group": "\(group.rawValue)",
-              "reason": "because"
+              "reasonCode": "needs-reply"
             }
             """
         }
@@ -227,7 +227,8 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(response.items.count, 5)
         XCTAssertEqual(Set(response.items.map(\.group)), Set(BriefingGroup.allCases))
         XCTAssertEqual(response.items.first?.message.receivedAt, receivedAt)
-        XCTAssertEqual(response.items.first?.reason, "because")
+        XCTAssertEqual(response.items.first?.reasonCode, "needs-reply")
+        XCTAssertEqual(response.items.first?.reason, .needsReply)
 
         let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
         let url = try XCTUnwrap(request.url)

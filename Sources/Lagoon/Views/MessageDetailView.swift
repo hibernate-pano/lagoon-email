@@ -30,6 +30,7 @@ struct MessageDetailView: View {
 
     @State private var summaryState: SummaryState = .idle
 
+    @Environment(\.l10n) private var l10n
     private let api = APIClient()
 
     private enum SummaryState: Equatable {
@@ -83,10 +84,10 @@ struct MessageDetailView: View {
                 Button {
                     Task { await togglePin() }
                 } label: {
-                    Label(isPinned ? "取消置顶" : "置顶", systemImage: isPinned ? "pin.slash" : "pin")
+                    Label(isPinned ? l10n.unpin : l10n.pin, systemImage: isPinned ? "pin.slash" : "pin")
                 }
                 .disabled(isPinBusy)
-                .help(isPinned ? "取消置顶这封邮件" : "置顶这封邮件")
+                .help(isPinned ? l10n.unpinHelp : l10n.pinHelp)
 
                 Button {
                     Task { await loadSummary() }
@@ -94,14 +95,14 @@ struct MessageDetailView: View {
                     if summaryState == .loading {
                         HStack(spacing: 6) {
                             ProgressView().controlSize(.small)
-                            Text("正在生成摘要…")
+                            Text(l10n.summarizing)
                         }
                     } else {
-                        Label("生成摘要", systemImage: "sparkles")
+                        Label(l10n.summarize, systemImage: "sparkles")
                     }
                 }
                 .disabled(summaryState == .loading)
-                .help("让服务器生成 AI 摘要和行动项")
+                .help(l10n.summarizeHelp)
             }
         }
         .task { await loadBody() }
@@ -111,7 +112,7 @@ struct MessageDetailView: View {
     // MARK: - Metadata
 
     private var subjectText: String {
-        messageBody?.subject ?? header?.subject ?? "（无主题）"
+        messageBody?.subject ?? header?.subject ?? l10n.noSubject
     }
 
     private var fromDisplay: String {
@@ -121,7 +122,7 @@ struct MessageDetailView: View {
         if let header {
             return header.fromName.map { "\($0) <\(header.fromAddress)>" } ?? header.fromAddress
         }
-        return "未知发件人"
+        return l10n.unknownSender
     }
 
     private var toDisplay: String? {
@@ -146,7 +147,7 @@ struct MessageDetailView: View {
                 .textSelection(.enabled)
 
             if let toDisplay {
-                Text("收件人 \(toDisplay)")
+                Text(l10n.recipient(toDisplay))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
@@ -167,22 +168,22 @@ struct MessageDetailView: View {
         if isLoadingBody && messageBody == nil {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text("正在加载邮件…").foregroundStyle(.secondary)
+                Text(l10n.loadingMessage).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else if let bodyError {
             VStack(alignment: .leading, spacing: 8) {
-                Text("无法加载这封邮件")
+                Text(l10n.couldNotLoadMessage)
                     .font(.headline)
                 Text(bodyError)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
-                Button("重试") { Task { await loadBody() } }
+                Button(l10n.retry) { Task { await loadBody() } }
             }
         } else if let messageBody {
             if messageBody.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text("这封邮件没有纯文本正文。")
+                Text(l10n.noPlainTextBody)
                     .foregroundStyle(.secondary)
             } else {
                 Text(messageBody.text)
@@ -204,11 +205,11 @@ struct MessageDetailView: View {
         case .loading:
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text("正在生成摘要…").foregroundStyle(.secondary)
+                Text(l10n.summarizing).foregroundStyle(.secondary)
             }
         case .unavailable:
             // 503 is a configuration state, not a failure: keep it muted.
-            Text("AI 未配置（缺少 LLM_PROVIDER_PRIMARY_API_KEY）")
+            Text(l10n.aiNotConfigured)
                 .font(.callout)
                 .foregroundStyle(.secondary)
         case .failed(let message):
@@ -225,7 +226,7 @@ struct MessageDetailView: View {
 
                     if !summary.actionItems.isEmpty {
                         Divider()
-                        Text("行动项")
+                        Text(l10n.actionItems)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         ForEach(Array(summary.actionItems.enumerated()), id: \.offset) { _, item in
@@ -239,14 +240,14 @@ struct MessageDetailView: View {
                     }
 
                     if let provider = summary.provider, !provider.isEmpty {
-                        Text("由 \(provider) 生成")
+                        Text(l10n.viaProvider(provider))
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             } label: {
-                Label("AI 摘要", systemImage: "sparkles")
+                Label(l10n.aiSummary, systemImage: "sparkles")
             }
         }
     }
@@ -292,7 +293,7 @@ struct MessageDetailView: View {
         } catch {
             isRead = false
             onReadStateChange(gmailId, false)
-            readError = "标记已读失败：\(error.lagoonUIMessage)"
+            readError = l10n.markReadFailed + error.lagoonUIMessage
         }
     }
 
@@ -307,7 +308,7 @@ struct MessageDetailView: View {
             onPinnedChanged(target)
         } catch {
             isPinned = !target
-            pinError = "\(target ? "置顶" : "取消置顶")失败：\(error.lagoonUIMessage)"
+            pinError = (target ? l10n.pinFailed : l10n.unpinFailed) + error.lagoonUIMessage
         }
         isPinBusy = false
     }
@@ -316,11 +317,15 @@ struct MessageDetailView: View {
         guard summaryState != .loading else { return }
         summaryState = .loading
         do {
-            summaryState = .loaded(try await api.fetchSummary(gmailId: gmailId, accountId: accountId))
+            summaryState = .loaded(try await api.fetchSummary(
+                gmailId: gmailId,
+                accountId: accountId,
+                language: l10n.language.rawValue
+            ))
         } catch APIError.badStatus(let code, _) where code == 503 {
             summaryState = .unavailable
         } catch {
-            summaryState = .failed("摘要失败：\(error.lagoonUIMessage)")
+            summaryState = .failed(l10n.summaryFailed + error.lagoonUIMessage)
         }
     }
 }

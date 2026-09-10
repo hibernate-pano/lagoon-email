@@ -10,10 +10,10 @@ public enum KeychainError: LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .unexpectedStatus(let status):
-            let message = SecCopyErrorMessageString(status, nil) as String? ?? "未知的钥匙串错误"
-            return "钥匙串错误：\(message) (\(status))"
+            let message = SecCopyErrorMessageString(status, nil) as String? ?? L10n.current.unknownKeychainError
+            return L10n.current.keychainError + "\(message) (\(status))"
         case .corruptData:
-            return "钥匙串错误：已保存的账号 ID 不是合法的 UUID。"
+            return L10n.current.corruptAccountID
         }
     }
 }

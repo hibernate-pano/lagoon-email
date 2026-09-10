@@ -141,7 +141,7 @@ final class RouteTests: XCTestCase {
         let actionItems: [String]
         let provider: String?
 
-        func summarize(_ body: MessageBody) async throws -> MessageSummary {
+        func summarize(_ body: MessageBody, language: String?) async throws -> MessageSummary {
             MessageSummary(
                 gmailId: body.gmailId,
                 summary: summary,
@@ -395,8 +395,8 @@ final class RouteTests: XCTestCase {
                     XCTAssertEqual(groups[archive.gmailId], .safeToArchive)
                     XCTAssertEqual(groups[pinned.gmailId], .pinned)
                     for item in decoded.items {
-                        XCTAssertNotNil(item.reason, "item \(item.message.gmailId) needs a reason")
-                        XCTAssertFalse(item.reason?.isEmpty ?? true)
+                        XCTAssertNotNil(item.reasonCode, "item \(item.message.gmailId) needs a reason code")
+                        XCTAssertFalse(item.reasonCode?.isEmpty ?? true)
                     }
                 }
             }
@@ -444,7 +444,7 @@ final class RouteTests: XCTestCase {
                         $0.message.gmailId == overridden.gmailId
                     }
                     XCTAssertEqual(overriddenItem?.group, .subscriptionNoise)
-                    XCTAssertEqual(overriddenItem?.reason, "AI 分类")
+                    XCTAssertEqual(overriddenItem?.reasonCode, "ai")
                     let heuristicItem = decoded.items.first {
                         $0.message.gmailId == heuristicOnly.gmailId
                     }

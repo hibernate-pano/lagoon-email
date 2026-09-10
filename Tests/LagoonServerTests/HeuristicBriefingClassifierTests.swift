@@ -42,7 +42,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         _ message: MessageHeader,
         pinned: Set<String> = [],
         listUnsubscribe: Set<String> = []
-    ) -> (group: BriefingGroup, reason: String) {
+    ) -> (group: BriefingGroup, reason: BriefingReason) {
         HeuristicBriefingClassifier.group(
             for: message,
             accountEmail: accountEmail,
@@ -60,7 +60,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         let message = header("m1", from: "no-reply@news.example.com", isRead: true, daysAgo: 30)
         let result = group(message, pinned: ["m1"], listUnsubscribe: ["m1"])
         XCTAssertEqual(result.group, .pinned)
-        XCTAssertFalse(result.reason.isEmpty)
+        XCTAssertFalse(result.reason.rawValue.isEmpty)
     }
 
     /// List-Unsubscribe beats the no-reply sender regex, and both beat
@@ -69,7 +69,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         let message = header("m2", from: "no-reply@example.com")
         let result = group(message, listUnsubscribe: ["m2"])
         XCTAssertEqual(result.group, .subscriptionNoise)
-        XCTAssertTrue(result.reason.contains("退订"), "the List-Unsubscribe branch must win: \(result.reason)")
+        XCTAssertEqual(result.reason, .listUnsubscribe, "the List-Unsubscribe branch must win")
     }
 
     /// The no-reply/newsletter sender regex is case-insensitive and matches
@@ -78,7 +78,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         let message = header("m3", from: "No-Reply@Example.COM")
         let result = group(message)
         XCTAssertEqual(result.group, .subscriptionNoise)
-        XCTAssertFalse(result.reason.isEmpty)
+        XCTAssertFalse(result.reason.rawValue.isEmpty)
     }
 
     func test_subscriptionSenderRegex_matchesKnownPatterns() {
@@ -115,7 +115,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         let message = header("m5", from: accountEmail, isRead: true, daysAgo: 30)
         let result = group(message)
         XCTAssertEqual(result.group, .awaitingReply)
-        XCTAssertFalse(result.reason.isEmpty)
+        XCTAssertFalse(result.reason.rawValue.isEmpty)
     }
 
     /// Address comparison is case-insensitive.
@@ -129,7 +129,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         let message = header("m7", from: "alice@example.com", isRead: true, daysAgo: 8)
         let result = group(message)
         XCTAssertEqual(result.group, .safeToArchive)
-        XCTAssertFalse(result.reason.isEmpty)
+        XCTAssertFalse(result.reason.rawValue.isEmpty)
     }
 
     /// Exactly 7 days is NOT older than 7 days (strict `>`), and unread old
@@ -153,7 +153,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
     func test_needsReply_isDefault() {
         let result = group(header("m11", from: "alice@example.com"))
         XCTAssertEqual(result.group, .needsReply)
-        XCTAssertFalse(result.reason.isEmpty)
+        XCTAssertFalse(result.reason.rawValue.isEmpty)
     }
 
     /// Full table: each row exercises the highest-precedence signal present.
@@ -172,7 +172,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
                 result.group, expected,
                 "gmailId \(message.gmailId) expected \(expected.rawValue)"
             )
-            XCTAssertFalse(result.reason.isEmpty, "reason must be non-empty for \(message.gmailId)")
+            XCTAssertFalse(result.reason.rawValue.isEmpty, "reason must be non-empty for \(message.gmailId)")
         }
     }
 
@@ -202,7 +202,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         for message in messages {
             let entry = try XCTUnwrap(withReasons[message.gmailId])
             XCTAssertFalse(
-                entry.reason.isEmpty,
+                entry.reason.rawValue.isEmpty,
                 "empty reason for \(message.gmailId) in \(entry.group.rawValue)"
             )
         }
@@ -217,6 +217,6 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         )
         let result = classifier.group(for: header("m1", from: "alice@example.com"), accountEmail: accountEmail)
         XCTAssertEqual(result.group, .pinned)
-        XCTAssertFalse(result.reason.isEmpty)
+        XCTAssertFalse(result.reason.rawValue.isEmpty)
     }
 }

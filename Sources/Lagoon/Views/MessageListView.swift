@@ -14,10 +14,12 @@ struct MessageListView: View {
 
     private static let refreshInterval: Duration = .seconds(30)
 
+    @Environment(\.l10n) private var l10n
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
-                Text("全部邮件")
+                Text(l10n.allMessages)
                     .font(.headline)
                 Spacer()
                 if isLoading {
@@ -26,11 +28,11 @@ struct MessageListView: View {
                 Button {
                     onShowBriefing()
                 } label: {
-                    Label("简报", systemImage: "rectangle.grid.1x2")
+                    Label(l10n.briefing, systemImage: "rectangle.grid.1x2")
                 }
                 .keyboardShortcut("0", modifiers: .command)
-                .help("返回简报（⌘0）")
-                Button("刷新") {
+                .help(l10n.backToBriefingHelp)
+                Button(l10n.refresh) {
                     Task { await refresh() }
                 }
                 .disabled(isLoading)
@@ -45,13 +47,13 @@ struct MessageListView: View {
             }
 
             if messages.isEmpty && !isLoading {
-                Text("还没有邮件 —— 服务器仍在同步。")
+                Text(l10n.noMessagesYet)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(messages) { m in
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(m.subject ?? "（无主题）")
+                        Text(m.subject ?? l10n.noSubject)
                             .font(.body)
                             .bold(!m.isRead)
                             .lineLimit(1)
@@ -101,7 +103,7 @@ struct MessageListView: View {
             messages = resp.messages
             accounts.setLastSync(resp)
         } catch {
-            errorMessage = "同步失败：\(error.localizedDescription)。服务器在运行吗？"
+            errorMessage = l10n.syncFailed + error.localizedDescription + " " + l10n.isServerRunning
         }
         isLoading = false
     }

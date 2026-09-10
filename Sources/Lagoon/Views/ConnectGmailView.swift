@@ -10,6 +10,7 @@ struct ConnectGmailView: View {
     @State private var connectAttempt = 0
     private let api = APIClient()
 
+    @Environment(\.l10n) private var l10n
     private static let pollInterval: Duration = .seconds(2)
     private static let pollTimeout: Duration = .seconds(180)
 
@@ -18,9 +19,9 @@ struct ConnectGmailView: View {
             Text("Lagoon")
                 .font(.largeTitle)
                 .bold()
-            Text("连接你的 Gmail 开始使用。")
+            Text(l10n.connectPrompt)
                 .foregroundStyle(.secondary)
-            Button("连接 Gmail") {
+            Button(l10n.connectGmail) {
                 errorMessage = nil
                 NSWorkspace.shared.open(api.oauthStartURL)
                 connectAttempt += 1
@@ -32,12 +33,12 @@ struct ConnectGmailView: View {
             if isPolling && connectAttempt > 0 {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text("等待浏览器授权…")
+                    Text(l10n.waitingForApproval)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             } else {
-                Text("在浏览器中完成授权后回到这里。")
+                Text(l10n.afterApproval)
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
@@ -70,7 +71,7 @@ struct ConnectGmailView: View {
         let deadline = ContinuousClock.now + Self.pollTimeout
         while !Task.isCancelled {
             if ContinuousClock.now >= deadline {
-                errorMessage = "仍未连接 —— 请重试"
+                errorMessage = l10n.stillNotConnected
                 return
             }
 
@@ -83,12 +84,12 @@ struct ConnectGmailView: View {
                         try accounts.set(accountId: first.id)
                         return
                     } catch {
-                        errorMessage = "保存账号失败：\(error.localizedDescription)"
+                        errorMessage = l10n.saveAccountFailed + error.localizedDescription
                         return
                     }
                 }
             } catch {
-                errorMessage = "检查连接失败：\(error.localizedDescription)"
+                errorMessage = l10n.checkConnectionFailed + error.localizedDescription
             }
 
             do {

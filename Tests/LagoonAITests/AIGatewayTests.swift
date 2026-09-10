@@ -240,7 +240,7 @@ final class AIGatewayTests: XCTestCase {
             receivedAt: Date(),
             text: "Please pay by Friday."
         )
-        let summary = try await ai.summarize(body)
+        let summary = try await ai.summarize(body, language: nil)
         XCTAssertEqual(summary.summary, "Short.")
         XCTAssertEqual(summary.actionItems, ["Reply", "Pay invoice"])
         XCTAssertEqual(summary.provider, "stub-model")
@@ -271,7 +271,7 @@ final class AIGatewayTests: XCTestCase {
             receivedAt: Date(),
             text: "Please pay by Friday."
         )
-        let summary = try await ai.summarize(body)
+        let summary = try await ai.summarize(body, language: nil)
         XCTAssertEqual(summary.summary, "简短。")
         XCTAssertEqual(summary.actionItems, ["回复"])
 
@@ -318,9 +318,64 @@ final class AIGatewayTests: XCTestCase {
             receivedAt: Date(),
             text: String(repeating: "x", count: 50_000)
         )
-        _ = try await ai.summarize(body)
+        _ = try await ai.summarize(body, language: nil)
         let text = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
         XCTAssertLessThan(text.count, 20_000, "body must be truncated before leaving the process")
+    }
+
+    // MARK: - reasoning-model robustness
+
+    /// Reasoning models intermittently answer with prose or truncated JSON.
+    /// The gateway retries once instead of failing the user's summary.
+    func test_summarize_retriesOnceOnUnparseableOutput() async throws {
+        nonisolated(unsafe) var call = 0
+        StubURLProtocol.set { _ in
+            call += 1
+            if call == 1 {
+                return (200, Data(#"{"choices":[{"message":{"content":"I cannot help with that"},"finish_reason":"stop"}]}"#.utf8))
+            }
+            return (200, Data(#"{"choices":[{"message":{"content":"{\"summary\":\"ok\",\"actionItems\":[]}"},"finish_reason":"stop"}]}"#.utf8))
+        }
+        let ai = try gateway()
+        let body = MessageBody(
+            gmailId: "g1",
+            subject: "s",
+            fromAddress: "a@b.com",
+            fromName: nil,
+            toAddress: nil,
+            receivedAt: Date(),
+            text: "body"
+        )
+        let summary = try await ai.summarize(body, language: "en")
+        XCTAssertEqual(summary.summary, "ok")
+        XCTAssertEqual(StubURLProtocol.requests.count, 2, "exactly one retry")
+
+        let sent = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
+        XCTAssertTrue(sent.contains("\"max_tokens\""), "a small default cap truncates the JSON")
+    }
+
+    /// A model that keeps answering garbage must fail after the retry, not loop.
+    func test_summarize_givesUpAfterOneRetry() async throws {
+        StubURLProtocol.set { _ in
+            (200, Data(#"{"choices":[{"message":{"content":"no json here"},"finish_reason":"length"}]}"#.utf8))
+        }
+        let ai = try gateway()
+        let body = MessageBody(
+            gmailId: "g1",
+            subject: nil,
+            fromAddress: "a@b.com",
+            fromName: nil,
+            toAddress: nil,
+            receivedAt: Date(),
+            text: "body"
+        )
+        do {
+            _ = try await ai.summarize(body, language: nil)
+            XCTFail("expected badResponse")
+        } catch let error as LLMError {
+            guard case .badResponse = error else { return XCTFail("unexpected \(error)") }
+        }
+        XCTAssertEqual(StubURLProtocol.requests.count, 2, "one attempt + one retry, then stop")
     }
 
     // MARK: - circuit breaker

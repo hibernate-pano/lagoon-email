@@ -89,13 +89,17 @@ public enum BriefingRoutes {
                     }
                 }
                 for (gmailId, group) in overrides where classified[gmailId] != nil {
-                    classified[gmailId] = (group, "AI 分类")
+                    classified[gmailId] = (group, .ai)
                 }
             }
 
             let items = messages.map { message -> BriefingItem in
-                let result = classified[message.gmailId] ?? (.needsReply, "Unclassified")
-                return BriefingItem(message: message, group: result.group, reason: result.reason)
+                let result = classified[message.gmailId] ?? (.needsReply, BriefingReason.unclassified)
+                return BriefingItem(
+                    message: message,
+                    group: result.group,
+                    reasonCode: result.reason.rawValue
+                )
             }
             return RouteJSON.response(BriefingResponse(items: items))
         }

@@ -19,11 +19,11 @@ public enum APIError: LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .invalidURL(let description):
-            return "服务器地址无效：\(description)"
+            return L10n.current.invalidServerURL + description
         case .invalidResponse:
-            return "服务器返回了非 HTTP 响应。"
+            return L10n.current.nonHTTPResponse
         case .badStatus(let code, let bodySnippet):
-            return "服务器返回 HTTP \(code)：\(bodySnippet)"
+            return L10n.current.httpStatus(code) + bodySnippet
         }
     }
 }
@@ -134,11 +134,22 @@ public final class APIClient: Sendable {
     /// When no LLM provider is configured the server answers 503; that surfaces
     /// as `APIError.badStatus(code: 503, …)` and the view renders the muted
     /// "AI 未配置" hint rather than a red error.
-    public func fetchSummary(gmailId: String, accountId: UUID) async throws -> MessageSummary {
+    /// - Parameter language: sent as `Accept-Language`, which is how the AI
+    ///   summary follows the UI language. nil omits the header and lets the
+    ///   server use its configured default.
+    public func fetchSummary(
+        gmailId: String,
+        accountId: UUID,
+        language: String? = nil
+    ) async throws -> MessageSummary {
         let url = try makeURL(path: ["api", "messages", gmailId, "summary"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
-        let (data, resp) = try await session.data(from: url)
+        var request = URLRequest(url: url)
+        if let language, !language.isEmpty {
+            request.setValue(language, forHTTPHeaderField: "Accept-Language")
+        }
+        let (data, resp) = try await session.data(for: request)
         try Self.validate(resp, data: data)
         return try Self.decode(MessageSummary.self, from: data)
     }

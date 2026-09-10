@@ -116,10 +116,7 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
             Emails: \(jsonString(rows))
             """
 
-        let completion = try await complete(capability: .classify, system: systemPrompt, user: user)
-        guard let parsed = parseJSONObject(completion.text) else {
-            throw LLMError.badResponse("classify: not a JSON object")
-        }
+        let parsed = try await completeJSON(capability: .classify, system: systemPrompt, user: user).json
         var result: [String: BriefingGroup] = [:]
         for (id, raw) in parsed {
             guard let raw = raw as? String,
@@ -133,14 +130,15 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
 
     // MARK: - MessageSummarizing
 
-    public func summarize(_ body: MessageBody) async throws -> MessageSummary {
+    public func summarize(_ body: MessageBody, language: String?) async throws -> MessageSummary {
+        let languageTag = language.flatMap { $0.isEmpty ? nil : $0 } ?? outputLanguage
         let text = String(body.text.prefix(12_000))
         let user = """
             Summarize this email in at most 3 sentences and extract concrete action \
             items addressed to the reader. Reply with STRICT JSON only:
             {"summary":"…","actionItems":["…"]}
             Write the summary and every action item in \
-            \(Self.languageName(for: outputLanguage)). Keep the JSON keys exactly \
+            \(Self.languageName(for: languageTag)). Keep the JSON keys exactly \
             as given (English) — translate only the values. Leave product names, \
             people names and code identifiers unchanged.
             From: \(body.fromAddress)
@@ -148,10 +146,11 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
             Body:
             \(text)
             """
-        let completion = try await complete(capability: .summary, system: systemPrompt, user: user)
-        guard let parsed = parseJSONObject(completion.text) else {
-            throw LLMError.badResponse("summary: not a JSON object")
-        }
+        let (parsed, model) = try await completeJSON(
+            capability: .summary,
+            system: systemPrompt,
+            user: user
+        )
         guard let summary = parsed["summary"] as? String, !summary.isEmpty else {
             throw LLMError.badResponse("summary: missing summary field")
         }
@@ -162,11 +161,37 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
             gmailId: body.gmailId,
             summary: summary,
             actionItems: actionItems,
-            provider: completion.model
+            provider: model
         )
     }
 
     // MARK: - Provider call + observability
+
+    /// Calls the provider and parses strict JSON, retrying once when the model
+    /// answers with prose or truncated JSON (observed intermittently with
+    /// reasoning models). Logs size/finish reason only — never the content.
+    private func completeJSON(
+        capability: LLMCapability,
+        system: String,
+        user: String,
+        attempts: Int = 2
+    ) async throws -> (json: [String: Any], model: String) {
+        var lastError: Error = LLMError.badResponse("\(capability.rawValue): no attempt")
+        for attempt in 1...max(1, attempts) {
+            let completion = try await complete(capability: capability, system: system, user: user)
+            if let parsed = parseJSONObject(completion.text) {
+                return (parsed, completion.model)
+            }
+            lastError = LLMError.badResponse("\(capability.rawValue): not a JSON object")
+            logger.warning("llm.unparseable", metadata: [
+                "capability": .string(capability.rawValue),
+                "attempt": .string("\(attempt)"),
+                "chars": .string("\(completion.text.count)"),
+                "finishReason": .string(completion.finishReason ?? "unknown")
+            ])
+        }
+        throw lastError
+    }
 
     private var systemPrompt: String {
         "You are Lagoon, an email assistant. You never invent facts. You answer only with the requested JSON."

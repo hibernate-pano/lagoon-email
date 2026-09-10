@@ -20,6 +20,8 @@ struct BriefingFeedView: View {
     private let api = APIClient()
     private static let refreshInterval: Duration = .seconds(30)
 
+    @Environment(\.l10n) private var l10n
+
     /// Lets the root surface switcher show the raw message list.
     var onShowAllMessages: () -> Void = {}
 
@@ -60,7 +62,7 @@ struct BriefingFeedView: View {
 
     private var headerBar: some View {
         HStack(spacing: 8) {
-            Text("简报")
+            Text(l10n.briefing)
                 .font(.headline)
             if isLoading {
                 ProgressView().controlSize(.small)
@@ -69,12 +71,12 @@ struct BriefingFeedView: View {
             Button {
                 onShowAllMessages()
             } label: {
-                Label("全部邮件", systemImage: "list.bullet")
+                Label(l10n.allMessages, systemImage: "list.bullet")
             }
             .keyboardShortcut("0", modifiers: .command)
-            .help("查看全部邮件列表（⌘0）")
+            .help(l10n.showRawListHelp)
 
-            Button("刷新") {
+            Button(l10n.refresh) {
                 Task { await refresh() }
             }
             .disabled(isLoading)
@@ -89,7 +91,7 @@ struct BriefingFeedView: View {
     private var content: some View {
         if items.isEmpty {
             if isLoading {
-                ProgressView("正在加载简报…")
+                ProgressView(l10n.loadingBriefing)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if errorMessage != nil {
                 errorState
@@ -131,7 +133,7 @@ struct BriefingFeedView: View {
                 Image(systemName: collapsedGroups.contains(group) ? "chevron.right" : "chevron.down")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                Text("\(group.emoji) \(group.title)")
+                Text("\(group.emoji) \(l10n.groupTitle(group))")
                     .font(.headline)
                 Spacer()
                 Text("\(count)")
@@ -142,25 +144,25 @@ struct BriefingFeedView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(collapsedGroups.contains(group) ? "展开 \(group.title)" : "收起 \(group.title)")
+        .help(collapsedGroups.contains(group) ? l10n.expandGroup(l10n.groupTitle(group)) : l10n.collapseGroup(l10n.groupTitle(group)))
         .id(group)
     }
 
     private var emptyState: some View {
         ContentUnavailableView {
-            Label("还没有简报", systemImage: "tray")
+            Label(l10n.noBriefingYet, systemImage: "tray")
         } description: {
-            Text("服务器还没有分类任何邮件，正在后台持续同步。")
+            Text(l10n.noBriefingYetDescription)
         }
     }
 
     private var errorState: some View {
         ContentUnavailableView {
-            Label("简报不可用", systemImage: "exclamationmark.triangle")
+            Label(l10n.briefingUnavailable, systemImage: "exclamationmark.triangle")
         } description: {
-            Text(errorMessage ?? "未知错误")
+            Text(errorMessage ?? l10n.unknownError)
         } actions: {
-            Button("重试") { Task { await refresh() } }
+            Button(l10n.retry) { Task { await refresh() } }
         }
     }
 
@@ -186,7 +188,7 @@ struct BriefingFeedView: View {
     private var groupJumpShortcuts: some View {
         VStack {
             ForEach(Array(BriefingGroup.allCases.enumerated()), id: \.element) { index, group in
-                Button(group.title) { jump(to: group) }
+                Button(l10n.groupTitle(group)) { jump(to: group) }
                     .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
             }
         }
@@ -222,9 +224,9 @@ struct BriefingFeedView: View {
             )
         } else {
             ContentUnavailableView(
-                "未连接",
+                l10n.notConnected,
                 systemImage: "person.crop.circle.badge.exclamationmark",
-                description: Text("请先连接 Gmail 账号以阅读邮件。")
+                description: Text(l10n.connectToRead)
             )
         }
     }
@@ -256,7 +258,7 @@ struct BriefingFeedView: View {
             isRead: isRead,
             isArchived: message.isArchived
         )
-        items[index] = BriefingItem(message: updated, group: item.group, reason: item.reason)
+        items[index] = BriefingItem(message: updated, group: item.group, reasonCode: item.reasonCode)
     }
 
     private func refresh() async {
@@ -268,7 +270,7 @@ struct BriefingFeedView: View {
             items = response.items
             errorMessage = nil
         } catch {
-            errorMessage = "简报加载失败：\(error.lagoonUIMessage)"
+            errorMessage = l10n.briefingFailed + error.lagoonUIMessage
         }
         isLoading = false
     }
@@ -277,11 +279,12 @@ struct BriefingFeedView: View {
 /// One Briefing Feed row: subject, sender, date, and the classifier's "why".
 private struct BriefingRow: View {
     let item: BriefingItem
+    @Environment(\.l10n) private var l10n
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(item.message.subject ?? "（无主题）")
+                Text(item.message.subject ?? l10n.noSubject)
                     .font(.body)
                     .bold(!item.message.isRead)
                     .lineLimit(1)
@@ -294,7 +297,7 @@ private struct BriefingRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-            if let reason = item.reason, !reason.isEmpty {
+            if let reason = l10n.reasonText(item.reasonCode) {
                 Text(reason)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)

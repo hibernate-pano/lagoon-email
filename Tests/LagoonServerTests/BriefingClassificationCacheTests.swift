@@ -245,7 +245,7 @@ final class BriefingClassificationCacheTests: XCTestCase {
                         )
                         // Heuristics stand when the classifier says nothing.
                         XCTAssertEqual(decoded.items.first?.group, .needsReply)
-                        XCTAssertEqual(decoded.items.first?.reason, "需要你回复")
+                        XCTAssertEqual(decoded.items.first?.reasonCode, "needs-reply")
                     }
                 }
             }

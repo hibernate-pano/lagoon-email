@@ -53,6 +53,24 @@ enum RouteParams {
         return UUID(uuidString: raw)
     }
 
+    /// First language tag of an `Accept-Language` header ("zh-CN,zh;q=0.9"
+    /// -> "zh-CN"). nil when absent or blank, so the AI gateway keeps its
+    /// configured default.
+    static func preferredLanguage(fromHeader raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let first = raw.split(separator: ",").first.map(String.init) ?? raw
+        let tag = first.split(separator: ";").first.map(String.init) ?? first
+        let trimmed = tag.trimmingCharacters(in: .whitespaces)
+        // Untrusted header: accept only a well-formed language tag
+        // (letters/digits/dashes starting with a letter), never a stray
+        // quality value or parameter fragment.
+        guard !trimmed.isEmpty,
+              trimmed.first?.isLetter == true,
+              trimmed.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" })
+        else { return nil }
+        return trimmed
+    }
+
     /// `gmailId` path component: percent-decoded, non-empty, treated as an
     /// opaque string. It is only ever passed to parameterized queries or
     /// percent-encoded into the Gmail URL.
@@ -223,7 +241,10 @@ public enum MessageRoutes {
                 return RouteJSON.error(.badGateway, "gmail-error")
             }
             do {
-                let result = try await summarizer.summarize(body)
+                let result = try await summarizer.summarize(
+                    body,
+                    language: RouteParams.preferredLanguage(fromHeader: request.headers[.acceptLanguage])
+                )
                 // Normalize the id to the requested message and never pass the
                 // provider's raw error text back to the client.
                 let summary = MessageSummary(
