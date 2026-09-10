@@ -180,7 +180,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
 
     func test_emptyInput_returnsEmpty() async throws {
         let classifier = HeuristicBriefingClassifier()
-        let groups = try await classifier.classify([], accountEmail: accountEmail)
+        let groups = try await classifier.classify([], accountEmail: accountEmail, language: nil)
         XCTAssertTrue(groups.isEmpty)
         XCTAssertTrue(classifier.classifyWithReasons([], accountEmail: accountEmail).isEmpty)
     }
@@ -206,7 +206,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
                 "empty reason for \(message.gmailId) in \(entry.group.rawValue)"
             )
         }
-        let groups = try await classifier.classify(messages, accountEmail: accountEmail)
+        let groups = try await classifier.classify(messages, accountEmail: accountEmail, language: nil)
         XCTAssertEqual(groups, withReasons.mapValues(\.group))
     }
 

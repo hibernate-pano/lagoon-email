@@ -5,6 +5,8 @@ import Foundation
 public struct OpenAICompatibleProvider: LLMProvider {
     public let name: String
     public let model: String
+    public let costPer1kPromptUsd: Double?
+    public let costPer1kCompletionUsd: Double?
     private let apiKey: String
     private let chatURL: URL
     private let session: URLSession
@@ -22,6 +24,8 @@ public struct OpenAICompatibleProvider: LLMProvider {
         }
         self.name = resolved.name
         self.model = resolved.model
+        self.costPer1kPromptUsd = resolved.config.costPer1kPromptUsd
+        self.costPer1kCompletionUsd = resolved.config.costPer1kCompletionUsd
         self.apiKey = resolved.apiKey
         self.chatURL = url
         self.session = session
@@ -70,14 +74,34 @@ public struct OpenAICompatibleProvider: LLMProvider {
             throw LLMError.badResponse("missing choices[0].message.content")
         }
         let usage = root["usage"] as? [String: Any]
+        let promptTokens = usage?["prompt_tokens"] as? Int ?? 0
+        let completionTokens = usage?["completion_tokens"] as? Int ?? 0
         let finishReason = choices.first?["finish_reason"] as? String
         return LLMCompletion(
             text: content,
-            promptTokens: usage?["prompt_tokens"] as? Int,
-            completionTokens: usage?["completion_tokens"] as? Int,
+            promptTokens: promptTokens,
+            completionTokens: completionTokens,
             model: model,
             latencyMs: latencyMs,
-            finishReason: finishReason
+            finishReason: finishReason,
+            costMicrosUSD: Self.costMicros(
+                promptTokens: promptTokens,
+                completionTokens: completionTokens,
+                promptRate: costPer1kPromptUsd,
+                completionRate: costPer1kCompletionUsd
+            )
         )
+    }
+
+    static func costMicros(
+        promptTokens: Int,
+        completionTokens: Int,
+        promptRate: Double?,
+        completionRate: Double?
+    ) -> Int64? {
+        guard let promptRate, let completionRate else { return nil }
+        let usd = Double(promptTokens) / 1000.0 * promptRate
+            + Double(completionTokens) / 1000.0 * completionRate
+        return Int64((usd * 1_000_000).rounded())
     }
 }

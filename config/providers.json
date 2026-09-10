@@ -9,6 +9,7 @@
       "priority": 1,
       "capabilities": ["summary", "classify", "action_item", "bundle_reason", "draft"],
       "chatPath": "/chat/completions",
+      "// "": "Set rates so LAGOON_BUDGET_USD_PER_MONTH can enforce a real cap.",
       "costPer1kPromptUsd": null,
       "costPer1kCompletionUsd": null
     }

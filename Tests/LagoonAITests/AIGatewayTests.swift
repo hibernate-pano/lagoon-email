@@ -178,7 +178,7 @@ final class AIGatewayTests: XCTestCase {
             (200, Data(#"{"choices":[{"message":{"content":"{\"g1\":\"needsReply\"}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.utf8))
         }
         let ai = try gateway()
-        let result = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com")
+        let result = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
         XCTAssertEqual(result["g1"], .needsReply)
 
         let body = bodyData(StubURLProtocol.requests.first)
@@ -197,7 +197,8 @@ final class AIGatewayTests: XCTestCase {
         let ai = try gateway()
         let result = try await ai.classify(
             [message(gmailId: "g1"), message(gmailId: "g2"), message(gmailId: "g3")],
-            accountEmail: "me@example.com"
+            accountEmail: "me@example.com",
+            language: nil
         )
         XCTAssertEqual(result, ["g1": .needsReply], "unknown group and local-only pinned must be dropped")
     }
@@ -207,7 +208,7 @@ final class AIGatewayTests: XCTestCase {
             (200, Data(#"{"choices":[{"message":{"content":"```json\n{\"g1\":\"safeToArchive\"}\n```"}}]}"#.utf8))
         }
         let ai = try gateway()
-        let result = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com")
+        let result = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
         XCTAssertEqual(result["g1"], .safeToArchive)
     }
 
@@ -217,7 +218,7 @@ final class AIGatewayTests: XCTestCase {
         }
         let ai = try gateway()
         do {
-            _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com")
+            _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
             XCTFail("expected badResponse")
         } catch let error as LLMError {
             guard case .badResponse = error else { return XCTFail("unexpected \(error)") }
@@ -240,7 +241,7 @@ final class AIGatewayTests: XCTestCase {
             receivedAt: Date(),
             text: "Please pay by Friday."
         )
-        let summary = try await ai.summarize(body, language: nil)
+        let summary = try await ai.summarize(body, language: nil, accountEmail: "test@example.com")
         XCTAssertEqual(summary.summary, "Short.")
         XCTAssertEqual(summary.actionItems, ["Reply", "Pay invoice"])
         XCTAssertEqual(summary.provider, "stub-model")
@@ -271,7 +272,7 @@ final class AIGatewayTests: XCTestCase {
             receivedAt: Date(),
             text: "Please pay by Friday."
         )
-        let summary = try await ai.summarize(body, language: nil)
+        let summary = try await ai.summarize(body, language: nil, accountEmail: "test@example.com")
         XCTAssertEqual(summary.summary, "简短。")
         XCTAssertEqual(summary.actionItems, ["回复"])
 
@@ -292,7 +293,7 @@ final class AIGatewayTests: XCTestCase {
             (200, Data(#"{"choices":[{"message":{"content":"{\"g1\":\"needsReply\"}"}}]}"#.utf8))
         }
         let ai = try gateway()
-        _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com")
+        _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
         let prompt = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
         XCTAssertTrue(prompt.contains("never translated"))
     }
@@ -318,7 +319,7 @@ final class AIGatewayTests: XCTestCase {
             receivedAt: Date(),
             text: String(repeating: "x", count: 50_000)
         )
-        _ = try await ai.summarize(body, language: nil)
+        _ = try await ai.summarize(body, language: nil, accountEmail: "test@example.com")
         let text = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
         XCTAssertLessThan(text.count, 20_000, "body must be truncated before leaving the process")
     }
@@ -346,7 +347,7 @@ final class AIGatewayTests: XCTestCase {
             receivedAt: Date(),
             text: "body"
         )
-        let summary = try await ai.summarize(body, language: "en")
+        let summary = try await ai.summarize(body, language: "en", accountEmail: "test@example.com")
         XCTAssertEqual(summary.summary, "ok")
         XCTAssertEqual(StubURLProtocol.requests.count, 2, "exactly one retry")
 
@@ -370,7 +371,7 @@ final class AIGatewayTests: XCTestCase {
             text: "body"
         )
         do {
-            _ = try await ai.summarize(body, language: nil)
+            _ = try await ai.summarize(body, language: nil, accountEmail: "test@example.com")
             XCTFail("expected badResponse")
         } catch let error as LLMError {
             guard case .badResponse = error else { return XCTFail("unexpected \(error)") }
@@ -384,11 +385,11 @@ final class AIGatewayTests: XCTestCase {
         StubURLProtocol.set { _ in (500, Data("{}".utf8)) }
         let ai = try gateway()
         for _ in 0..<5 {
-            _ = try? await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com")
+            _ = try? await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
         }
         let callsBefore = StubURLProtocol.requests.count
         do {
-            _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com")
+            _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
             XCTFail("expected circuitOpen")
         } catch let error as LLMError {
             guard case .circuitOpen = error else { return XCTFail("unexpected \(error)") }
@@ -403,15 +404,15 @@ final class AIGatewayTests: XCTestCase {
             return failNext ? (500, Data("{}".utf8)) : (200, Data(#"{"choices":[{"message":{"content":"{\"g1\":\"needsReply\"}"}}]}"#.utf8))
         }
         let ai = try gateway()
-        _ = try? await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com")
-        _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com")
+        _ = try? await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
+        _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
         // After a success, four more failures must not open the breaker.
         StubURLProtocol.set { _ in (500, Data("{}".utf8)) }
         for _ in 0..<4 {
-            _ = try? await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com")
+            _ = try? await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
         }
         let callsBefore = StubURLProtocol.requests.count
-        _ = try? await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com")
+        _ = try? await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
         XCTAssertEqual(StubURLProtocol.requests.count, callsBefore + 1, "four failures must not open the breaker")
     }
 

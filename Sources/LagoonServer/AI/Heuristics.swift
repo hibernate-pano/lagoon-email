@@ -34,7 +34,8 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
 
     public func classify(
         _ messages: [MessageHeader],
-        accountEmail: String
+        accountEmail: String,
+        language: String?
     ) async throws -> [String: BriefingGroup] {
         var result: [String: BriefingGroup] = [:]
         for message in messages {

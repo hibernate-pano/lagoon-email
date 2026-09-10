@@ -58,7 +58,14 @@ struct LagoonServerMain {
         // Spec §6.5: the AI Gateway is the only module that talks to LLM
         // providers. `nil` when no provider is configured (missing key/base
         // URL) — the server then stays heuristic-only and /summary returns 503.
-        let ai = AIGateway.fromEnvironment(logger: logger)
+        // The budget actor enforces the monthly cost cap from
+        // LAGOON_BUDGET_USD_PER_MONTH (<= 0 disables); see Sources/LagoonServer/AI/UsageBudget.swift.
+        let capUSD = Double(ProcessInfo.processInfo.environment["LAGOON_BUDGET_USD_PER_MONTH"] ?? "") ?? 0
+        let usageBudget = try await UsageBudget(db: db, capUSDPerMonth: capUSD, logger: logger)
+        let ai: AIGateway? = {
+            guard let gateway = AIGateway.fromEnvironment(logger: logger) else { return nil }
+            return gateway
+        }()
         if ai == nil {
             logger.info("AI gateway disabled: set LLM_PROVIDER_PRIMARY_BASE_URL and LLM_PROVIDER_PRIMARY_API_KEY")
         }

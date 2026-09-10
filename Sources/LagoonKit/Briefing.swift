@@ -131,13 +131,23 @@ public struct MessageSummary: Codable, Equatable, Sendable {
 public protocol BriefingClassifying: Sendable {
     /// - Returns: gmailId → group, for the ids the classifier is confident
     ///   about. Ids it omits keep the heuristic/default grouping.
-    func classify(_ messages: [MessageHeader], accountEmail: String) async throws -> [String: BriefingGroup]
+    func classify(
+        _ messages: [MessageHeader],
+        accountEmail: String,
+        language: String?
+    ) async throws -> [String: BriefingGroup]
 }
 
 /// Produces the per-conversation summary + action items. Implemented by the AI
 /// Gateway; returns `nil`-equivalent (throws) when no provider is configured.
 public protocol MessageSummarizing: Sendable {
-    /// - Parameter language: BCP-47-ish tag the summary must be written in.
-    ///   `nil` uses the gateway's configured default.
-    func summarize(_ body: MessageBody, language: String?) async throws -> MessageSummary
+    /// - Parameters:
+    ///   - body: the email to summarize,
+    ///   - language: BCP-47-ish tag the summary must be written in,
+    ///   - accountEmail: used for the per-account usage audit log.
+func summarize(
+        _ body: MessageBody,
+        language: String?,
+        accountEmail: String
+    ) async throws -> MessageSummary
 }

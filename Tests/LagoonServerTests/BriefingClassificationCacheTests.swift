@@ -18,7 +18,8 @@ private final class CountingClassifier: BriefingClassifying, @unchecked Sendable
 
     func classify(
         _ messages: [MessageHeader],
-        accountEmail: String
+        accountEmail: String,
+        language: String?
     ) async throws -> [String: BriefingGroup] {
         lock.lock()
         _calls += 1
@@ -32,7 +33,8 @@ private final class CountingClassifier: BriefingClassifying, @unchecked Sendable
 private struct SilentClassifier: BriefingClassifying {
     func classify(
         _ messages: [MessageHeader],
-        accountEmail: String
+        accountEmail: String,
+        language: String?
     ) async throws -> [String: BriefingGroup] { [:] }
 }
 

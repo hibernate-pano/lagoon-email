@@ -19,6 +19,9 @@ public struct LLMCompletion: Sendable {
     /// Provider `finish_reason`. `length` means the answer was truncated and
     /// JSON parsing may legitimately fail, so it is worth logging/retrying.
     public let finishReason: String?
+    /// Estimated cost in micro-USD (rate * tokens). nil when the provider has
+    /// no rate configured; the budget cap cannot be enforced then.
+    public let costMicrosUSD: Int64?
 
     public init(
         text: String,
@@ -26,7 +29,8 @@ public struct LLMCompletion: Sendable {
         completionTokens: Int?,
         model: String,
         latencyMs: Int,
-        finishReason: String? = nil
+        finishReason: String? = nil,
+        costMicrosUSD: Int64? = nil
     ) {
         self.text = text
         self.promptTokens = promptTokens
@@ -34,6 +38,7 @@ public struct LLMCompletion: Sendable {
         self.model = model
         self.latencyMs = latencyMs
         self.finishReason = finishReason
+        self.costMicrosUSD = costMicrosUSD
     }
 }
 
@@ -45,16 +50,23 @@ public enum LLMError: Error, CustomStringConvertible {
     case http(Int)
     case badResponse(String)
     case circuitOpen(provider: String)
+    /// The configured monthly budget is exhausted.
+    case budgetExceeded(currentUSD: Double, capUSD: Double)
 
     public var description: String {
         switch self {
         case .notConfigured: "no LLM provider configured"
         case .invalidBaseURL(let raw): "invalid provider base URL: \(raw)"
         case .blockedHost(let host): "provider host not allowed: \(host)"
-        case .redirectBlocked: "provider redirect blocked"
+        case .redirectBlocked: "provider HTTP redirect blocked"
         case .http(let status): "provider returned HTTP \(status)"
         case .badResponse(let detail): "unparseable provider response: \(detail)"
         case .circuitOpen(let provider): "provider circuit open: \(provider)"
+        case .budgetExceeded(let cur, let cap):
+            String(
+                format: "LLM budget exceeded: $%.4f of $%.2f",
+                cur, cap
+            )
         }
     }
 }
@@ -65,5 +77,59 @@ public enum LLMError: Error, CustomStringConvertible {
 public protocol LLMProvider: Sendable {
     var name: String { get }
     var model: String { get }
+    /// USD per 1k prompt / completion tokens. nil disables budget enforcement
+    /// for this provider.
+    var costPer1kPromptUsd: Double? { get }
+    var costPer1kCompletionUsd: Double? { get }
     func complete(capability: LLMCapability, system: String, user: String) async throws -> LLMCompletion
+}
+
+/// Per-month cost cap (spec §6.5).
+///
+/// `checkBeforeCall` runs before the HTTP request with a best-effort estimate;
+/// `record` runs after with actual tokens. Both are no-ops when no provider
+/// rate is configured.
+public protocol BudgetPolicy: Sendable {
+    /// Throws `LLMError.budgetExceeded` if the call would breach the cap.
+    func checkBeforeCall(
+        capability: String,
+        model: String,
+        estimatedPromptTokens: Int,
+        estimatedCompletionTokens: Int,
+        promptRate: Double?,
+        completionRate: Double?
+    ) async throws
+
+    /// Records the actual call and updates the running total. The cap is not
+    /// re-checked here: a single over-budget call is allowed so the user keeps
+    /// the answer; the next call's pre-check rejects.
+    func record(
+        capability: String,
+        model: String,
+        accountEmail: String,
+        promptTokens: Int,
+        completionTokens: Int,
+        costMicrosUSD: Int64
+    ) async throws
+}
+
+/// A no-op budget policy for deployments that don't configure a cap.
+public struct NoBudgetPolicy: BudgetPolicy {
+    public init() {}
+    public func checkBeforeCall(
+        capability: String,
+        model: String,
+        estimatedPromptTokens: Int,
+        estimatedCompletionTokens: Int,
+        promptRate: Double?,
+        completionRate: Double?
+    ) async throws {}
+    public func record(
+        capability: String,
+        model: String,
+        accountEmail: String,
+        promptTokens: Int,
+        completionTokens: Int,
+        costMicrosUSD: Int64
+    ) async throws {}
 }

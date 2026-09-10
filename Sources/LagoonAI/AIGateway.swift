@@ -18,18 +18,31 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
     private let breaker: CircuitBreaker
     private let logger: Logger
     public let outputLanguage: String
+    private let budget: BudgetPolicy
 
     public init(
         providers: [LLMProvider],
         routing: [String: String],
         outputLanguage: String = AIGateway.defaultOutputLanguage,
+        budget: BudgetPolicy = NoBudgetPolicy(),
         logger: Logger = Logger(label: "lagoon.ai")
     ) {
         self.providers = providers
         self.routing = routing
         self.outputLanguage = outputLanguage
+        self.budget = budget
         self.breaker = CircuitBreaker()
         self.logger = logger
+    }
+
+    /// Conservative upper bound for completion tokens used in pre-call cost
+    /// estimation. The actual value is recorded after the call; this only
+    /// prevents an obviously-too-large call from crossing the cap.
+    private static let estimatedCompletionTokens = 1_500
+
+    /// Rough English token estimate: ~4 chars per token.
+    private static func estimatePromptTokens(_ text: String) -> Int {
+        max(1, text.count / 4)
     }
 
     /// Human-readable name for a BCP-47-ish language tag, used in prompts.
@@ -50,6 +63,7 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileURL: URL? = nil,
         session: URLSession = ProviderHTTP.makeSession(),
+        budget: BudgetPolicy = NoBudgetPolicy(),
         logger: Logger = Logger(label: "lagoon.ai")
     ) -> AIGateway? {
         do {
@@ -63,8 +77,9 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
                 providers: providers,
                 routing: routing,
                 outputLanguage: language,
+                budget: budget,
                 logger: logger
-            )
+            ) // fromEnvironment has no Postgres connection; budget is NoBudgetPolicy. App.swift wires the real one.
         } catch {
             logger.warning("AI gateway disabled", metadata: ["reason": .string("\(error)")])
             return nil
@@ -90,7 +105,8 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
 
     public func classify(
         _ messages: [MessageHeader],
-        accountEmail: String
+        accountEmail: String,
+        language: String?
     ) async throws -> [String: BriefingGroup] {
         guard !messages.isEmpty else { return [:] }
         // Only headers/snippet/age — never a body (spec §6.6 rule 5).
@@ -116,7 +132,19 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
             Emails: \(jsonString(rows))
             """
 
-        let parsed = try await completeJSON(capability: .classify, system: systemPrompt, user: user).json
+        let provider = provider(for: .classify)
+        try await chargeBudgetPreCheck(
+            capability: .classify,
+            provider: provider,
+            systemPrompt: systemPrompt,
+            userPrompt: user,
+            accountEmail: accountEmail
+        )
+        let (parsed, completion) = try await completeJSON(
+            capability: .classify,
+            system: systemPrompt,
+            user: user
+        )
         var result: [String: BriefingGroup] = [:]
         for (id, raw) in parsed {
             guard let raw = raw as? String,
@@ -130,7 +158,11 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
 
     // MARK: - MessageSummarizing
 
-    public func summarize(_ body: MessageBody, language: String?) async throws -> MessageSummary {
+    public func summarize(
+        _ body: MessageBody,
+        language: String?,
+        accountEmail: String
+    ) async throws -> MessageSummary {
         let languageTag = language.flatMap { $0.isEmpty ? nil : $0 } ?? outputLanguage
         let text = String(body.text.prefix(12_000))
         let user = """
@@ -146,7 +178,15 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
             Body:
             \(text)
             """
-        let (parsed, model) = try await completeJSON(
+        let provider = provider(for: .summary)
+        try await chargeBudgetPreCheck(
+            capability: .summary,
+            provider: provider,
+            systemPrompt: systemPrompt,
+            userPrompt: user,
+            accountEmail: accountEmail
+        )
+        let (parsed, completion) = try await completeJSON(
             capability: .summary,
             system: systemPrompt,
             user: user
@@ -157,11 +197,65 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
         let actionItems = (parsed["actionItems"] as? [Any])?
             .compactMap { $0 as? String }
             .filter { !$0.isEmpty } ?? []
+        await recordBudgetPostCall(
+            capability: .summary,
+            provider: provider,
+            accountEmail: accountEmail,
+            completion: completion
+        )
         return MessageSummary(
             gmailId: body.gmailId,
             summary: summary,
             actionItems: actionItems,
-            provider: model
+            provider: completion.model
+        )
+    }
+
+    // MARK: - Budget helpers
+
+    private func chargeBudgetPreCheck(
+        capability: LLMCapability,
+        provider: LLMProvider?,
+        systemPrompt: String,
+        userPrompt: String,
+        accountEmail: String
+    ) async throws {
+        guard let provider else { return }
+        let estPrompt = Self.estimatePromptTokens(systemPrompt) + Self.estimatePromptTokens(userPrompt)
+        do {
+            try await budget.checkBeforeCall(
+                capability: capability.rawValue,
+                model: provider.model,
+                estimatedPromptTokens: estPrompt,
+                estimatedCompletionTokens: Self.estimatedCompletionTokens,
+                promptRate: provider.costPer1kPromptUsd,
+                completionRate: provider.costPer1kCompletionUsd
+            )
+        } catch {
+            logger.error("llm.budget.preCheckFailed", metadata: [
+                "capability": .string(capability.rawValue),
+                "model": .string(provider.model),
+                "account": .string(accountEmail),
+                "err": .string("\(error)"),
+            ])
+            throw error
+        }
+    }
+
+    private func recordBudgetPostCall(
+        capability: LLMCapability,
+        provider: LLMProvider?,
+        accountEmail: String,
+        completion: LLMCompletion,
+    ) async {
+        guard provider != nil else { return }
+        try? await budget.record(
+            capability: capability.rawValue,
+            model: completion.model,
+            accountEmail: accountEmail,
+            promptTokens: completion.promptTokens ?? 0,
+            completionTokens: completion.completionTokens ?? 0,
+            costMicrosUSD: completion.costMicrosUSD ?? 0
         )
     }
 
@@ -175,12 +269,12 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
         system: String,
         user: String,
         attempts: Int = 2
-    ) async throws -> (json: [String: Any], model: String) {
+    ) async throws -> (json: [String: Any], completion: LLMCompletion) {
         var lastError: Error = LLMError.badResponse("\(capability.rawValue): no attempt")
         for attempt in 1...max(1, attempts) {
             let completion = try await complete(capability: capability, system: system, user: user)
             if let parsed = parseJSONObject(completion.text) {
-                return (parsed, completion.model)
+                return (parsed, completion)
             }
             lastError = LLMError.badResponse("\(capability.rawValue): not a JSON object")
             logger.warning("llm.unparseable", metadata: [

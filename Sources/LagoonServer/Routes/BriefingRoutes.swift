@@ -75,7 +75,8 @@ public enum BriefingRoutes {
                     do {
                         let fresh = try await classifier.classify(
                             pending,
-                            accountEmail: account.email
+                            accountEmail: account.email,
+                            language: nil
                         )
                         await cache.store(fresh, for: pending)
                         for (gmailId, group) in fresh { overrides[gmailId] = group }

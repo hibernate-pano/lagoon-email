@@ -243,7 +243,8 @@ public enum MessageRoutes {
             do {
                 let result = try await summarizer.summarize(
                     body,
-                    language: RouteParams.preferredLanguage(fromHeader: request.headers[.acceptLanguage])
+                    language: RouteParams.preferredLanguage(fromHeader: request.headers[.acceptLanguage]),
+                    accountEmail: account.email
                 )
                 // Normalize the id to the requested message and never pass the
                 // provider's raw error text back to the client.

@@ -121,7 +121,8 @@ final class RouteTests: XCTestCase {
 
         func classify(
             _ messages: [MessageHeader],
-            accountEmail: String
+            accountEmail: String,
+            language: String?
         ) async throws -> [String: BriefingGroup] {
             groups
         }
@@ -130,7 +131,8 @@ final class RouteTests: XCTestCase {
     private struct ThrowingBriefingClassifier: BriefingClassifying {
         func classify(
             _ messages: [MessageHeader],
-            accountEmail: String
+            accountEmail: String,
+            language: String?
         ) async throws -> [String: BriefingGroup] {
             throw RouteTestError.classifierFailed
         }
@@ -141,7 +143,7 @@ final class RouteTests: XCTestCase {
         let actionItems: [String]
         let provider: String?
 
-        func summarize(_ body: MessageBody, language: String?) async throws -> MessageSummary {
+        func summarize(_ body: MessageBody, language: String?, accountEmail: String) async throws -> MessageSummary {
             MessageSummary(
                 gmailId: body.gmailId,
                 summary: summary,
