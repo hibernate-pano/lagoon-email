@@ -17,24 +17,31 @@ public enum ActionsRoutes {
         db: PostgresConnection,
         client: GmailClient,
         tokens: GmailTokenService,
-        logger: Logger
+        logger: Logger,
+        makeProvider: MailProviderFactory.Builder? = nil
     ) {
+        let makeProvider = makeProvider
+            ?? MailProviderFactory.factory(client: client, tokens: tokens, db: db, logger: logger)
+
         // POST /api/messages/{remoteId}/archive?accountId=
-        // Tries Gmail `users.messages.modify removeLabelIds=INBOX`. Falls back to
-        // local mark-as-archived if the token lacks `gmail.modify` scope.
+        // Moves the message through the account's provider (`MailProvider.archive`).
+        // Gated on the negotiated `capabilities.archiveFolder`: a provider that
+        // cannot move messages is rejected before any local state changes.
         router.post("api/messages/:remoteId/archive") { request, context -> Response in
             return await archiveHandler(
-                request: request, context: context, db: db, client: client, tokens: tokens, logger: logger
+                request: request, context: context, db: db,
+                makeProvider: makeProvider, logger: logger
             )
         }
 
         // POST /api/messages/{remoteId}/unsubscribe
-        // Reads the cached List-Unsubscribe header, fires HTTP POST/GET to the
-        // endpoint, then records + marks read locally. Returns the URL it called
-        // so the UI can show "Unsubscribed from <publisher>".
+        // Reads the List-Unsubscribe header through the provider, fires an HTTP
+        // POST/GET to the endpoint, then records + marks read locally. Returns
+        // the publisher it called so the UI can show "Unsubscribed from <publisher>".
         router.post("api/messages/:remoteId/unsubscribe") { request, context -> Response in
             return await unsubscribeHandler(
-                request: request, context: context, db: db, client: client, tokens: tokens, logger: logger
+                request: request, context: context, db: db,
+                makeProvider: makeProvider, logger: logger
             )
         }
 
@@ -57,7 +64,8 @@ public enum ActionsRoutes {
         // (so undoing the undo is itself undoable).
         router.post("api/actions/:id/undo") { request, context -> Response in
             return await undoActionHandler(
-                request: request, context: context, db: db, client: client, tokens: tokens, logger: logger
+                request: request, context: context, db: db,
+                makeProvider: makeProvider, logger: logger
             )
         }
     }
@@ -66,7 +74,7 @@ public enum ActionsRoutes {
 
     private static func archiveHandler(
         request: Request, context: BasicRequestContext, db: PostgresConnection,
-        client: GmailClient, tokens: GmailTokenService, logger: Logger
+        makeProvider: MailProviderFactory.Builder, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -84,46 +92,30 @@ public enum ActionsRoutes {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
 
-        let token = try? await tokens.validToken(for: account)
+        // Spec §3.7: a provider without an archive target must not half-archive.
+        // The gate runs before any write, so a 409 leaves both remote and local
+        // state untouched.
+        guard account.capabilities.archiveFolder else {
+            return RouteJSON.error(.conflict, "archive-unavailable")
+        }
+        guard let provider = makeProvider(account) else {
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        }
         let writeSucceeded: Bool
-        if let token {
-            do {
-                try await client.modifyMessageLabels(
-                    accessToken: token.accessToken,
-                    remoteId: remoteId,
-                    removeLabelIds: ["INBOX"]
-                )
-                writeSucceeded = true
-            } catch GmailClientError.unauthorized {
-                do {
-                    let refreshed = try await tokens.forceRefresh(for: account)
-                    try await client.modifyMessageLabels(
-                        accessToken: refreshed,
-                        remoteId: remoteId,
-                        removeLabelIds: ["INBOX"]
-                    )
-                    writeSucceeded = true
-                } catch {
-                    writeSucceeded = false
-                }
-            } catch GmailClientError.http(let status, _) where status == 403 {
-                // Token doesn't have `gmail.modify` scope. Degrade silently and
-                // update local state only — the user can grant the scope and
-                // retry. The UI shows "archived locally; will sync once you
-                // grant modify scope".
-                logger.warning("archive.scopeMissing", metadata: [
-                    "remoteId": .string(remoteId),
-                    "account": .string(account.email),
-                ])
-                writeSucceeded = false
-            } catch {
-                logger.error("archive.failed", metadata: [
-                    "remoteId": .string(remoteId),
-                    "err": .string("\(error)"),
-                ])
-                return RouteJSON.error(.badGateway, "gmail-error")
-            }
-        } else {
+        do {
+            try await provider.archive(remoteId: remoteId)
+            writeSucceeded = true
+        } catch MailError.archiveUnavailable {
+            return RouteJSON.error(.conflict, "archive-unavailable")
+        } catch MailError.authFailed {
+            return RouteJSON.error(.unauthorized, "provider-auth-failed")
+        } catch {
+            // Degrade like the old Gmail scope-missing path: archive locally and
+            // record remoteWrite=false so undo stays local-only too.
+            logger.warning("archive.remoteFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "label": .string(MessageRoutes.providerLabel(error)),
+            ])
             writeSucceeded = false
         }
 
@@ -153,7 +145,7 @@ public enum ActionsRoutes {
 
     private static func unsubscribeHandler(
         request: Request, context: BasicRequestContext, db: PostgresConnection,
-        client: GmailClient, tokens: GmailTokenService, logger: Logger
+        makeProvider: MailProviderFactory.Builder, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -171,42 +163,23 @@ public enum ActionsRoutes {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
 
-        // 1. Find the List-Unsubscribe header from the most-recent cached header.
-        let headerRow = try? await db.query(
-            """
-            SELECT h.value FROM message_headers m
-            JOIN LATERAL (
-                SELECT value FROM (
-                    SELECT '<' || split_part(value, '<', 2) AS value
-                    FROM regexp_split_to_table(
-                        (SELECT payload->>'headers' FROM raw_message_headers WHERE remote_id = m.remote_id ORDER BY fetched_at DESC LIMIT 1),
-                        chr(10)
-                    ) AS parts(value) WHERE value LIKE 'List-Unsubscribe:%'
-                ) sub LIMIT 1
-            ) h ON true
-            WHERE m.account_id = $1 AND m.remote_id = $2
-            """,
-            [PostgresData(uuid: accountId), PostgresData(string: remoteId)]
-        ).get()
-        // The query above is complex; fall back to a simpler check: just record
-        // the action and let the UI show the result.
-        _ = headerRow
-
-        // Simpler: we don't currently persist raw headers separately. Instead, we
-        // fetch the message via Gmail at unsubscribe time. This costs an API
-        // call but only when the user clicks unsubscribe.
+        // The List-Unsubscribe value is fetched on demand — it costs one
+        // provider round-trip and only when the user actually clicks.
         var unsubscribed = false
         var publisher: String? = nil
-        if let token = try? await tokens.validToken(for: account) {
+        if let provider = makeProvider(account) {
             do {
-                let msg = try await client.getMessage(accessToken: token.accessToken, remoteId: remoteId)
-                if let raw = msg.payload?.headers?.first(where: { $0.name.lowercased() == "list-unsubscribe" })?.value,
+                let headers = try await provider.fetchRawHeaderValues(remoteId: remoteId)
+                if let raw = headers.first(where: { $0.key.lowercased() == "list-unsubscribe" })?.value,
                    let url = firstUnsubscribeURL(raw) {
                     publisher = extractPublisher(raw)
                     unsubscribed = (try? await hitUnsubscribe(url: url)) ?? false
                 }
             } catch {
-                logger.warning("unsubscribe.fetchFailed", metadata: ["remoteId": .string(remoteId), "err": .string("\(error)")])
+                logger.warning("unsubscribe.fetchFailed", metadata: [
+                    "remoteId": .string(remoteId),
+                    "label": .string(MessageRoutes.providerLabel(error)),
+                ])
             }
         }
 
@@ -313,7 +286,7 @@ public enum ActionsRoutes {
 
     private static func undoActionHandler(
         request: Request, context: BasicRequestContext, db: PostgresConnection,
-        client: GmailClient, tokens: GmailTokenService, logger: Logger
+        makeProvider: MailProviderFactory.Builder, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -343,10 +316,13 @@ public enum ActionsRoutes {
         }
 
         // Reverse each action type. The inverse is best-effort; archive becomes
-        // "add INBOX back"; mark-read becomes "mark unread"; pin/unpin flip;
+        // "add the mailbox back"; mark-read becomes "mark unread"; pin/unpin flip;
         // classify-override inserts a counter-override; unsubscribe is terminal.
         do {
-            try await reverse(action: action, account: account, client: client, tokens: tokens, db: db, logger: logger)
+            try await reverse(
+                action: action, account: account,
+                makeProvider: makeProvider, db: db, logger: logger
+            )
             let _ = try await AIActionStore.record(
                 accountId: accountId,
                 kind: .archive, // 'undo' is itself an action; kind is informational
@@ -360,26 +336,29 @@ public enum ActionsRoutes {
     }
 
     private static func reverse(
-        action: AIAction, account: Account, client: GmailClient, tokens: GmailTokenService,
+        action: AIAction, account: Account,
+        makeProvider: MailProviderFactory.Builder,
         db: PostgresConnection, logger: Logger
     ) async throws {
         let remoteId = action.payload["remoteId"] ?? ""
         switch action.kind {
         case .archive:
-            // Archive → put it back in INBOX.
+            // Archive → put it back.
             try await db.query(
                 "UPDATE message_headers SET is_archived = FALSE WHERE remote_id = $1 AND account_id = $2",
                 [PostgresData(string: remoteId), PostgresData(uuid: account.id)]
             ).get()
-            if action.payload["remote"] == "true" {
+            if action.payload["remote"] == "true", let provider = makeProvider(account) {
                 do {
-                    let token = try await tokens.validToken(for: account)
-                    try? await client.modifyMessageLabels(
-                        accessToken: token.accessToken,
-                        remoteId: remoteId,
-                        addLabelIds: ["INBOX"]
-                    )
-                } catch { /* remote undo failed; local state already reactivated */ }
+                    try await provider.unarchive(remoteId: remoteId)
+                } catch {
+                    // Remote undo failed; local state already reactivated and the
+                    // next sync reconciles.
+                    logger.warning("undo.remoteFailed", metadata: [
+                        "remoteId": .string(remoteId),
+                        "label": .string(MessageRoutes.providerLabel(error)),
+                    ])
+                }
             }
         case .markRead:
             try await db.query(

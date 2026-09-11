@@ -16,12 +16,16 @@ public enum DraftRoutes {
         client: GmailClient,
         tokens: GmailTokenService,
         summarizer: (any MessageSummarizing)?,
-        logger: Logger
+        logger: Logger,
+        makeProvider: MailProviderFactory.Builder? = nil
     ) {
+        let makeProvider = makeProvider
+            ?? MailProviderFactory.factory(client: client, tokens: tokens, db: db, logger: logger)
+
         router.post("api/messages/:remoteId/draft") { request, context -> Response in
             return await generateHandler(
                 request: request, context: context, db: db,
-                client: client, tokens: tokens,
+                makeProvider: makeProvider,
                 summarizer: summarizer, logger: logger
             )
         }
@@ -40,7 +44,7 @@ public enum DraftRoutes {
 
     private static func generateHandler(
         request: Request, context: BasicRequestContext, db: PostgresConnection,
-        client: GmailClient, tokens: GmailTokenService,
+        makeProvider: MailProviderFactory.Builder,
         summarizer: (any MessageSummarizing)?, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
@@ -64,11 +68,16 @@ public enum DraftRoutes {
 
         let body: MessageBody
         do {
+            guard let provider = makeProvider(account) else {
+                return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+            }
             body = try await MessageRoutes.fetchBody(
-                account: account, remoteId: remoteId, client: client, tokens: tokens
+                account: account, remoteId: remoteId, provider: provider, db: db
             )
+        } catch let error as MailError {
+            return MessageRoutes.providerError(error, logger: logger, remoteId: remoteId)
         } catch {
-            return errorResponse(.badGateway, "gmail-error", logger: logger, error: error)
+            return errorResponse(.badGateway, "provider-unreachable", logger: logger, error: error)
         }
 
         let language = RouteParams.preferredLanguage(fromHeader: request.headers[.acceptLanguage])
@@ -163,24 +172,33 @@ public enum DraftRoutes {
                         userInfo: [NSLocalizedDescriptionKey: "missing-account"]
                     )
                 }
-                let token = try await tokens.validToken(for: account)
-                let headerRow = try? await db.query(
-                    "SELECT thread_id, from_address, subject FROM message_headers WHERE account_id = $1 AND remote_id = $2",
-                    [PostgresData(uuid: accountId), PostgresData(string: draft.remoteId)]
-                ).get()
-                if let row = headerRow?.rows.first,
-                   let threadId = row.column("thread_id")?.string {
-                    let from = row.column("from_address")?.string ?? ""
-                    let subject = row.column("subject")?.string ?? "(no subject)"
-                    let body = draft.variants[req.variant]
-                    let id = try await client.createDraft(
-                        accessToken: token.accessToken,
-                        threadId: threadId,
-                        to: from,
-                        subject: subject,
-                        body: body
-                    )
-                    gmailDraftId = id
+                // Server-side drafts are a Gmail API feature; an IMAP account
+                // keeps the chosen variant locally (SMTP has no draft concept).
+                if account.provider == .gmail {
+                    let token = try await tokens.validToken(for: account)
+                    let headerRow = try? await db.query(
+                        "SELECT thread_id, from_address, subject FROM message_headers WHERE account_id = $1 AND remote_id = $2",
+                        [PostgresData(uuid: accountId), PostgresData(string: draft.remoteId)]
+                    ).get()
+                    if let row = headerRow?.rows.first,
+                       let threadId = row.column("thread_id")?.string {
+                        let from = row.column("from_address")?.string ?? ""
+                        let subject = row.column("subject")?.string ?? "(no subject)"
+                        let body = draft.variants[req.variant]
+                        let id = try await client.createDraft(
+                            accessToken: token.accessToken,
+                            threadId: threadId,
+                            to: from,
+                            subject: subject,
+                            body: body
+                        )
+                        gmailDraftId = id
+                    }
+                } else {
+                    logger.info("draft.pushSkipped", metadata: [
+                        "draftId": .string("\(draftId)"),
+                        "provider": .string(account.provider.rawValue),
+                    ])
                 }
             } catch GmailClientError.http(let status, _) where status == 403 {
                 logger.warning("draft.scopeMissing", metadata: ["draftId": .string("\(draftId)")])

@@ -114,6 +114,14 @@ public enum MailError: Error, Equatable {
     }
 }
 
+/// A provider whose archive target is a server-side folder (IMAP). The connect
+/// flow persists the resolved name into the account's sync cursor so the undo
+/// route can move a message back without re-listing folders.
+public protocol ArchiveFolderResolving: Sendable {
+    /// The resolved remote archive mailbox, `nil` when the server has none.
+    func archiveFolder() async -> String?
+}
+
 /// The one seam every mailbox backend implements. Routes and the sync engine
 /// talk to this, never to Gmail/IMAP directly.
 public protocol MailProvider: Sendable {

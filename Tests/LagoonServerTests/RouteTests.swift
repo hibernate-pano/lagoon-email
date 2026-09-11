@@ -42,7 +42,9 @@ final class RouteTests: XCTestCase {
             }
 
             let router = Router()
-            AccountsRoutes.register(on: router, db: conn)
+            AccountsRoutes.register(
+                on: router, db: conn, logger: Self.testLogger, makeProvider: { _ in nil }
+            )
             let app = Application(router: router)
 
             try await app.test(.router) { client in
@@ -79,7 +81,9 @@ final class RouteTests: XCTestCase {
             )
 
             let router = Router()
-            AccountsRoutes.register(on: router, db: conn)
+            AccountsRoutes.register(
+                on: router, db: conn, logger: Self.testLogger, makeProvider: { _ in nil }
+            )
             let app = Application(router: router)
 
             try await app.test(.router) { client in
@@ -89,7 +93,7 @@ final class RouteTests: XCTestCase {
                         response.headers[.contentType],
                         "application/json; charset=utf-8"
                     )
-                    let decoded = try JSONDecoder().decode(
+                    let decoded = try Self.iso8601Decoder().decode(
                         [ConnectedAccount].self,
                         from: Data(buffer: response.body)
                     )
@@ -165,32 +169,41 @@ final class RouteTests: XCTestCase {
         return URLSession(configuration: config)
     }
 
-    /// Registers `MessageRoutes` with a URLProtocol-stubbed Gmail client and a
-    /// token service pointed at the same guarded test DB. The Gmail client is
-    /// only exercised by the `/summary` test; the other message routes touch
-    /// the DB alone.
+    /// Gmail collaborators for routes whose default provider builder needs them.
+    /// The stubbed session keeps any accidental network call inside the process.
+    private func makeGmailCollaborators(
+        db: PostgresConnection
+    ) -> (GmailClient, GmailTokenService) {
+        let session = Self.makeSession()
+        let client = GmailClient(session: session)
+        let tokens = GmailTokenService(
+            db: db,
+            oauth: GoogleOAuthClient(
+                clientID: "test-client",
+                clientSecret: "test-secret",
+                redirectURI: "http://127.0.0.1:9999/callback",
+                session: session
+            ),
+            logger: Self.testLogger
+        )
+        return (client, tokens)
+    }
+
     private func makeMessageRouter(
         db: PostgresConnection,
-        summarizer: (any MessageSummarizing)? = nil
+        summarizer: (any MessageSummarizing)? = nil,
+        makeProvider: MailProviderFactory.Builder? = nil
     ) -> Router<BasicRequestContext> {
-        let session = Self.makeSession()
+        let (client, tokens) = makeGmailCollaborators(db: db)
         let router = Router()
         MessageRoutes.register(
             on: router,
             db: db,
-            client: GmailClient(session: session),
-            tokens: GmailTokenService(
-                db: db,
-                oauth: GoogleOAuthClient(
-                    clientID: "test-client",
-                    clientSecret: "test-secret",
-                    redirectURI: "http://127.0.0.1:9999/callback",
-                    session: session
-                ),
-                logger: Self.testLogger
-            ),
+            client: client,
+            tokens: tokens,
             logger: Self.testLogger,
-            summarizer: summarizer
+            summarizer: summarizer,
+            makeProvider: makeProvider
         )
         return router
     }
@@ -849,6 +862,448 @@ final class RouteTests: XCTestCase {
                     XCTAssertEqual(try Self.errorCode(from: response.body), "unknown-account")
                 }
             }
+        }
+    }
+
+    // MARK: - T8: account write path + provider dispatch
+
+    /// Scripted `MailProvider` for route tests. Failures are injected as typed
+    /// `MailError`s so the assertions are about the route's status mapping, and
+    /// calls are recorded so "the provider was actually asked to do it" is
+    /// testable without a live connection.
+    private actor StubMailProvider: MailProvider {
+        nonisolated let kind: MailProviderKind
+        private(set) var capabilitiesValue: MailCapabilities
+        private var probeError: MailError?
+        private var bodyError: MailError?
+        private var archiveError: MailError?
+        var bodyText = "stub body text"
+        private(set) var probeCalls = 0
+        private(set) var archivedRemoteIds: [String] = []
+        private(set) var readCalls: [String] = []
+
+        init(
+            kind: MailProviderKind = .qq,
+            capabilities: MailCapabilities = MailCapabilities(
+                archiveFolder: true, idle: true, move: true, serverSnippet: true
+            )
+        ) {
+            self.kind = kind
+            self.capabilitiesValue = capabilities
+        }
+
+        func setProbeError(_ error: MailError?) { probeError = error }
+        func setBodyError(_ error: MailError?) { bodyError = error }
+        func setArchiveError(_ error: MailError?) { archiveError = error }
+
+        func capabilities() async -> MailCapabilities { capabilitiesValue }
+
+        func pullChanges(after cursor: MailSyncState, waitUpTo: Duration) async throws -> MailChangeSet {
+            MailChangeSet(upserts: [], resetRequired: false, cursor: cursor)
+        }
+
+        func fetchBody(remoteId: String) async throws -> String {
+            if let bodyError { throw bodyError }
+            return bodyText
+        }
+
+        func fetchRawHeaderValues(remoteId: String) async throws -> [String: String] { [:] }
+
+        func setRead(remoteId: String, isRead: Bool) async throws {
+            readCalls.append(remoteId)
+        }
+
+        func archive(remoteId: String) async throws {
+            if let archiveError { throw archiveError }
+            archivedRemoteIds.append(remoteId)
+        }
+
+        func unarchive(remoteId: String) async throws {}
+
+        func send(_ outbound: OutboundMessage) async throws -> String? { nil }
+
+        func probe() async throws {
+            probeCalls += 1
+            if let probeError { throw probeError }
+        }
+    }
+
+    private func makeAccountsRouter(
+        db: PostgresConnection,
+        provider: any MailProvider,
+        sync: SyncEngine? = nil
+    ) -> Router<BasicRequestContext> {
+        let router = Router()
+        AccountsRoutes.register(
+            on: router,
+            db: db,
+            logger: Self.testLogger,
+            sync: sync,
+            makeProvider: { _ in provider }
+        )
+        return router
+    }
+
+    private static func jsonBody(_ object: [String: String]) -> ByteBuffer {
+        let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
+        return ByteBuffer(data: data)
+    }
+
+    func test_postAccountsIMAP_missingField_returns400() async throws {
+        try await TestDatabase.withConnection { conn in
+            let provider = StubMailProvider()
+            let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/accounts/imap",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: Self.jsonBody(["provider": "qq", "email": "me@qq.com"])
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "missing-field")
+                }
+                let calls = await provider.probeCalls
+                XCTAssertEqual(calls, 0, "a malformed request must never touch the network")
+            }
+        }
+    }
+
+    func test_postAccountsIMAP_probeAuthFailed_returns401() async throws {
+        let email = "imap-\(UUID().uuidString)@qq.com"
+        // The connect flow seals the credential blob before probing, so the
+        // cipher needs a key even for the rejected path.
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: { conn in
+                try? await TestDatabase.deleteAccount(oauthUser: email, provider: .qq, db: conn)
+            }) { conn in
+                let provider = StubMailProvider()
+                await provider.setProbeError(.authFailed)
+                let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
+                try await app.test(.router) { client in
+                    try await client.execute(
+                        uri: "/api/accounts/imap",
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: Self.jsonBody(["provider": "qq", "email": email, "authCode": "wrong-code"])
+                    ) { response in
+                        XCTAssertEqual(response.status, .unauthorized)
+                        XCTAssertEqual(try Self.errorCode(from: response.body), "imap-auth-failed")
+                    }
+                }
+                let stored = try await AccountStore.find(byOAuthUser: email, provider: .qq, db: conn)
+                XCTAssertNil(stored, "a failed probe must not leave an account row")
+            }
+        }
+    }
+
+    func test_postAccountsIMAP_success_returns201ActiveWithCapabilities() async throws {
+        let email = "imap-\(UUID().uuidString)@qq.com"
+        let authCode = "auth-code-\(UUID().uuidString)"
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: { conn in
+                try? await TestDatabase.deleteAccount(oauthUser: email, provider: .qq, db: conn)
+            }) { conn in
+                let provider = StubMailProvider()
+                let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
+                try await app.test(.router) { client in
+                    try await client.execute(
+                        uri: "/api/accounts/imap",
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: Self.jsonBody(["provider": "qq", "email": email, "authCode": authCode])
+                    ) { response in
+                        XCTAssertEqual(response.status, .created)
+                        let raw = String(buffer: response.body)
+                        XCTAssertFalse(raw.contains(authCode), "the auth code must never be echoed")
+                        let decoded = try Self.iso8601Decoder().decode(
+                            ConnectedAccount.self, from: Data(buffer: response.body)
+                        )
+                        XCTAssertEqual(decoded.provider, .qq)
+                        XCTAssertEqual(decoded.email, email)
+                        XCTAssertTrue(decoded.isActive)
+                        XCTAssertEqual(
+                            decoded.capabilities,
+                            MailCapabilities(archiveFolder: true, idle: true, move: true, serverSnippet: true)
+                        )
+                    }
+                    try await client.execute(uri: "/api/accounts", method: .get) { response in
+                        let raw = String(buffer: response.body)
+                        XCTAssertFalse(raw.contains(authCode), "GET /api/accounts must never echo secrets")
+                        let decoded = try Self.iso8601Decoder().decode(
+                            [ConnectedAccount].self, from: Data(buffer: response.body)
+                        )
+                        let mine = decoded.first { $0.email == email }
+                        XCTAssertNotNil(mine, "the fresh account must be listed")
+                        XCTAssertTrue(mine?.isActive ?? false)
+                        XCTAssertTrue(mine?.capabilities.archiveFolder ?? false)
+                    }
+                }
+
+                let stored = try await AccountStore.find(byOAuthUser: email, provider: .qq, db: conn)
+                let account = try XCTUnwrap(stored)
+                XCTAssertTrue(account.isActive)
+                let credentials = try await CredentialVault.read(accountId: account.id, db: conn)
+                XCTAssertEqual(credentials, .imap(username: email, authCode: authCode))
+                XCTAssertEqual(account.capabilities.archiveFolder, true)
+            }
+        }
+    }
+
+    func test_postAccountsIMAP_existingAccount_returns409() async throws {
+        let email = "imap-\(UUID().uuidString)@qq.com"
+        try await TestDatabase.withConnection(cleanup: { conn in
+            try? await TestDatabase.deleteAccount(oauthUser: email, provider: .qq, db: conn)
+        }) { conn in
+            try await seedAccount(
+                Account(
+                    id: UUID(), provider: .qq, oauthUser: email, email: email,
+                    credentials: Data([1, 2, 3]), isActive: false
+                ),
+                db: conn
+            )
+            let provider = StubMailProvider()
+            let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/accounts/imap",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: Self.jsonBody(["provider": "qq", "email": email, "authCode": "code"])
+                ) { response in
+                    XCTAssertEqual(response.status, .conflict)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "account-exists")
+                }
+            }
+            let calls = await provider.probeCalls
+            XCTAssertEqual(calls, 0, "an existing account is reported before any network work")
+        }
+    }
+
+    func test_postActivate_flipsTheActiveAccount() async throws {
+        let first = makeAccount(oauthUser: "route-\(UUID().uuidString)", email: "a-\(UUID())@example.com")
+        let second = makeAccount(oauthUser: "route-\(UUID().uuidString)", email: "b-\(UUID())@example.com")
+        try await TestDatabase.withConnection(cleanup: { conn in
+            try? await TestDatabase.deleteAccount(id: first.id, db: conn)
+            try? await TestDatabase.deleteAccount(id: second.id, db: conn)
+        }) { conn in
+            try await seedAccount(first, db: conn)
+            try await seedAccount(second, db: conn)
+            try await AccountStore.setActive(accountId: first.id, db: conn)
+
+            let provider = StubMailProvider()
+            let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/accounts/\(second.id.uuidString)/activate",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .noContent)
+                }
+            }
+
+            let active = try await AccountStore.find(byId: second.id, db: conn)
+            XCTAssertEqual(active?.isActive, true)
+            let demoted = try await AccountStore.find(byId: first.id, db: conn)
+            XCTAssertEqual(demoted?.isActive, false)
+        }
+    }
+
+    func test_postActivate_unknownAccount_returns404() async throws {
+        try await TestDatabase.withConnection { conn in
+            let provider = StubMailProvider()
+            let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/accounts/\(UUID().uuidString)/activate",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "unknown-account")
+                }
+            }
+        }
+    }
+
+    func test_deleteAccount_returns204AndRemovesRow() async throws {
+        let account = makeAccount(oauthUser: "route-\(UUID().uuidString)", email: "d-\(UUID())@example.com")
+        try await TestDatabase.withConnection(cleanup: { conn in
+            try? await TestDatabase.deleteAccount(id: account.id, db: conn)
+        }) { conn in
+            try await seedAccount(account, db: conn)
+            let provider = StubMailProvider()
+            let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/accounts/\(account.id.uuidString)",
+                    method: .delete
+                ) { response in
+                    XCTAssertEqual(response.status, .noContent)
+                }
+                try await client.execute(uri: "/api/accounts", method: .get) { response in
+                    let decoded = try Self.iso8601Decoder().decode(
+                        [ConnectedAccount].self, from: Data(buffer: response.body)
+                    )
+                    XCTAssertFalse(decoded.contains { $0.id == account.id })
+                }
+            }
+        }
+    }
+
+    func test_deleteAccount_unknownAccount_returns404() async throws {
+        try await TestDatabase.withConnection { conn in
+            let provider = StubMailProvider()
+            let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/accounts/\(UUID().uuidString)",
+                    method: .delete
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                }
+            }
+        }
+    }
+
+    func test_getBody_providerText_returns200MessageBody() async throws {
+        let account = makeAccount(oauthUser: "route-\(UUID().uuidString)", email: "me-\(UUID())@example.com")
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(accountId: account.id, remoteId: "77", from: "alice@example.com")
+            try await MessageStore.upsert(message, db: conn)
+
+            let provider = StubMailProvider()
+            let app = Application(
+                router: makeMessageRouter(db: conn, makeProvider: { _ in provider })
+            )
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/77/body?accountId=\(account.id.uuidString)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        MessageBody.self, from: Data(buffer: response.body)
+                    )
+                    XCTAssertEqual(decoded.remoteId, "77")
+                    XCTAssertEqual(decoded.text, "stub body text")
+                    XCTAssertEqual(decoded.fromAddress, "alice@example.com")
+                    XCTAssertEqual(decoded.subject, message.subject)
+                }
+            }
+        }
+    }
+
+    func test_getBody_providerGone_returns410() async throws {
+        let account = makeAccount(oauthUser: "route-\(UUID().uuidString)", email: "me-\(UUID())@example.com")
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let provider = StubMailProvider()
+            await provider.setBodyError(.messageGone)
+            let app = Application(
+                router: makeMessageRouter(db: conn, makeProvider: { _ in provider })
+            )
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/78/body?accountId=\(account.id.uuidString)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .gone)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "message-gone")
+                }
+            }
+        }
+    }
+
+    func test_getBody_providerAuthFailed_returns401() async throws {
+        let account = makeAccount(oauthUser: "route-\(UUID().uuidString)", email: "me-\(UUID())@example.com")
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let provider = StubMailProvider()
+            await provider.setBodyError(.authFailed)
+            let app = Application(
+                router: makeMessageRouter(db: conn, makeProvider: { _ in provider })
+            )
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/79/body?accountId=\(account.id.uuidString)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "provider-auth-failed")
+                }
+            }
+        }
+    }
+
+    func test_postArchive_providerMovesTheMessage() async throws {
+        let account = makeAccount(oauthUser: "route-\(UUID().uuidString)", email: "me-\(UUID())@example.com")
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(
+                Account(
+                    id: account.id, provider: .qq, oauthUser: account.oauthUser,
+                    email: account.email, credentials: Data([1, 2, 3]),
+                    capabilities: MailCapabilities(
+                        archiveFolder: true, idle: true, move: true, serverSnippet: true
+                    ),
+                    isActive: true
+                ),
+                db: conn
+            )
+            let provider = StubMailProvider()
+            let router = makeMessageRouter(db: conn, makeProvider: { _ in provider })
+            let (client, tokens) = makeGmailCollaborators(db: conn)
+            ActionsRoutes.register(
+                on: router, db: conn, client: client, tokens: tokens,
+                logger: Self.testLogger, makeProvider: { _ in provider }
+            )
+            let app = Application(router: router)
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/80/archive?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let archived = await provider.archivedRemoteIds
+            XCTAssertEqual(archived, ["80"])
+        }
+    }
+
+    func test_postArchive_capabilityMissing_returns409() async throws {
+        let account = makeAccount(oauthUser: "route-\(UUID().uuidString)", email: "me-\(UUID())@example.com")
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(
+                Account(
+                    id: account.id, provider: .qq, oauthUser: account.oauthUser,
+                    email: account.email, credentials: Data([1, 2, 3]),
+                    capabilities: MailCapabilities(
+                        archiveFolder: false, idle: true, move: true, serverSnippet: true
+                    ),
+                    isActive: true
+                ),
+                db: conn
+            )
+            let provider = StubMailProvider()
+            let router = makeMessageRouter(db: conn, makeProvider: { _ in provider })
+            let (client, tokens) = makeGmailCollaborators(db: conn)
+            ActionsRoutes.register(
+                on: router, db: conn, client: client, tokens: tokens,
+                logger: Self.testLogger, makeProvider: { _ in provider }
+            )
+            let app = Application(router: router)
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/81/archive?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .conflict)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "archive-unavailable")
+                }
+            }
+            let archived = await provider.archivedRemoteIds
+            XCTAssertTrue(archived.isEmpty, "a disabled capability must not reach the provider")
         }
     }
 }

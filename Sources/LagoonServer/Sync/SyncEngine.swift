@@ -25,6 +25,8 @@ public actor SyncEngine {
     private var loop: Task<Void, Never>?
     private var consecutiveFailures = 0
     private var currentAccountId: UUID?
+    /// Accounts whose negotiated capabilities have been persisted this process.
+    private var capabilitiesChecked: Set<UUID> = []
     /// Provider instances are long-lived: an IMAP provider holds an IDLE
     /// connection and a Gmail provider remembers the last poll it diffed
     /// against, so rebuilding one per tick would lose both.
@@ -57,6 +59,17 @@ public actor SyncEngine {
         loop = nil
     }
 
+    /// The active account changed (activate / connect / delete). A tick can be
+    /// blocked inside a long IDLE or poll for the old account, so it is
+    /// cancelled and the loop restarted against the new active row.
+    public func accountChanged() {
+        currentAccountId = nil
+        capabilitiesChecked.removeAll()
+        loop?.cancel()
+        loop = nil
+        start()
+    }
+
     /// One round: pull, persist, record health. Never throws — failures become
     /// state (`needsReconnect` / `error` / `degraded`) plus a backoff pause.
     ///
@@ -79,6 +92,7 @@ public actor SyncEngine {
                 await sleep(.seconds(60))
                 return
             }
+            await ensureCapabilities(for: account, provider: provider)
             let changes = try await provider.pullChanges(
                 after: account.syncState,
                 waitUpTo: waitBudget
@@ -92,6 +106,23 @@ public actor SyncEngine {
         } catch {
             await markFailure(error)
         }
+    }
+
+    /// Negotiated capabilities are account data (spec §2.5): version-skewed
+    /// rows carry all-false `.unknown`, and the client gates verbs (archive)
+    /// on them. Refreshed once per account per process, before the first pull
+    /// so the gate is honest as early as possible.
+    private func ensureCapabilities(for account: Account, provider: any MailProvider) async {
+        guard !capabilitiesChecked.contains(account.id), account.capabilities == .unknown else {
+            return
+        }
+        capabilitiesChecked.insert(account.id)
+        let capabilities = await provider.capabilities()
+        try? await AccountStore.updateCapabilities(
+            accountId: account.id,
+            capabilities: capabilities,
+            db: db
+        )
     }
 
     private func provider(for account: Account) -> (any MailProvider)? {
@@ -160,6 +191,7 @@ public actor SyncEngine {
     private func markAuthFailure() async {
         if let id = currentAccountId {
             providersByAccount[id] = nil
+            capabilitiesChecked.remove(id)
             try? await AccountStore.updateHealth(
                 accountId: id,
                 health: SyncHealth(

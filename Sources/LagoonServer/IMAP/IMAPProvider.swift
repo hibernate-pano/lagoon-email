@@ -11,7 +11,7 @@ import PostgresNIO
 /// §3.2); `SyncEngine` caches instances per account, so the connection, the
 /// resolved archive folder and the read-state baseline all survive between
 /// ticks.
-public actor IMAPProvider: MailProvider {
+public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     /// First pull backfills `UIDNEXT - window` … end, so a freshly connected
     /// mailbox shows recent mail instead of its whole history (spec §3.2).
     static let backfillWindow: Int64 = 500

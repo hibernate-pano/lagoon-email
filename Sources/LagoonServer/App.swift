@@ -84,6 +84,12 @@ struct LagoonServerMain {
             logger.info("AI gateway disabled: set LLM_PROVIDER_PRIMARY_BASE_URL and LLM_PROVIDER_PRIMARY_API_KEY")
         }
 
+        // The routes build providers through the same factory the engine uses;
+        // each route binds it once so every handler shares the collaborators.
+        let makeProvider = MailProviderFactory.factory(
+            client: gmailClient, tokens: tokens, db: db, logger: logger
+        )
+
         let router = Router()
         // A loopback bind alone is not a security boundary: DNS rebinding can
         // point any browser on this machine at 127.0.0.1 and read synced mail.
@@ -93,7 +99,9 @@ struct LagoonServerMain {
         OAuthRoutes.register(
             on: router, db: db, oauth: google, sync: syncEngine, logger: logger
         )
-        AccountsRoutes.register(on: router, db: db)
+        AccountsRoutes.register(
+            on: router, db: db, logger: logger, sync: syncEngine, makeProvider: makeProvider
+        )
         SyncRoutes.register(on: router, db: db)
         MessageRoutes.register(
             on: router,
@@ -101,14 +109,17 @@ struct LagoonServerMain {
             client: gmailClient,
             tokens: tokens,
             logger: logger,
-            summarizer: ai
+            summarizer: ai,
+            makeProvider: makeProvider
         )
         BriefingRoutes.register(on: router, db: db, logger: logger, classifier: ai)
         ActionsRoutes.register(
-            on: router, db: db, client: gmailClient, tokens: tokens, logger: logger
+            on: router, db: db, client: gmailClient, tokens: tokens, logger: logger,
+            makeProvider: makeProvider
         )
         DraftRoutes.register(
-            on: router, db: db, client: gmailClient, tokens: tokens, summarizer: ai, logger: logger
+            on: router, db: db, client: gmailClient, tokens: tokens, summarizer: ai,
+            logger: logger, makeProvider: makeProvider
         )
         SearchRoutes.register(on: router, db: db)
         BudgetRoutes.register(on: router, budget: usageBudget)

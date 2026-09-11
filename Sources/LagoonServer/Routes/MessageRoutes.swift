@@ -89,10 +89,15 @@ public enum MessageRoutes {
         client: GmailClient,
         tokens: GmailTokenService,
         logger: Logger,
-        summarizer: (any MessageSummarizing)? = nil
+        summarizer: (any MessageSummarizing)? = nil,
+        makeProvider: MailProviderFactory.Builder? = nil
     ) {
+        let makeProvider = makeProvider
+            ?? MailProviderFactory.factory(client: client, tokens: tokens, db: db, logger: logger)
+
         // GET /api/messages/{remoteId}/body?accountId=<uuid>
-        // 200 MessageBody | 400 malformed | 404 unknown | 502 Gmail error
+        // 200 MessageBody | 400 malformed | 404 unknown | 410 message-gone
+        // | 401 provider-auth-failed | 502 provider-unreachable
         router.get("api/messages/:remoteId/body") { request, context -> Response in
             guard let accountId = RouteParams.accountId(from: request) else {
                 return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -113,27 +118,32 @@ public enum MessageRoutes {
                 ])
                 return RouteJSON.error(.internalServerError, "internal-error")
             }
+            guard let provider = makeProvider(account) else {
+                return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+            }
             do {
                 let body = try await Self.fetchBody(
                     account: account,
                     remoteId: remoteId,
-                    client: client,
-                    tokens: tokens
+                    provider: provider,
+                    db: db
                 )
                 return RouteJSON.response(body)
-            } catch GmailClientError.http(let status, _) where status == 404 {
-                return RouteJSON.error(.notFound, "unknown-message")
+            } catch let error as MailError {
+                return Self.providerError(error, logger: logger, remoteId: remoteId)
             } catch {
                 logger.error("body fetch failed", metadata: [
                     "accountId": .string(accountId.uuidString),
                     "remoteId": .string(remoteId),
                     "err": .string("\(error)")
                 ])
-                return RouteJSON.error(.badGateway, "gmail-error")
+                return RouteJSON.error(.badGateway, "provider-unreachable")
             }
         }
 
         // POST /api/messages/{remoteId}/read?accountId=<uuid> -> 204
+        // Local state is authoritative and never blocks on the network; the
+        // remote `\Seen` write is best-effort (spec §3.7).
         router.post("api/messages/:remoteId/read") { request, context -> Response in
             guard let accountId = RouteParams.accountId(from: request) else {
                 return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -141,10 +151,20 @@ public enum MessageRoutes {
             guard let remoteId = RouteParams.remoteId(from: context) else {
                 return RouteJSON.error(.badRequest, "malformed-remoteId")
             }
+            let account: Account
             do {
-                guard try await AccountStore.find(byId: accountId, db: db) != nil else {
+                guard let found = try await AccountStore.find(byId: accountId, db: db) else {
                     return RouteJSON.error(.notFound, "unknown-account")
                 }
+                account = found
+            } catch {
+                logger.error("markRead lookup failed", metadata: [
+                    "accountId": .string(accountId.uuidString),
+                    "err": .string("\(error)")
+                ])
+                return RouteJSON.error(.internalServerError, "internal-error")
+            }
+            do {
                 try await MessageStore.markRead(remoteId: remoteId, accountId: accountId, db: db)
             } catch {
                 logger.error("markRead failed", metadata: [
@@ -153,6 +173,16 @@ public enum MessageRoutes {
                     "err": .string("\(error)")
                 ])
                 return RouteJSON.error(.internalServerError, "internal-error")
+            }
+            if let provider = makeProvider(account) {
+                do {
+                    try await provider.setRead(remoteId: remoteId, isRead: true)
+                } catch {
+                    logger.warning("markRead.remoteFailed", metadata: [
+                        "remoteId": .string(remoteId),
+                        "label": .string(Self.providerLabel(error)),
+                    ])
+                }
             }
             return Response(status: .noContent)
         }
@@ -224,21 +254,24 @@ public enum MessageRoutes {
             }
             let body: MessageBody
             do {
+                guard let provider = makeProvider(account) else {
+                    return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+                }
                 body = try await Self.fetchBody(
                     account: account,
                     remoteId: remoteId,
-                    client: client,
-                    tokens: tokens
+                    provider: provider,
+                    db: db
                 )
-            } catch GmailClientError.http(let status, _) where status == 404 {
-                return RouteJSON.error(.notFound, "unknown-message")
+            } catch let error as MailError {
+                return Self.providerError(error, logger: logger, remoteId: remoteId)
             } catch {
                 logger.error("summary body fetch failed", metadata: [
                     "accountId": .string(accountId.uuidString),
                     "remoteId": .string(remoteId),
                     "err": .string("\(error)")
                 ])
-                return RouteJSON.error(.badGateway, "gmail-error")
+                return RouteJSON.error(.badGateway, "provider-unreachable")
             }
             do {
                 let result = try await summarizer.summarize(
@@ -268,42 +301,54 @@ public enum MessageRoutes {
 
     // MARK: - Body fetch (shared by /body and /summary)
 
-    /// Fetch a full message and turn it into the shared `MessageBody`. A 401 is
-    /// retried once with a forced refresh (unless this call already refreshed).
+    /// Fetch a full message through the account's provider and shape it as the
+    /// shared `MessageBody` contract. Metadata comes from the synced row (best
+    /// effort: a row that vanished still yields the body text).
     static func fetchBody(
         account: Account,
         remoteId: String,
-        client: GmailClient,
-        tokens: GmailTokenService
+        provider: any MailProvider,
+        db: PostgresConnection
     ) async throws -> MessageBody {
-        let token = try await tokens.validToken(for: account)
-        let raw: RawGmailMessage
-        do {
-            raw = try await client.getMessageFull(accessToken: token.accessToken, remoteId: remoteId)
-        } catch GmailClientError.unauthorized {
-            guard !token.didRefresh else { throw GmailClientError.unauthorized }
-            let refreshed = try await tokens.forceRefresh(for: account)
-            raw = try await client.getMessageFull(accessToken: refreshed, remoteId: remoteId)
-        }
-        return messageBody(from: raw, fallbackGmailId: remoteId)
+        let text = try await provider.fetchBody(remoteId: remoteId)
+        let stored = try? await MessageStore.find(remoteId: remoteId, accountId: account.id, db: db)
+        return MessageBody(
+            remoteId: remoteId,
+            subject: stored?.subject,
+            fromAddress: stored?.fromAddress ?? "",
+            fromName: stored?.fromName,
+            toAddress: nil,
+            receivedAt: stored?.receivedAt ?? Date(),
+            text: text
+        )
     }
 
-    /// Map a raw Gmail full response onto the shared `MessageBody` contract.
-    static func messageBody(from raw: RawGmailMessage, fallbackGmailId: String) -> MessageBody {
-        func header(_ name: String) -> String? {
-            raw.payload?.headers?.first { $0.name.lowercased() == name }?.value
+    /// Map a provider failure onto the route-level status. Only the stable
+    /// label is logged; upstream text never reaches the client (spec §5.2).
+    static func providerError(
+        _ error: MailError,
+        logger: Logger,
+        remoteId: String
+    ) -> Response {
+        logger.warning("provider.requestFailed", metadata: [
+            "remoteId": .string(remoteId),
+            "label": .string(error.logLabel),
+        ])
+        switch error {
+        case .messageGone:
+            return RouteJSON.error(.gone, "message-gone")
+        case .authFailed:
+            return RouteJSON.error(.unauthorized, "provider-auth-failed")
+        case .notConfigured:
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        case .archiveUnavailable:
+            return RouteJSON.error(.conflict, "archive-unavailable")
+        case .unreachable, .protocolError:
+            return RouteJSON.error(.badGateway, "provider-unreachable")
         }
-        let (fromAddress, fromName) = FromHeader.parse(header("from") ?? "")
-        let receivedAt = raw.internalDate.flatMap { Int64($0) }
-            .map { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) } ?? Date()
-        return MessageBody(
-            remoteId: raw.id.isEmpty ? fallbackGmailId : raw.id,
-            subject: header("subject"),
-            fromAddress: fromAddress,
-            fromName: fromName,
-            toAddress: header("to"),
-            receivedAt: receivedAt,
-            text: GmailBodyExtractor.plainText(from: raw.payload)
-        )
+    }
+
+    static func providerLabel(_ error: Error) -> String {
+        (error as? MailError)?.logLabel ?? "\(type(of: error))"
     }
 }
