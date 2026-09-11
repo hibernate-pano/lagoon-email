@@ -77,4 +77,69 @@ final class LocalizationTests: XCTestCase {
         UserDefaults.standard.set(AppLanguage.zhHans.rawValue, forKey: LanguagePreference.defaultsKey)
         XCTAssertEqual(APIError.invalidResponse.localizedDescription, "服务器返回了非 HTTP 响应。")
     }
+
+    // MARK: - T9: connect (QQ / IMAP), account directory, sync health
+
+    func test_qqConnectStrings_existInBothLanguages() {
+        let zhStrings = [
+            zh.connectQQTab, zh.connectQQTitle, zh.qqEmailPlaceholder, zh.qqAuthCodePlaceholder,
+            zh.qqHelp, zh.qqConnectButton, zh.qqMissingFields, zh.qqAuthFailed,
+            zh.qqUnreachable, zh.qqAccountExists, zh.connectFailed,
+        ]
+        let enStrings = [
+            en.connectQQTab, en.connectQQTitle, en.qqEmailPlaceholder, en.qqAuthCodePlaceholder,
+            en.qqHelp, en.qqConnectButton, en.qqMissingFields, en.qqAuthFailed,
+            en.qqUnreachable, en.qqAccountExists, en.connectFailed,
+        ]
+        for value in zhStrings + enStrings {
+            XCTAssertFalse(value.isEmpty)
+        }
+        for (chinese, english) in zip(zhStrings, enStrings) {
+            XCTAssertNotEqual(chinese, english, "untranslated string pair: \(chinese)")
+        }
+    }
+
+    func test_accountDirectoryStrings_existInBothLanguages() {
+        XCTAssertEqual(zh.addAccount, "添加账号")
+        XCTAssertEqual(en.addAccount, "Add account")
+        XCTAssertEqual(zh.activateAccount, "切换到这个账号")
+        XCTAssertEqual(en.activateAccount, "Switch to this account")
+        XCTAssertEqual(zh.activateAccountFailed, "切换账号失败：")
+        XCTAssertEqual(en.activateAccountFailed, "Could not switch account: ")
+        XCTAssertEqual(zh.deleteAccountFailed, "删除这个账号失败：")
+        XCTAssertEqual(en.deleteAccountFailed, "Could not remove this account: ")
+        XCTAssertFalse(zh.accountsMenuHelp.isEmpty)
+        XCTAssertFalse(en.accountsMenuHelp.isEmpty)
+    }
+
+    func test_providerNames_existInBothLanguages() {
+        for kind in MailProviderKind.allCases {
+            let chinese = zh.providerName(kind)
+            let english = en.providerName(kind)
+            XCTAssertFalse(chinese.isEmpty, "missing zh name for \(kind.rawValue)")
+            XCTAssertFalse(english.isEmpty, "missing en name for \(kind.rawValue)")
+        }
+        XCTAssertEqual(zh.providerName(.qq), "QQ 邮箱")
+        XCTAssertEqual(en.providerName(.qq), "QQ Mail")
+    }
+
+    func test_syncHealthStrings_coverEveryStatusInBothLanguages() {
+        let statuses: [SyncHealth.Status] = [.ok, .degraded, .needsReconnect, .error]
+        for status in statuses {
+            let chinese = zh.healthStatusText(status)
+            let english = en.healthStatusText(status)
+            XCTAssertFalse(chinese.isEmpty, "missing zh text for \(status.rawValue)")
+            XCTAssertFalse(english.isEmpty, "missing en text for \(status.rawValue)")
+        }
+        XCTAssertEqual(zh.reconnect, "重新连接")
+        XCTAssertEqual(en.reconnect, "Reconnect")
+        XCTAssertEqual(zh.healthDegraded, "同步不稳定：")
+        XCTAssertEqual(en.healthDegraded, "Sync degraded: ")
+        XCTAssertEqual(zh.healthError, "同步失败：")
+        XCTAssertEqual(en.healthError, "Sync failed: ")
+        XCTAssertFalse(zh.healthNeedsReconnect.isEmpty)
+        XCTAssertFalse(en.healthNeedsReconnect.isEmpty)
+        XCTAssertFalse(zh.archiveUnavailable.isEmpty)
+        XCTAssertFalse(en.archiveUnavailable.isEmpty)
+    }
 }

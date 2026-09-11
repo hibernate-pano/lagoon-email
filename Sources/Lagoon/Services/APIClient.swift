@@ -56,7 +56,7 @@ public final class APIClient: Sendable {
         }
     }
 
-    /// Browser entry point for the OAuth dance. Used by ConnectGmailView.
+    /// Browser entry point for the OAuth dance. Used by ConnectView.
     public var oauthStartURL: URL {
         baseURL.appendingPathComponent("oauth/gmail/start")
     }
@@ -79,7 +79,7 @@ public final class APIClient: Sendable {
         return try dec.decode(SyncResponse.self, from: data)
     }
 
-    /// OAuth completion handshake (M0): polled by ConnectGmailView because the
+    /// OAuth completion handshake (M0): polled by ConnectView because the
     /// app is a bare SwiftPM executable and cannot register a URL scheme.
     public func fetchAccounts() async throws -> [ConnectedAccount] {
         let url = baseURL.appendingPathComponent("api/accounts")
@@ -88,6 +88,45 @@ public final class APIClient: Sendable {
         let dec = JSONDecoder()
         dec.dateDecodingStrategy = .iso8601
         return try dec.decode([ConnectedAccount].self, from: data)
+    }
+
+    // MARK: - M1.5 accounts (QQ/IMAP connect + activation)
+
+    /// POST /api/accounts/imap {provider, email, authCode} → 201 ConnectedAccount.
+    ///
+    /// The auth code only ever travels request body → TLS → server; the response
+    /// never echoes it. 401 means the provider rejected the code, 502 that the
+    /// mailbox could not be reached, 409 that the account already exists.
+    public func connectQQ(email: String, authCode: String) async throws -> ConnectedAccount {
+        let url = try makeURL(path: ["api", "accounts", "imap"], query: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = [
+            "provider": MailProviderKind.qq.rawValue,
+            "email": email,
+            "authCode": authCode,
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await session.data(for: request)
+        try Self.validate(resp, data: data)
+        return try Self.decode(ConnectedAccount.self, from: data)
+    }
+
+    /// POST /api/accounts/{id}/activate → 204. The server flips every other row
+    /// inactive in the same statement.
+    public func activateAccount(id: UUID) async throws {
+        try await post(path: ["api", "accounts", id.uuidString, "activate"], query: [])
+    }
+
+    /// DELETE /api/accounts/{id} → 204. Foreign keys cascade to that account's
+    /// messages, pins and drafts.
+    public func deleteAccount(id: UUID) async throws {
+        let url = try makeURL(path: ["api", "accounts", id.uuidString], query: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        let (data, resp) = try await session.data(for: request)
+        try Self.validate(resp, data: data)
     }
 
     // MARK: - M1 Briefing Feed

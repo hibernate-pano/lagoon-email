@@ -356,4 +356,101 @@ final class APIClientTests: XCTestCase {
             client.oauthStartURL.absoluteString
         )
     }
+
+    // MARK: - T9: IMAP connect + account directory
+
+    /// URLSession hands the body to `URLProtocol` as a stream, so body
+    /// assertions read whichever form the request carries.
+    private func bodyData(of request: URLRequest) throws -> Data {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return Data() }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        while stream.hasBytesAvailable {
+            let read = stream.read(&buffer, maxLength: buffer.count)
+            if read <= 0 { break }
+            data.append(buffer, count: read)
+        }
+        return data
+    }
+
+    func test_connectQQ_postsJSONBodyAndDecodesConnectedAccount() async throws {
+        let id = UUID()
+        let body = Data("""
+        {"id":"\(id.uuidString)","provider":"qq","email":"me@qq.com","isActive":true,
+         "syncHealth":{"status":"ok"},
+         "capabilities":{"archiveFolder":true,"idle":true,"move":true,"serverSnippet":true}}
+        """.utf8)
+        stub(status: 201, body: body)
+
+        let account = try await makeClient().connectQQ(email: "me@qq.com", authCode: "secret-code")
+
+        XCTAssertEqual(account.id, id)
+        XCTAssertEqual(account.provider, .qq)
+        XCTAssertEqual(account.email, "me@qq.com")
+        XCTAssertTrue(account.isActive)
+        XCTAssertTrue(account.capabilities.archiveFolder)
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/api/accounts/imap")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+        let sent = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: bodyData(of: request)) as? [String: String]
+        )
+        XCTAssertEqual(sent["provider"], "qq")
+        XCTAssertEqual(sent["email"], "me@qq.com")
+        XCTAssertEqual(sent["authCode"], "secret-code")
+    }
+
+    func test_connectQQ_401_throwsBadStatus() async throws {
+        stub(status: 401, body: Data("{\"error\":\"imap-auth-failed\"}".utf8))
+
+        do {
+            _ = try await makeClient().connectQQ(email: "me@qq.com", authCode: "wrong")
+            XCTFail("expected APIError.badStatus(401)")
+        } catch APIError.badStatus(let code, _) {
+            XCTAssertEqual(code, 401)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
+    func test_activateAccount_postsToActivateAndTreats204AsSuccess() async throws {
+        let id = UUID()
+        stub(status: 204, body: Data())
+
+        try await makeClient().activateAccount(id: id)
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/api/accounts/\(id.uuidString)/activate")
+    }
+
+    func test_deleteAccount_sendsDeleteAndTreats204AsSuccess() async throws {
+        let id = UUID()
+        stub(status: 204, body: Data())
+
+        try await makeClient().deleteAccount(id: id)
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.httpMethod, "DELETE")
+        XCTAssertEqual(request.url?.path, "/api/accounts/\(id.uuidString)")
+    }
+
+    func test_deleteAccount_404_throwsBadStatus() async throws {
+        let id = UUID()
+        stub(status: 404, body: Data("{\"error\":\"unknown-account\"}".utf8))
+
+        do {
+            try await makeClient().deleteAccount(id: id)
+            XCTFail("expected APIError.badStatus(404)")
+        } catch APIError.badStatus(let code, _) {
+            XCTAssertEqual(code, 404)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
 }

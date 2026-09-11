@@ -147,7 +147,7 @@ public struct L10n: Sendable, Equatable {
 
     // MARK: - Connect
 
-    public var connectPrompt: String { pick("连接你的 Gmail 开始使用。", "Connect your Gmail to begin.") }
+    public var connectPrompt: String { pick("连接你的邮箱开始使用。", "Connect your mailbox to begin.") }
     public var connectGmail: String { pick("连接 Gmail", "Connect Gmail") }
     public var waitingForApproval: String {
         pick("等待浏览器授权…", "waiting for browser approval…")
@@ -159,6 +159,65 @@ public struct L10n: Sendable, Equatable {
     public var saveAccountFailed: String { pick("保存账号失败：", "Could not save account: ") }
     public var checkConnectionFailed: String {
         pick("检查连接失败：", "Could not check connection: ")
+    }
+
+    // MARK: - Connect (QQ / IMAP)
+
+    public var connectQQTab: String { pick("QQ 邮箱", "QQ Mail") }
+    public var connectQQTitle: String { pick("连接 QQ 邮箱", "Connect QQ Mail") }
+    public var qqEmailPlaceholder: String { pick("QQ 邮箱地址", "QQ email address") }
+    public var qqAuthCodePlaceholder: String { pick("授权码", "Authorization code") }
+    public var qqHelp: String {
+        pick(
+            "在 QQ 邮箱网页版：设置 → 账户 → POP3/IMAP/SMTP 服务，开启 IMAP/SMTP 后生成授权码（不是登录密码）。",
+            "In QQ Mail: Settings → Account → POP3/IMAP/SMTP service. Enable IMAP/SMTP and generate an authorization code (not your login password)."
+        )
+    }
+    public var qqConnectButton: String { pick("连接", "Connect") }
+    public var qqMissingFields: String {
+        pick("请填写邮箱地址和授权码。", "Enter both the email address and the authorization code.")
+    }
+    public var qqAuthFailed: String {
+        pick("授权码被拒绝 —— 请重新生成后重试。", "The authorization code was rejected — generate a new one and retry.")
+    }
+    public var qqUnreachable: String {
+        pick("无法连接 QQ 邮箱服务器，请检查网络后重试。", "Could not reach the QQ Mail servers — check your network and retry.")
+    }
+    public var qqAccountExists: String { pick("该 QQ 邮箱已经接入过了。", "That QQ mailbox is already connected.") }
+    public var connectFailed: String { pick("连接失败：", "Connect failed: ") }
+
+    // MARK: - Accounts directory
+
+    public var accountsMenuHelp: String { pick("账号", "Accounts") }
+    public var addAccount: String { pick("添加账号", "Add account") }
+    public var activateAccount: String { pick("切换到这个账号", "Switch to this account") }
+    public var activateAccountFailed: String { pick("切换账号失败：", "Could not switch account: ") }
+    public var deleteAccountFailed: String { pick("删除这个账号失败：", "Could not remove this account: ") }
+    public func providerName(_ kind: MailProviderKind) -> String {
+        switch kind {
+        case .gmail: return pick("Gmail", "Gmail")
+        case .qq: return pick("QQ 邮箱", "QQ Mail")
+        }
+    }
+
+    // MARK: - Sync health
+
+    public var reconnect: String { pick("重新连接", "Reconnect") }
+    public func healthStatusText(_ status: SyncHealth.Status) -> String {
+        switch status {
+        case .ok: return pick("同步正常", "Syncing")
+        case .degraded: return pick("同步不稳定", "Sync degraded")
+        case .needsReconnect: return pick("需要重新连接", "Reconnect needed")
+        case .error: return pick("同步失败", "Sync failed")
+        }
+    }
+    public var healthDegraded: String { pick("同步不稳定：", "Sync degraded: ") }
+    public var healthNeedsReconnect: String {
+        pick("授权已失效 —— 重新连接后继续同步。", "Authorization expired — reconnect to keep syncing.")
+    }
+    public var healthError: String { pick("同步失败：", "Sync failed: ") }
+    public var archiveUnavailable: String {
+        pick("这个邮箱没有可用的归档文件夹。", "This mailbox has no usable archive folder.")
     }
 
     // MARK: - Actions

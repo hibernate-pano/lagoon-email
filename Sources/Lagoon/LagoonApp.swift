@@ -9,7 +9,7 @@ struct LagoonApp: App {
         WindowGroup("Lagoon") {
             Group {
                 if accounts.accountId == nil {
-                    ConnectGmailView()
+                    ConnectView()
                 } else {
                     // Spec §7.1: the Briefing Feed is the default landing surface.
                     RootView()
