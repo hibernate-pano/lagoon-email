@@ -1,0 +1,23 @@
+MIME-Version: 1.0
+Subject: Nested
+Content-Type: multipart/mixed; boundary="outer"
+
+--outer
+Content-Type: multipart/alternative; boundary="inner"
+
+--inner
+Content-Type: text/plain; charset=UTF-8
+
+最内层纯文本
+--inner
+Content-Type: text/html; charset=UTF-8
+
+<p>最内层 HTML</p>
+--inner--
+--outer
+Content-Type: application/pdf; name="a.pdf"
+Content-Disposition: attachment; filename="a.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQ=
+--outer--

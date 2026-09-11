@@ -41,7 +41,7 @@ let package = Package(
             "LagoonServer",
             "LagoonKit",
             .product(name: "HummingbirdTesting", package: "hummingbird")
-        ]),
+        ], exclude: ["Fixtures"]),
         .testTarget(name: "LagoonTests", dependencies: ["Lagoon"]),
         .testTarget(name: "LagoonAITests", dependencies: ["LagoonAI", "LagoonKit"])
     ]

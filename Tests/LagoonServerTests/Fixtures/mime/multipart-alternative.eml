@@ -1,0 +1,13 @@
+MIME-Version: 1.0
+Subject: Multipart alternative
+Content-Type: multipart/alternative; boundary="bnd-alt"
+
+--bnd-alt
+Content-Type: text/plain; charset=UTF-8
+
+纯文本版本
+--bnd-alt
+Content-Type: text/html; charset=UTF-8
+
+<html><body><p>HTML 版本</p></body></html>
+--bnd-alt--
