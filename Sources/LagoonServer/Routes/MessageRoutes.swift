@@ -293,7 +293,7 @@ public enum MessageRoutes {
         func header(_ name: String) -> String? {
             raw.payload?.headers?.first { $0.name.lowercased() == name }?.value
         }
-        let (fromAddress, fromName) = GmailProvider.parseFromHeader(header("from") ?? "")
+        let (fromAddress, fromName) = FromHeader.parse(header("from") ?? "")
         let receivedAt = raw.internalDate.flatMap { Int64($0) }
             .map { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) } ?? Date()
         return MessageBody(

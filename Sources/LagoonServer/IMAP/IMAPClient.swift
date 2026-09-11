@@ -127,7 +127,16 @@ public actor IMAPClient {
                 "imap.auth.saslFallback",
                 metadata: ["reason": .string(Self.reasonLabel(error))]
             )
-            _ = try await connection.execute("LOGIN \(quotedUser) \(quotedSecret)")
+            do {
+                _ = try await connection.execute("LOGIN \(quotedUser) \(quotedSecret)")
+            } catch let error as MailError {
+                // A rejected LOGIN is a credential verdict, not a syntax bug:
+                // some servers answer a wrong auth code with a bare NO, and
+                // spec §3.4 requires that to stop the retry loop
+                // (`needsReconnect`) instead of backing off on a protocol error.
+                if case .protocolError("tagged NO") = error { throw MailError.authFailed }
+                throw error
+            }
         }
         // Credentials are never logged; only the failure category above.
         cachedCapabilities = nil
@@ -191,23 +200,21 @@ public actor IMAPClient {
         let responses = try await connection.execute(
             "UID FETCH \(fromUid):* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (\(fieldList))])"
         )
+        return Self.parseHeaders(responses)
+    }
 
-        var headers: [IMAPFetchedHeader] = []
-        for response in responses {
-            guard case .untagged = response.kind,
-                  let literal = response.literal,
-                  let items = IMAPResponseParser.parenthesized(response.raw),
-                  let uid = Self.numberValue(after: "UID", in: items) else { continue }
-            headers.append(
-                IMAPFetchedHeader(
-                    uid: uid,
-                    flags: Self.flagList(in: items),
-                    internalDate: Self.internalDate(in: items),
-                    rawHeaders: Self.headerBlock(literal)
-                )
-            )
-        }
-        return headers
+    /// The same header block for one known UID — how a read-state flip is
+    /// refreshed without re-scanning the mailbox (the store overwrites
+    /// `subject` on conflict, so a flip must carry the real headers).
+    public func fetchHeader(
+        uid: Int64,
+        fields: [String] = IMAPClient.defaultHeaderFields
+    ) async throws -> [IMAPFetchedHeader] {
+        let fieldList = fields.joined(separator: " ")
+        let responses = try await connection.execute(
+            "UID FETCH \(uid) (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (\(fieldList))])"
+        )
+        return Self.parseHeaders(responses)
     }
 
     /// Flag rescan over a bounded UID window (spec §3.2 step 3) — how the
@@ -274,6 +281,12 @@ public actor IMAPClient {
     public func copy(uid: Int64, to mailbox: String) async throws {
         let quoted = try Self.quoted(mailbox)
         _ = try await connection.execute("UID COPY \(uid) \(quoted)")
+    }
+
+    /// Removes every `\Deleted`-flagged message from the selected mailbox —
+    /// the last step of the no-MOVE archiving fallback (spec §4.3).
+    public func expunge() async throws {
+        _ = try await connection.execute("EXPUNGE")
     }
 
     public func createMailbox(_ name: String) async throws {
@@ -400,6 +413,27 @@ public actor IMAPClient {
             return nil
         }
         return sign * (hours * 3600 + minutes * 60)
+    }
+
+    /// FETCH responses → header blocks. One parser serves the range fetch and
+    /// the single-UID refresh so both interpret the wire form identically.
+    static func parseHeaders(_ responses: [IMAPResponse]) -> [IMAPFetchedHeader] {
+        var headers: [IMAPFetchedHeader] = []
+        for response in responses {
+            guard case .untagged = response.kind,
+                  let literal = response.literal,
+                  let items = IMAPResponseParser.parenthesized(response.raw),
+                  let uid = Self.numberValue(after: "UID", in: items) else { continue }
+            headers.append(
+                IMAPFetchedHeader(
+                    uid: uid,
+                    flags: Self.flagList(in: items),
+                    internalDate: Self.internalDate(in: items),
+                    rawHeaders: Self.headerBlock(literal)
+                )
+            )
+        }
+        return headers
     }
 
     /// Raw header block → lowercase name → value, with continuation lines

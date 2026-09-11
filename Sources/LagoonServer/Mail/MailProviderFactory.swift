@@ -25,10 +25,7 @@ public enum MailProviderFactory {
                 logger: logger
             )
         case .qq:
-            // IMAP provider lands in Task 7/8; until then such an account is
-            // visibly unhealthy instead of silently unsynced.
-            _ = db
-            return nil
+            return IMAPProvider(account: account, db: db, logger: logger)
         }
     }
 }

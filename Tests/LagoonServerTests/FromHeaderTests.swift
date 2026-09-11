@@ -3,19 +3,19 @@ import XCTest
 
 final class FromHeaderTests: XCTestCase {
     func test_named_address() {
-        let (addr, name) = GmailProvider.parseFromHeader("Alice Zhang <alice@example.com>")
+        let (addr, name) = FromHeader.parse("Alice Zhang <alice@example.com>")
         XCTAssertEqual(addr, "alice@example.com")
         XCTAssertEqual(name, "Alice Zhang")
     }
 
     func test_quoted_name() {
-        let (addr, name) = GmailProvider.parseFromHeader("\"Zhang, Alice\" <alice@example.com>")
+        let (addr, name) = FromHeader.parse("\"Zhang, Alice\" <alice@example.com>")
         XCTAssertEqual(addr, "alice@example.com")
         XCTAssertEqual(name, "Zhang, Alice")
     }
 
     func test_bare_address() {
-        let (addr, name) = GmailProvider.parseFromHeader("bob@example.com")
+        let (addr, name) = FromHeader.parse("bob@example.com")
         XCTAssertEqual(addr, "bob@example.com")
         XCTAssertNil(name)
     }

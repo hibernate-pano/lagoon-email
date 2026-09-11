@@ -157,7 +157,7 @@ public actor GmailProvider: MailProvider {
                 !value.isEmpty else { return nil }
             return value
         }
-        let (address, name) = parseFromHeader(header("from") ?? "")
+        let (address, name) = FromHeader.parse(header("from") ?? "")
         let receivedAt = raw.internalDate.flatMap { Int64($0) }
             .map { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) } ?? Date()
         return RemoteHeader(
@@ -182,19 +182,6 @@ public actor GmailProvider: MailProvider {
             $0.name.lowercased() == "list-unsubscribe"
                 && !$0.value.trimmingCharacters(in: .whitespaces).isEmpty
         } ?? false
-    }
-
-    static func parseFromHeader(_ raw: String) -> (String, String?) {
-        if raw.contains("<") && raw.contains(">") {
-            let namePart = raw.split(separator: "<").first.map(String.init)?
-                .trimmingCharacters(in: .whitespaces)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-            let addrPart = raw.split(separator: "<").last.map(String.init)?
-                .replacingOccurrences(of: ">", with: "")
-                .trimmingCharacters(in: .whitespaces)
-            return (addrPart ?? raw, (namePart?.isEmpty == false) ? namePart : nil)
-        }
-        return (raw.trimmingCharacters(in: .whitespaces), nil)
     }
 
     // MARK: - Body & headers
