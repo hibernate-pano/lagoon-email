@@ -1,8 +1,28 @@
 # Lagoon
 
-An AI Inbox Operating System for the Apple ecosystem. This is the **M0 Spike** — a thin vertical slice proving the Gmail sync architecture end-to-end. No AI features yet; those land in M1.
+An AI Inbox Operating System for the Apple ecosystem. Current state: **M1.5** — the
+mailbox layer is provider-agnostic and **QQ Mail is the primary account** (authorization
+code → IMAP sync → read → Briefing Feed → AI summary → SMTP reply → archive/⌘Z undo).
+The original Gmail path (OAuth + REST) is preserved and switchable.
 
-See `docs/superpowers/specs/2026-09-09-lagoon-email-design.md` for the product spec and `docs/superpowers/plans/2026-09-09-m0-spike.md` for the implementation plan.
+Docs: [M1.5 spec](docs/superpowers/specs/2026-09-11-imap-qq-provider-design.md) ·
+[M1.5 plan](docs/superpowers/plans/2026-09-11-imap-qq-provider.md) ·
+[M1.5 smoke notes](docs/superpowers/m1-5-smoke.md) ·
+[product spec](docs/superpowers/specs/2026-09-09-lagoon-email-design.md) ·
+[user guide (zh)](docs/使用说明.md)
+
+## Provider capability matrix
+
+| | QQ Mail (`qq`) | Gmail (`gmail`) |
+|---|---|---|
+| Connect | in-app form: address + 16-char authorization code, probed against `imap.qq.com:993` before storing | browser OAuth (PKCE) + `GET /api/accounts` polling handshake |
+| Sync | IMAP (implicit TLS 993); IDLE when advertised, otherwise UID-window polling; `UIDVALIDITY` change → full resync | Gmail REST (`historyId` cursor) |
+| Read body | `FETCH` + MIME → plain text (GBK/GB18030/Shift-JIS aware, HTML stripped) | `format=full` + MIME extractor |
+| Classify / summarize | same server pipeline (heuristics + optional LLM) | same |
+| Reply (send) | SMTP implicit TLS 465, `MIMEBuilder` output | Gmail `messages.send` with the same `MIMEBuilder` output |
+| Archive | `UID MOVE` into the server's archive role folder (creates it if absent; falls back to COPY+EXPUNGE); gated on `capabilities.archiveFolder` | label change |
+| Undo | local flip + remote move back (`unarchive`); sent/unsubscribed/drafted are explicitly not undoable | same |
+| Capability discovery | `probe` at connect + `capabilities` refresh in the sync loop | all-true (REST always supports it) |
 
 ## What M0 proves
 
@@ -81,6 +101,11 @@ as soon as the account appears (a bare `swift run` executable cannot register a
 URL scheme, so the browser cannot call back into the app directly). Your 50 most
 recent Gmail messages then appear; the server re-polls every 30 s.
 
+**QQ Mail (primary):** no Google credentials needed — switch the connect screen to
+the **QQ Mail** tab, paste the address and a 16-character authorization code
+(QQ Mail → Settings → Account → enable IMAP/SMTP → generate code), and the server
+probes `imap.qq.com` before storing anything. Details (zh): `docs/使用说明.md` §零.
+
 ## Checks
 
 ```bash
@@ -93,13 +118,14 @@ bash scripts/test-guardrails.sh # prove the guardrail rules catch fixtures
 
 | Path | Purpose |
 |------|---------|
-| `Sources/LagoonKit` | Shared types (Account, MessageHeader, SyncCursor, SyncResponse), Postgres helpers, SQL migrations |
-| `Sources/LagoonServer` | Hummingbird app: OAuth routes, Gmail REST client + 30 s poller, sync API |
+| `Sources/LagoonKit` | Shared types (Account, MessageHeader, MailSyncState, MailCapabilities, SyncHealth), Postgres helpers, SQL migrations |
+| `Sources/LagoonServer` | Hummingbird app: OAuth + IMAP/SMTP, provider seam (`MailProvider`), sync engine, poller, API routes |
 | `Sources/Lagoon` | macOS SwiftUI app |
 | `Sources/LagoonKit/Migrations/*.sql` | Schema, applied by `scripts/db-migrate.sh` |
+| `docs/superpowers/` | Specs, implementation plans, smoke notes (`m0-smoke.md`, `m1-5-smoke.md`) |
 | `scripts/` | DB migrations, CI guardrails, full check |
 
-## Security posture (spec §6.6) — what is true in M0.1
+## Security posture (spec §6.6) — what is true today
 
 - **All SQL is parameterized** (`$1, $2, …`) — enforced by
   `scripts/ci-guardrails.sh`. The rule scans Swift string literals of any
@@ -115,6 +141,13 @@ bash scripts/test-guardrails.sh # prove the guardrail rules catch fixtures
   This protects the `accounts.access_token` / `refresh_token` columns in
   Postgres. It is **not** end-to-end encryption: the key lives in the server's
   environment next to the database.
+- **IMAP/SMTP only 993/465 with implicit TLS and full certificate
+  verification** (`NIOSSLStreamTransport`, no “skip verification” switch). Hosts
+  come from server-side presets (`imap.qq.com` / `smtp.qq.com`) — never from user
+  input, so there is no SSRF surface. QQ authorization codes are sealed into the
+  same AES-GCM credentials blob as the Gmail tokens, and never appear in logs,
+  error strings or API responses (`GET /api/accounts` returns address, health and
+  capabilities only).
 - **Server binds loopback only** (`LAGOON_SERVER_HOST`, default `127.0.0.1`); a
   non-loopback host refuses to start. This is a deliberate stopgap because
   **M0 has no API authentication** — anything that can reach the port can read
@@ -201,35 +234,49 @@ Provider routing and defaults live in `config/providers.json`; see
 `Sources/LagoonAI/README.md`. With no key the server stays heuristic-only and
 `/summary` returns 503 — it never crashes.
 
-### Not in this slice (still M1)
+### M1.5 — provider seam, QQ Mail, reply send
 
-- Multi-draft composer / send — needs the `gmail.send` + `gmail.compose`
-  scopes, which forces re-consent
-- Gmail-side archive / label changes — needs `gmail.modify` (archive is
-  currently not performed at all; nothing is hidden locally either)
-- Undo surface + `ai_actions` table (spec §6.6 rule 7)
-- Time-saved status bar, whitelist autonomy, SwiftData local cache, Pub/Sub
-  push, Postgres pool, iOS
+- **`MailProvider` seam** (`Sources/LagoonServer/Mail/MailProvider.swift`) with two
+  implementations: `GmailProvider` (REST + OAuth) and `IMAPProvider` (IMAP 993 +
+  SMTP 465). Routes resolve the provider per account through
+  `MailProviderFactory`; tests inject a scripted stub.
+- **Migration 008**: `gmail_id` → `remote_id` everywhere, sealed `credentials`
+  blob, `sync_state` / `capabilities` / `is_active` / health columns.
+- **Sync engine** (`Sources/LagoonServer/Sync/SyncEngine.swift`): one active
+  account, IDLE-or-poll pull, `UIDVALIDITY`-change full resync, backoff
+  1→2→…→300 s, auth failures stop the loop and surface `needsReconnect`.
+- **Reply send**: `POST /api/messages/{remoteId}/send {body}` → `MIMEBuilder`
+  thread-correct message (Re: de-dup, RFC 2047 subjects, base64 body) over SMTP
+  (`smtp.qq.com:465`) or Gmail `messages.send`. Client sheet with ⌘↩.
+- **Archive + undo**: provider-side move into the archive folder, gated on
+  `capabilities.archiveFolder` (client disables the button, server answers
+  409 `archive-unavailable`); ⌘Z reverses locally **and** remotely.
+- **Account directory**: `GET /api/accounts` with per-account `syncHealth` +
+  `capabilities`; activate/delete; connect UI for both providers.
 
-## Deferred (still M1):
+### Not in this slice
 
-- SwiftData local cache on the client
-- Gmail `historyId` incremental sync
-- Pub/Sub push + push verification
-- API authentication
-- Postgres connection pool
+- **QQ `\Sent` append** — a reply sent over SMTP relies on the server's own
+  Sent-folder behaviour; we do not `APPEND` a copy (see `m1-5-smoke.md`).
+- Multi-draft composer tabs, time-saved status bar, whitelist autonomy,
+  SwiftData local cache, Pub/Sub push, Postgres pool, iOS.
+- **Real-account QQ verification** — the protocol/logic layer is covered by 323
+  automated tests, but no real QQ mailbox has been exercised yet; the checklist
+  lives in `docs/superpowers/m1-5-smoke.md`.
 
-## Known limitations (by design, M0.1)
+## Known limitations (by design)
 
 - No API authentication — the server is loopback-only for that reason
-- **Pre-M0.1 OAuth rows are unreadable** — plaintext token blobs written before
-  AES-GCM cannot be decrypted, so an existing connected account silently stops
-  syncing (it still appears in `GET /api/accounts`). Reconnect Gmail or delete
-  the stale row; rotating `LAGOON_TOKEN_KEY` alone does not help.
-- Gmail polling every 30 s; `POST /webhook/gmail` returns `501` (Pub/Sub push lands in M1)
+- **Pre-M0.1 OAuth rows are unreadable, and pre-008 Gmail rows lost their token
+  columns** — after migration 008 an existing Gmail account surfaces as
+  `sync-failed: not-configured` and stops updating (it still appears in
+  `GET /api/accounts`). Reconnect Gmail or delete the stale row.
+- Gmail polling every 30 s; `POST /webhook/gmail` returns `501`
 - OAuth state stored in-process (lost on server restart)
 - No SwiftData local cache — the app refetches from the server
-- No Gmail `historyId` incremental sync — each poll refetches the 50 most recent messages
+- Gmail `historyId` incremental sync via the API only (no Pub/Sub push)
+- Body is fetched on demand and never stored server-side (headers/snippets only)
 - Postgres: single connection, no pool
-- macOS only, single Gmail account
-- No Briefing Feed / AI — raw list only
+- macOS only; one active account at a time (the directory can hold several)
+- Archive undo is best-effort on the remote side: if the remote move back fails,
+  the local state still flips and the next sync reconciles

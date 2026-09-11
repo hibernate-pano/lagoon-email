@@ -141,6 +141,8 @@ final class LocalizationTests: XCTestCase {
         XCTAssertFalse(en.healthNeedsReconnect.isEmpty)
         XCTAssertFalse(zh.archiveUnavailable.isEmpty)
         XCTAssertFalse(en.archiveUnavailable.isEmpty)
+        XCTAssertFalse(zh.archiveFailed.isEmpty)
+        XCTAssertFalse(en.archiveFailed.isEmpty)
     }
 
     // MARK: - T11: reply composer

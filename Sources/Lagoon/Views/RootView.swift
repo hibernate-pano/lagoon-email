@@ -37,6 +37,9 @@ struct RootView: View {
         }
         .environment(\.l10n, l10n)
         .environmentObject(undo)
+        // Views gate verbs (archive) on the active account's negotiated
+        // capabilities, so the directory must be reachable from the feed.
+        .environmentObject(directory)
         .toolbar { toolbar }
         .sheet(isPresented: $showSearch) {
             SearchSheet()

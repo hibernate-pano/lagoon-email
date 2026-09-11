@@ -46,6 +46,7 @@ struct MessageDetailView: View {
     @Environment(\.l10n) private var l10n
     @EnvironmentObject private var accounts: AccountStore
     @EnvironmentObject private var undo: UndoController
+    @EnvironmentObject private var directory: DirectoryStore
     private let api = APIClient()
 
     private enum SummaryState: Equatable {
@@ -189,11 +190,20 @@ struct MessageDetailView: View {
                 Label(l10n.archiveAndNext, systemImage: "tray.and.arrow.down")
             }
             .keyboardShortcut("e", modifiers: .command)
-            .help(l10n.shortcutArchiveNext)
+            .disabled(!canArchive)
+            .help(canArchive ? l10n.shortcutArchiveNext : l10n.archiveUnavailable)
         }
     }
 
     // MARK: - Sections
+
+    /// Negotiated on the server and read from the account row. While the
+    /// directory has not loaded yet (or no account is connected) we do not
+    /// pretend archiving is impossible: the server is the authority and
+    /// answers 409 archive-unavailable if it really is.
+    private var canArchive: Bool {
+        directory.active?.capabilities.archiveFolder ?? true
+    }
 
     private var toDisplay: String? {
         guard let to = messageBody?.toAddress, !to.isEmpty else { return nil }

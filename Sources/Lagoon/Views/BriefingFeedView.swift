@@ -9,6 +9,7 @@ import LagoonKit
 struct BriefingFeedView: View {
     @EnvironmentObject private var accounts: AccountStore
     @EnvironmentObject private var undo: UndoController
+    @EnvironmentObject private var directory: DirectoryStore
     @State private var items: [BriefingItem] = []
     @State private var isLoading = false
     @State private var errorMessage: String?
@@ -20,6 +21,13 @@ struct BriefingFeedView: View {
     private let api = APIClient()
     private static let refreshInterval: Duration = .seconds(30)
     @Environment(\.l10n) private var l10n
+
+    /// Same gate as the detail toolbar. Unknown (directory not loaded yet, or a
+    /// version-skewed row) reads as allowed: the server is the authority and
+    /// answers 409 archive-unavailable when the folder really is missing.
+    private var canArchive: Bool {
+        directory.active?.capabilities.archiveFolder ?? true
+    }
 
     var onShowAllMessages: () -> Void = {}
 
@@ -102,6 +110,7 @@ struct BriefingFeedView: View {
                                         Label(l10n.archived, systemImage: "tray.and.arrow.down")
                                     }
                                     .tint(.orange)
+                                    .disabled(!canArchive)
                                 }
                                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                                     Button { togglePin(item: item) } label: {
@@ -417,6 +426,14 @@ struct BriefingFeedView: View {
 
     private func archiveAndUndo(byId remoteId: String) async {
 
+        guard canArchive else {
+
+            errorMessage = l10n.archiveUnavailable
+
+            return
+
+        }
+
         guard let accountId = accounts.accountId else { return }
 
         do {
@@ -435,7 +452,15 @@ struct BriefingFeedView: View {
 
             }
 
-        } catch {}
+        } catch APIError.badStatus(let code, _) where code == 409 {
+
+            errorMessage = l10n.archiveUnavailable
+
+        } catch {
+
+            errorMessage = l10n.archiveFailed + error.lagoonUIMessage
+
+        }
 
     }
 

@@ -219,6 +219,7 @@ public struct L10n: Sendable, Equatable {
     public var archiveUnavailable: String {
         pick("这个邮箱没有可用的归档文件夹。", "This mailbox has no usable archive folder.")
     }
+    public var archiveFailed: String { pick("归档失败：", "Archive failed: ") }
 
     // MARK: - Actions
     public var undo: String { pick("撤销", "Undo") }

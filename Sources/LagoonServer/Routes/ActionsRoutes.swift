@@ -251,7 +251,7 @@ public enum ActionsRoutes {
                 kind: .classifyOverride,
                 payload: [
                     "remoteId": remoteId,
-                    "fromGroup": BriefingReason.needsReply.rawValue,
+                    "fromGroup": BriefingGroup.needsReply.rawValue,
                     "toGroup": req.toGroup,
                 ],
                 db: db
@@ -359,7 +359,7 @@ public enum ActionsRoutes {
                 "UPDATE message_headers SET is_archived = FALSE WHERE remote_id = $1 AND account_id = $2",
                 [PostgresData(string: remoteId), PostgresData(uuid: account.id)]
             ).get()
-            if action.payload["remote"] == "true", let provider = makeProvider(account) {
+            if action.payload["remoteWrite"] == "true", let provider = makeProvider(account) {
                 do {
                     try await provider.unarchive(remoteId: remoteId)
                 } catch {

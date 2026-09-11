@@ -887,6 +887,7 @@ final class RouteTests: XCTestCase {
         var bodyText = "stub body text"
         private(set) var probeCalls = 0
         private(set) var archivedRemoteIds: [String] = []
+        private(set) var unarchivedRemoteIds: [String] = []
         private(set) var readCalls: [String] = []
         private(set) var sentOutbounds: [OutboundMessage] = []
         private var sendResult: String? = "stub-provider-message-id"
@@ -928,7 +929,9 @@ final class RouteTests: XCTestCase {
             archivedRemoteIds.append(remoteId)
         }
 
-        func unarchive(remoteId: String) async throws {}
+        func unarchive(remoteId: String) async throws {
+            unarchivedRemoteIds.append(remoteId)
+        }
 
         func send(_ outbound: OutboundMessage) async throws -> String? {
             sentOutbounds.append(outbound)
@@ -1603,6 +1606,252 @@ final class RouteTests: XCTestCase {
             }
             let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
             XCTAssertNil(actions.first { $0.kind == .send })
+        }
+    }
+
+    // MARK: - T12: undo regressions (archive / classify-override / terminal kinds)
+
+    /// Account row with a usable archive folder — the archive route refuses to
+    /// run without it (409).
+    private func seedArchiveCapableAccount(
+        _ account: Account, db: PostgresConnection
+    ) async throws {
+        try await seedAccount(
+            Account(
+                id: account.id, provider: .qq, oauthUser: account.oauthUser,
+                email: account.email, credentials: Data([1, 2, 3]),
+                capabilities: MailCapabilities(
+                    archiveFolder: true, idle: true, move: true, serverSnippet: true
+                ),
+                isActive: true
+            ),
+            db: db
+        )
+    }
+
+    /// Regression: the archive audit row stores the remote outcome under
+    /// `remoteWrite`, and undo must read that same key — a mismatch left the
+    /// local flag flipped while the message stayed in the archive folder.
+    func test_undoArchive_restoresLocalStateAndUnarchivesRemotely() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedArchiveCapableAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id, remoteId: "undo-\(UUID())", from: "alice@example.com"
+            )
+            try await MessageStore.upsert(message, db: conn)
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/archive?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let archived = try await MessageStore.find(
+                remoteId: message.remoteId, accountId: account.id, db: conn
+            )
+            XCTAssertEqual(archived?.isArchived, true)
+
+            let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
+            let archiveRow = try XCTUnwrap(
+                actions.first { $0.kind == .archive && $0.payload["remoteId"] == message.remoteId }
+            )
+            XCTAssertEqual(archiveRow.payload["remoteWrite"], "true")
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(archiveRow.id)/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+
+            let restored = try await MessageStore.find(
+                remoteId: message.remoteId, accountId: account.id, db: conn
+            )
+            XCTAssertEqual(restored?.isArchived, false)
+            let unarchived = await provider.unarchivedRemoteIds
+            XCTAssertEqual(
+                unarchived, [message.remoteId],
+                "a remotely archived message must be moved back remotely too"
+            )
+        }
+    }
+
+    /// When the archive only landed locally (provider degraded), undo must not
+    /// invent a remote move.
+    func test_undoArchive_whenRemoteWriteFailed_staysLocalOnly() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedArchiveCapableAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id, remoteId: "undo-\(UUID())", from: "alice@example.com"
+            )
+            try await MessageStore.upsert(message, db: conn)
+            let provider = StubMailProvider()
+            await provider.setArchiveError(.protocolError("move-rejected"))
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/archive?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok, "a degraded archive still succeeds locally")
+                }
+            }
+            let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
+            let archiveRow = try XCTUnwrap(
+                actions.first { $0.kind == .archive && $0.payload["remoteId"] == message.remoteId }
+            )
+            XCTAssertEqual(archiveRow.payload["remoteWrite"], "false")
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(archiveRow.id)/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+
+            let restored = try await MessageStore.find(
+                remoteId: message.remoteId, accountId: account.id, db: conn
+            )
+            XCTAssertEqual(restored?.isArchived, false)
+            let unarchived = await provider.unarchivedRemoteIds
+            XCTAssertTrue(unarchived.isEmpty, "there was no remote move to reverse")
+        }
+    }
+
+    /// Regression: the classify audit row must store a valid `BriefingGroup`
+    /// raw value, or undo cannot parse `fromGroup` and silently skips the
+    /// counter-override.
+    func test_undoClassifyOverride_flipsTheSenderBack() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id, remoteId: "co-\(UUID())", from: "alice@example.com"
+            )
+            try await MessageStore.upsert(message, db: conn)
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/classify?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: sendBody(#"{"toGroup":"safeToArchive"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let afterOverride = try await AIActionStore.overridesBySender(
+                accountId: account.id, db: conn
+            )
+            XCTAssertEqual(afterOverride["alice@example.com"], .safeToArchive)
+
+            let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
+            let row = try XCTUnwrap(actions.first { $0.kind == .classifyOverride })
+            XCTAssertEqual(row.payload["fromGroup"], BriefingGroup.needsReply.rawValue)
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(row.id)/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let afterUndo = try await AIActionStore.overridesBySender(
+                accountId: account.id, db: conn
+            )
+            XCTAssertEqual(
+                afterUndo["alice@example.com"], .needsReply,
+                "undo must write a counter-override back to the original group"
+            )
+        }
+    }
+
+    func test_undoUnsubscribe_isNotUndoable() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id, remoteId: "un-\(UUID())", from: "news@example.com"
+            )
+            try await MessageStore.upsert(message, db: conn)
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/unsubscribe?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
+            let row = try XCTUnwrap(actions.first { $0.kind == .unsubscribe })
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(row.id)/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "not-undoable")
+                }
+            }
+        }
+    }
+
+    /// Mirrors the audit row DraftRoutes writes; a stored draft cannot be
+    /// un-created, so undo refuses instead of 500ing.
+    func test_undoDraftCreate_isNotUndoable() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let row = try await AIActionStore.record(
+                accountId: account.id, kind: .draftCreate,
+                payload: ["remoteId": "draft-1", "variantCount": "3"],
+                db: conn
+            )
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(row.id)/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "not-undoable")
+                }
+            }
         }
     }
 }
