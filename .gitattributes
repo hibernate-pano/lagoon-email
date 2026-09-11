@@ -1,0 +1,4 @@
+# MIME fixtures are byte-exact inputs, not source: MIMEParserTests assert on
+# CRLF-delimited multipart bodies, and `core.autocrlf=input` would otherwise
+# store them as LF and change what the tests exercise.
+Tests/LagoonServerTests/Fixtures/** -text
