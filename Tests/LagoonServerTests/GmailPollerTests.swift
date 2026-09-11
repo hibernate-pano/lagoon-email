@@ -30,7 +30,7 @@ final class GmailPollerTests: XCTestCase {
 
     /// `users.messages.get?format=metadata` response.
     private static func metadataBody(
-        gmailId: String,
+        remoteId: String,
         from: String,
         subject: String,
         unread: Bool,
@@ -44,9 +44,9 @@ final class GmailPollerTests: XCTestCase {
             headers.append(["name": "List-Unsubscribe", "value": "<mailto:unsub@example.com>"])
         }
         var message: [String: Any] = [
-            "id": gmailId,
-            "threadId": "thread-\(gmailId)",
-            "snippet": "snippet \(gmailId)",
+            "id": remoteId,
+            "threadId": "thread-\(remoteId)",
+            "snippet": "snippet \(remoteId)",
             "internalDate": "1700000000000",
             "payload": ["headers": headers],
         ]
@@ -133,17 +133,13 @@ final class GmailPollerTests: XCTestCase {
 
     // MARK: - Account plumbing
 
-    private func makeAccount(
-        oauthUser: String,
-        tokenExpiresAt: Date
-    ) -> Account {
+    private func makeAccount(oauthUser: String) -> Account {
         Account(
             id: UUID(),
             provider: .gmail,
             oauthUser: oauthUser,
             email: "\(oauthUser)@example.com",
-            tokenExpiresAt: tokenExpiresAt,
-            historyId: nil
+            credentials: nil
         )
     }
 
@@ -151,14 +147,31 @@ final class GmailPollerTests: XCTestCase {
         _ account: Account,
         accessToken: String,
         refreshToken: String,
+        expiresAt: Date,
         db: PostgresConnection
     ) async throws {
         try await AccountStore.upsert(
             account,
-            accessToken: try AccessTokenCipher.seal(accessToken),
-            refreshToken: try AccessTokenCipher.seal(refreshToken),
+            credentials: try CredentialVault.seal(.gmail(
+                accessToken: accessToken,
+                refreshToken: refreshToken,
+                expiresAt: expiresAt
+            )),
             db: db
         )
+    }
+
+    /// Decrypted Gmail credentials for assertions (fails the test on mismatch).
+    private func gmailTokens(
+        _ accountId: UUID,
+        db: PostgresConnection
+    ) async throws -> (accessToken: String, refreshToken: String, expiresAt: Date) {
+        let credentials = try await CredentialVault.read(accountId: accountId, db: db)
+        guard case .gmail(let accessToken, let refreshToken, let expiresAt) = credentials else {
+            XCTFail("expected gmail credentials for this account")
+            throw GmailTokenError.notGmailAccount
+        }
+        return (accessToken, refreshToken, expiresAt)
     }
 
     private func cleanup(_ oauthUser: String) -> @Sendable (PostgresConnection) async -> Void {
@@ -202,11 +215,14 @@ final class GmailPollerTests: XCTestCase {
 
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
             try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
-                let account = makeAccount(
-                    oauthUser: oauthUser,
-                    tokenExpiresAt: Date().addingTimeInterval(-3600)
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(
+                    account,
+                    accessToken: oldAccess,
+                    refreshToken: oldRefresh,
+                    expiresAt: Date().addingTimeInterval(-3600),
+                    db: conn
                 )
-                try await seed(account, accessToken: oldAccess, refreshToken: oldRefresh, db: conn)
                 installStub(tokenBody: tokenBody(accessToken: newAccess, refreshToken: newRefresh))
 
                 await makePoller(db: conn).tick()
@@ -220,7 +236,7 @@ final class GmailPollerTests: XCTestCase {
                     "the sync must use the freshly refreshed access token"
                 )
 
-                let stored = try await AccessTokenCipher.read(accountId: account.id, db: conn)
+                let stored = try await gmailTokens(account.id, db: conn)
                 XCTAssertEqual(stored.accessToken, newAccess)
                 XCTAssertEqual(stored.refreshToken, newRefresh)
                 XCTAssertEqual(
@@ -243,11 +259,14 @@ final class GmailPollerTests: XCTestCase {
             try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
                 // Still valid: the proactive path must NOT run, so the 401 is
                 // the only reason to refresh.
-                let account = makeAccount(
-                    oauthUser: oauthUser,
-                    tokenExpiresAt: Date().addingTimeInterval(3600)
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(
+                    account,
+                    accessToken: oldAccess,
+                    refreshToken: oldRefresh,
+                    expiresAt: Date().addingTimeInterval(3600),
+                    db: conn
                 )
-                try await seed(account, accessToken: oldAccess, refreshToken: oldRefresh, db: conn)
                 installStub(
                     tokenBody: tokenBody(accessToken: newAccess, refreshToken: newRefresh),
                     rejectAccessTokens: ["Bearer \(oldAccess)"]
@@ -274,7 +293,7 @@ final class GmailPollerTests: XCTestCase {
                     "the single retry uses the refreshed token"
                 )
 
-                let stored = try await AccessTokenCipher.read(accountId: account.id, db: conn)
+                let stored = try await gmailTokens(account.id, db: conn)
                 XCTAssertEqual(stored.accessToken, newAccess)
             }
         }
@@ -289,18 +308,21 @@ final class GmailPollerTests: XCTestCase {
 
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
             try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
-                let account = makeAccount(
-                    oauthUser: oauthUser,
-                    tokenExpiresAt: Date().addingTimeInterval(-3600)
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(
+                    account,
+                    accessToken: oldAccess,
+                    refreshToken: oldRefresh,
+                    expiresAt: Date().addingTimeInterval(-3600),
+                    db: conn
                 )
-                try await seed(account, accessToken: oldAccess, refreshToken: oldRefresh, db: conn)
                 // Google omits refresh_token on refresh grants.
                 installStub(tokenBody: tokenBody(accessToken: newAccess))
 
                 await makePoller(db: conn).tick()
 
                 XCTAssertEqual(refreshRequests(forRefreshToken: oldRefresh).count, 1)
-                let stored = try await AccessTokenCipher.read(accountId: account.id, db: conn)
+                let stored = try await gmailTokens(account.id, db: conn)
                 XCTAssertEqual(stored.accessToken, newAccess)
                 XCTAssertEqual(
                     stored.refreshToken, oldRefresh,
@@ -319,11 +341,14 @@ final class GmailPollerTests: XCTestCase {
 
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
             try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
-                let account = makeAccount(
-                    oauthUser: oauthUser,
-                    tokenExpiresAt: Date().addingTimeInterval(3600)
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(
+                    account,
+                    accessToken: oldAccess,
+                    refreshToken: oldRefresh,
+                    expiresAt: Date().addingTimeInterval(3600),
+                    db: conn
                 )
-                try await seed(account, accessToken: oldAccess, refreshToken: oldRefresh, db: conn)
                 installStub(tokenBody: tokenBody(accessToken: newAccess))
 
                 await makePoller(db: conn).tick()
@@ -350,11 +375,14 @@ final class GmailPollerTests: XCTestCase {
 
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
             try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
-                let account = makeAccount(
-                    oauthUser: oauthUser,
-                    tokenExpiresAt: Date().addingTimeInterval(-3600)
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(
+                    account,
+                    accessToken: oldAccess,
+                    refreshToken: oldRefresh,
+                    expiresAt: Date().addingTimeInterval(-3600),
+                    db: conn
                 )
-                try await seed(account, accessToken: oldAccess, refreshToken: oldRefresh, db: conn)
                 // Proactive refresh succeeds but the new token is still 401'd.
                 installStub(
                     tokenBody: tokenBody(accessToken: newAccess, refreshToken: newRefresh),
@@ -390,16 +418,19 @@ final class GmailPollerTests: XCTestCase {
 
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
             try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
-                let account = makeAccount(
-                    oauthUser: oauthUser,
-                    tokenExpiresAt: Date().addingTimeInterval(3600)
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(
+                    account,
+                    accessToken: access,
+                    refreshToken: refresh,
+                    expiresAt: Date().addingTimeInterval(3600),
+                    db: conn
                 )
-                try await seed(account, accessToken: access, refreshToken: refresh, db: conn)
 
                 var metadata: [String: Data] = [:]
                 for (index, id) in ids.enumerated() {
                     metadata[id] = Self.metadataBody(
-                        gmailId: id,
+                        remoteId: id,
                         from: "Sender \(index) <sender\(index)@example.com>",
                         subject: "Subject \(index)",
                         unread: index.isMultiple(of: 2),
@@ -420,10 +451,10 @@ final class GmailPollerTests: XCTestCase {
                     db: conn
                 )
                 XCTAssertEqual(stored.count, ids.count, "every listed message must be stored")
-                XCTAssertEqual(Set(stored.map(\.gmailId)), Set(ids))
+                XCTAssertEqual(Set(stored.map(\.remoteId)), Set(ids))
 
                 for index in 0..<ids.count {
-                    let row = stored.first { $0.gmailId == ids[index] }
+                    let row = stored.first { $0.remoteId == ids[index] }
                     XCTAssertEqual(row?.fromAddress, "sender\(index)@example.com")
                     XCTAssertEqual(row?.fromName, "Sender \(index)")
                     XCTAssertEqual(row?.subject, "Subject \(index)")

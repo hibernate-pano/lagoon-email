@@ -75,13 +75,13 @@ public struct BriefingResponse: Codable, Equatable, Sendable {
     }
 }
 
-/// Response payload of GET /api/messages/{gmailId}/body.
+/// Response payload of GET /api/messages/{remoteId}/body.
 ///
 /// `text` is plain text: the server prefers Gmail's `text/plain` part and falls
 /// back to stripping the `text/html` part. HTML rendering is deliberately not
 /// part of this slice.
 public struct MessageBody: Codable, Equatable, Sendable {
-    public let gmailId: String
+    public let remoteId: String
     public let subject: String?
     public let fromAddress: String
     public let fromName: String?
@@ -90,7 +90,7 @@ public struct MessageBody: Codable, Equatable, Sendable {
     public let text: String
 
     public init(
-        gmailId: String,
+        remoteId: String,
         subject: String?,
         fromAddress: String,
         fromName: String?,
@@ -98,7 +98,7 @@ public struct MessageBody: Codable, Equatable, Sendable {
         receivedAt: Date,
         text: String
     ) {
-        self.gmailId = gmailId
+        self.remoteId = remoteId
         self.subject = subject
         self.fromAddress = fromAddress
         self.fromName = fromName
@@ -108,16 +108,16 @@ public struct MessageBody: Codable, Equatable, Sendable {
     }
 }
 
-/// Response payload of GET /api/messages/{gmailId}/summary (spec §5 P0:
+/// Response payload of GET /api/messages/{remoteId}/summary (spec §5 P0:
 /// AI summary + action-item extraction).
 public struct MessageSummary: Codable, Equatable, Sendable {
-    public let gmailId: String
+    public let remoteId: String
     public let summary: String
     public let actionItems: [String]
     public let provider: String?
 
-    public init(gmailId: String, summary: String, actionItems: [String], provider: String?) {
-        self.gmailId = gmailId
+    public init(remoteId: String, summary: String, actionItems: [String], provider: String?) {
+        self.remoteId = remoteId
         self.summary = summary
         self.actionItems = actionItems
         self.provider = provider
@@ -129,7 +129,7 @@ public struct MessageSummary: Codable, Equatable, Sendable {
 /// deterministic heuristic classifier in `Sources/LagoonServer/AI/Heuristics.swift`.
 /// Server routes depend only on this protocol.
 public protocol BriefingClassifying: Sendable {
-    /// - Returns: gmailId → group, for the ids the classifier is confident
+    /// - Returns: remoteId → group, for the ids the classifier is confident
     ///   about. Ids it omits keep the heuristic/default grouping.
     func classify(
         _ messages: [MessageHeader],

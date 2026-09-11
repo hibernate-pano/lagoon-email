@@ -18,7 +18,7 @@ public enum DraftRoutes {
         summarizer: (any MessageSummarizing)?,
         logger: Logger
     ) {
-        router.post("api/messages/:gmailId/draft") { request, context -> Response in
+        router.post("api/messages/:remoteId/draft") { request, context -> Response in
             return await generateHandler(
                 request: request, context: context, db: db,
                 client: client, tokens: tokens,
@@ -33,7 +33,7 @@ public enum DraftRoutes {
             )
         }
 
-        router.get("api/messages/:gmailId/drafts") { request, context -> Response in
+        router.get("api/messages/:remoteId/drafts") { request, context -> Response in
             return await listHandler(request: request, context: context, db: db)
         }
     }
@@ -46,8 +46,8 @@ public enum DraftRoutes {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
         }
-        guard let gmailId = RouteParams.gmailId(from: context) else {
-            return RouteJSON.error(.badRequest, "malformed-gmailId")
+        guard let remoteId = RouteParams.remoteId(from: context) else {
+            return RouteJSON.error(.badRequest, "malformed-remoteId")
         }
         guard let summarizer else {
             return RouteJSON.error(.serviceUnavailable, "ai-not-configured")
@@ -65,7 +65,7 @@ public enum DraftRoutes {
         let body: MessageBody
         do {
             body = try await MessageRoutes.fetchBody(
-                account: account, gmailId: gmailId, client: client, tokens: tokens
+                account: account, remoteId: remoteId, client: client, tokens: tokens
             )
         } catch {
             return errorResponse(.badGateway, "gmail-error", logger: logger, error: error)
@@ -83,19 +83,19 @@ public enum DraftRoutes {
 
         do {
             _ = try await DraftReplyStore.create(
-                accountId: accountId, gmailId: gmailId, variants: variants, db: db
+                accountId: accountId, remoteId: remoteId, variants: variants, db: db
             )
             _ = try await AIActionStore.record(
                 accountId: accountId,
                 kind: .draftCreate,
-                payload: ["gmailId": gmailId, "variantCount": "\(variants.count)"],
+                payload: ["remoteId": remoteId, "variantCount": "\(variants.count)"],
                 db: db
             )
         } catch {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
         do {
-            let drafts = try await DraftReplyStore.list(accountId: accountId, gmailId: gmailId, db: db)
+            let drafts = try await DraftReplyStore.list(accountId: accountId, remoteId: remoteId, db: db)
             return RouteJSON.response(DraftListResponse(drafts: drafts))
         } catch {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
@@ -165,8 +165,8 @@ public enum DraftRoutes {
                 }
                 let token = try await tokens.validToken(for: account)
                 let headerRow = try? await db.query(
-                    "SELECT thread_id, from_address, subject FROM message_headers WHERE account_id = $1 AND gmail_id = $2",
-                    [PostgresData(uuid: accountId), PostgresData(string: draft.gmailId)]
+                    "SELECT thread_id, from_address, subject FROM message_headers WHERE account_id = $1 AND remote_id = $2",
+                    [PostgresData(uuid: accountId), PostgresData(string: draft.remoteId)]
                 ).get()
                 if let row = headerRow?.rows.first,
                    let threadId = row.column("thread_id")?.string {
@@ -206,11 +206,11 @@ public enum DraftRoutes {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
         }
-        guard let gmailId = RouteParams.gmailId(from: context) else {
-            return RouteJSON.error(.badRequest, "malformed-gmailId")
+        guard let remoteId = RouteParams.remoteId(from: context) else {
+            return RouteJSON.error(.badRequest, "malformed-remoteId")
         }
         do {
-            let drafts = try await DraftReplyStore.list(accountId: accountId, gmailId: gmailId, db: db)
+            let drafts = try await DraftReplyStore.list(accountId: accountId, remoteId: remoteId, db: db)
             return RouteJSON.response(DraftListResponse(drafts: drafts))
         } catch {
             return RouteJSON.error(.internalServerError, "internal-error")
@@ -219,7 +219,7 @@ public enum DraftRoutes {
 
     private static func findDraft(id: Int64, db: PostgresConnection) async throws -> DraftReply? {
         let rows = try await db.query(
-            "SELECT id, account_id, gmail_id, variants, chosen_variant, created_at FROM draft_replies WHERE id = $1",
+            "SELECT id, account_id, remote_id, variants, chosen_variant, created_at FROM draft_replies WHERE id = $1",
             [PostgresData(int64: id)]
         ).get()
         return try rows.rows.first.map { try DraftReplyStore.decode($0) }
@@ -307,7 +307,7 @@ public enum SearchRoutes {
     ) async throws -> [MessageHeader] {
         let pattern = "%\(q)%"
         let sql = """
-            SELECT id, account_id, gmail_id, thread_id,
+            SELECT id, account_id, remote_id, thread_id,
                    from_address,
                    NULLIF(from_name, '') as from_name,
                    NULLIF(subject, '') as subject,

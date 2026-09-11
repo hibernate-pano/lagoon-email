@@ -98,15 +98,22 @@ final class APIClientTests: XCTestCase {
 
     func test_fetchAccounts_decodes_one_element() async throws {
         let id = UUID()
-        let body = Data(#"[{"id":"\#(id.uuidString)","provider":"gmail","email":"a@b.com"}]"#.utf8)
+        let body = Data(#"""
+        [{"id":"\#(id.uuidString)","provider":"qq","email":"a@b.com","isActive":true,
+          "syncHealth":{"status":"needsReconnect","lastError":"auth failed"},
+          "capabilities":{"archiveFolder":false,"idle":true,"move":true,"serverSnippet":false}}]
+        """#.utf8)
         stub(status: 200, body: body)
 
         let accounts = try await makeClient().fetchAccounts()
 
         XCTAssertEqual(accounts.count, 1)
         XCTAssertEqual(accounts.first?.id, id)
-        XCTAssertEqual(accounts.first?.provider, .gmail)
+        XCTAssertEqual(accounts.first?.provider, .qq)
         XCTAssertEqual(accounts.first?.email, "a@b.com")
+        XCTAssertEqual(accounts.first?.isActive, true)
+        XCTAssertEqual(accounts.first?.syncHealth.status, .needsReconnect)
+        XCTAssertEqual(accounts.first?.capabilities.idle, true)
     }
 
     func test_fetchAccounts_non2xx_throwsBadStatusWithBodySnippet() async throws {
@@ -155,7 +162,7 @@ final class APIClientTests: XCTestCase {
             {
               "id": "\(messageId.uuidString)",
               "accountId": "\(accountId.uuidString)",
-              "gmailId": "g1",
+              "remoteId": "g1",
               "threadId": "t1",
               "fromAddress": "alice@example.com",
               "fromName": "Alice",
@@ -195,17 +202,17 @@ final class APIClientTests: XCTestCase {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
 
-        func itemJSON(group: BriefingGroup, gmailId: String) -> String {
+        func itemJSON(group: BriefingGroup, remoteId: String) -> String {
             """
             {
               "message": {
                 "id": "\(UUID().uuidString)",
                 "accountId": "\(accountId.uuidString)",
-                "gmailId": "\(gmailId)",
-                "threadId": "t-\(gmailId)",
+                "remoteId": "\(remoteId)",
+                "threadId": "t-\(remoteId)",
                 "fromAddress": "alice@example.com",
                 "fromName": "Alice",
-                "subject": "Subject \(gmailId)",
+                "subject": "Subject \(remoteId)",
                 "snippet": "Snippet",
                 "receivedAt": "\(formatter.string(from: receivedAt))",
                 "isRead": false,
@@ -218,7 +225,7 @@ final class APIClientTests: XCTestCase {
         }
 
         let items = BriefingGroup.allCases.enumerated().map { index, group in
-            itemJSON(group: group, gmailId: "g\(index)")
+            itemJSON(group: group, remoteId: "g\(index)")
         }
         stub(status: 200, body: Data("{\"items\":[\(items.joined(separator: ","))]}".utf8))
 
@@ -240,14 +247,14 @@ final class APIClientTests: XCTestCase {
 
     func test_fetchBody_percentEncodesGmailIdAndDecodesISO8601ReceivedAt() async throws {
         let accountId = UUID()
-        let gmailId = "a/b?c#d e"
+        let remoteId = "a/b?c#d e"
         let receivedAt = Date(timeIntervalSince1970: 1_700_000_000)
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
 
         let body = Data("""
         {
-          "gmailId": "\(gmailId)",
+          "remoteId": "\(remoteId)",
           "subject": "Hello",
           "fromAddress": "alice@example.com",
           "fromName": "Alice",
@@ -258,9 +265,9 @@ final class APIClientTests: XCTestCase {
         """.utf8)
         stub(status: 200, body: body)
 
-        let messageBody = try await makeClient().fetchBody(gmailId: gmailId, accountId: accountId)
+        let messageBody = try await makeClient().fetchBody(remoteId: remoteId, accountId: accountId)
 
-        XCTAssertEqual(messageBody.gmailId, gmailId)
+        XCTAssertEqual(messageBody.remoteId, remoteId)
         XCTAssertEqual(messageBody.receivedAt, receivedAt)
         XCTAssertEqual(messageBody.text, "Plain text body")
 
@@ -268,7 +275,7 @@ final class APIClientTests: XCTestCase {
         let url = try XCTUnwrap(request.url)
         let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
         XCTAssertEqual(components.percentEncodedPath, "/api/messages/a%2Fb%3Fc%23d%20e/body")
-        XCTAssertEqual(url.path, "/api/messages/\(gmailId)/body")
+        XCTAssertEqual(url.path, "/api/messages/\(remoteId)/body")
         XCTAssertEqual(queryValue("accountId", in: request), accountId.uuidString)
     }
 
@@ -276,7 +283,7 @@ final class APIClientTests: XCTestCase {
         let accountId = UUID()
         stub(status: 204, body: Data())
 
-        try await makeClient().markRead(gmailId: "msg-1", accountId: accountId)
+        try await makeClient().markRead(remoteId: "msg-1", accountId: accountId)
 
         let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
         let url = try XCTUnwrap(request.url)
@@ -290,8 +297,8 @@ final class APIClientTests: XCTestCase {
         stub(status: 204, body: Data())
 
         let client = makeClient()
-        try await client.setPinned(gmailId: "msg-1", accountId: accountId, pinned: true)
-        try await client.setPinned(gmailId: "msg-1", accountId: accountId, pinned: false)
+        try await client.setPinned(remoteId: "msg-1", accountId: accountId, pinned: true)
+        try await client.setPinned(remoteId: "msg-1", accountId: accountId, pinned: false)
 
         let requests = StubURLProtocol.capturedRequests
         XCTAssertEqual(requests.count, 2)
@@ -306,7 +313,7 @@ final class APIClientTests: XCTestCase {
         let accountId = UUID()
         let body = Data("""
         {
-          "gmailId": "msg-1",
+          "remoteId": "msg-1",
           "summary": "Short summary",
           "actionItems": ["Reply", "Archive"],
           "provider": "openai"
@@ -314,9 +321,9 @@ final class APIClientTests: XCTestCase {
         """.utf8)
         stub(status: 200, body: body)
 
-        let summary = try await makeClient().fetchSummary(gmailId: "msg-1", accountId: accountId)
+        let summary = try await makeClient().fetchSummary(remoteId: "msg-1", accountId: accountId)
 
-        XCTAssertEqual(summary.gmailId, "msg-1")
+        XCTAssertEqual(summary.remoteId, "msg-1")
         XCTAssertEqual(summary.summary, "Short summary")
         XCTAssertEqual(summary.actionItems, ["Reply", "Archive"])
         XCTAssertEqual(summary.provider, "openai")
@@ -332,7 +339,7 @@ final class APIClientTests: XCTestCase {
         stub(status: 503, body: Data("no AI provider configured".utf8))
 
         do {
-            _ = try await makeClient().fetchSummary(gmailId: "msg-1", accountId: accountId)
+            _ = try await makeClient().fetchSummary(remoteId: "msg-1", accountId: accountId)
             XCTFail("expected APIError.badStatus(503)")
         } catch APIError.badStatus(let code, let bodySnippet) {
             XCTAssertEqual(code, 503)

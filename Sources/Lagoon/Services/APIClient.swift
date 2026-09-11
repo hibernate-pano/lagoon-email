@@ -104,9 +104,9 @@ public final class APIClient: Sendable {
         return try Self.decode(BriefingResponse.self, from: data)
     }
 
-    /// GET /api/messages/{gmailId}/body?accountId= — plain-text body (spec §3).
-    public func fetchBody(gmailId: String, accountId: UUID) async throws -> MessageBody {
-        let url = try makeURL(path: ["api", "messages", gmailId, "body"], query: [
+    /// GET /api/messages/{remoteId}/body?accountId= — plain-text body (spec §3).
+    public func fetchBody(remoteId: String, accountId: UUID) async throws -> MessageBody {
+        let url = try makeURL(path: ["api", "messages", remoteId, "body"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
         let (data, resp) = try await session.data(from: url)
@@ -116,9 +116,9 @@ public final class APIClient: Sendable {
 
     // MARK: - M2+ actions
 
-    /// POST /api/messages/{gmailId}/archive?accountId= → {ok, gmailId, remote}.
-    public func archiveMessage(gmailId: String, accountId: UUID) async throws -> ArchiveResponse {
-        let url = try makeURL(path: ["api", "messages", gmailId, "archive"], query: [
+    /// POST /api/messages/{remoteId}/archive?accountId= → {ok, remoteId, remote}.
+    public func archiveMessage(remoteId: String, accountId: UUID) async throws -> ArchiveResponse {
+        let url = try makeURL(path: ["api", "messages", remoteId, "archive"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
         var request = URLRequest(url: url)
@@ -128,9 +128,9 @@ public final class APIClient: Sendable {
         return try Self.decode(ArchiveResponse.self, from: data)
     }
 
-    /// POST /api/messages/{gmailId}/unsubscribe?accountId= → {ok, unsubscribed, publisher}.
-    public func unsubscribeMessage(gmailId: String, accountId: UUID) async throws -> UnsubscribeResponse {
-        let url = try makeURL(path: ["api", "messages", gmailId, "unsubscribe"], query: [
+    /// POST /api/messages/{remoteId}/unsubscribe?accountId= → {ok, unsubscribed, publisher}.
+    public func unsubscribeMessage(remoteId: String, accountId: UUID) async throws -> UnsubscribeResponse {
+        let url = try makeURL(path: ["api", "messages", remoteId, "unsubscribe"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
         var request = URLRequest(url: url)
@@ -140,9 +140,9 @@ public final class APIClient: Sendable {
         return try Self.decode(UnsubscribeResponse.self, from: data)
     }
 
-    /// POST /api/messages/{gmailId}/classify {toGroup}.
-    public func overrideClassification(gmailId: String, accountId: UUID, to: BriefingGroup) async throws {
-        let url = try makeURL(path: ["api", "messages", gmailId, "classify"], query: [
+    /// POST /api/messages/{remoteId}/classify {toGroup}.
+    public func overrideClassification(remoteId: String, accountId: UUID, to: BriefingGroup) async throws {
+        let url = try makeURL(path: ["api", "messages", remoteId, "classify"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
         var request = URLRequest(url: url)
@@ -179,9 +179,9 @@ public final class APIClient: Sendable {
         try Self.validate(resp, data: data)
     }
 
-    /// POST /api/messages/{gmailId}/draft → DraftReply.
-    public func generateDrafts(gmailId: String, accountId: UUID, language: String? = nil) async throws -> DraftReply {
-        let url = try makeURL(path: ["api", "messages", gmailId, "draft"], query: [
+    /// POST /api/messages/{remoteId}/draft → DraftReply.
+    public func generateDrafts(remoteId: String, accountId: UUID, language: String? = nil) async throws -> DraftReply {
+        let url = try makeURL(path: ["api", "messages", remoteId, "draft"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
         var request = URLRequest(url: url)
@@ -226,22 +226,22 @@ public final class APIClient: Sendable {
         return try Self.decode(UsageReport.self, from: data)
     }
 
-    /// POST /api/messages/{gmailId}/read?accountId= → 204.
-    public func markRead(gmailId: String, accountId: UUID) async throws {
-        try await post(path: ["api", "messages", gmailId, "read"], query: [
+    /// POST /api/messages/{remoteId}/read?accountId= → 204.
+    public func markRead(remoteId: String, accountId: UUID) async throws {
+        try await post(path: ["api", "messages", remoteId, "read"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
     }
 
-    /// POST /api/messages/{gmailId}/pin?accountId=&pinned= → 204.
-    public func setPinned(gmailId: String, accountId: UUID, pinned: Bool) async throws {
-        try await post(path: ["api", "messages", gmailId, "pin"], query: [
+    /// POST /api/messages/{remoteId}/pin?accountId=&pinned= → 204.
+    public func setPinned(remoteId: String, accountId: UUID, pinned: Bool) async throws {
+        try await post(path: ["api", "messages", remoteId, "pin"], query: [
             .init(name: "accountId", value: accountId.uuidString),
             .init(name: "pinned", value: pinned ? "true" : "false")
         ])
     }
 
-    /// GET /api/messages/{gmailId}/summary?accountId=.
+    /// GET /api/messages/{remoteId}/summary?accountId=.
     ///
     /// When no LLM provider is configured the server answers 503; that surfaces
     /// as `APIError.badStatus(code: 503, …)` and the view renders the muted
@@ -250,11 +250,11 @@ public final class APIClient: Sendable {
     ///   summary follows the UI language. nil omits the header and lets the
     ///   server use its configured default.
     public func fetchSummary(
-        gmailId: String,
+        remoteId: String,
         accountId: UUID,
         language: String? = nil
     ) async throws -> MessageSummary {
-        let url = try makeURL(path: ["api", "messages", gmailId, "summary"], query: [
+        let url = try makeURL(path: ["api", "messages", remoteId, "summary"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
         var request = URLRequest(url: url)

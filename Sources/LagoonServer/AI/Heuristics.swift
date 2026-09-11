@@ -39,7 +39,7 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
     ) async throws -> [String: BriefingGroup] {
         var result: [String: BriefingGroup] = [:]
         for message in messages {
-            result[message.gmailId] = group(for: message, accountEmail: accountEmail).group
+            result[message.remoteId] = group(for: message, accountEmail: accountEmail).group
         }
         return result
     }
@@ -52,7 +52,7 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
     ) -> [String: (group: BriefingGroup, reason: BriefingReason)] {
         var result: [String: (group: BriefingGroup, reason: BriefingReason)] = [:]
         for message in messages {
-            result[message.gmailId] = group(for: message, accountEmail: accountEmail)
+            result[message.remoteId] = group(for: message, accountEmail: accountEmail)
         }
         return result
     }
@@ -84,10 +84,10 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
         listUnsubscribeGmailIds: Set<String>,
         now: Date = Date()
     ) -> (group: BriefingGroup, reason: BriefingReason) {
-        if pinnedGmailIds.contains(message.gmailId) {
+        if pinnedGmailIds.contains(message.remoteId) {
             return (.pinned, .pinned)
         }
-        if listUnsubscribeGmailIds.contains(message.gmailId) {
+        if listUnsubscribeGmailIds.contains(message.remoteId) {
             return (.subscriptionNoise, .listUnsubscribe)
         }
         if matchesSubscriptionSender(message.fromAddress) {

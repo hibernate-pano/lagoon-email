@@ -3,7 +3,7 @@ import Foundation
 public struct MessageHeader: Codable, Equatable, Sendable, Identifiable {
     public let id: UUID
     public let accountId: UUID
-    public let gmailId: String
+    public let remoteId: String
     public let threadId: String
     public let fromAddress: String
     public let fromName: String?
@@ -12,11 +12,16 @@ public struct MessageHeader: Codable, Equatable, Sendable, Identifiable {
     public let receivedAt: Date
     public let isRead: Bool
     public let isArchived: Bool
+    /// RFC5322 Message-ID / In-Reply-To / References, captured so replies can
+    /// thread correctly (IMAP has no threads API).
+    public let messageIdHeader: String?
+    public let inReplyTo: String?
+    public let references: String?
 
     public init(
         id: UUID,
         accountId: UUID,
-        gmailId: String,
+        remoteId: String,
         threadId: String,
         fromAddress: String,
         fromName: String?,
@@ -24,11 +29,14 @@ public struct MessageHeader: Codable, Equatable, Sendable, Identifiable {
         snippet: String?,
         receivedAt: Date,
         isRead: Bool,
-        isArchived: Bool
+        isArchived: Bool,
+        messageIdHeader: String? = nil,
+        inReplyTo: String? = nil,
+        references: String? = nil
     ) {
         self.id = id
         self.accountId = accountId
-        self.gmailId = gmailId
+        self.remoteId = remoteId
         self.threadId = threadId
         self.fromAddress = fromAddress
         self.fromName = fromName
@@ -37,5 +45,8 @@ public struct MessageHeader: Codable, Equatable, Sendable, Identifiable {
         self.receivedAt = receivedAt
         self.isRead = isRead
         self.isArchived = isArchived
+        self.messageIdHeader = messageIdHeader
+        self.inReplyTo = inReplyTo
+        self.references = references
     }
 }

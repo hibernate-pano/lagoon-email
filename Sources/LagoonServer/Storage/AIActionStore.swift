@@ -61,7 +61,7 @@ public enum AIActionStore {
                 SELECT o.to_group, m.from_address, o.created_at,
                     row_number() OVER (PARTITION BY m.from_address ORDER BY o.created_at DESC) AS rn
                 FROM ai_overrides o
-                JOIN message_headers m ON m.gmail_id = o.gmail_id AND m.account_id = o.account_id
+                JOIN message_headers m ON m.remote_id = o.remote_id AND m.account_id = o.account_id
                 WHERE o.account_id = $1
             )
             SELECT from_address, to_group FROM ranked WHERE rn = 1
@@ -81,16 +81,16 @@ public enum AIActionStore {
 
     public static func insertOverride(
         accountId: UUID,
-        gmailId: String,
+        remoteId: String,
         fromGroup: BriefingGroup,
         toGroup: BriefingGroup,
         db: PostgresConnection
     ) async throws {
         try await db.query(
-            "INSERT INTO ai_overrides (account_id, gmail_id, from_group, to_group) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO ai_overrides (account_id, remote_id, from_group, to_group) VALUES ($1, $2, $3, $4)",
             [
                 PostgresData(uuid: accountId),
-                PostgresData(string: gmailId),
+                PostgresData(string: remoteId),
                 PostgresData(string: fromGroup.rawValue),
                 PostgresData(string: toGroup.rawValue),
             ]
@@ -131,20 +131,20 @@ public enum AIActionStore {
 public enum DraftReplyStore {
     public static func create(
         accountId: UUID,
-        gmailId: String,
+        remoteId: String,
         variants: [String],
         db: PostgresConnection
     ) async throws -> DraftReply {
         let json = try JSONSerialization.data(withJSONObject: variants)
         let rows = try await db.query(
             """
-            INSERT INTO draft_replies (account_id, gmail_id, variants)
+            INSERT INTO draft_replies (account_id, remote_id, variants)
             VALUES ($1, $2, $3::jsonb)
-            RETURNING id, account_id, gmail_id, variants, chosen_variant, created_at
+            RETURNING id, account_id, remote_id, variants, chosen_variant, created_at
             """,
             [
                 PostgresData(uuid: accountId),
-                PostgresData(string: gmailId),
+                PostgresData(string: remoteId),
                 PostgresData(jsonb: json),
             ]
         ).get()
@@ -153,16 +153,16 @@ public enum DraftReplyStore {
 
     public static func list(
         accountId: UUID,
-        gmailId: String? = nil,
+        remoteId: String? = nil,
         db: PostgresConnection
     ) async throws -> [DraftReply] {
         let sql: String
         let params: [PostgresData]
-        if let gmailId {
-            sql = "SELECT id, account_id, gmail_id, variants, chosen_variant, created_at FROM draft_replies WHERE account_id = $1 AND gmail_id = $2 ORDER BY created_at DESC"
-            params = [PostgresData(uuid: accountId), PostgresData(string: gmailId)]
+        if let remoteId {
+            sql = "SELECT id, account_id, remote_id, variants, chosen_variant, created_at FROM draft_replies WHERE account_id = $1 AND remote_id = $2 ORDER BY created_at DESC"
+            params = [PostgresData(uuid: accountId), PostgresData(string: remoteId)]
         } else {
-            sql = "SELECT id, account_id, gmail_id, variants, chosen_variant, created_at FROM draft_replies WHERE account_id = $1 ORDER BY created_at DESC LIMIT 50"
+            sql = "SELECT id, account_id, remote_id, variants, chosen_variant, created_at FROM draft_replies WHERE account_id = $1 ORDER BY created_at DESC LIMIT 50"
             params = [PostgresData(uuid: accountId)]
         }
         let rows = try await db.query(sql, params).get()
@@ -173,14 +173,14 @@ public enum DraftReplyStore {
         let r = row.makeRandomAccess()
         let id: Int64 = try r["id"].decode(Int64.self)
         let accId: UUID = try r["account_id"].decode(UUID.self)
-        let gmailId: String = try r["gmail_id"].decode(String.self)
+        let remoteId: String = try r["remote_id"].decode(String.self)
         let variantsJSON: String = try r["variants"].decode(String.self)
         let chosenVariant: Int? = try? r["chosen_variant"].decode(Int.self)
         let createdAt: Date = try r["created_at"].decode(Date.self)
         return DraftReply(
             id: id,
             accountId: accId,
-            gmailId: gmailId,
+            remoteId: remoteId,
             variants: parseVariantsJSON(variantsJSON),
             chosenVariant: chosenVariant,
             createdAt: createdAt

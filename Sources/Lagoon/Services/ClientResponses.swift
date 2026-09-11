@@ -3,7 +3,7 @@ import LagoonKit
 
 public struct ArchiveResponse: Codable, Sendable, Equatable {
     public let ok: Bool
-    public let gmailId: String
+    public let remoteId: String
     public let remote: Bool
 }
 

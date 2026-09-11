@@ -51,11 +51,7 @@ public actor GmailPoller {
     }
 
     private static func allAccounts(db: PostgresConnection) async throws -> [Account] {
-        let result = try await db.query(
-            "SELECT id, provider, oauth_user, email, token_expires_at, history_id FROM accounts",
-            []
-        ).get()
-        return try result.rows.map { try AccountStore.decode($0) }
+        try await AccountStore.all(db: db)
     }
 
     private func syncAccount(_ account: Account) async {
@@ -101,7 +97,7 @@ public actor GmailPoller {
             let responses = try await withThrowingTaskGroup(of: RawGmailMessage.self) { group in
                 for id in batch {
                     group.addTask { [client, accessToken] in
-                        try await client.getMessage(accessToken: accessToken, gmailId: id)
+                        try await client.getMessage(accessToken: accessToken, remoteId: id)
                     }
                 }
                 var collected: [RawGmailMessage] = []
@@ -134,7 +130,7 @@ public actor GmailPoller {
         return MessageHeader(
             id: UUID(),
             accountId: accountId,
-            gmailId: raw.id,
+            remoteId: raw.id,
             threadId: raw.threadId,
             fromAddress: address,
             fromName: name,

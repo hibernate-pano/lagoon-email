@@ -35,16 +35,16 @@ public enum AIActionKind: String, Codable, Sendable, CaseIterable {
 public struct DraftReply: Codable, Sendable, Identifiable, Equatable {
     public let id: Int64
     public let accountId: UUID
-    public let gmailId: String
+    public let remoteId: String
     public let variants: [String]
     public let chosenVariant: Int?
     public let createdAt: Date
 
-    public init(id: Int64, accountId: UUID, gmailId: String,
+    public init(id: Int64, accountId: UUID, remoteId: String,
                 variants: [String], chosenVariant: Int?, createdAt: Date) {
         self.id = id
         self.accountId = accountId
-        self.gmailId = gmailId
+        self.remoteId = remoteId
         self.variants = variants
         self.chosenVariant = chosenVariant
         self.createdAt = createdAt
@@ -60,11 +60,11 @@ public struct AIActionListResponse: Codable, Sendable, Equatable {
 /// User override on AI classification. The heuristic applies these so future
 /// calls to the same sender land in the group the user actually wanted.
 public struct ClassifyOverrideRequest: Codable, Sendable, Equatable {
-    public let gmailId: String
+    public let remoteId: String
     public let fromGroup: String
     public let toGroup: String
-    public init(gmailId: String, fromGroup: String, toGroup: String) {
-        self.gmailId = gmailId
+    public init(remoteId: String, fromGroup: String, toGroup: String) {
+        self.remoteId = remoteId
         self.fromGroup = fromGroup
         self.toGroup = toGroup
     }

@@ -68,14 +68,13 @@ final class RouteTests: XCTestCase {
                 provider: .gmail,
                 oauthUser: oauthUser,
                 email: "route-\(UUID().uuidString)@example.com",
-                tokenExpiresAt: Date(),
-                historyId: nil
+                credentials: nil,
+                isActive: true
             )
             let preExistingCount = try await AccountStore.all(db: conn).count
             try await AccountStore.upsert(
                 account,
-                accessToken: Data([1, 2, 3]),
-                refreshToken: Data([4, 5, 6]),
+                credentials: Data([1, 2, 3]),
                 db: conn
             )
 
@@ -101,7 +100,10 @@ final class RouteTests: XCTestCase {
                         decoded.contains(ConnectedAccount(
                             id: account.id,
                             provider: .gmail,
-                            email: account.email
+                            email: account.email,
+                            isActive: true,
+                            syncHealth: SyncHealth(status: .ok),
+                            capabilities: .unknown
                         )),
                         "response \(decoded) must contain the inserted account"
                     )
@@ -114,7 +116,7 @@ final class RouteTests: XCTestCase {
 
     private enum RouteTestError: Error { case classifierFailed }
 
-    /// Returns a fixed gmailId → group map. Ids it omits keep the heuristic
+    /// Returns a fixed remoteId → group map. Ids it omits keep the heuristic
     /// grouping (the route only overrides the ids present in the map).
     private struct FakeBriefingClassifier: BriefingClassifying {
         let groups: [String: BriefingGroup]
@@ -145,7 +147,7 @@ final class RouteTests: XCTestCase {
 
         func summarize(_ body: MessageBody, language: String?, accountEmail: String) async throws -> MessageSummary {
             MessageSummary(
-                gmailId: body.gmailId,
+                remoteId: body.remoteId,
                 summary: summary,
                 actionItems: actionItems,
                 provider: provider
@@ -230,14 +232,14 @@ final class RouteTests: XCTestCase {
             provider: .gmail,
             oauthUser: oauthUser,
             email: email,
-            tokenExpiresAt: Date().addingTimeInterval(3600),
-            historyId: nil
+            credentials: nil,
+            isActive: true
         )
     }
 
     private func makeHeader(
         accountId: UUID,
-        gmailId: String,
+        remoteId: String,
         from: String,
         isRead: Bool = false,
         daysAgo: Double = 0
@@ -245,11 +247,11 @@ final class RouteTests: XCTestCase {
         MessageHeader(
             id: UUID(),
             accountId: accountId,
-            gmailId: gmailId,
-            threadId: "thread-\(gmailId)",
+            remoteId: remoteId,
+            threadId: "thread-\(remoteId)",
             fromAddress: from,
             fromName: nil,
-            subject: "subject \(gmailId)",
+            subject: "subject \(remoteId)",
             snippet: nil,
             receivedAt: Date().addingTimeInterval(-daysAgo * 24 * 60 * 60),
             isRead: isRead,
@@ -268,14 +270,12 @@ final class RouteTests: XCTestCase {
 
     private func seedAccount(
         _ account: Account,
-        accessToken: Data = Data([1, 2, 3]),
-        refreshToken: Data = Data([4, 5, 6]),
+        credentials: Data = Data([1, 2, 3]),
         db: PostgresConnection
     ) async throws {
         try await AccountStore.upsert(
             account,
-            accessToken: accessToken,
-            refreshToken: refreshToken,
+            credentials: credentials,
             db: db
         )
     }
@@ -305,7 +305,7 @@ final class RouteTests: XCTestCase {
     /// Minimal Gmail `format=full` payload: one text/plain part plus From /
     /// Subject / To headers, enough for `GmailBodyExtractor.plainText`.
     private static func gmailFullMessageJSON(
-        gmailId: String,
+        remoteId: String,
         subject: String,
         from: String,
         text: String
@@ -320,8 +320,8 @@ final class RouteTests: XCTestCase {
             "body": ["data": Data(text.utf8).base64EncodedString()],
         ]
         let message: [String: Any] = [
-            "id": gmailId,
-            "threadId": "thread-\(gmailId)",
+            "id": remoteId,
+            "threadId": "thread-\(remoteId)",
             "internalDate": "1700000000000",
             "payload": payload,
         ]
@@ -352,23 +352,23 @@ final class RouteTests: XCTestCase {
         try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
             try await seedAccount(account, db: conn)
 
-            let needsReply = makeHeader(accountId: account.id, gmailId: "n-\(UUID())", from: "alice@example.com")
-            let subscription = makeHeader(accountId: account.id, gmailId: "s-\(UUID())", from: "no-reply@news.example.com")
-            let awaiting = makeHeader(accountId: account.id, gmailId: "a-\(UUID())", from: account.email)
+            let needsReply = makeHeader(accountId: account.id, remoteId: "n-\(UUID())", from: "alice@example.com")
+            let subscription = makeHeader(accountId: account.id, remoteId: "s-\(UUID())", from: "no-reply@news.example.com")
+            let awaiting = makeHeader(accountId: account.id, remoteId: "a-\(UUID())", from: account.email)
             let archive = makeHeader(
                 accountId: account.id,
-                gmailId: "r-\(UUID())",
+                remoteId: "r-\(UUID())",
                 from: "bob@example.com",
                 isRead: true,
                 daysAgo: 30
             )
-            let pinned = makeHeader(accountId: account.id, gmailId: "p-\(UUID())", from: "carol@example.com")
+            let pinned = makeHeader(accountId: account.id, remoteId: "p-\(UUID())", from: "carol@example.com")
             for header in [needsReply, subscription, awaiting, archive, pinned] {
                 try await MessageStore.upsert(header, db: conn)
             }
             try await MessageStore.setPinned(
                 true,
-                gmailId: pinned.gmailId,
+                remoteId: pinned.remoteId,
                 accountId: account.id,
                 db: conn
             )
@@ -390,14 +390,14 @@ final class RouteTests: XCTestCase {
                     )
                     XCTAssertEqual(decoded.items.count, 5)
                     var groups: [String: BriefingGroup] = [:]
-                    for item in decoded.items { groups[item.message.gmailId] = item.group }
-                    XCTAssertEqual(groups[needsReply.gmailId], .needsReply)
-                    XCTAssertEqual(groups[subscription.gmailId], .subscriptionNoise)
-                    XCTAssertEqual(groups[awaiting.gmailId], .awaitingReply)
-                    XCTAssertEqual(groups[archive.gmailId], .safeToArchive)
-                    XCTAssertEqual(groups[pinned.gmailId], .pinned)
+                    for item in decoded.items { groups[item.message.remoteId] = item.group }
+                    XCTAssertEqual(groups[needsReply.remoteId], .needsReply)
+                    XCTAssertEqual(groups[subscription.remoteId], .subscriptionNoise)
+                    XCTAssertEqual(groups[awaiting.remoteId], .awaitingReply)
+                    XCTAssertEqual(groups[archive.remoteId], .safeToArchive)
+                    XCTAssertEqual(groups[pinned.remoteId], .pinned)
                     for item in decoded.items {
-                        XCTAssertNotNil(item.reasonCode, "item \(item.message.gmailId) needs a reason code")
+                        XCTAssertNotNil(item.reasonCode, "item \(item.message.remoteId) needs a reason code")
                         XCTAssertFalse(item.reasonCode?.isEmpty ?? true)
                     }
                 }
@@ -417,19 +417,19 @@ final class RouteTests: XCTestCase {
             try await seedAccount(account, db: conn)
             let overridden = makeHeader(
                 accountId: account.id,
-                gmailId: "o-\(UUID())",
+                remoteId: "o-\(UUID())",
                 from: "alice@example.com"
             )
             let heuristicOnly = makeHeader(
                 accountId: account.id,
-                gmailId: "h-\(UUID())",
+                remoteId: "h-\(UUID())",
                 from: "bob@example.com"
             )
             try await MessageStore.upsert(overridden, db: conn)
             try await MessageStore.upsert(heuristicOnly, db: conn)
 
             let classifier = FakeBriefingClassifier(
-                groups: [overridden.gmailId: .subscriptionNoise]
+                groups: [overridden.remoteId: .subscriptionNoise]
             )
             let app = Application(router: makeBriefingRouter(db: conn, classifier: classifier))
             try await app.test(.router) { client in
@@ -443,12 +443,12 @@ final class RouteTests: XCTestCase {
                         from: Data(buffer: response.body)
                     )
                     let overriddenItem = decoded.items.first {
-                        $0.message.gmailId == overridden.gmailId
+                        $0.message.remoteId == overridden.remoteId
                     }
                     XCTAssertEqual(overriddenItem?.group, .subscriptionNoise)
                     XCTAssertEqual(overriddenItem?.reasonCode, "ai")
                     let heuristicItem = decoded.items.first {
-                        $0.message.gmailId == heuristicOnly.gmailId
+                        $0.message.remoteId == heuristicOnly.remoteId
                     }
                     XCTAssertEqual(
                         heuristicItem?.group, .needsReply,
@@ -471,7 +471,7 @@ final class RouteTests: XCTestCase {
             try await seedAccount(account, db: conn)
             let message = makeHeader(
                 accountId: account.id,
-                gmailId: "t-\(UUID())",
+                remoteId: "t-\(UUID())",
                 from: "alice@example.com"
             )
             try await MessageStore.upsert(message, db: conn)
@@ -490,7 +490,7 @@ final class RouteTests: XCTestCase {
                         from: Data(buffer: response.body)
                     )
                     XCTAssertEqual(decoded.items.count, 1)
-                    XCTAssertEqual(decoded.items.first?.message.gmailId, message.gmailId)
+                    XCTAssertEqual(decoded.items.first?.message.remoteId, message.remoteId)
                     XCTAssertEqual(decoded.items.first?.group, .needsReply)
                 }
             }
@@ -509,7 +509,7 @@ final class RouteTests: XCTestCase {
             try await MessageStore.upsert(
                 makeHeader(
                     accountId: account.id,
-                    gmailId: "b-\(UUID())",
+                    remoteId: "b-\(UUID())",
                     from: "alice@example.com"
                 ),
                 db: conn
@@ -538,7 +538,7 @@ final class RouteTests: XCTestCase {
         }
     }
 
-    // MARK: - GET /api/messages/{gmailId}/summary
+    // MARK: - GET /api/messages/{remoteId}/summary
 
     /// No AI provider configured → 503 with the stable error envelope. The
     /// check happens before the account lookup, so no DB rows are needed.
@@ -567,7 +567,7 @@ final class RouteTests: XCTestCase {
     func test_getSummary_fakeSummarizer_returns200MessageSummary() async throws {
         let oauthUser = "route-\(UUID().uuidString)"
         let account = makeAccount(oauthUser: oauthUser, email: "me-\(UUID().uuidString)@example.com")
-        let gmailId = "msg-\(UUID())"
+        let remoteId = "msg-\(UUID())"
 
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
             try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
@@ -575,12 +575,15 @@ final class RouteTests: XCTestCase {
                 // never calls the OAuth refresh endpoint.
                 try await seedAccount(
                     account,
-                    accessToken: try AccessTokenCipher.seal("access-\(UUID())"),
-                    refreshToken: try AccessTokenCipher.seal("refresh-\(UUID())"),
+                    credentials: try CredentialVault.seal(.gmail(
+                        accessToken: "access-\(UUID())",
+                        refreshToken: "refresh-\(UUID())",
+                        expiresAt: Date().addingTimeInterval(3600)
+                    )),
                     db: conn
                 )
                 let bodyJSON = Self.gmailFullMessageJSON(
-                    gmailId: gmailId,
+                    remoteId: remoteId,
                     subject: "Hello",
                     from: "Alice <alice@example.com>",
                     text: "Please review the plan."
@@ -601,7 +604,7 @@ final class RouteTests: XCTestCase {
                 let app = Application(router: makeMessageRouter(db: conn, summarizer: summarizer))
                 try await app.test(.router) { client in
                     try await client.execute(
-                        uri: "/api/messages/\(gmailId)/summary?accountId=\(account.id.uuidString)",
+                        uri: "/api/messages/\(remoteId)/summary?accountId=\(account.id.uuidString)",
                         method: .get
                     ) { response in
                         XCTAssertEqual(response.status, .ok)
@@ -613,7 +616,7 @@ final class RouteTests: XCTestCase {
                             MessageSummary.self,
                             from: Data(buffer: response.body)
                         )
-                        XCTAssertEqual(decoded.gmailId, gmailId)
+                        XCTAssertEqual(decoded.remoteId, remoteId)
                         XCTAssertEqual(decoded.summary, "Review plan")
                         XCTAssertEqual(decoded.actionItems, ["Review plan"])
                         XCTAssertEqual(decoded.provider, "fake")
@@ -623,7 +626,7 @@ final class RouteTests: XCTestCase {
         }
     }
 
-    // MARK: - POST /api/messages/{gmailId}/read
+    // MARK: - POST /api/messages/{remoteId}/read
 
     func test_postRead_returns204AndFlipsIsRead() async throws {
         let account = makeAccount(
@@ -635,7 +638,7 @@ final class RouteTests: XCTestCase {
             try await seedAccount(account, db: conn)
             let message = makeHeader(
                 accountId: account.id,
-                gmailId: "m-\(UUID())",
+                remoteId: "m-\(UUID())",
                 from: "alice@example.com",
                 isRead: false
             )
@@ -644,7 +647,7 @@ final class RouteTests: XCTestCase {
             let app = Application(router: makeMessageRouter(db: conn))
             try await app.test(.router) { client in
                 try await client.execute(
-                    uri: "/api/messages/\(message.gmailId)/read?accountId=\(account.id.uuidString)",
+                    uri: "/api/messages/\(message.remoteId)/read?accountId=\(account.id.uuidString)",
                     method: .post
                 ) { response in
                     XCTAssertEqual(response.status, .noContent)
@@ -657,14 +660,14 @@ final class RouteTests: XCTestCase {
                 db: conn
             )
             XCTAssertEqual(
-                recent.first { $0.gmailId == message.gmailId }?.isRead,
+                recent.first { $0.remoteId == message.remoteId }?.isRead,
                 true,
                 "POST /read must persist is_read = TRUE"
             )
         }
     }
 
-    // MARK: - POST /api/messages/{gmailId}/pin
+    // MARK: - POST /api/messages/{remoteId}/pin
 
     /// `pinned=true` moves the item into the pinned group; `pinned=false`
     /// removes the pin and the item returns to its heuristic group.
@@ -678,14 +681,14 @@ final class RouteTests: XCTestCase {
             try await seedAccount(account, db: conn)
             let message = makeHeader(
                 accountId: account.id,
-                gmailId: "p-\(UUID())",
+                remoteId: "p-\(UUID())",
                 from: "alice@example.com"
             )
             try await MessageStore.upsert(message, db: conn)
 
             let briefingURI = "/api/briefing?accountId=\(account.id.uuidString)"
             let pinURI: (Bool) -> String = { pinned in
-                "/api/messages/\(message.gmailId)/pin?accountId=\(account.id.uuidString)&pinned=\(pinned)"
+                "/api/messages/\(message.remoteId)/pin?accountId=\(account.id.uuidString)&pinned=\(pinned)"
             }
             let app = Application(router: makeM1Router(db: conn))
             try await app.test(.router) { client in
@@ -696,7 +699,7 @@ final class RouteTests: XCTestCase {
                         BriefingResponse.self,
                         from: Data(buffer: response.body)
                     )
-                    let item = decoded.items.first { $0.message.gmailId == message.gmailId }
+                    let item = decoded.items.first { $0.message.remoteId == message.remoteId }
                     XCTAssertEqual(item?.group, .needsReply)
                 }
 
@@ -709,7 +712,7 @@ final class RouteTests: XCTestCase {
                         BriefingResponse.self,
                         from: Data(buffer: response.body)
                     )
-                    let item = decoded.items.first { $0.message.gmailId == message.gmailId }
+                    let item = decoded.items.first { $0.message.remoteId == message.remoteId }
                     XCTAssertEqual(item?.group, .pinned)
                 }
 
@@ -722,7 +725,7 @@ final class RouteTests: XCTestCase {
                         BriefingResponse.self,
                         from: Data(buffer: response.body)
                     )
-                    let item = decoded.items.first { $0.message.gmailId == message.gmailId }
+                    let item = decoded.items.first { $0.message.remoteId == message.remoteId }
                     XCTAssertEqual(
                         item?.group, .needsReply,
                         "unpinning must fall back to the heuristic group"
@@ -770,9 +773,9 @@ final class RouteTests: XCTestCase {
         }
     }
 
-    /// Documents that the `malformed-gmailId` 400 branch is unreachable: the
+    /// Documents that the `malformed-remoteId` 400 branch is unreachable: the
     /// router splits paths with `omittingEmptySubsequences: true`, so an empty
-    /// path segment collapses and the `:gmailId` capture can never be empty.
+    /// path segment collapses and the `:remoteId` capture can never be empty.
     /// `/api/messages//read` therefore 404s (route does not match).
     func test_emptyGmailIdPathSegment_is404_malformedGmailId400BranchUnreachable() async throws {
         try await TestDatabase.withConnection { conn in

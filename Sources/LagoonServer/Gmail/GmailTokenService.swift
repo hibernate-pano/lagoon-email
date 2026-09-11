@@ -3,6 +3,8 @@ import Logging
 import PostgresNIO
 import LagoonKit
 
+public enum GmailTokenError: Error { case notGmailAccount }
+
 /// Shared access-token acquisition for every server-side Gmail call.
 ///
 /// Extracted from `GmailPoller` so the poller and the message routes share one
@@ -27,13 +29,36 @@ public actor GmailTokenService {
         }
     }
 
+    private struct GmailTokens: Sendable {
+        let accessToken: String
+        let refreshToken: String
+        let expiresAt: Date
+
+        init(accessToken: String, refreshToken: String, expiresAt: Date) {
+            self.accessToken = accessToken
+            self.refreshToken = refreshToken
+            self.expiresAt = expiresAt
+        }
+
+        init?(_ credentials: AccountCredentials) {
+            guard case .gmail(let accessToken, let refreshToken, let expiresAt) = credentials else {
+                return nil
+            }
+            self.init(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt)
+        }
+
+        var credentials: AccountCredentials {
+            .gmail(accessToken: accessToken, refreshToken: refreshToken, expiresAt: expiresAt)
+        }
+    }
+
     private let db: PostgresConnection
     private let oauth: GoogleOAuthClient
     private let logger: Logger
 
     /// In-flight refreshes keyed by account id. Overlapping callers await the
     /// first refresh instead of issuing a duplicate POST to Google.
-    private var refreshInFlight: [UUID: Task<AccessTokenCipher.StoredCredentials, Error>] = [:]
+    private var refreshInFlight: [UUID: Task<GmailTokens, Error>] = [:]
 
     public init(db: PostgresConnection, oauth: GoogleOAuthClient, logger: Logger) {
         self.db = db
@@ -44,7 +69,7 @@ public actor GmailTokenService {
     /// A token that is valid for at least ~60s, refreshing proactively when the
     /// stored one is at or near expiry.
     public func validToken(for account: Account) async throws -> Token {
-        var creds = try await AccessTokenCipher.read(accountId: account.id, db: db)
+        var creds = try await storedTokens(accountId: account.id)
         // Refresh a little before expiry so an in-flight call does not 401.
         if creds.expiresAt <= Date().addingTimeInterval(60) {
             creds = try await refreshSingleFlight(account: account, current: creds)
@@ -58,9 +83,17 @@ public actor GmailTokenService {
     /// call returns that result rather than starting another one.
     @discardableResult
     public func forceRefresh(for account: Account) async throws -> String {
-        let current = try await AccessTokenCipher.read(accountId: account.id, db: db)
+        let current = try await storedTokens(accountId: account.id)
         let creds = try await refreshSingleFlight(account: account, current: current)
         return creds.accessToken
+    }
+
+    private func storedTokens(accountId: UUID) async throws -> GmailTokens {
+        let credentials = try await CredentialVault.read(accountId: accountId, db: db)
+        guard let tokens = GmailTokens(credentials) else {
+            throw GmailTokenError.notGmailAccount
+        }
+        return tokens
     }
 
     /// Single-flight wrapper: if a refresh for this account is already in
@@ -68,8 +101,8 @@ public actor GmailTokenService {
     /// soon as the in-flight attempt finishes (success or failure).
     private func refreshSingleFlight(
         account: Account,
-        current: AccessTokenCipher.StoredCredentials
-    ) async throws -> AccessTokenCipher.StoredCredentials {
+        current: GmailTokens
+    ) async throws -> GmailTokens {
         if let inFlight = refreshInFlight[account.id] {
             return try await inFlight.value
         }
@@ -84,23 +117,18 @@ public actor GmailTokenService {
     /// we keep the stored one.
     private func refreshCredentials(
         account: Account,
-        current: AccessTokenCipher.StoredCredentials
-    ) async throws -> AccessTokenCipher.StoredCredentials {
+        current: GmailTokens
+    ) async throws -> GmailTokens {
         let result = try await oauth.refresh(refreshToken: current.refreshToken)
         let refreshToken = result.refreshToken ?? current.refreshToken
         let expiresAt = Date().addingTimeInterval(TimeInterval(result.expiresIn))
-        try await AccountStore.updateTokens(
-            accountId: account.id,
-            accessTokenCiphertext: try AccessTokenCipher.seal(result.accessToken),
-            refreshTokenCiphertext: try AccessTokenCipher.seal(refreshToken),
-            expiresAt: expiresAt,
-            db: db
-        )
-        logger.info("refreshed access token", metadata: ["account": .string(account.email)])
-        return AccessTokenCipher.StoredCredentials(
+        let refreshed = GmailTokens(
             accessToken: result.accessToken,
             refreshToken: refreshToken,
             expiresAt: expiresAt
         )
+        try await CredentialVault.write(refreshed.credentials, accountId: account.id, db: db)
+        logger.info("refreshed access token", metadata: ["account": .string(account.email)])
+        return refreshed
     }
 }

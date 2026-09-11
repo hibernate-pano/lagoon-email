@@ -79,7 +79,7 @@ public enum BriefingRoutes {
                             language: nil
                         )
                         await cache.store(fresh, for: pending)
-                        for (gmailId, group) in fresh { overrides[gmailId] = group }
+                        for (remoteId, group) in fresh { overrides[remoteId] = group }
                     } catch {
                         // Fail open: heuristic grouping is still useful, and
                         // nothing is cached so the next refresh retries.
@@ -89,13 +89,13 @@ public enum BriefingRoutes {
                         ])
                     }
                 }
-                for (gmailId, group) in overrides where classified[gmailId] != nil {
-                    classified[gmailId] = (group, .ai)
+                for (remoteId, group) in overrides where classified[remoteId] != nil {
+                    classified[remoteId] = (group, .ai)
                 }
             }
 
             let items = messages.map { message -> BriefingItem in
-                let result = classified[message.gmailId] ?? (.needsReply, BriefingReason.unclassified)
+                let result = classified[message.remoteId] ?? (.needsReply, BriefingReason.unclassified)
                 return BriefingItem(
                     message: message,
                     group: result.group,

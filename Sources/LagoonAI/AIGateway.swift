@@ -112,7 +112,7 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
         // Only headers/snippet/age — never a body (spec §6.6 rule 5).
         let rows: [[String: Any]] = messages.map { message in
             var row: [String: Any] = [
-                "id": message.gmailId,
+                "id": message.remoteId,
                 "from": message.fromAddress,
                 "read": message.isRead,
                 "ageDays": Int(Date().timeIntervalSince(message.receivedAt) / 86400)
@@ -204,7 +204,7 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
             completion: completion
         )
         return MessageSummary(
-            gmailId: body.gmailId,
+            remoteId: body.remoteId,
             summary: summary,
             actionItems: actionItems,
             provider: completion.model

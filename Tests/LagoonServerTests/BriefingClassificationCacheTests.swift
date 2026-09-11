@@ -25,7 +25,7 @@ private final class CountingClassifier: BriefingClassifying, @unchecked Sendable
         _calls += 1
         _messagesSeen += messages.count
         lock.unlock()
-        return Dictionary(uniqueKeysWithValues: messages.map { ($0.gmailId, .subscriptionNoise) })
+        return Dictionary(uniqueKeysWithValues: messages.map { ($0.remoteId, .subscriptionNoise) })
     }
 }
 
@@ -44,7 +44,7 @@ final class BriefingClassificationCacheTests: XCTestCase {
         MessageHeader(
             id: UUID(),
             accountId: UUID(),
-            gmailId: id,
+            remoteId: id,
             threadId: "t-\(id)",
             fromAddress: "a@example.com",
             fromName: nil,
@@ -63,7 +63,7 @@ final class BriefingClassificationCacheTests: XCTestCase {
         let messages = [header("a"), header("b")]
         let (known, pending) = await cache.cached(for: messages)
         XCTAssertTrue(known.isEmpty)
-        XCTAssertEqual(pending.map(\.gmailId), ["a", "b"])
+        XCTAssertEqual(pending.map(\.remoteId), ["a", "b"])
     }
 
     func test_storedGroups_areServedAndNotAskedAgain() async {
@@ -86,7 +86,7 @@ final class BriefingClassificationCacheTests: XCTestCase {
         let read = header("a", isRead: true)
         let (known, pending) = await cache.cached(for: [read])
         XCTAssertTrue(known.isEmpty)
-        XCTAssertEqual(pending.map(\.gmailId), ["a"])
+        XCTAssertEqual(pending.map(\.remoteId), ["a"])
     }
 
     func test_entriesExpireAfterTTL() async {
@@ -110,8 +110,8 @@ final class BriefingClassificationCacheTests: XCTestCase {
             provider: .gmail,
             oauthUser: oauthUser,
             email: "\(oauthUser)@example.com",
-            tokenExpiresAt: Date().addingTimeInterval(3600),
-            historyId: nil
+            credentials: nil,
+            isActive: true
         )
     }
 
@@ -128,8 +128,7 @@ final class BriefingClassificationCacheTests: XCTestCase {
         }) { conn in
             try await AccountStore.upsert(
                 account,
-                accessToken: Data([1, 2, 3]),
-                refreshToken: Data([4, 5, 6]),
+                credentials: Data([1, 2, 3]),
                 db: conn
             )
             let ids = ["m1-\(UUID())", "m2-\(UUID())", "m3-\(UUID())"]
@@ -138,7 +137,7 @@ final class BriefingClassificationCacheTests: XCTestCase {
                     MessageHeader(
                         id: UUID(),
                         accountId: account.id,
-                        gmailId: id,
+                        remoteId: id,
                         threadId: "t-\(id)",
                         fromAddress: "sender@example.com",
                         fromName: nil,
@@ -181,7 +180,7 @@ final class BriefingClassificationCacheTests: XCTestCase {
             XCTAssertEqual(classifier.messagesSeen, 3, "only the unseen messages are sent")
 
             // Marking one read changes its cache key -> only that one is re-sent.
-            try await MessageStore.markRead(gmailId: ids[0], accountId: account.id, db: conn)
+            try await MessageStore.markRead(remoteId: ids[0], accountId: account.id, db: conn)
             try await app.test(.router) { client in
                 try await client.execute(uri: uri, method: .get) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -203,8 +202,7 @@ final class BriefingClassificationCacheTests: XCTestCase {
         }) { conn in
             try await AccountStore.upsert(
                 account,
-                accessToken: Data([1, 2, 3]),
-                refreshToken: Data([4, 5, 6]),
+                credentials: Data([1, 2, 3]),
                 db: conn
             )
             let id = "s-\(UUID())"
@@ -212,7 +210,7 @@ final class BriefingClassificationCacheTests: XCTestCase {
                 MessageHeader(
                     id: UUID(),
                     accountId: account.id,
-                    gmailId: id,
+                    remoteId: id,
                     threadId: "t-\(id)",
                     fromAddress: "alice@example.com",
                     fromName: nil,

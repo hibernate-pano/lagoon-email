@@ -71,11 +71,11 @@ enum RouteParams {
         return trimmed
     }
 
-    /// `gmailId` path component: percent-decoded, non-empty, treated as an
+    /// `remoteId` path component: percent-decoded, non-empty, treated as an
     /// opaque string. It is only ever passed to parameterized queries or
     /// percent-encoded into the Gmail URL.
-    static func gmailId(from context: BasicRequestContext) -> String? {
-        guard let raw = context.parameters.get("gmailId"), !raw.isEmpty else { return nil }
+    static func remoteId(from context: BasicRequestContext) -> String? {
+        guard let raw = context.parameters.get("remoteId"), !raw.isEmpty else { return nil }
         let decoded = raw.removingPercentEncoding ?? raw
         return decoded.isEmpty ? nil : decoded
     }
@@ -91,14 +91,14 @@ public enum MessageRoutes {
         logger: Logger,
         summarizer: (any MessageSummarizing)? = nil
     ) {
-        // GET /api/messages/{gmailId}/body?accountId=<uuid>
+        // GET /api/messages/{remoteId}/body?accountId=<uuid>
         // 200 MessageBody | 400 malformed | 404 unknown | 502 Gmail error
-        router.get("api/messages/:gmailId/body") { request, context -> Response in
+        router.get("api/messages/:remoteId/body") { request, context -> Response in
             guard let accountId = RouteParams.accountId(from: request) else {
                 return RouteJSON.error(.badRequest, "malformed-accountId")
             }
-            guard let gmailId = RouteParams.gmailId(from: context) else {
-                return RouteJSON.error(.badRequest, "malformed-gmailId")
+            guard let remoteId = RouteParams.remoteId(from: context) else {
+                return RouteJSON.error(.badRequest, "malformed-remoteId")
             }
             let account: Account
             do {
@@ -116,7 +116,7 @@ public enum MessageRoutes {
             do {
                 let body = try await Self.fetchBody(
                     account: account,
-                    gmailId: gmailId,
+                    remoteId: remoteId,
                     client: client,
                     tokens: tokens
                 )
@@ -126,30 +126,30 @@ public enum MessageRoutes {
             } catch {
                 logger.error("body fetch failed", metadata: [
                     "accountId": .string(accountId.uuidString),
-                    "gmailId": .string(gmailId),
+                    "remoteId": .string(remoteId),
                     "err": .string("\(error)")
                 ])
                 return RouteJSON.error(.badGateway, "gmail-error")
             }
         }
 
-        // POST /api/messages/{gmailId}/read?accountId=<uuid> -> 204
-        router.post("api/messages/:gmailId/read") { request, context -> Response in
+        // POST /api/messages/{remoteId}/read?accountId=<uuid> -> 204
+        router.post("api/messages/:remoteId/read") { request, context -> Response in
             guard let accountId = RouteParams.accountId(from: request) else {
                 return RouteJSON.error(.badRequest, "malformed-accountId")
             }
-            guard let gmailId = RouteParams.gmailId(from: context) else {
-                return RouteJSON.error(.badRequest, "malformed-gmailId")
+            guard let remoteId = RouteParams.remoteId(from: context) else {
+                return RouteJSON.error(.badRequest, "malformed-remoteId")
             }
             do {
                 guard try await AccountStore.find(byId: accountId, db: db) != nil else {
                     return RouteJSON.error(.notFound, "unknown-account")
                 }
-                try await MessageStore.markRead(gmailId: gmailId, accountId: accountId, db: db)
+                try await MessageStore.markRead(remoteId: remoteId, accountId: accountId, db: db)
             } catch {
                 logger.error("markRead failed", metadata: [
                     "accountId": .string(accountId.uuidString),
-                    "gmailId": .string(gmailId),
+                    "remoteId": .string(remoteId),
                     "err": .string("\(error)")
                 ])
                 return RouteJSON.error(.internalServerError, "internal-error")
@@ -157,13 +157,13 @@ public enum MessageRoutes {
             return Response(status: .noContent)
         }
 
-        // POST /api/messages/{gmailId}/pin?accountId=<uuid>&pinned=true|false -> 204
-        router.post("api/messages/:gmailId/pin") { request, context -> Response in
+        // POST /api/messages/{remoteId}/pin?accountId=<uuid>&pinned=true|false -> 204
+        router.post("api/messages/:remoteId/pin") { request, context -> Response in
             guard let accountId = RouteParams.accountId(from: request) else {
                 return RouteJSON.error(.badRequest, "malformed-accountId")
             }
-            guard let gmailId = RouteParams.gmailId(from: context) else {
-                return RouteJSON.error(.badRequest, "malformed-gmailId")
+            guard let remoteId = RouteParams.remoteId(from: context) else {
+                return RouteJSON.error(.badRequest, "malformed-remoteId")
             }
             guard let rawPinned = request.uri.queryParameters["pinned"].map(String.init) else {
                 return RouteJSON.error(.badRequest, "malformed-pinned")
@@ -182,14 +182,14 @@ public enum MessageRoutes {
                 }
                 try await MessageStore.setPinned(
                     pinned,
-                    gmailId: gmailId,
+                    remoteId: remoteId,
                     accountId: accountId,
                     db: db
                 )
             } catch {
                 logger.error("setPinned failed", metadata: [
                     "accountId": .string(accountId.uuidString),
-                    "gmailId": .string(gmailId),
+                    "remoteId": .string(remoteId),
                     "err": .string("\(error)")
                 ])
                 return RouteJSON.error(.internalServerError, "internal-error")
@@ -197,14 +197,14 @@ public enum MessageRoutes {
             return Response(status: .noContent)
         }
 
-        // GET /api/messages/{gmailId}/summary?accountId=<uuid>
+        // GET /api/messages/{remoteId}/summary?accountId=<uuid>
         // 200 MessageSummary | 503 {"error":"ai-not-configured"} | 502 AI error
-        router.get("api/messages/:gmailId/summary") { request, context -> Response in
+        router.get("api/messages/:remoteId/summary") { request, context -> Response in
             guard let accountId = RouteParams.accountId(from: request) else {
                 return RouteJSON.error(.badRequest, "malformed-accountId")
             }
-            guard let gmailId = RouteParams.gmailId(from: context) else {
-                return RouteJSON.error(.badRequest, "malformed-gmailId")
+            guard let remoteId = RouteParams.remoteId(from: context) else {
+                return RouteJSON.error(.badRequest, "malformed-remoteId")
             }
             guard let summarizer else {
                 return RouteJSON.error(.serviceUnavailable, "ai-not-configured")
@@ -226,7 +226,7 @@ public enum MessageRoutes {
             do {
                 body = try await Self.fetchBody(
                     account: account,
-                    gmailId: gmailId,
+                    remoteId: remoteId,
                     client: client,
                     tokens: tokens
                 )
@@ -235,7 +235,7 @@ public enum MessageRoutes {
             } catch {
                 logger.error("summary body fetch failed", metadata: [
                     "accountId": .string(accountId.uuidString),
-                    "gmailId": .string(gmailId),
+                    "remoteId": .string(remoteId),
                     "err": .string("\(error)")
                 ])
                 return RouteJSON.error(.badGateway, "gmail-error")
@@ -249,7 +249,7 @@ public enum MessageRoutes {
                 // Normalize the id to the requested message and never pass the
                 // provider's raw error text back to the client.
                 let summary = MessageSummary(
-                    gmailId: body.gmailId,
+                    remoteId: body.remoteId,
                     summary: result.summary,
                     actionItems: result.actionItems,
                     provider: result.provider
@@ -258,7 +258,7 @@ public enum MessageRoutes {
             } catch {
                 logger.error("summarizer failed", metadata: [
                     "accountId": .string(accountId.uuidString),
-                    "gmailId": .string(gmailId),
+                    "remoteId": .string(remoteId),
                     "err": .string("\(error)")
                 ])
                 return RouteJSON.error(.badGateway, "ai-error")
@@ -272,20 +272,20 @@ public enum MessageRoutes {
     /// retried once with a forced refresh (unless this call already refreshed).
     static func fetchBody(
         account: Account,
-        gmailId: String,
+        remoteId: String,
         client: GmailClient,
         tokens: GmailTokenService
     ) async throws -> MessageBody {
         let token = try await tokens.validToken(for: account)
         let raw: RawGmailMessage
         do {
-            raw = try await client.getMessageFull(accessToken: token.accessToken, gmailId: gmailId)
+            raw = try await client.getMessageFull(accessToken: token.accessToken, remoteId: remoteId)
         } catch GmailClientError.unauthorized {
             guard !token.didRefresh else { throw GmailClientError.unauthorized }
             let refreshed = try await tokens.forceRefresh(for: account)
-            raw = try await client.getMessageFull(accessToken: refreshed, gmailId: gmailId)
+            raw = try await client.getMessageFull(accessToken: refreshed, remoteId: remoteId)
         }
-        return messageBody(from: raw, fallbackGmailId: gmailId)
+        return messageBody(from: raw, fallbackGmailId: remoteId)
     }
 
     /// Map a raw Gmail full response onto the shared `MessageBody` contract.
@@ -297,7 +297,7 @@ public enum MessageRoutes {
         let receivedAt = raw.internalDate.flatMap { Int64($0) }
             .map { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) } ?? Date()
         return MessageBody(
-            gmailId: raw.id.isEmpty ? fallbackGmailId : raw.id,
+            remoteId: raw.id.isEmpty ? fallbackGmailId : raw.id,
             subject: header("subject"),
             fromAddress: fromAddress,
             fromName: fromName,

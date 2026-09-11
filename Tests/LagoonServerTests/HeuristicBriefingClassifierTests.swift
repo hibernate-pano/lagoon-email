@@ -16,7 +16,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
     // MARK: - Helpers
 
     private func header(
-        _ gmailId: String,
+        _ remoteId: String,
         from: String,
         isRead: Bool = false,
         daysAgo: Double = 0
@@ -24,11 +24,11 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         MessageHeader(
             id: UUID(),
             accountId: UUID(),
-            gmailId: gmailId,
-            threadId: "t-\(gmailId)",
+            remoteId: remoteId,
+            threadId: "t-\(remoteId)",
             fromAddress: from,
             fromName: nil,
-            subject: "subject \(gmailId)",
+            subject: "subject \(remoteId)",
             snippet: nil,
             receivedAt: now.addingTimeInterval(-daysAgo * 24 * 60 * 60),
             isRead: isRead,
@@ -170,9 +170,9 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
             let result = group(message, pinned: pinned, listUnsubscribe: listUnsub)
             XCTAssertEqual(
                 result.group, expected,
-                "gmailId \(message.gmailId) expected \(expected.rawValue)"
+                "remoteId \(message.remoteId) expected \(expected.rawValue)"
             )
-            XCTAssertFalse(result.reason.rawValue.isEmpty, "reason must be non-empty for \(message.gmailId)")
+            XCTAssertFalse(result.reason.rawValue.isEmpty, "reason must be non-empty for \(message.remoteId)")
         }
     }
 
@@ -200,10 +200,10 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         let withReasons = classifier.classifyWithReasons(messages, accountEmail: accountEmail)
         XCTAssertEqual(withReasons.count, messages.count)
         for message in messages {
-            let entry = try XCTUnwrap(withReasons[message.gmailId])
+            let entry = try XCTUnwrap(withReasons[message.remoteId])
             XCTAssertFalse(
                 entry.reason.rawValue.isEmpty,
-                "empty reason for \(message.gmailId) in \(entry.group.rawValue)"
+                "empty reason for \(message.remoteId) in \(entry.group.rawValue)"
             )
         }
         let groups = try await classifier.classify(messages, accountEmail: accountEmail, language: nil)

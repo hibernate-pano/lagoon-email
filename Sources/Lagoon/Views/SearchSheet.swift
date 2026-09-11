@@ -34,7 +34,7 @@ struct SearchSheet: View {
             else if results.isEmpty { Text(l10n.noResults).foregroundStyle(.secondary).padding(20) }
             else {
                 List(results) { m in
-                    NavigationLink(value: m.gmailId) {
+                    NavigationLink(value: m.remoteId) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(m.subject ?? l10n.noSubject).bold(!m.isRead).lineLimit(1)
                             HStack {
@@ -47,9 +47,9 @@ struct SearchSheet: View {
             }
         }
         .frame(width: 640, height: 480)
-        .navigationDestination(for: String.self) { gmailId in
+        .navigationDestination(for: String.self) { remoteId in
             if let accountId = accounts.accountId {
-                NavigationStack { MessageDetailView(gmailId: gmailId, accountId: accountId, header: results.first { $0.gmailId == gmailId }, initiallyPinned: false) }
+                NavigationStack { MessageDetailView(remoteId: remoteId, accountId: accountId, header: results.first { $0.remoteId == remoteId }, initiallyPinned: false) }
             }
         }
     }

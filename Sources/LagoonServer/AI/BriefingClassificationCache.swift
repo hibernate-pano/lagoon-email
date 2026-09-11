@@ -41,7 +41,7 @@ public actor BriefingClassificationCache {
                 pending.append(message)
                 continue
             }
-            if let group = entry.group { known[message.gmailId] = group }
+            if let group = entry.group { known[message.remoteId] = group }
         }
         return (known, pending)
     }
@@ -54,7 +54,7 @@ public actor BriefingClassificationCache {
         now: Date = Date()
     ) {
         for message in messages {
-            entries[key(message)] = Entry(group: groups[message.gmailId], storedAt: now)
+            entries[key(message)] = Entry(group: groups[message.remoteId], storedAt: now)
         }
         if entries.count > limit {
             // Drop the oldest half rather than growing without bound.
@@ -68,6 +68,6 @@ public actor BriefingClassificationCache {
     public func count() -> Int { entries.count }
 
     private func key(_ message: MessageHeader) -> String {
-        "\(message.gmailId)|\(message.isRead ? 1 : 0)"
+        "\(message.remoteId)|\(message.isRead ? 1 : 0)"
     }
 }

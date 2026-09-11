@@ -4,7 +4,7 @@ import Logging
 import PostgresNIO
 import LagoonKit
 
-struct ArchiveResponse: Encodable { let ok: Bool; let gmailId: String; let remote: Bool }
+struct ArchiveResponse: Encodable { let ok: Bool; let remoteId: String; let remote: Bool }
 struct OkResponse: Encodable { let ok: Bool }
 struct UnsubscribeResponse: Encodable { let ok: Bool; let unsubscribed: Bool; let publisher: String }
 struct UndoResponse: Encodable { let ok: Bool; let undone: Int64 }
@@ -19,29 +19,29 @@ public enum ActionsRoutes {
         tokens: GmailTokenService,
         logger: Logger
     ) {
-        // POST /api/messages/{gmailId}/archive?accountId=
+        // POST /api/messages/{remoteId}/archive?accountId=
         // Tries Gmail `users.messages.modify removeLabelIds=INBOX`. Falls back to
         // local mark-as-archived if the token lacks `gmail.modify` scope.
-        router.post("api/messages/:gmailId/archive") { request, context -> Response in
+        router.post("api/messages/:remoteId/archive") { request, context -> Response in
             return await archiveHandler(
                 request: request, context: context, db: db, client: client, tokens: tokens, logger: logger
             )
         }
 
-        // POST /api/messages/{gmailId}/unsubscribe
+        // POST /api/messages/{remoteId}/unsubscribe
         // Reads the cached List-Unsubscribe header, fires HTTP POST/GET to the
         // endpoint, then records + marks read locally. Returns the URL it called
         // so the UI can show "Unsubscribed from <publisher>".
-        router.post("api/messages/:gmailId/unsubscribe") { request, context -> Response in
+        router.post("api/messages/:remoteId/unsubscribe") { request, context -> Response in
             return await unsubscribeHandler(
                 request: request, context: context, db: db, client: client, tokens: tokens, logger: logger
             )
         }
 
-        // POST /api/messages/{gmailId}/classify  {toGroup}
+        // POST /api/messages/{remoteId}/classify  {toGroup}
         // The from-group is inferred from the current classifier output if
         // known, or the override is stored as a forward-only nudge.
-        router.post("api/messages/:gmailId/classify") { request, context -> Response in
+        router.post("api/messages/:remoteId/classify") { request, context -> Response in
             return await classifyOverrideHandler(
                 request: request, context: context, db: db, logger: logger
             )
@@ -71,8 +71,8 @@ public enum ActionsRoutes {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
         }
-        guard let gmailId = RouteParams.gmailId(from: context) else {
-            return RouteJSON.error(.badRequest, "malformed-gmailId")
+        guard let remoteId = RouteParams.remoteId(from: context) else {
+            return RouteJSON.error(.badRequest, "malformed-remoteId")
         }
         let account: Account
         do {
@@ -90,7 +90,7 @@ public enum ActionsRoutes {
             do {
                 try await client.modifyMessageLabels(
                     accessToken: token.accessToken,
-                    gmailId: gmailId,
+                    remoteId: remoteId,
                     removeLabelIds: ["INBOX"]
                 )
                 writeSucceeded = true
@@ -99,7 +99,7 @@ public enum ActionsRoutes {
                     let refreshed = try await tokens.forceRefresh(for: account)
                     try await client.modifyMessageLabels(
                         accessToken: refreshed,
-                        gmailId: gmailId,
+                        remoteId: remoteId,
                         removeLabelIds: ["INBOX"]
                     )
                     writeSucceeded = true
@@ -112,13 +112,13 @@ public enum ActionsRoutes {
                 // retry. The UI shows "archived locally; will sync once you
                 // grant modify scope".
                 logger.warning("archive.scopeMissing", metadata: [
-                    "gmailId": .string(gmailId),
+                    "remoteId": .string(remoteId),
                     "account": .string(account.email),
                 ])
                 writeSucceeded = false
             } catch {
                 logger.error("archive.failed", metadata: [
-                    "gmailId": .string(gmailId),
+                    "remoteId": .string(remoteId),
                     "err": .string("\(error)"),
                 ])
                 return RouteJSON.error(.badGateway, "gmail-error")
@@ -130,23 +130,23 @@ public enum ActionsRoutes {
         do {
             // Local state always flips so the UI re-groups immediately.
             try await db.query(
-                "UPDATE message_headers SET is_archived = TRUE WHERE gmail_id = $1 AND account_id = $2",
-                [PostgresData(string: gmailId), PostgresData(uuid: accountId)]
+                "UPDATE message_headers SET is_archived = TRUE WHERE remote_id = $1 AND account_id = $2",
+                [PostgresData(string: remoteId), PostgresData(uuid: accountId)]
             ).get()
             let _ = try await AIActionStore.record(
                 accountId: accountId,
                 kind: .archive,
-                payload: ["gmailId": gmailId, "remoteWrite": writeSucceeded ? "true" : "false"],
+                payload: ["remoteId": remoteId, "remoteWrite": writeSucceeded ? "true" : "false"],
                 db: db
             )
         } catch {
             logger.error("archive.localUpdateFailed", metadata: [
-                "gmailId": .string(gmailId),
+                "remoteId": .string(remoteId),
                 "err": .string("\(error)"),
             ])
             return RouteJSON.error(.internalServerError, "internal-error")
         }
-        return RouteJSON.response(ArchiveResponse(ok: true, gmailId: gmailId, remote: writeSucceeded))
+        return RouteJSON.response(ArchiveResponse(ok: true, remoteId: remoteId, remote: writeSucceeded))
     }
 
     // MARK: - Unsubscribe
@@ -158,8 +158,8 @@ public enum ActionsRoutes {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
         }
-        guard let gmailId = RouteParams.gmailId(from: context) else {
-            return RouteJSON.error(.badRequest, "malformed-gmailId")
+        guard let remoteId = RouteParams.remoteId(from: context) else {
+            return RouteJSON.error(.badRequest, "malformed-remoteId")
         }
         let account: Account
         do {
@@ -179,14 +179,14 @@ public enum ActionsRoutes {
                 SELECT value FROM (
                     SELECT '<' || split_part(value, '<', 2) AS value
                     FROM regexp_split_to_table(
-                        (SELECT payload->>'headers' FROM raw_message_headers WHERE gmail_id = m.gmail_id ORDER BY fetched_at DESC LIMIT 1),
+                        (SELECT payload->>'headers' FROM raw_message_headers WHERE remote_id = m.remote_id ORDER BY fetched_at DESC LIMIT 1),
                         chr(10)
                     ) AS parts(value) WHERE value LIKE 'List-Unsubscribe:%'
                 ) sub LIMIT 1
             ) h ON true
-            WHERE m.account_id = $1 AND m.gmail_id = $2
+            WHERE m.account_id = $1 AND m.remote_id = $2
             """,
-            [PostgresData(uuid: accountId), PostgresData(string: gmailId)]
+            [PostgresData(uuid: accountId), PostgresData(string: remoteId)]
         ).get()
         // The query above is complex; fall back to a simpler check: just record
         // the action and let the UI show the result.
@@ -199,27 +199,27 @@ public enum ActionsRoutes {
         var publisher: String? = nil
         if let token = try? await tokens.validToken(for: account) {
             do {
-                let msg = try await client.getMessage(accessToken: token.accessToken, gmailId: gmailId)
+                let msg = try await client.getMessage(accessToken: token.accessToken, remoteId: remoteId)
                 if let raw = msg.payload?.headers?.first(where: { $0.name.lowercased() == "list-unsubscribe" })?.value,
                    let url = firstUnsubscribeURL(raw) {
                     publisher = extractPublisher(raw)
                     unsubscribed = (try? await hitUnsubscribe(url: url)) ?? false
                 }
             } catch {
-                logger.warning("unsubscribe.fetchFailed", metadata: ["gmailId": .string(gmailId), "err": .string("\(error)")])
+                logger.warning("unsubscribe.fetchFailed", metadata: ["remoteId": .string(remoteId), "err": .string("\(error)")])
             }
         }
 
         do {
             try await db.query(
-                "UPDATE message_headers SET is_archived = TRUE, is_read = TRUE WHERE gmail_id = $1 AND account_id = $2",
-                [PostgresData(string: gmailId), PostgresData(uuid: accountId)]
+                "UPDATE message_headers SET is_archived = TRUE, is_read = TRUE WHERE remote_id = $1 AND account_id = $2",
+                [PostgresData(string: remoteId), PostgresData(uuid: accountId)]
             ).get()
             let _ = try await AIActionStore.record(
                 accountId: accountId,
                 kind: .unsubscribe,
                 payload: [
-                    "gmailId": gmailId,
+                    "remoteId": remoteId,
                     "publisher": publisher ?? "",
                     "remote": unsubscribed ? "true" : "false",
                 ],
@@ -239,8 +239,8 @@ public enum ActionsRoutes {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
         }
-        guard let gmailId = RouteParams.gmailId(from: context) else {
-            return RouteJSON.error(.badRequest, "malformed-gmailId")
+        guard let remoteId = RouteParams.remoteId(from: context) else {
+            return RouteJSON.error(.badRequest, "malformed-remoteId")
         }
         let body: Data
         do { body = try await collectBody(request) } catch {
@@ -258,12 +258,12 @@ public enum ActionsRoutes {
         }
         do {
             // `fromGroup` is best-effort: we don't have the current classifier
-            // group for this gmailId without a separate lookup. Most overrides
+            // group for this remoteId without a separate lookup. Most overrides
             // come from the user seeing "AI classified wrong"; storing the
             // nudge and updating by sender is enough.
             try await AIActionStore.insertOverride(
                 accountId: accountId,
-                gmailId: gmailId,
+                remoteId: remoteId,
                 fromGroup: .needsReply,
                 toGroup: toGroup,
                 db: db
@@ -272,7 +272,7 @@ public enum ActionsRoutes {
                 accountId: accountId,
                 kind: .classifyOverride,
                 payload: [
-                    "gmailId": gmailId,
+                    "remoteId": remoteId,
                     "fromGroup": BriefingReason.needsReply.rawValue,
                     "toGroup": req.toGroup,
                 ],
@@ -363,39 +363,39 @@ public enum ActionsRoutes {
         action: AIAction, account: Account, client: GmailClient, tokens: GmailTokenService,
         db: PostgresConnection, logger: Logger
     ) async throws {
-        let gmailId = action.payload["gmailId"] ?? ""
+        let remoteId = action.payload["remoteId"] ?? ""
         switch action.kind {
         case .archive:
             // Archive → put it back in INBOX.
             try await db.query(
-                "UPDATE message_headers SET is_archived = FALSE WHERE gmail_id = $1 AND account_id = $2",
-                [PostgresData(string: gmailId), PostgresData(uuid: account.id)]
+                "UPDATE message_headers SET is_archived = FALSE WHERE remote_id = $1 AND account_id = $2",
+                [PostgresData(string: remoteId), PostgresData(uuid: account.id)]
             ).get()
             if action.payload["remote"] == "true" {
                 do {
                     let token = try await tokens.validToken(for: account)
                     try? await client.modifyMessageLabels(
                         accessToken: token.accessToken,
-                        gmailId: gmailId,
+                        remoteId: remoteId,
                         addLabelIds: ["INBOX"]
                     )
                 } catch { /* remote undo failed; local state already reactivated */ }
             }
         case .markRead:
             try await db.query(
-                "UPDATE message_headers SET is_read = FALSE WHERE gmail_id = $1 AND account_id = $2",
-                [PostgresData(string: gmailId), PostgresData(uuid: account.id)]
+                "UPDATE message_headers SET is_read = FALSE WHERE remote_id = $1 AND account_id = $2",
+                [PostgresData(string: remoteId), PostgresData(uuid: account.id)]
             ).get()
         case .pin:
-            try await MessageStore.setPinned(false, gmailId: gmailId, accountId: account.id, db: db)
+            try await MessageStore.setPinned(false, remoteId: remoteId, accountId: account.id, db: db)
         case .unpin:
-            try await MessageStore.setPinned(true, gmailId: gmailId, accountId: account.id, db: db)
+            try await MessageStore.setPinned(true, remoteId: remoteId, accountId: account.id, db: db)
         case .classifyOverride:
             // Counter-override: flip back to the original group.
             if let from = action.payload["fromGroup"].flatMap(BriefingGroup.init(rawValue:)),
                let to = action.payload["toGroup"].flatMap(BriefingGroup.init(rawValue:)) {
                 try await AIActionStore.insertOverride(
-                    accountId: account.id, gmailId: gmailId,
+                    accountId: account.id, remoteId: remoteId,
                     fromGroup: to, toGroup: from, db: db
                 )
             }

@@ -3,6 +3,10 @@ import PostgresNIO
 import LagoonKit
 
 public enum MessageStore {
+    // Every query uses $N placeholders — no SQL is ever concatenated. The
+    // SELECT column list is repeated literally per query (the CI guardrail
+    // forbids interpolation inside SQL literals, even for constants).
+
     /// Upsert a polled header row. `listUnsubscribe` is the presence of the
     /// `List-Unsubscribe` header on the metadata response; it feeds the
     /// heuristic briefing classifier. Defaults to false so existing call sites
@@ -14,25 +18,30 @@ public enum MessageStore {
     ) async throws {
         let sql = """
             INSERT INTO message_headers (
-                id, account_id, gmail_id, thread_id,
+                id, account_id, remote_id, thread_id,
                 from_address, from_name, subject, snippet,
-                received_at, is_read, is_archived, list_unsubscribe, fetched_at
+                received_at, is_read, is_archived, list_unsubscribe,
+                message_id_header, in_reply_to, references_header, fetched_at
             ) VALUES (
                 $1, $2, $3, $4,
                 $5, $6, $7, $8,
-                $9, $10, $11, $12, now()
+                $9, $10, $11, $12,
+                $13, $14, $15, now()
             )
-            ON CONFLICT (account_id, gmail_id) DO UPDATE SET
+            ON CONFLICT (account_id, remote_id) DO UPDATE SET
                 subject = EXCLUDED.subject,
                 snippet = EXCLUDED.snippet,
                 is_read = message_headers.is_read OR EXCLUDED.is_read,
                 list_unsubscribe = message_headers.list_unsubscribe OR EXCLUDED.list_unsubscribe,
+                message_id_header = COALESCE(EXCLUDED.message_id_header, message_headers.message_id_header),
+                in_reply_to = COALESCE(EXCLUDED.in_reply_to, message_headers.in_reply_to),
+                references_header = COALESCE(EXCLUDED.references_header, message_headers.references_header),
                 fetched_at = now()
         """
         try await db.query(sql, [
             PostgresData(uuid: m.id),
             PostgresData(uuid: m.accountId),
-            PostgresData(string: m.gmailId),
+            PostgresData(string: m.remoteId),
             PostgresData(string: m.threadId),
             PostgresData(string: m.fromAddress),
             m.fromName.map { PostgresData(string: $0) } ?? PostgresData(string: ""),
@@ -41,7 +50,10 @@ public enum MessageStore {
             PostgresData(date: m.receivedAt),
             PostgresData(bool: m.isRead),
             PostgresData(bool: m.isArchived),
-            PostgresData(bool: listUnsubscribe)
+            PostgresData(bool: listUnsubscribe),
+            m.messageIdHeader.map { PostgresData(string: $0) } ?? .null,
+            m.inReplyTo.map { PostgresData(string: $0) } ?? .null,
+            m.references.map { PostgresData(string: $0) } ?? .null
         ]).get()
     }
 
@@ -51,12 +63,12 @@ public enum MessageStore {
         db: PostgresConnection
     ) async throws -> [MessageHeader] {
         let sql = """
-            SELECT id, account_id, gmail_id, thread_id,
-                   from_address,
-                   NULLIF(from_name, '') as from_name,
-                   NULLIF(subject, '') as subject,
-                   NULLIF(snippet, '') as snippet,
-                   received_at, is_read, is_archived
+            SELECT id, account_id, remote_id, thread_id, from_address,
+                   NULLIF(from_name, '') AS from_name,
+                   NULLIF(subject, '') AS subject,
+                   NULLIF(snippet, '') AS snippet,
+                   received_at, is_read, is_archived,
+                   message_id_header, in_reply_to, references_header
             FROM message_headers
             WHERE account_id = $1 AND is_archived = FALSE
             ORDER BY received_at DESC
@@ -69,17 +81,49 @@ public enum MessageStore {
         return try rows.map { try Self.decode($0) }
     }
 
+    /// Single header by provider-native id (UIDVALIDITY-reset-safe: UIDs are
+    /// only unique within an account, never globally).
+    public static func find(
+        remoteId: String,
+        accountId: UUID,
+        db: PostgresConnection
+    ) async throws -> MessageHeader? {
+        let sql = """
+            SELECT id, account_id, remote_id, thread_id, from_address,
+                   NULLIF(from_name, '') AS from_name,
+                   NULLIF(subject, '') AS subject,
+                   NULLIF(snippet, '') AS snippet,
+                   received_at, is_read, is_archived,
+                   message_id_header, in_reply_to, references_header
+            FROM message_headers
+            WHERE account_id = $1 AND remote_id = $2
+            LIMIT 1
+        """
+        let rows = try await db.query(sql, [
+            PostgresData(uuid: accountId),
+            PostgresData(string: remoteId)
+        ]).get()
+        return try rows.first.map { try Self.decode($0) }
+    }
+
+    /// Wipes every header for an account (UIDVALIDITY change → full resync).
+    /// Pins/drafts live in their own tables and are intentionally preserved.
+    public static func deleteAll(accountId: UUID, db: PostgresConnection) async throws {
+        let sql = "DELETE FROM message_headers WHERE account_id = $1"
+        try await db.query(sql, [PostgresData(uuid: accountId)]).get()
+    }
+
     public static func markRead(
-        gmailId: String,
+        remoteId: String,
         accountId: UUID,
         db: PostgresConnection
     ) async throws {
         let sql = """
             UPDATE message_headers SET is_read = TRUE
-            WHERE gmail_id = $1 AND account_id = $2
+            WHERE remote_id = $1 AND account_id = $2
         """
         try await db.query(sql, [
-            PostgresData(string: gmailId),
+            PostgresData(string: remoteId),
             PostgresData(uuid: accountId)
         ]).get()
     }
@@ -90,10 +134,10 @@ public enum MessageStore {
         forAccount accountId: UUID,
         db: PostgresConnection
     ) async throws -> Set<String> {
-        let sql = "SELECT gmail_id FROM message_pins WHERE account_id = $1"
+        let sql = "SELECT remote_id FROM message_pins WHERE account_id = $1"
         let rows = try await db.query(sql, [PostgresData(uuid: accountId)]).get()
         let ids = try rows.map { row -> String in
-            try row.makeRandomAccess()["gmail_id"].decode(String.self)
+            try row.makeRandomAccess()["remote_id"].decode(String.self)
         }
         return Set(ids)
     }
@@ -105,12 +149,12 @@ public enum MessageStore {
         db: PostgresConnection
     ) async throws -> Set<String> {
         let sql = """
-            SELECT gmail_id FROM message_headers
+            SELECT remote_id FROM message_headers
             WHERE account_id = $1 AND list_unsubscribe = TRUE
         """
         let rows = try await db.query(sql, [PostgresData(uuid: accountId)]).get()
         let ids = try rows.map { row -> String in
-            try row.makeRandomAccess()["gmail_id"].decode(String.self)
+            try row.makeRandomAccess()["remote_id"].decode(String.self)
         }
         return Set(ids)
     }
@@ -119,25 +163,25 @@ public enum MessageStore {
     /// `false` deletes. Both are parameterized and safe to retry.
     public static func setPinned(
         _ pinned: Bool,
-        gmailId: String,
+        remoteId: String,
         accountId: UUID,
         db: PostgresConnection
     ) async throws {
         if pinned {
             let sql = """
-                INSERT INTO message_pins (account_id, gmail_id)
+                INSERT INTO message_pins (account_id, remote_id)
                 VALUES ($1, $2)
-                ON CONFLICT (account_id, gmail_id) DO NOTHING
+                ON CONFLICT (account_id, remote_id) DO NOTHING
             """
             try await db.query(sql, [
                 PostgresData(uuid: accountId),
-                PostgresData(string: gmailId)
+                PostgresData(string: remoteId)
             ]).get()
         } else {
-            let sql = "DELETE FROM message_pins WHERE account_id = $1 AND gmail_id = $2"
+            let sql = "DELETE FROM message_pins WHERE account_id = $1 AND remote_id = $2"
             try await db.query(sql, [
                 PostgresData(uuid: accountId),
-                PostgresData(string: gmailId)
+                PostgresData(string: remoteId)
             ]).get()
         }
     }
@@ -159,7 +203,7 @@ public enum MessageStore {
         let r = row.makeRandomAccess()
         let id: UUID = try r["id"].decode(UUID.self)
         let accountId: UUID = try r["account_id"].decode(UUID.self)
-        let gmailId: String = try r["gmail_id"].decode(String.self)
+        let remoteId: String = try r["remote_id"].decode(String.self)
         let threadId: String = try r["thread_id"].decode(String.self)
         let fromAddress: String = try r["from_address"].decode(String.self)
         let fromName: String? = (try? r["from_name"].decode(String.self)).flatMap { $0.isEmpty ? nil : $0 }
@@ -168,10 +212,13 @@ public enum MessageStore {
         let receivedAt: Date = try r["received_at"].decode(Date.self)
         let isRead: Bool = try r["is_read"].decode(Bool.self)
         let isArchived: Bool = try r["is_archived"].decode(Bool.self)
+        let messageIdHeader: String? = (try? r["message_id_header"].decode(String.self)).flatMap { $0.isEmpty ? nil : $0 }
+        let inReplyTo: String? = (try? r["in_reply_to"].decode(String.self)).flatMap { $0.isEmpty ? nil : $0 }
+        let references: String? = (try? r["references_header"].decode(String.self)).flatMap { $0.isEmpty ? nil : $0 }
         return MessageHeader(
             id: id,
             accountId: accountId,
-            gmailId: gmailId,
+            remoteId: remoteId,
             threadId: threadId,
             fromAddress: fromAddress,
             fromName: fromName,
@@ -179,7 +226,10 @@ public enum MessageStore {
             snippet: snippet,
             receivedAt: receivedAt,
             isRead: isRead,
-            isArchived: isArchived
+            isArchived: isArchived,
+            messageIdHeader: messageIdHeader,
+            inReplyTo: inReplyTo,
+            references: references
         )
     }
 }

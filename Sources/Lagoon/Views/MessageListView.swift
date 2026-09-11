@@ -55,7 +55,7 @@ struct MessageListView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     List(messages) { m in
-                        NavigationLink(value: m.gmailId) {
+                        NavigationLink(value: m.remoteId) {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(m.subject ?? l10n.noSubject)
                                     .font(.body)
@@ -82,8 +82,8 @@ struct MessageListView: View {
                     .listStyle(.inset)
                 }
             }
-            .navigationDestination(for: String.self) { gmailId in
-                destination(for: gmailId)
+            .navigationDestination(for: String.self) { remoteId in
+                destination(for: remoteId)
             }
         }
         .frame(minWidth: 720, minHeight: 480)
@@ -105,18 +105,18 @@ struct MessageListView: View {
     // MARK: - Navigation
 
     @ViewBuilder
-    private func destination(for gmailId: String) -> some View {
+    private func destination(for remoteId: String) -> some View {
         if let accountId = accounts.accountId {
-            let header = messages.first { $0.gmailId == gmailId }
+            let header = messages.first { $0.remoteId == remoteId }
             MessageDetailView(
-                gmailId: gmailId,
+                remoteId: remoteId,
                 accountId: accountId,
                 header: header,
                 // We don't render pin state in the raw list; the detail
                 // still loads / toggles it via the server.
                 initiallyPinned: false,
-                onReadStateChange: { gmailId, isRead in
-                    setRead(gmailId: gmailId, isRead: isRead)
+                onReadStateChange: { remoteId, isRead in
+                    setRead(remoteId: remoteId, isRead: isRead)
                 },
                 onPinnedChanged: { _ in
                     Task { await refresh() }
@@ -131,13 +131,13 @@ struct MessageListView: View {
         }
     }
 
-    private func setRead(gmailId: String, isRead: Bool) {
-        guard let index = messages.firstIndex(where: { $0.gmailId == gmailId }) else { return }
+    private func setRead(remoteId: String, isRead: Bool) {
+        guard let index = messages.firstIndex(where: { $0.remoteId == remoteId }) else { return }
         let message = messages[index]
         messages[index] = MessageHeader(
             id: message.id,
             accountId: message.accountId,
-            gmailId: message.gmailId,
+            remoteId: message.remoteId,
             threadId: message.threadId,
             fromAddress: message.fromAddress,
             fromName: message.fromName,

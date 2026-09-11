@@ -33,8 +33,8 @@ struct BriefingFeedView: View {
                 }
                 .onAppear { scrollProxy = proxy }
             }
-            .navigationDestination(for: String.self) { gmailId in
-                destination(for: gmailId)
+            .navigationDestination(for: String.self) { remoteId in
+                destination(for: remoteId)
             }
             .background(groupJumpShortcuts)
             .safeAreaInset(edge: .bottom) { UndoToast(controller: undo) }
@@ -94,7 +94,7 @@ struct BriefingFeedView: View {
                     Section {
                         if !collapsedGroups.contains(group) {
                             ForEach(groupItems) { item in
-                                NavigationLink(value: item.message.gmailId) {
+                                NavigationLink(value: item.message.remoteId) {
                                     BriefingRow(item: item)
                                 }
                                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
@@ -211,7 +211,7 @@ struct BriefingFeedView: View {
 
         guard !visible.isEmpty else { return }
 
-        let current = selectedGmailId.flatMap { id in visible.firstIndex(where: { $0.message.gmailId == id }) } ?? 0
+        let current = selectedGmailId.flatMap { id in visible.firstIndex(where: { $0.message.remoteId == id }) } ?? 0
 
         let next: Int
 
@@ -227,7 +227,7 @@ struct BriefingFeedView: View {
 
         }
 
-        let target = visible[next].message.gmailId
+        let target = visible[next].message.remoteId
 
         selectedGmailId = target
 
@@ -271,23 +271,23 @@ struct BriefingFeedView: View {
 
     @ViewBuilder
 
-    private func destination(for gmailId: String) -> some View {
+    private func destination(for remoteId: String) -> some View {
 
         if let accountId = accounts.accountId {
 
-            let visible = items.filter { !collapsedGroups.contains($0.group) }.map { $0.message.gmailId }
+            let visible = items.filter { !collapsedGroups.contains($0.group) }.map { $0.message.remoteId }
 
-            let siblings = visible.contains(gmailId) ? visible : nil
+            let siblings = visible.contains(remoteId) ? visible : nil
 
             MessageDetailView(
 
-                gmailId: gmailId,
+                remoteId: remoteId,
 
                 accountId: accountId,
 
-                header: items.first { $0.message.gmailId == gmailId }?.message,
+                header: items.first { $0.message.remoteId == remoteId }?.message,
 
-                initiallyPinned: items.first { $0.message.gmailId == gmailId }?.group == .pinned,
+                initiallyPinned: items.first { $0.message.remoteId == remoteId }?.group == .pinned,
 
                 siblings: siblings,
 
@@ -305,7 +305,7 @@ struct BriefingFeedView: View {
 
                 onReadStateChange: { id, isRead in
 
-                    setRead(gmailId: id, isRead: isRead)
+                    setRead(remoteId: id, isRead: isRead)
 
                 },
 
@@ -345,9 +345,9 @@ struct BriefingFeedView: View {
 
 
 
-    private func setRead(gmailId: String, isRead: Bool) {
+    private func setRead(remoteId: String, isRead: Bool) {
 
-        guard let index = items.firstIndex(where: { $0.message.gmailId == gmailId }) else { return }
+        guard let index = items.firstIndex(where: { $0.message.remoteId == remoteId }) else { return }
 
         let item = items[index]
 
@@ -367,7 +367,7 @@ struct BriefingFeedView: View {
 
         MessageHeader(
 
-            id: m.id, accountId: m.accountId, gmailId: m.gmailId, threadId: m.threadId,
+            id: m.id, accountId: m.accountId, remoteId: m.remoteId, threadId: m.threadId,
 
             fromAddress: m.fromAddress, fromName: m.fromName,
 
@@ -383,7 +383,7 @@ struct BriefingFeedView: View {
 
     private func handleArchived(id: String, isArchived: Bool) {
 
-        items.removeAll { $0.message.gmailId == id }
+        items.removeAll { $0.message.remoteId == id }
 
     }
 
@@ -397,7 +397,7 @@ struct BriefingFeedView: View {
 
         Task {
 
-            try? await api.setPinned(gmailId: item.message.gmailId, accountId: accountId, pinned: toPinned)
+            try? await api.setPinned(remoteId: item.message.remoteId, accountId: accountId, pinned: toPinned)
 
             await refresh()
 
@@ -409,21 +409,21 @@ struct BriefingFeedView: View {
 
     private func archiveAndUndo(_ item: BriefingItem) async {
 
-        await archiveAndUndo(byId: item.message.gmailId)
+        await archiveAndUndo(byId: item.message.remoteId)
 
     }
 
 
 
-    private func archiveAndUndo(byId gmailId: String) async {
+    private func archiveAndUndo(byId remoteId: String) async {
 
         guard let accountId = accounts.accountId else { return }
 
         do {
 
-            let response = try await api.archiveMessage(gmailId: gmailId, accountId: accountId)
+            let response = try await api.archiveMessage(remoteId: remoteId, accountId: accountId)
 
-            items.removeAll { $0.message.gmailId == gmailId }
+            items.removeAll { $0.message.remoteId == remoteId }
 
             if let actions = try? await api.fetchActions(accountId: accountId, since: Date().addingTimeInterval(-30)),
 

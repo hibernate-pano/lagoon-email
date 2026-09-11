@@ -84,7 +84,7 @@ enum TestDatabase {
 
     static func deleteAccount(
         oauthUser: String,
-        provider: MailProvider,
+        provider: MailProviderKind,
         db: PostgresConnection
     ) async throws {
         try await db.query(

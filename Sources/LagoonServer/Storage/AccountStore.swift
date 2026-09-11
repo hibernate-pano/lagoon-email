@@ -5,31 +5,49 @@ import LagoonKit
 public enum AccountStoreError: Error { case notFound }
 
 public enum AccountStore {
-    /// Every query uses $N placeholders — no SQL is ever concatenated.
+    // Every query uses $N placeholders — no SQL is ever concatenated. The
+    // SELECT column list is repeated literally per query (the CI guardrail
+    // forbids interpolation inside SQL literals, even for constants).
+
+    private static let jsonEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .iso8601
+        return e
+    }()
+
+    private static let jsonDecoder: JSONDecoder = {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
+    }()
+
+    private static func encodeJSON<T: Encodable>(_ value: T) throws -> Data {
+        try jsonEncoder.encode(value)
+    }
+
+    private static func decodeJSON<T: Decodable>(_ type: T.Type, from data: Data?) -> T? {
+        guard let data else { return nil }
+        return try? jsonDecoder.decode(T.self, from: data)
+    }
+
+    /// Insert a new account or refresh the stored credentials of the existing
+    /// one (same provider + oauth_user). Credentials arrive already sealed.
     public static func upsert(
         _ account: Account,
-        accessToken: Data,
-        refreshToken: Data,
+        credentials: Data,
         db: PostgresConnection
     ) async throws {
         let sql = """
             INSERT INTO accounts (
-                id, provider, oauth_user, email,
-                access_token, refresh_token, token_expires_at, history_id,
-                created_at, updated_at
+                id, provider, oauth_user, email, credentials, sync_state, capabilities,
+                is_active, sync_status, last_sync_at, last_sync_error, created_at, updated_at
             ) VALUES (
-                $1, $2, $3, $4,
-                $5, $6, $7, $8,
-                now(), now()
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, $9, $10, $11, now(), now()
             )
             ON CONFLICT (provider, oauth_user) DO UPDATE SET
                 email = EXCLUDED.email,
-                access_token = EXCLUDED.access_token,
-                refresh_token = EXCLUDED.refresh_token,
-                token_expires_at = EXCLUDED.token_expires_at,
-                history_id = CASE WHEN EXCLUDED.history_id IS NOT NULL
-                                  THEN EXCLUDED.history_id
-                                  ELSE accounts.history_id END,
+                credentials = EXCLUDED.credentials,
                 updated_at = now()
         """
         try await db.query(sql, [
@@ -37,41 +55,94 @@ public enum AccountStore {
             PostgresData(string: account.provider.rawValue),
             PostgresData(string: account.oauthUser),
             PostgresData(string: account.email),
-            PostgresData(bytes: accessToken),
-            PostgresData(bytes: refreshToken),
-            PostgresData(date: account.tokenExpiresAt),
-            account.historyId.map { PostgresData(string: $0) } ?? PostgresData.null
+            PostgresData(bytes: credentials),
+            PostgresData(jsonb: try encodeJSON(account.syncState)),
+            PostgresData(jsonb: try encodeJSON(account.capabilities)),
+            PostgresData(bool: account.isActive),
+            PostgresData(string: account.syncHealth.status.rawValue),
+            account.syncHealth.lastSyncAt.map { PostgresData(date: $0) } ?? .null,
+            account.syncHealth.lastError.map { PostgresData(string: $0) } ?? .null
         ]).get()
     }
 
-    /// Update only the OAuth tokens (refresh flow). Never touches read state.
-    public static func updateTokens(
+    /// Replace only the sealed credential blob (token refresh / re-auth).
+    /// Never touches read state, cursor, or health.
+    public static func updateCredentials(
         accountId: UUID,
-        accessTokenCiphertext: Data,
-        refreshTokenCiphertext: Data,
-        expiresAt: Date,
+        credentials: Data,
         db: PostgresConnection
     ) async throws {
         let sql = """
             UPDATE accounts
-            SET access_token = $2,
-                refresh_token = $3,
-                token_expires_at = $4,
+            SET credentials = $2, updated_at = now()
+            WHERE id = $1
+        """
+        try await db.query(sql, [
+            PostgresData(uuid: accountId),
+            PostgresData(bytes: credentials)
+        ]).get()
+    }
+
+    public static func updateSyncState(
+        accountId: UUID,
+        syncState: MailSyncState,
+        db: PostgresConnection
+    ) async throws {
+        let sql = """
+            UPDATE accounts
+            SET sync_state = $2, updated_at = now()
+            WHERE id = $1
+        """
+        try await db.query(sql, [
+            PostgresData(uuid: accountId),
+            PostgresData(jsonb: try encodeJSON(syncState))
+        ]).get()
+    }
+
+    public static func updateCapabilities(
+        accountId: UUID,
+        capabilities: MailCapabilities,
+        db: PostgresConnection
+    ) async throws {
+        let sql = """
+            UPDATE accounts
+            SET capabilities = $2, updated_at = now()
+            WHERE id = $1
+        """
+        try await db.query(sql, [
+            PostgresData(uuid: accountId),
+            PostgresData(jsonb: try encodeJSON(capabilities))
+        ]).get()
+    }
+
+    /// Writes the three health columns. `lastSyncAt` is set on success by the
+    /// caller; a `needsReconnect` write keeps whatever error text explains it.
+    public static func updateHealth(
+        accountId: UUID,
+        health: SyncHealth,
+        db: PostgresConnection
+    ) async throws {
+        let sql = """
+            UPDATE accounts
+            SET sync_status = $2,
+                last_sync_at = COALESCE($3, last_sync_at),
+                last_sync_error = $4,
                 updated_at = now()
             WHERE id = $1
         """
         try await db.query(sql, [
             PostgresData(uuid: accountId),
-            PostgresData(bytes: accessTokenCiphertext),
-            PostgresData(bytes: refreshTokenCiphertext),
-            PostgresData(date: expiresAt)
+            PostgresData(string: health.status.rawValue),
+            health.lastSyncAt.map { PostgresData(date: $0) } ?? .null,
+            health.lastError.map { PostgresData(string: $0) } ?? .null
         ]).get()
     }
 
     /// All connected accounts, used by GET /api/accounts.
     public static func all(db: PostgresConnection) async throws -> [Account] {
         let sql = """
-            SELECT id, provider, oauth_user, email, token_expires_at, history_id
+            SELECT id, provider, oauth_user, email, credentials, sync_state,
+                   capabilities, is_active, sync_status, last_sync_at, last_sync_error
             FROM accounts
             ORDER BY email
         """
@@ -79,13 +150,54 @@ public enum AccountStore {
         return try rows.map { try Self.decode($0) }
     }
 
+    /// The single active account (UI target of every provider-neutral route).
+    public static func active(db: PostgresConnection) async throws -> Account? {
+        let sql = """
+            SELECT id, provider, oauth_user, email, credentials, sync_state,
+                   capabilities, is_active, sync_status, last_sync_at, last_sync_error
+            FROM accounts
+            WHERE is_active = TRUE
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """
+        let rows = try await db.query(sql, []).get()
+        return try rows.first.map { try Self.decode($0) }
+    }
+
+    /// Atomically flip the active flag: exactly one account is active after
+    /// this statement (`is_active = (id = $1)`), or none when `$1` is unknown.
+    public static func setActive(accountId: UUID, db: PostgresConnection) async throws {
+        let sql = "UPDATE accounts SET is_active = (id = $1), updated_at = now()"
+        try await db.query(sql, [PostgresData(uuid: accountId)]).get()
+    }
+
+    /// Enforce the one-active-account invariant at startup. No-op when exactly
+    /// one account is active; repairs zero-or-many states deterministically.
+    public static func reconcileActive(db: PostgresConnection) async throws {
+        let accounts = try await all(db: db)
+        let actives = accounts.filter(\.isActive)
+        if actives.count == 1 { return }
+        if actives.isEmpty, let newest = accounts.max(by: { $0.id.uuidString < $1.id.uuidString }) {
+            try await setActive(accountId: newest.id, db: db)
+        } else if let keep = actives.first {
+            try await setActive(accountId: keep.id, db: db)
+        }
+    }
+
+    /// Deletes the account row; foreign keys cascade to messages/pins/drafts.
+    public static func delete(accountId: UUID, db: PostgresConnection) async throws {
+        let sql = "DELETE FROM accounts WHERE id = $1"
+        try await db.query(sql, [PostgresData(uuid: accountId)]).get()
+    }
+
     public static func find(
         byOAuthUser oauthUser: String,
-        provider: MailProvider,
+        provider: MailProviderKind,
         db: PostgresConnection
     ) async throws -> Account? {
         let sql = """
-            SELECT id, provider, oauth_user, email, token_expires_at, history_id
+            SELECT id, provider, oauth_user, email, credentials, sync_state,
+                   capabilities, is_active, sync_status, last_sync_at, last_sync_error
             FROM accounts
             WHERE oauth_user = $1 AND provider = $2
             LIMIT 1
@@ -105,7 +217,8 @@ public enum AccountStore {
         db: PostgresConnection
     ) async throws -> Account? {
         let sql = """
-            SELECT id, provider, oauth_user, email, token_expires_at, history_id
+            SELECT id, provider, oauth_user, email, credentials, sync_state,
+                   capabilities, is_active, sync_status, last_sync_at, last_sync_error
             FROM accounts
             WHERE id = $1
             LIMIT 1
@@ -123,15 +236,27 @@ public enum AccountStore {
         let providerRaw: String = try r["provider"].decode(String.self)
         let oauthUser: String = try r["oauth_user"].decode(String.self)
         let email: String = try r["email"].decode(String.self)
-        let tokenExpiresAt: Date = try r["token_expires_at"].decode(Date.self)
-        let historyRaw: String = (try? r["history_id"].decode(String.self)) ?? ""
+        let credentials: Data? = try r["credentials"].decode(Data?.self)
+        let syncState = decodeJSON(MailSyncState.self, from: r[data: "sync_state"].jsonb) ?? MailSyncState()
+        let capabilities = decodeJSON(MailCapabilities.self, from: r[data: "capabilities"].jsonb) ?? .unknown
+        let isActive: Bool = try r["is_active"].decode(Bool.self)
+        let statusRaw: String = try r["sync_status"].decode(String.self)
+        let lastSyncAt: Date? = try r["last_sync_at"].decode(Date?.self)
+        let lastError: String? = try r["last_sync_error"].decode(String?.self)
         return Account(
             id: id,
-            provider: MailProvider(rawValue: providerRaw) ?? .gmail,
+            provider: MailProviderKind(rawValue: providerRaw) ?? .gmail,
             oauthUser: oauthUser,
             email: email,
-            tokenExpiresAt: tokenExpiresAt,
-            historyId: historyRaw.isEmpty ? nil : historyRaw
+            credentials: credentials,
+            syncState: syncState,
+            capabilities: capabilities,
+            isActive: isActive,
+            syncHealth: SyncHealth(
+                status: SyncHealth.Status(rawValue: statusRaw) ?? .ok,
+                lastSyncAt: lastSyncAt,
+                lastError: lastError
+            )
         )
     }
 }

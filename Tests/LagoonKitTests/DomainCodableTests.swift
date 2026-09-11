@@ -26,8 +26,11 @@ final class DomainCodableTests: XCTestCase {
             provider: .gmail,
             oauthUser: "u",
             email: "u@example.com",
-            tokenExpiresAt: Date(timeIntervalSince1970: 1000),
-            historyId: "h1"
+            credentials: Data([0x01, 0x02]),
+            syncState: MailSyncState(historyId: "h1"),
+            capabilities: MailCapabilities(archiveFolder: true, idle: true, move: true, serverSnippet: true),
+            isActive: true,
+            syncHealth: SyncHealth(status: .ok)
         )
         let data = try makeEncoder().encode(a)
         let back = try makeDecoder().decode(Account.self, from: data)
@@ -38,7 +41,7 @@ final class DomainCodableTests: XCTestCase {
         let m = MessageHeader(
             id: UUID(),
             accountId: UUID(),
-            gmailId: "abc",
+            remoteId: "abc",
             threadId: "t1",
             fromAddress: "alice@example.com",
             fromName: "Alice",
@@ -63,7 +66,7 @@ final class DomainCodableTests: XCTestCase {
         let message = MessageHeader(
             id: UUID(),
             accountId: accountId,
-            gmailId: "g1",
+            remoteId: "g1",
             threadId: "t1",
             fromAddress: "alice@example.com",
             fromName: "Alice",
@@ -98,7 +101,7 @@ final class DomainCodableTests: XCTestCase {
                 MessageHeader(
                     id: UUID(),
                     accountId: accountId,
-                    gmailId: "g2",
+                    remoteId: "g2",
                     threadId: "t2",
                     fromAddress: "bob@example.com",
                     fromName: nil,
@@ -129,7 +132,7 @@ final class DomainCodableTests: XCTestCase {
         let message = MessageHeader(
             id: UUID(),
             accountId: UUID(),
-            gmailId: "g3",
+            remoteId: "g3",
             threadId: "t3",
             fromAddress: "carol@example.com",
             fromName: nil,
@@ -156,7 +159,7 @@ final class DomainCodableTests: XCTestCase {
         {
           "id": "\(UUID().uuidString)",
           "accountId": "\(UUID().uuidString)",
-          "gmailId": "g4",
+          "remoteId": "g4",
           "threadId": "t4",
           "fromAddress": "dave@example.com",
           "receivedAt": "2023-11-14T22:13:20Z",
@@ -173,12 +176,23 @@ final class DomainCodableTests: XCTestCase {
     func test_connected_account_decodes_server_json() throws {
         // Exact shape of GET /api/accounts (ConnectedAccount.swift contract).
         let json = """
-        [{"id":"00000000-0000-0000-0000-000000000001","provider":"gmail","email":"a@b.com"}]
+        [{
+          "id":"00000000-0000-0000-0000-000000000001",
+          "provider":"qq",
+          "email":"a@b.com",
+          "isActive":true,
+          "syncHealth":{"status":"degraded","lastError":"imap timeout"},
+          "capabilities":{"archiveFolder":false,"idle":true,"move":false,"serverSnippet":false}
+        }]
         """
         let accounts = try makeDecoder().decode([ConnectedAccount].self, from: Data(json.utf8))
         XCTAssertEqual(accounts.count, 1)
         XCTAssertEqual(accounts.first?.id, UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
-        XCTAssertEqual(accounts.first?.provider, .gmail)
+        XCTAssertEqual(accounts.first?.provider, .qq)
         XCTAssertEqual(accounts.first?.email, "a@b.com")
+        XCTAssertEqual(accounts.first?.isActive, true)
+        XCTAssertEqual(accounts.first?.syncHealth.status, .degraded)
+        XCTAssertEqual(accounts.first?.capabilities.idle, true)
+        XCTAssertEqual(accounts.first?.capabilities.archiveFolder, false)
     }
 }

@@ -59,20 +59,26 @@ public enum OAuthRoutes {
                     throw OAuthClientError.missingRefreshToken
                 }
                 let info = try await oauth.fetchUserInfo(accessToken: tokens.accessToken)
+                let expiresAt = Date().addingTimeInterval(TimeInterval(tokens.expiresIn))
                 let account = Account(
                     id: UUID(),
                     provider: .gmail,
                     oauthUser: info.sub,
                     email: info.email,
-                    tokenExpiresAt: Date().addingTimeInterval(TimeInterval(tokens.expiresIn)),
-                    historyId: nil
+                    credentials: nil,
+                    isActive: false
                 )
                 try await AccountStore.upsert(
                     account,
-                    accessToken: try AccessTokenCipher.seal(tokens.accessToken),
-                    refreshToken: try AccessTokenCipher.seal(refreshToken),
+                    credentials: try CredentialVault.seal(.gmail(
+                        accessToken: tokens.accessToken,
+                        refreshToken: refreshToken,
+                        expiresAt: expiresAt
+                    )),
                     db: db
                 )
+                // A freshly connected account becomes the one active account.
+                try await AccountStore.setActive(accountId: account.id, db: db)
                 await poller.tick()
                 return Response(
                     status: .ok,

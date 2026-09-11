@@ -5,17 +5,17 @@ import LagoonKit
 /// and exposes the M2 actions: pin, archive, summarize, draft (3 variants),
 /// override, unsubscribe.
 struct MessageDetailView: View {
-    let gmailId: String
+    let remoteId: String
     let accountId: UUID
     let header: MessageHeader?
     let initiallyPinned: Bool
     /// Optional sibling list for j/k navigation and auto-advance on archive.
     var siblings: [String]? = nil
     /// Called after a successful archive/undo so the list row can disappear/return.
-    var onArchived: ((String, Bool) -> Void)? = nil  // (gmailId, isArchived)
+    var onArchived: ((String, Bool) -> Void)? = nil  // (remoteId, isArchived)
     var onReadStateChange: (String, Bool) -> Void = { _, _ in }
     var onPinnedChanged: (Bool) -> Void = { _ in }
-    /// Called after a successful archive with the next sibling gmailId.
+    /// Called after a successful archive with the next sibling remoteId.
     var onAdvanceTo: ((String) -> Void)? = nil
 
     @State private var messageBody: MessageBody?
@@ -61,7 +61,7 @@ struct MessageDetailView: View {
     }
 
     init(
-        gmailId: String,
+        remoteId: String,
         accountId: UUID,
         header: MessageHeader?,
         initiallyPinned: Bool,
@@ -71,7 +71,7 @@ struct MessageDetailView: View {
         onReadStateChange: @escaping (String, Bool) -> Void = { _, _ in },
         onPinnedChanged: @escaping (Bool) -> Void = { _ in }
     ) {
-        self.gmailId = gmailId
+        self.remoteId = remoteId
         self.accountId = accountId
         self.header = header
         self.initiallyPinned = initiallyPinned
@@ -308,7 +308,7 @@ struct MessageDetailView: View {
         isLoadingBody = true
         bodyError = nil
         do {
-            messageBody = try await api.fetchBody(gmailId: gmailId, accountId: accountId)
+            messageBody = try await api.fetchBody(remoteId: remoteId, accountId: accountId)
         } catch {
             bodyError = error.lagoonUIMessage
         }
@@ -320,10 +320,10 @@ struct MessageDetailView: View {
         didMarkRead = true
         guard !isRead else { return }
         isRead = true
-        onReadStateChange(gmailId, true)
-        do { try await api.markRead(gmailId: gmailId, accountId: accountId) } catch {
+        onReadStateChange(remoteId, true)
+        do { try await api.markRead(remoteId: remoteId, accountId: accountId) } catch {
             isRead = false
-            onReadStateChange(gmailId, false)
+            onReadStateChange(remoteId, false)
             readError = l10n.markReadFailed + error.lagoonUIMessage
         }
     }
@@ -334,7 +334,7 @@ struct MessageDetailView: View {
         onPinnedChanged(target)
         isPinBusy = true
         do {
-            try await api.setPinned(gmailId: gmailId, accountId: accountId, pinned: target)
+            try await api.setPinned(remoteId: remoteId, accountId: accountId, pinned: target)
         } catch {
             isPinned = !target
             onPinnedChanged(!target)
@@ -347,7 +347,7 @@ struct MessageDetailView: View {
         summaryState = .loading
         do {
             let summary = try await api.fetchSummary(
-                gmailId: gmailId, accountId: accountId,
+                remoteId: remoteId, accountId: accountId,
                 language: l10n.language.rawValue
             )
             summaryState = .loaded(summary)
@@ -362,7 +362,7 @@ struct MessageDetailView: View {
         draftState = .loading
         do {
             let draft = try await api.generateDrafts(
-                gmailId: gmailId, accountId: accountId,
+                remoteId: remoteId, accountId: accountId,
                 language: l10n.language.rawValue
             )
             draftState = .loaded(draft)
@@ -376,10 +376,10 @@ struct MessageDetailView: View {
 
     private func archiveAndAdvance() async {
         do {
-            let response = try await api.archiveMessage(gmailId: gmailId, accountId: accountId)
-            onArchived?(gmailId, true)
+            let response = try await api.archiveMessage(remoteId: remoteId, accountId: accountId)
+            onArchived?(remoteId, true)
             // Find the next sibling for auto-advance.
-            if let siblings, let index = siblings.firstIndex(of: gmailId) {
+            if let siblings, let index = siblings.firstIndex(of: remoteId) {
                 let nextIndex = siblings.index(after: index)
                 if nextIndex < siblings.endIndex {
                     onAdvanceTo?(siblings[nextIndex])
@@ -398,7 +398,7 @@ struct MessageDetailView: View {
 
     private func unsubscribe() async {
         do {
-            let response = try await api.unsubscribeMessage(gmailId: gmailId, accountId: accountId)
+            let response = try await api.unsubscribeMessage(remoteId: remoteId, accountId: accountId)
             let msg = response.unsubscribed
                 ? "\(l10n.unsubscribed) · \(response.publisher)"
                 : "\(response.publisher) \(l10n.unsubscribed.lowercased()) — server kept it"
@@ -413,7 +413,7 @@ struct MessageDetailView: View {
         Task {
             do {
                 try await api.overrideClassification(
-                    gmailId: gmailId, accountId: accountId,
+                    remoteId: remoteId, accountId: accountId,
                     to: group
                 )
             } catch { /* non-fatal */ }

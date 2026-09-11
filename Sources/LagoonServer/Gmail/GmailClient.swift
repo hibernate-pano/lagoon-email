@@ -74,11 +74,11 @@ public final class GmailClient: Sendable {
 
     public func getMessage(
         accessToken: String,
-        gmailId: String
+        remoteId: String
     ) async throws -> RawGmailMessage {
         try await fetchMessage(
             accessToken: accessToken,
-            gmailId: gmailId,
+            remoteId: remoteId,
             format: "metadata",
             metadataHeaders: ["From", "Subject", "To", "List-Unsubscribe"]
         )
@@ -87,11 +87,11 @@ public final class GmailClient: Sendable {
     /// `format=full`: returns the MIME tree so the caller can extract the body.
     public func getMessageFull(
         accessToken: String,
-        gmailId: String
+        remoteId: String
     ) async throws -> RawGmailMessage {
         try await fetchMessage(
             accessToken: accessToken,
-            gmailId: gmailId,
+            remoteId: remoteId,
             format: "full",
             metadataHeaders: []
         )
@@ -99,14 +99,14 @@ public final class GmailClient: Sendable {
 
     private func fetchMessage(
         accessToken: String,
-        gmailId: String,
+        remoteId: String,
         format: String,
         metadataHeaders: [String]
     ) async throws -> RawGmailMessage {
-        // gmailId is a server-issued opaque token; percent-encode it so a
+        // remoteId is a server-issued opaque token; percent-encode it so a
         // hostile value cannot alter the path (spec §6.6 rule 2).
         var c = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")!
-        c.path += "/\(Self.percentEncodePath(gmailId))"
+        c.path += "/\(Self.percentEncodePath(remoteId))"
         var items: [URLQueryItem] = [.init(name: "format", value: format)]
         items += metadataHeaders.map { .init(name: "metadataHeaders", value: $0) }
         c.queryItems = items
@@ -123,12 +123,12 @@ public final class GmailClient: Sendable {
     /// scope; returns 403 otherwise. Caller catches and degrades.
     public func modifyMessageLabels(
         accessToken: String,
-        gmailId: String,
+        remoteId: String,
         addLabelIds: [String] = [],
         removeLabelIds: [String] = []
     ) async throws {
         var c = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")!
-        c.path += "/\(Self.percentEncodePath(gmailId))/modify"
+        c.path += "/\(Self.percentEncodePath(remoteId))/modify"
         var req = URLRequest(url: c.url!)
         req.httpMethod = "POST"
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")

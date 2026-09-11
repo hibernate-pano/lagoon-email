@@ -7,17 +7,29 @@ import Foundation
 /// scheme and the server cannot deep-link the new `accountId` back to it.
 /// Instead the client polls this endpoint while the connect screen is visible.
 ///
-/// Contract: HTTP 200, `application/json; charset=utf-8`, a JSON array in any
-/// order (empty array when nothing is connected). No other fields are added
-/// without bumping the client.
+/// M1.5 adds `isActive` / `syncHealth` / `capabilities` so the client can show
+/// sync state and disable unreachable verbs (e.g. archive without a folder).
 public struct ConnectedAccount: Codable, Equatable, Sendable, Identifiable {
     public let id: UUID
-    public let provider: MailProvider
+    public let provider: MailProviderKind
     public let email: String
+    public let isActive: Bool
+    public let syncHealth: SyncHealth
+    public let capabilities: MailCapabilities
 
-    public init(id: UUID, provider: MailProvider, email: String) {
+    public init(
+        id: UUID,
+        provider: MailProviderKind,
+        email: String,
+        isActive: Bool,
+        syncHealth: SyncHealth,
+        capabilities: MailCapabilities
+    ) {
         self.id = id
         self.provider = provider
         self.email = email
+        self.isActive = isActive
+        self.syncHealth = syncHealth
+        self.capabilities = capabilities
     }
 }

@@ -114,15 +114,15 @@ final class AIGatewayTests: XCTestCase {
         return AIGateway(providers: [provider], routing: ["summary": "stub", "classify": "stub"])
     }
 
-    private func message(gmailId: String, from: String = "alice@example.com") -> MessageHeader {
+    private func message(remoteId: String, from: String = "alice@example.com") -> MessageHeader {
         MessageHeader(
             id: UUID(),
             accountId: UUID(),
-            gmailId: gmailId,
-            threadId: "t-\(gmailId)",
+            remoteId: remoteId,
+            threadId: "t-\(remoteId)",
             fromAddress: from,
             fromName: "Alice",
-            subject: "Subject \(gmailId)",
+            subject: "Subject \(remoteId)",
             snippet: "snippet",
             receivedAt: Date().addingTimeInterval(-3600),
             isRead: false,
@@ -178,7 +178,7 @@ final class AIGatewayTests: XCTestCase {
             (200, Data(#"{"choices":[{"message":{"content":"{\"g1\":\"needsReply\"}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.utf8))
         }
         let ai = try gateway()
-        let result = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
+        let result = try await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
         XCTAssertEqual(result["g1"], .needsReply)
 
         let body = bodyData(StubURLProtocol.requests.first)
@@ -196,7 +196,7 @@ final class AIGatewayTests: XCTestCase {
         }
         let ai = try gateway()
         let result = try await ai.classify(
-            [message(gmailId: "g1"), message(gmailId: "g2"), message(gmailId: "g3")],
+            [message(remoteId: "g1"), message(remoteId: "g2"), message(remoteId: "g3")],
             accountEmail: "me@example.com",
             language: nil
         )
@@ -208,7 +208,7 @@ final class AIGatewayTests: XCTestCase {
             (200, Data(#"{"choices":[{"message":{"content":"```json\n{\"g1\":\"safeToArchive\"}\n```"}}]}"#.utf8))
         }
         let ai = try gateway()
-        let result = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
+        let result = try await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
         XCTAssertEqual(result["g1"], .safeToArchive)
     }
 
@@ -218,7 +218,7 @@ final class AIGatewayTests: XCTestCase {
         }
         let ai = try gateway()
         do {
-            _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
+            _ = try await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
             XCTFail("expected badResponse")
         } catch let error as LLMError {
             guard case .badResponse = error else { return XCTFail("unexpected \(error)") }
@@ -233,7 +233,7 @@ final class AIGatewayTests: XCTestCase {
         }
         let ai = try gateway()
         let body = MessageBody(
-            gmailId: "g1",
+            remoteId: "g1",
             subject: "Invoice",
             fromAddress: "billing@example.com",
             fromName: "Billing",
@@ -264,7 +264,7 @@ final class AIGatewayTests: XCTestCase {
             outputLanguage: "zh-Hans"
         )
         let body = MessageBody(
-            gmailId: "g1",
+            remoteId: "g1",
             subject: "Invoice",
             fromAddress: "billing@example.com",
             fromName: "Billing",
@@ -293,7 +293,7 @@ final class AIGatewayTests: XCTestCase {
             (200, Data(#"{"choices":[{"message":{"content":"{\"g1\":\"needsReply\"}"}}]}"#.utf8))
         }
         let ai = try gateway()
-        _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
+        _ = try await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
         let prompt = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
         XCTAssertTrue(prompt.contains("never translated"))
     }
@@ -311,7 +311,7 @@ final class AIGatewayTests: XCTestCase {
         }
         let ai = try gateway()
         let body = MessageBody(
-            gmailId: "g1",
+            remoteId: "g1",
             subject: nil,
             fromAddress: "a@b.com",
             fromName: nil,
@@ -339,7 +339,7 @@ final class AIGatewayTests: XCTestCase {
         }
         let ai = try gateway()
         let body = MessageBody(
-            gmailId: "g1",
+            remoteId: "g1",
             subject: "s",
             fromAddress: "a@b.com",
             fromName: nil,
@@ -362,7 +362,7 @@ final class AIGatewayTests: XCTestCase {
         }
         let ai = try gateway()
         let body = MessageBody(
-            gmailId: "g1",
+            remoteId: "g1",
             subject: nil,
             fromAddress: "a@b.com",
             fromName: nil,
@@ -385,11 +385,11 @@ final class AIGatewayTests: XCTestCase {
         StubURLProtocol.set { _ in (500, Data("{}".utf8)) }
         let ai = try gateway()
         for _ in 0..<5 {
-            _ = try? await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
+            _ = try? await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
         }
         let callsBefore = StubURLProtocol.requests.count
         do {
-            _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
+            _ = try await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
             XCTFail("expected circuitOpen")
         } catch let error as LLMError {
             guard case .circuitOpen = error else { return XCTFail("unexpected \(error)") }
@@ -404,15 +404,15 @@ final class AIGatewayTests: XCTestCase {
             return failNext ? (500, Data("{}".utf8)) : (200, Data(#"{"choices":[{"message":{"content":"{\"g1\":\"needsReply\"}"}}]}"#.utf8))
         }
         let ai = try gateway()
-        _ = try? await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
-        _ = try await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
+        _ = try? await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
+        _ = try await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
         // After a success, four more failures must not open the breaker.
         StubURLProtocol.set { _ in (500, Data("{}".utf8)) }
         for _ in 0..<4 {
-            _ = try? await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
+            _ = try? await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
         }
         let callsBefore = StubURLProtocol.requests.count
-        _ = try? await ai.classify([message(gmailId: "g1")], accountEmail: "me@example.com", language: nil)
+        _ = try? await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
         XCTAssertEqual(StubURLProtocol.requests.count, callsBefore + 1, "four failures must not open the breaker")
     }
 

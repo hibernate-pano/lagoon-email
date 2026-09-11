@@ -10,21 +10,21 @@ final class MessageStoreTests: XCTestCase {
             provider: .gmail,
             oauthUser: oauthUser,
             email: "m@example.com",
-            tokenExpiresAt: Date(),
-            historyId: nil
+            credentials: nil,
+            syncState: MailSyncState()
         )
     }
 
     private func makeMessage(
         account: Account,
-        gmailId: String,
+        remoteId: String,
         isRead: Bool = false,
         isArchived: Bool = false
     ) -> MessageHeader {
         MessageHeader(
             id: UUID(),
             accountId: account.id,
-            gmailId: gmailId,
+            remoteId: remoteId,
             threadId: "t1",
             fromAddress: "alice@example.com",
             fromName: "Alice",
@@ -50,16 +50,15 @@ final class MessageStoreTests: XCTestCase {
             let account = makeAccount(oauthUser: oauthUser)
             try await AccountStore.upsert(
                 account,
-                accessToken: Data([1]),
-                refreshToken: Data([1]),
+                credentials: Data([1]),
                 db: conn
             )
-            let msg = makeMessage(account: account, gmailId: "g-\(UUID().uuidString)")
+            let msg = makeMessage(account: account, remoteId: "g-\(UUID().uuidString)")
             try await MessageStore.upsert(msg, db: conn)
 
             let recent = try await MessageStore.recent(forAccount: account.id, limit: 10, db: conn)
             XCTAssertEqual(recent.count, 1)
-            XCTAssertEqual(recent.first?.gmailId, msg.gmailId)
+            XCTAssertEqual(recent.first?.remoteId, msg.remoteId)
             XCTAssertEqual(recent.first?.isRead, false)
         }
     }
@@ -70,21 +69,20 @@ final class MessageStoreTests: XCTestCase {
             let account = makeAccount(oauthUser: oauthUser)
             try await AccountStore.upsert(
                 account,
-                accessToken: Data([1]),
-                refreshToken: Data([1]),
+                credentials: Data([1]),
                 db: conn
             )
-            let gmailId = "g-\(UUID().uuidString)"
+            let remoteId = "g-\(UUID().uuidString)"
             try await MessageStore.upsert(
-                makeMessage(account: account, gmailId: gmailId, isRead: false),
+                makeMessage(account: account, remoteId: remoteId, isRead: false),
                 db: conn
             )
-            try await MessageStore.markRead(gmailId: gmailId, accountId: account.id, db: conn)
+            try await MessageStore.markRead(remoteId: remoteId, accountId: account.id, db: conn)
 
             // Regression: the poller used to re-upsert and clobber is_read back
             // to false. The conflict update must not touch read state.
             try await MessageStore.upsert(
-                makeMessage(account: account, gmailId: gmailId, isRead: false),
+                makeMessage(account: account, remoteId: remoteId, isRead: false),
                 db: conn
             )
 
@@ -102,24 +100,23 @@ final class MessageStoreTests: XCTestCase {
             let account = makeAccount(oauthUser: oauthUser)
             try await AccountStore.upsert(
                 account,
-                accessToken: Data([1]),
-                refreshToken: Data([1]),
+                credentials: Data([1]),
                 db: conn
             )
 
             // Counted: unread + not archived.
             try await MessageStore.upsert(
-                makeMessage(account: account, gmailId: "unread-\(UUID().uuidString)", isRead: false, isArchived: false),
+                makeMessage(account: account, remoteId: "unread-\(UUID().uuidString)", isRead: false, isArchived: false),
                 db: conn
             )
             // Not counted: read.
             try await MessageStore.upsert(
-                makeMessage(account: account, gmailId: "read-\(UUID().uuidString)", isRead: true, isArchived: false),
+                makeMessage(account: account, remoteId: "read-\(UUID().uuidString)", isRead: true, isArchived: false),
                 db: conn
             )
             // Not counted: archived (even though unread).
             try await MessageStore.upsert(
-                makeMessage(account: account, gmailId: "archived-\(UUID().uuidString)", isRead: false, isArchived: true),
+                makeMessage(account: account, remoteId: "archived-\(UUID().uuidString)", isRead: false, isArchived: true),
                 db: conn
             )
 

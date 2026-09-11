@@ -1,7 +1,5 @@
 import Foundation
 import Crypto
-import PostgresNIO
-import LagoonKit
 
 public enum TokenCipherError: Error {
     case missingKey
@@ -9,26 +7,14 @@ public enum TokenCipherError: Error {
     case notUTF8
 }
 
-/// Server-side AES-256-GCM for OAuth token blobs.
+/// Server-side AES-256-GCM for secret blobs (OAuth tokens, IMAP auth codes).
 ///
 /// The key is `LAGOON_TOKEN_KEY`: base64 of exactly 32 random bytes.
 /// Stored blobs are `AES.GCM.SealedBox.combined` (nonce || ciphertext || tag).
 /// This is intentionally fail-closed: a missing or malformed key throws and we
-/// never read or write a plaintext token. (A client-keychain key is impossible
-/// here — the server must decrypt the token to call Gmail on the user's behalf.)
+/// never read or write a plaintext secret. (A client-keychain key is impossible
+/// here — the server must decrypt the secret to act on the user's behalf.)
 public enum AccessTokenCipher {
-    public struct StoredCredentials: Sendable {
-        public let accessToken: String
-        public let refreshToken: String
-        public let expiresAt: Date
-
-        public init(accessToken: String, refreshToken: String, expiresAt: Date) {
-            self.accessToken = accessToken
-            self.refreshToken = refreshToken
-            self.expiresAt = expiresAt
-        }
-    }
-
     /// Encrypt `plaintext` into `AES.GCM.SealedBox.combined`.
     public static func seal(_ plaintext: String) throws -> Data {
         let key = try loadKey()
@@ -46,25 +32,6 @@ public enum AccessTokenCipher {
             throw TokenCipherError.notUTF8
         }
         return text
-    }
-
-    /// Read and decrypt both token blobs for an account.
-    public static func read(
-        accountId: UUID,
-        db: PostgresConnection
-    ) async throws -> StoredCredentials {
-        let sql = "SELECT access_token, refresh_token, token_expires_at FROM accounts WHERE id = $1"
-        let result = try await db.query(sql, [PostgresData(uuid: accountId)]).get()
-        guard let row = result.rows.first else { throw AccountStoreError.notFound }
-        let r = row.makeRandomAccess()
-        let accessBlob: Data = try r["access_token"].decode(Data.self)
-        let refreshBlob: Data = try r["refresh_token"].decode(Data.self)
-        let expiresAt: Date = try r["token_expires_at"].decode(Date.self)
-        return StoredCredentials(
-            accessToken: try open(accessBlob),
-            refreshToken: try open(refreshBlob),
-            expiresAt: expiresAt
-        )
     }
 
     /// Validate `LAGOON_TOKEN_KEY` without touching any data. Called at startup.

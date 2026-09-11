@@ -14,9 +14,17 @@ final class AccountStoreTests: XCTestCase {
             provider: .gmail,
             oauthUser: oauthUser,
             email: email,
-            tokenExpiresAt: Date(),
-            historyId: historyId
+            credentials: nil,
+            syncState: MailSyncState(historyId: historyId)
         )
+    }
+
+    private func sealedCredentials() throws -> Data {
+        try CredentialVault.seal(.gmail(
+            accessToken: "access-\(UUID().uuidString)",
+            refreshToken: "refresh-\(UUID().uuidString)",
+            expiresAt: Date().addingTimeInterval(3600)
+        ))
     }
 
     /// Deletes only the account row this test created (by `oauth_user`).
@@ -33,8 +41,7 @@ final class AccountStoreTests: XCTestCase {
             let a = makeAccount(oauthUser: oauthUser)
             try await AccountStore.upsert(
                 a,
-                accessToken: Data([1, 2, 3]),
-                refreshToken: Data([4, 5, 6]),
+                credentials: Data([1, 2, 3]),
                 db: conn
             )
             let back = try await AccountStore.find(
@@ -44,78 +51,95 @@ final class AccountStoreTests: XCTestCase {
             )
             XCTAssertEqual(back?.id, a.id)
             XCTAssertEqual(back?.email, a.email)
+            XCTAssertEqual(back?.provider, .gmail)
+            XCTAssertEqual(back?.credentials, Data([1, 2, 3]))
         }
     }
 
-    func test_updateTokens_readsBackThroughCipher() async throws {
+    func test_updateCredentials_readsBackThroughVault() async throws {
         let oauthUser = "acct-\(UUID().uuidString)"
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
             try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
                 let a = makeAccount(oauthUser: oauthUser)
                 try await AccountStore.upsert(
                     a,
-                    accessToken: Data([9]),
-                    refreshToken: Data([9]),
+                    credentials: try sealedCredentials(),
                     db: conn
                 )
 
                 let newAccess = "access-\(UUID().uuidString)"
                 let newRefresh = "refresh-\(UUID().uuidString)"
                 let expiry = Date().addingTimeInterval(3600)
-                try await AccountStore.updateTokens(
+                try await AccountStore.updateCredentials(
                     accountId: a.id,
-                    accessTokenCiphertext: try AccessTokenCipher.seal(newAccess),
-                    refreshTokenCiphertext: try AccessTokenCipher.seal(newRefresh),
-                    expiresAt: expiry,
+                    credentials: try CredentialVault.seal(.gmail(
+                        accessToken: newAccess,
+                        refreshToken: newRefresh,
+                        expiresAt: expiry
+                    )),
                     db: conn
                 )
 
-                let stored = try await AccessTokenCipher.read(accountId: a.id, db: conn)
-                XCTAssertEqual(stored.accessToken, newAccess)
-                XCTAssertEqual(stored.refreshToken, newRefresh)
+                let stored = try await CredentialVault.read(accountId: a.id, db: conn)
+                guard case .gmail(let access, let refresh, let expires) = stored else {
+                    return XCTFail("expected gmail credentials after updateCredentials")
+                }
+                XCTAssertEqual(access, newAccess)
+                XCTAssertEqual(refresh, newRefresh)
+                // The sealed blob is ISO-8601 JSON, so the expiry round-trips at
+                // second granularity (the 60s refresh margin absorbs the slack).
                 XCTAssertEqual(
-                    stored.expiresAt.timeIntervalSince1970,
+                    expires.timeIntervalSince1970,
                     expiry.timeIntervalSince1970,
-                    accuracy: 0.001
+                    accuracy: 1.0
                 )
             }
         }
     }
 
-    func test_upsert_nilHistoryId_preservesExisting_andNonNilOverwrites() async throws {
+    /// Re-connecting an existing (provider, oauth_user) refreshes email and
+    /// credentials but must never clobber the sync cursor or the active flag.
+    func test_upsert_existingAccount_keepsCursorAndActiveFlag() async throws {
         let oauthUser = "acct-\(UUID().uuidString)"
         try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
             let first = makeAccount(oauthUser: oauthUser, email: "first@example.com", historyId: "h1")
-            try await AccountStore.upsert(
-                first,
-                accessToken: Data([1]),
-                refreshToken: Data([1]),
-                db: conn
-            )
+            try await AccountStore.upsert(first, credentials: Data([1]), db: conn)
+            try await AccountStore.setActive(accountId: first.id, db: conn)
 
-            // Re-upsert with historyId nil: must NOT clobber the stored cursor.
             let second = makeAccount(oauthUser: oauthUser, email: "second@example.com", historyId: nil)
-            try await AccountStore.upsert(
-                second,
-                accessToken: Data([2]),
-                refreshToken: Data([2]),
-                db: conn
-            )
-            var found = try await AccountStore.find(byOAuthUser: oauthUser, provider: .gmail, db: conn)
-            XCTAssertEqual(found?.historyId, "h1")
-            XCTAssertEqual(found?.email, "second@example.com")
+            try await AccountStore.upsert(second, credentials: Data([2]), db: conn)
 
-            // A non-nil historyId overwrites.
-            let third = makeAccount(oauthUser: oauthUser, email: "third@example.com", historyId: "h2")
-            try await AccountStore.upsert(
-                third,
-                accessToken: Data([3]),
-                refreshToken: Data([3]),
-                db: conn
-            )
-            found = try await AccountStore.find(byOAuthUser: oauthUser, provider: .gmail, db: conn)
-            XCTAssertEqual(found?.historyId, "h2")
-            XCTAssertEqual(found?.email, "third@example.com")
+            let found = try await AccountStore.find(byOAuthUser: oauthUser, provider: .gmail, db: conn)
+            XCTAssertEqual(found?.id, first.id, "same (provider, oauth_user) must reuse the row")
+            XCTAssertEqual(found?.email, "second@example.com")
+            XCTAssertEqual(found?.credentials, Data([2]))
+            XCTAssertEqual(found?.syncState.historyId, "h1", "re-connect must not reset the cursor")
+            XCTAssertEqual(found?.isActive, true, "re-connect must not deactivate the account")
+        }
+    }
+
+    func test_setActive_activatesExactlyOne() async throws {
+        let oauthA = "acct-\(UUID().uuidString)"
+        let oauthB = "acct-\(UUID().uuidString)"
+        try await TestDatabase.withConnection(cleanup: { conn in
+            try? await TestDatabase.deleteAccount(oauthUser: oauthA, provider: .gmail, db: conn)
+            try? await TestDatabase.deleteAccount(oauthUser: oauthB, provider: .gmail, db: conn)
+        }) { conn in
+            let a = makeAccount(oauthUser: oauthA, email: "a-\(UUID().uuidString)@example.com")
+            let b = makeAccount(oauthUser: oauthB, email: "b-\(UUID().uuidString)@example.com")
+            try await AccountStore.upsert(a, credentials: Data([1]), db: conn)
+            try await AccountStore.upsert(b, credentials: Data([1]), db: conn)
+
+            try await AccountStore.setActive(accountId: a.id, db: conn)
+            var active = try await AccountStore.active(db: conn)
+            XCTAssertEqual(active?.id, a.id)
+
+            try await AccountStore.setActive(accountId: b.id, db: conn)
+            active = try await AccountStore.active(db: conn)
+            XCTAssertEqual(active?.id, b.id)
+
+            let all = try await AccountStore.all(db: conn)
+            XCTAssertEqual(all.filter(\.isActive).count, 1, "setting B active must deactivate A")
         }
     }
 
@@ -128,8 +152,8 @@ final class AccountStoreTests: XCTestCase {
         }) { conn in
             let a = makeAccount(oauthUser: oauthA, email: "a-\(UUID().uuidString)@example.com")
             let b = makeAccount(oauthUser: oauthB, email: "b-\(UUID().uuidString)@example.com")
-            try await AccountStore.upsert(a, accessToken: Data([1]), refreshToken: Data([1]), db: conn)
-            try await AccountStore.upsert(b, accessToken: Data([1]), refreshToken: Data([1]), db: conn)
+            try await AccountStore.upsert(a, credentials: Data([1]), db: conn)
+            try await AccountStore.upsert(b, credentials: Data([1]), db: conn)
 
             let all = try await AccountStore.all(db: conn)
             let ids = Set(all.map(\.id))

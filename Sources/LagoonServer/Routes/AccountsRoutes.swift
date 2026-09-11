@@ -11,7 +11,14 @@ public enum AccountsRoutes {
         router.get("api/accounts") { _, _ -> Response in
             let accounts = try await AccountStore.all(db: db)
             let connected = accounts.map {
-                ConnectedAccount(id: $0.id, provider: $0.provider, email: $0.email)
+                ConnectedAccount(
+                    id: $0.id,
+                    provider: $0.provider,
+                    email: $0.email,
+                    isActive: $0.isActive,
+                    syncHealth: $0.syncHealth,
+                    capabilities: $0.capabilities
+                )
             }
             let data = try JSONEncoder().encode(connected)
             return Response(
