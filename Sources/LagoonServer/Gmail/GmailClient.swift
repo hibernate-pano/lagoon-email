@@ -80,7 +80,13 @@ public final class GmailClient: Sendable {
             accessToken: accessToken,
             remoteId: remoteId,
             format: "metadata",
-            metadataHeaders: ["From", "Subject", "To", "List-Unsubscribe"]
+            metadataHeaders: [
+                "From", "Subject", "To", "List-Unsubscribe",
+                // Threading/reply-chain headers: the store keeps them so a
+                // reply can set In-Reply-To/References (IMAP has no threads API
+                // either, so both providers share this contract).
+                "Message-ID", "In-Reply-To", "References",
+            ]
         )
     }
 
@@ -173,10 +179,11 @@ public final class GmailClient: Sendable {
     }
 
     /// `users.messages.send` — actually send a message. Requires `gmail.send`
-    /// scope. M0.1 doesn't use this; kept for the post-approval build.
+    /// scope. `threadId` is optional: a reply threads through the References
+    /// chain in `rawRFC822` alone.
     public func sendMessage(
         accessToken: String,
-        threadId: String,
+        threadId: String?,
         rawRFC822: String
     ) async throws -> String {
         var c = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages/send")!
@@ -185,10 +192,10 @@ public final class GmailClient: Sendable {
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         try OutboundGuard.validate(req.url!)
-        let payload: [String: Any] = [
-            "threadId": threadId,
+        var payload: [String: Any] = [
             "raw": rawRFC822.data(using: .utf8)!.base64EncodedString(),
         ]
+        if let threadId { payload["threadId"] = threadId }
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
         let (data, resp) = try await session.outboundData(for: req)
         try Self.assertOK(resp, data)

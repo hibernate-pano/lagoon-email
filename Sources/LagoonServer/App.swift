@@ -49,11 +49,25 @@ struct LagoonServerMain {
             clientSecret: cfg.googleClientSecret,
             redirectURI: cfg.googleRedirectURI
         )
-        // One shared token service so the poller and the message routes share
-        // the single-flight refresh registry.
+        // One shared token service so the sync engine and the message routes
+        // share the single-flight refresh registry.
         let gmailClient = GmailClient()
         let tokens = GmailTokenService(db: db, oauth: google, logger: logger)
-        let poller = GmailPoller(db: db, client: gmailClient, tokens: tokens, logger: logger)
+        // The sync engine is the only writer of message rows for the active
+        // account: it asks the account's `MailProvider` for changes and applies
+        // them (spec §3.2/§3.4). Providers are built lazily and cached, so an
+        // IMAP connection survives between ticks.
+        let syncEngine = SyncEngine(db: db, logger: logger) { account in
+            MailProviderFactory.make(
+                account: account,
+                client: gmailClient,
+                tokens: tokens,
+                db: db,
+                logger: logger
+            )
+        }
+        // Repair a zero-or-many active-account state before the loop starts.
+        try await AccountStore.reconcileActive(db: db)
 
         // Spec §6.5: the AI Gateway is the only module that talks to LLM
         // providers. `nil` when no provider is configured (missing key/base
@@ -76,7 +90,9 @@ struct LagoonServerMain {
         // Reject requests whose Host is not loopback (Networking/HostGuard.swift).
         router.add(middleware: LoopbackHostMiddleware())
         HealthRoutes.register(on: router)
-        OAuthRoutes.register(on: router, db: db, oauth: google, poller: poller, logger: logger)
+        OAuthRoutes.register(
+            on: router, db: db, oauth: google, sync: syncEngine, logger: logger
+        )
         AccountsRoutes.register(on: router, db: db)
         SyncRoutes.register(on: router, db: db)
         MessageRoutes.register(
@@ -104,13 +120,10 @@ struct LagoonServerMain {
             logger: logger
         )
 
-        // M0 periodic sync; M1 replaces with Pub/Sub push fanout.
-        Task.detached {
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(30))
-                await poller.tick()
-            }
-        }
+        // M0 periodic sync; M1 replaces with Pub/Sub push fanout. The loop
+        // blocks inside `pullChanges` (IDLE for IMAP, 30s polls for Gmail), so
+        // one tick per 5 minutes is the idle floor, not a busy loop.
+        Task { await syncEngine.start() }
 
         logger.info("starting", metadata: ["host": .string(cfg.host), "port": .string("\(cfg.port)")])
         try await app.runService()

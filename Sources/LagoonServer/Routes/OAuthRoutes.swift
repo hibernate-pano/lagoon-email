@@ -9,7 +9,7 @@ public enum OAuthRoutes {
         on router: Router<BasicRequestContext>,
         db: PostgresConnection,
         oauth: GoogleOAuthClient,
-        poller: GmailPoller,
+        sync: SyncEngine,
         logger: Logger
     ) {
         router.get("oauth/gmail/start") { _, _ -> Response in
@@ -79,7 +79,10 @@ public enum OAuthRoutes {
                 )
                 // A freshly connected account becomes the one active account.
                 try await AccountStore.setActive(accountId: account.id, db: db)
-                await poller.tick()
+                // Pull once so the (polling) browser handshake finds mail
+                // already there. The tiny budget keeps this request from
+                // inheriting the sync loop's 5-minute idle wait.
+                await sync.tickOnce(waitBudget: .milliseconds(1))
                 return Response(
                     status: .ok,
                     body: .init(byteBuffer: ByteBuffer(
