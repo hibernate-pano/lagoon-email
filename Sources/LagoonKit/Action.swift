@@ -28,6 +28,7 @@ public enum AIActionKind: String, Codable, Sendable, CaseIterable {
     case unsubscribe
     case classifyOverride = "classify_override"
     case draftCreate = "draft_create"
+    case send
 }
 
 /// AI-generated reply drafts. `variants` is three (or however many) tones;

@@ -218,6 +218,23 @@ public final class APIClient: Sendable {
         try Self.validate(resp, data: data)
     }
 
+    /// POST /api/messages/{remoteId}/send {body} → SendResponse.
+    ///
+    /// Recipient, subject and threading headers are taken from the stored
+    /// message on the server; only the body travels from here.
+    public func sendReply(remoteId: String, accountId: UUID, body: String) async throws -> SendResponse {
+        let url = try makeURL(path: ["api", "messages", remoteId, "send"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["body": body])
+        let (data, resp) = try await session.data(for: request)
+        try Self.validate(resp, data: data)
+        return try Self.decode(SendResponse.self, from: data)
+    }
+
     /// POST /api/messages/{remoteId}/draft → DraftReply.
     public func generateDrafts(remoteId: String, accountId: UUID, language: String? = nil) async throws -> DraftReply {
         let url = try makeURL(path: ["api", "messages", remoteId, "draft"], query: [

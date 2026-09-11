@@ -274,6 +274,22 @@ public struct L10n: Sendable, Equatable {
     public var shortcutSearch: String { pick("⌘F = 搜索", "⌘F = search") }
     public var shortcutHelp: String { pick("? = 快捷键", "? = shortcuts") }
 
+    // MARK: - Reply composer
+
+    public var reply: String { pick("回复", "Reply") }
+    public var replyHelp: String { pick("回复这封邮件", "Reply to this message") }
+    public var replyTitle: String { pick("回复邮件", "Reply") }
+    public var replyTo: String { pick("收件人", "To") }
+    public var replyBodyPlaceholder: String { pick("写回复…", "Write your reply…") }
+    public var send: String { pick("发送", "Send") }
+    public var sending: String { pick("发送中…", "Sending…") }
+    public var sendFailed: String { pick("发送失败：", "Send failed: ") }
+    public var sent: String { pick("已发送", "Sent") }
+    public func sentTo(_ address: String) -> String { pick("已发送给 \(address)", "Sent to \(address)") }
+    public var emptyReply: String { pick("回复内容不能为空。", "The reply cannot be empty.") }
+    public var cancel: String { pick("取消", "Cancel") }
+    public var shortcutSend: String { pick("⌘↩ = 发送", "⌘↩ = send") }
+
     // MARK: - Infrastructure errors
 
     public var readSavedAccountFailed: String {

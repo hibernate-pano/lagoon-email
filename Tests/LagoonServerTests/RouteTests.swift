@@ -255,7 +255,11 @@ final class RouteTests: XCTestCase {
         remoteId: String,
         from: String,
         isRead: Bool = false,
-        daysAgo: Double = 0
+        daysAgo: Double = 0,
+        subject: String? = nil,
+        messageIdHeader: String? = nil,
+        inReplyTo: String? = nil,
+        references: String? = nil
     ) -> MessageHeader {
         MessageHeader(
             id: UUID(),
@@ -264,11 +268,14 @@ final class RouteTests: XCTestCase {
             threadId: "thread-\(remoteId)",
             fromAddress: from,
             fromName: nil,
-            subject: "subject \(remoteId)",
+            subject: subject ?? "subject \(remoteId)",
             snippet: nil,
             receivedAt: Date().addingTimeInterval(-daysAgo * 24 * 60 * 60),
             isRead: isRead,
-            isArchived: false
+            isArchived: false,
+            messageIdHeader: messageIdHeader,
+            inReplyTo: inReplyTo,
+            references: references
         )
     }
 
@@ -881,6 +888,9 @@ final class RouteTests: XCTestCase {
         private(set) var probeCalls = 0
         private(set) var archivedRemoteIds: [String] = []
         private(set) var readCalls: [String] = []
+        private(set) var sentOutbounds: [OutboundMessage] = []
+        private var sendResult: String? = "stub-provider-message-id"
+        private var sendError: MailError?
 
         init(
             kind: MailProviderKind = .qq,
@@ -920,12 +930,19 @@ final class RouteTests: XCTestCase {
 
         func unarchive(remoteId: String) async throws {}
 
-        func send(_ outbound: OutboundMessage) async throws -> String? { nil }
+        func send(_ outbound: OutboundMessage) async throws -> String? {
+            sentOutbounds.append(outbound)
+            if let sendError { throw sendError }
+            return sendResult
+        }
 
         func probe() async throws {
             probeCalls += 1
             if let probeError { throw probeError }
         }
+
+        func setSendResult(_ id: String?) { sendResult = id }
+        func setSendError(_ error: MailError?) { sendError = error }
     }
 
     private func makeAccountsRouter(
@@ -1304,6 +1321,288 @@ final class RouteTests: XCTestCase {
             }
             let archived = await provider.archivedRemoteIds
             XCTAssertTrue(archived.isEmpty, "a disabled capability must not reach the provider")
+        }
+    }
+
+    // MARK: - T11: POST /api/messages/{remoteId}/send
+
+    /// Registers message + action routes on one router with the same stub
+    /// provider, so a send and its audit row can be exercised end to end.
+    private func makeSendRouter(
+        db: PostgresConnection,
+        provider: any MailProvider
+    ) -> Router<BasicRequestContext> {
+        let router = makeMessageRouter(db: db, makeProvider: { _ in provider })
+        let (client, tokens) = makeGmailCollaborators(db: db)
+        ActionsRoutes.register(
+            on: router, db: db, client: client, tokens: tokens,
+            logger: Self.testLogger, makeProvider: { _ in provider }
+        )
+        return router
+    }
+
+    private func sendBody(_ json: String) -> ByteBuffer {
+        ByteBuffer(data: Data(json.utf8))
+    }
+
+    func test_postSend_usesStoredThreadingHeadersAndRecordsAuditRow() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id,
+                remoteId: "send-\(UUID())",
+                from: "alice@example.com",
+                subject: "Q3 预算",
+                messageIdHeader: "<orig@example.com>",
+                references: "<root@example.com> <parent@example.com>"
+            )
+            try await MessageStore.upsert(message, db: conn)
+
+            let provider = StubMailProvider()
+            await provider.setSendResult("<smtp-1@qq.com>")
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/send?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: sendBody(#"{"body":"好的，我周五前给答复。"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        SendResponse.self, from: response.body
+                    )
+                    XCTAssertTrue(decoded.ok)
+                    XCTAssertEqual(decoded.providerMessageId, "<smtp-1@qq.com>")
+                }
+            }
+
+            let sent = await provider.sentOutbounds
+            XCTAssertEqual(sent.count, 1, "the provider must be asked exactly once")
+            let outbound = try XCTUnwrap(sent.first)
+            XCTAssertEqual(outbound.fromEmail, account.email)
+            XCTAssertEqual(outbound.to, "alice@example.com")
+            XCTAssertEqual(outbound.subject, "Q3 预算")
+            XCTAssertEqual(outbound.body, "好的，我周五前给答复。")
+            XCTAssertEqual(outbound.inReplyTo, "<orig@example.com>")
+            XCTAssertEqual(
+                outbound.references,
+                "<root@example.com> <parent@example.com> <orig@example.com>",
+                "References must extend the parent chain with the parent's own id"
+            )
+
+            let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
+            let auditRow = try XCTUnwrap(actions.first { $0.kind == .send })
+            XCTAssertEqual(auditRow.payload["remoteId"], message.remoteId)
+            XCTAssertEqual(auditRow.payload["to"], "alice@example.com")
+
+            // Sending is final: the audit row exists, but undo must refuse it.
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(auditRow.id)/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "not-undoable")
+                }
+            }
+        }
+    }
+
+    func test_postSend_withoutReferencesUsesOnlyTheParentMessageId() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id,
+                remoteId: "send-\(UUID())",
+                from: "alice@example.com",
+                messageIdHeader: "<only@example.com>"
+            )
+            try await MessageStore.upsert(message, db: conn)
+
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/send?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: sendBody(#"{"body":"ok"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+
+            let sent = await provider.sentOutbounds
+            let outbound = try XCTUnwrap(sent.first)
+            XCTAssertEqual(outbound.inReplyTo, "<only@example.com>")
+            XCTAssertEqual(outbound.references, "<only@example.com>")
+        }
+    }
+
+    func test_postSend_malformedBody_returns400() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id,
+                remoteId: "send-\(UUID())",
+                from: "alice@example.com",
+                messageIdHeader: "<orig@example.com>"
+            )
+            try await MessageStore.upsert(message, db: conn)
+
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+            for body in [#"{}"#, #"{"body":""}"#, #"{"body":"   "}"#, "{not json"] {
+                try await app.test(.router) { client in
+                    try await client.execute(
+                        uri: "/api/messages/\(message.remoteId)/send?accountId=\(account.id.uuidString)",
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: sendBody(body)
+                    ) { response in
+                        XCTAssertEqual(response.status, .badRequest, "body: \(body)")
+                        XCTAssertEqual(try Self.errorCode(from: response.body), "malformed-body")
+                    }
+                }
+            }
+            let sent = await provider.sentOutbounds
+            XCTAssertTrue(sent.isEmpty, "a malformed request must not reach the provider")
+        }
+    }
+
+    func test_postSend_unknownMessage_returns404() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/ghost/send?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: sendBody(#"{"body":"hello"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "unknown-message")
+                }
+            }
+            let sent = await provider.sentOutbounds
+            XCTAssertTrue(sent.isEmpty)
+        }
+    }
+
+    func test_postSend_providerNotConfigured_returns503() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id,
+                remoteId: "send-\(UUID())",
+                from: "alice@example.com",
+                messageIdHeader: "<orig@example.com>"
+            )
+            try await MessageStore.upsert(message, db: conn)
+            let app = Application(router: makeMessageRouter(db: conn, makeProvider: { _ in nil }))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/send?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: sendBody(#"{"body":"hello"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "provider-not-configured")
+                }
+            }
+        }
+    }
+
+    func test_postSend_providerAuthFailed_returns401AndWritesNoAuditRow() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id,
+                remoteId: "send-\(UUID())",
+                from: "alice@example.com",
+                messageIdHeader: "<orig@example.com>"
+            )
+            try await MessageStore.upsert(message, db: conn)
+
+            let provider = StubMailProvider()
+            await provider.setSendError(.authFailed)
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/send?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: sendBody(#"{"body":"hello"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "smtp-auth-failed")
+                }
+            }
+            let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
+            XCTAssertNil(actions.first { $0.kind == .send }, "a failed send is not audited")
+        }
+    }
+
+    func test_postSend_providerUnreachable_returns502AndWritesNoAuditRow() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id,
+                remoteId: "send-\(UUID())",
+                from: "alice@example.com",
+                messageIdHeader: "<orig@example.com>"
+            )
+            try await MessageStore.upsert(message, db: conn)
+
+            let provider = StubMailProvider()
+            await provider.setSendError(.unreachable("smtp-421"))
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/send?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: sendBody(#"{"body":"hello"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .badGateway)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "smtp-send-failed")
+                }
+            }
+            let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
+            XCTAssertNil(actions.first { $0.kind == .send })
         }
     }
 }

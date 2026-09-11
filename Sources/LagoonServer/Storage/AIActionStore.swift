@@ -113,9 +113,11 @@ public enum AIActionStore {
         )
     }
 
-    private static func encode(_ payload: [String: String]) throws -> String {
-        let data = try JSONSerialization.data(withJSONObject: payload)
-        return String(data: data, encoding: .utf8) ?? "{}"
+    /// Returns bytes, not a String: `PostgresData(jsonb:)` has an `Encodable`
+    /// overload that would JSON-encode a String a second time, storing the
+    /// payload as a JSON string instead of an object.
+    private static func encode(_ payload: [String: String]) throws -> Data {
+        try JSONSerialization.data(withJSONObject: payload)
     }
 
     private static func decodePayload(_ json: String) throws -> [String: String] {

@@ -453,4 +453,54 @@ final class APIClientTests: XCTestCase {
             XCTFail("unexpected error: \(error)")
         }
     }
+
+    // MARK: - Reply send (T11)
+
+    func test_sendReply_postsBodyAndDecodesProviderMessageId() async throws {
+        let accountId = UUID()
+        let remoteId = "1234"
+        stub(status: 200, body: Data(#"{"ok":true,"providerMessageId":"<smtp-1@qq.com>"}"#.utf8))
+
+        let response = try await makeClient().sendReply(
+            remoteId: remoteId, accountId: accountId, body: "好的，我周五前给答复。"
+        )
+
+        XCTAssertTrue(response.ok)
+        XCTAssertEqual(response.providerMessageId, "<smtp-1@qq.com>")
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/api/messages/1234/send")
+        XCTAssertEqual(queryValue("accountId", in: request), accountId.uuidString)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+        let sent = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: bodyData(of: request)) as? [String: String]
+        )
+        XCTAssertEqual(sent, ["body": "好的，我周五前给答复。"])
+    }
+
+    func test_sendReply_acceptsNullProviderMessageId() async throws {
+        stub(status: 200, body: Data(#"{"ok":true,"providerMessageId":null}"#.utf8))
+
+        let response = try await makeClient().sendReply(
+            remoteId: "42", accountId: UUID(), body: "hi"
+        )
+
+        XCTAssertTrue(response.ok)
+        XCTAssertNil(response.providerMessageId)
+    }
+
+    func test_sendReply_401_surfacesSmtpAuthFailureAsBadStatus() async throws {
+        stub(status: 401, body: Data("{\"error\":\"smtp-auth-failed\"}".utf8))
+
+        do {
+            _ = try await makeClient().sendReply(remoteId: "42", accountId: UUID(), body: "hi")
+            XCTFail("expected APIError.badStatus(401)")
+        } catch APIError.badStatus(let code, let snippet) {
+            XCTAssertEqual(code, 401)
+            XCTAssertTrue(snippet.contains("smtp-auth-failed"), "snippet: \(snippet)")
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
 }

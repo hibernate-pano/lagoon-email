@@ -274,11 +274,22 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         }
     }
 
+    /// SMTP lives beside IMAP, not inside it: a fresh TLS session per send, to
+    /// the preset host only. The auth code is the same one IMAP uses, read
+    /// straight from the sealed blob and never held past the session.
     public func send(_ outbound: OutboundMessage) async throws -> String? {
-        // SMTP lands in Task 10/11; until then an IMAP account cannot send and
-        // says so instead of pretending.
-        _ = outbound
-        throw MailError.notConfigured("smtp-not-wired")
+        guard let preset = ProviderPresets.imap(for: account.provider) else {
+            throw MailError.notConfigured("no smtp preset")
+        }
+        let credentials = try await imapCredentials()
+        let smtp = SMTPClient(transport: transportFactory(), logger: logger)
+        return try await smtp.send(
+            outbound,
+            host: preset.smtpHost,
+            port: preset.smtpPort,
+            username: credentials.username,
+            authCode: credentials.authCode
+        )
     }
 
     public func probe() async throws {

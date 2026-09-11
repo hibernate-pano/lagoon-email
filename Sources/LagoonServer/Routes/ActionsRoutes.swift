@@ -9,6 +9,11 @@ struct OkResponse: Encodable { let ok: Bool }
 struct UnsubscribeResponse: Encodable { let ok: Bool; let unsubscribed: Bool; let publisher: String }
 struct UndoResponse: Encodable { let ok: Bool; let undone: Int64 }
 
+/// Some actions have no inverse — a sent reply is gone, an unsubscribe already
+/// told the publisher. The route answers 400 `not-undoable` for these instead
+/// of a 500 that reads like a server fault.
+struct NotUndoable: Error { let kind: AIActionKind }
+
 /// Every "Lagoon did something" mutation flows through here. The undo panel
 /// reads from the same table (GET /api/actions).
 public enum ActionsRoutes {
@@ -329,6 +334,12 @@ public enum ActionsRoutes {
                 payload: ["undoOf": "\(actionId)"],
                 db: db
             )
+        } catch let error as NotUndoable {
+            logger.info("actions.notUndoable", metadata: [
+                "kind": .string(error.kind.rawValue),
+                "actionId": .string("\(actionId)"),
+            ])
+            return RouteJSON.error(.badRequest, "not-undoable")
         } catch {
             return errorResponse(.internalServerError, "undo-failed", logger: logger, error: error)
         }
@@ -378,12 +389,10 @@ public enum ActionsRoutes {
                     fromGroup: to, toGroup: from, db: db
                 )
             }
-        case .unsubscribe, .draftCreate:
-            // Terminal: we can't really "unsubscribe" or "undraft". Tell the user.
-            throw NSError(
-                domain: "Lagoon.Undo", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "\(action.kind.rawValue) cannot be undone"]
-            )
+        case .unsubscribe, .draftCreate, .send:
+            // Terminal: we can't take back an unsubscribe, an undraft, or a
+            // reply that has already left the building. Tell the user why.
+            throw NotUndoable(kind: action.kind)
         }
     }
 

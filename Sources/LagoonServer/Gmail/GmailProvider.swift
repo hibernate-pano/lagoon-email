@@ -237,39 +237,23 @@ public actor GmailProvider: MailProvider {
         }
     }
 
+    /// Same wire format as the IMAP path: one `MIMEBuilder` message, uploaded
+    /// through the Gmail `raw` endpoint. Gmail threads on the References chain
+    /// in the message itself, so no threadId is needed.
     public func send(_ outbound: OutboundMessage) async throws -> String? {
-        let raw = Self.plainRFC822(outbound)
+        let message = MIMEBuilder.reply(
+            outbound,
+            messageId: "<\(UUID().uuidString.lowercased())@lagoon>"
+        )
+        // MIMEBuilder output is pure ASCII (base64 body, encoded-word headers).
+        let raw = String(decoding: message, as: UTF8.self)
         return try await perform { token in
-            // Gmail threads on the References chain in the message itself, so
-            // no threadId is needed (and OutboundMessage has none).
             try await self.client.sendMessage(
                 accessToken: token,
                 threadId: nil,
                 rawRFC822: raw
             )
         }
-    }
-
-    /// Minimal RFC 5322 message for the Gmail `raw` upload. T11 replaces this
-    /// with `MIMEBuilder` (encoded-word subject, base64 body, Message-ID).
-    static func plainRFC822(_ message: OutboundMessage) -> String {
-        var lines: [String] = []
-        if let name = message.fromName, !name.isEmpty {
-            lines.append("From: \(name) <\(message.fromEmail)>")
-        } else {
-            lines.append("From: \(message.fromEmail)")
-        }
-        lines.append("To: \(message.to)")
-        lines.append("Subject: \(message.subject)")
-        if let inReplyTo = message.inReplyTo {
-            lines.append("In-Reply-To: \(inReplyTo)")
-        }
-        if let references = message.references {
-            lines.append("References: \(references)")
-        }
-        lines.append("")
-        lines.append(message.body)
-        return lines.joined(separator: "\r\n")
     }
 
     public func probe() async throws {

@@ -39,6 +39,10 @@ struct MessageDetailView: View {
 
     @State private var archivedLocal = false
 
+    @State private var showComposer = false
+    @State private var sentNotice: String?
+    @State private var sentNoticeDismiss: Task<Void, Never>?
+
     @Environment(\.l10n) private var l10n
     @EnvironmentObject private var accounts: AccountStore
     @EnvironmentObject private var undo: UndoController
@@ -91,6 +95,9 @@ struct MessageDetailView: View {
                 if let readError { inlineNotice(readError, systemImage: "envelope.badge") }
                 if let pinError { inlineNotice(pinError, systemImage: "pin.slash") }
                 if archivedLocal { inlineNotice(l10n.archivedLocallyOnly, systemImage: "tray.and.arrow.down") }
+                if let sentNotice {
+                    inlineNotice(sentNotice, systemImage: "paperplane.fill", color: .green)
+                }
                 summarySection
                 draftSection
                 Divider()
@@ -109,6 +116,19 @@ struct MessageDetailView: View {
                 DraftPickerSheet(draft: draft, onPick: handleDraftPick)
             }
         }
+        .sheet(isPresented: $showComposer) {
+            ComposerSheet(
+                remoteId: remoteId,
+                accountId: accountId,
+                to: header?.fromAddress ?? "",
+                subject: subjectText,
+                initialBody: draftPick.map { draft in
+                    draft.variants.indices.contains(0) ? draft.variants[0] : ""
+                } ?? ""
+            ) { _ in
+                showSentNotice()
+            }
+        }
         .confirmationDialog(l10n.overrideGroup, isPresented: $showOverrideMenu, titleVisibility: .visible) {
             ForEach(BriefingGroup.allCases.filter { $0 != .pinned }, id: \.self) { group in
                 Button(l10n.groupTitle(group)) { overrideClassification(to: group) }
@@ -120,6 +140,11 @@ struct MessageDetailView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup {
+            Button { showComposer = true } label: {
+                Label(l10n.reply, systemImage: "arrowshape.turn.up.left")
+            }
+            .help(l10n.replyHelp)
+
             Button { Task { await togglePin() } } label: {
                 Label(isPinned ? l10n.unpin : l10n.pin, systemImage: isPinned ? "pin.slash" : "pin")
             }
@@ -420,9 +445,23 @@ struct MessageDetailView: View {
         }
     }
 
-    private func inlineNotice(_ message: String, systemImage: String) -> some View {
+    /// Announce the reply and clear itself: sending is final, so there is
+    /// nothing to undo — only to confirm.
+    private func showSentNotice() {
+        sentNoticeDismiss?.cancel()
+        sentNotice = l10n.sentTo(header?.fromAddress ?? "")
+        sentNoticeDismiss = Task {
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled else { return }
+            sentNotice = nil
+        }
+    }
+
+    private func inlineNotice(
+        _ message: String, systemImage: String, color: Color = .orange
+    ) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: systemImage).foregroundStyle(.orange)
+            Image(systemName: systemImage).foregroundStyle(color)
             Text(message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             Spacer()
         }

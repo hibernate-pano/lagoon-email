@@ -79,7 +79,17 @@ enum RouteParams {
         let decoded = raw.removingPercentEncoding ?? raw
         return decoded.isEmpty ? nil : decoded
     }
+
+    /// Raw request body bytes, capped so a hostile client cannot make the
+    /// server buffer without bound. The caller maps a failure onto 400.
+    static func collectBody(_ request: Request) async throws -> Data {
+        let buffer = try await request.body.collect(upTo: 1 << 20)
+        return Data(buffer: buffer)
+    }
 }
+
+/// `POST /api/messages/{remoteId}/send` response.
+struct SendResponse: Codable { let ok: Bool; let providerMessageId: String? }
 
 /// Message-level M1 endpoints: full body, read state, pinning and AI summary.
 public enum MessageRoutes {
@@ -296,6 +306,149 @@ public enum MessageRoutes {
                 ])
                 return RouteJSON.error(.badGateway, "ai-error")
             }
+        }
+
+        // POST /api/messages/{remoteId}/send?accountId=<uuid>  {"body":"..."}
+        // 200 SendResponse | 400 malformed-body | 404 unknown-message
+        // | 401 smtp-auth-failed | 502 smtp-send-failed | 503 provider-not-configured
+        router.post("api/messages/:remoteId/send") { request, context -> Response in
+            return await Self.sendHandler(
+                request: request, context: context, db: db,
+                makeProvider: makeProvider, logger: logger
+            )
+        }
+    }
+
+    // MARK: - Send
+
+    /// Send a plain-text reply to the message's sender. Everything the wire
+    /// needs (recipient, subject, threading headers) comes from the synced
+    /// row — the client only supplies the body, so it cannot redirect a reply.
+    /// The `Re:` prefix and RFC 2047 encoding belong to `MIMEBuilder`, which
+    /// both providers run.
+    private static func sendHandler(
+        request: Request,
+        context: BasicRequestContext,
+        db: PostgresConnection,
+        makeProvider: MailProviderFactory.Builder,
+        logger: Logger
+    ) async -> Response {
+        guard let accountId = RouteParams.accountId(from: request) else {
+            return RouteJSON.error(.badRequest, "malformed-accountId")
+        }
+        guard let remoteId = RouteParams.remoteId(from: context) else {
+            return RouteJSON.error(.badRequest, "malformed-remoteId")
+        }
+        let rawBody: Data
+        do {
+            rawBody = try await RouteParams.collectBody(request)
+        } catch {
+            return RouteJSON.error(.badRequest, "malformed-body")
+        }
+        struct SendRequest: Decodable { let body: String }
+        guard let decoded = try? JSONDecoder().decode(SendRequest.self, from: rawBody),
+              !decoded.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return RouteJSON.error(.badRequest, "malformed-body")
+        }
+
+        let account: Account
+        do {
+            guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                return RouteJSON.error(.notFound, "unknown-account")
+            }
+            account = found
+        } catch {
+            logger.error("send account lookup failed", metadata: [
+                "accountId": .string(accountId.uuidString),
+                "err": .string("\(error)")
+            ])
+            return RouteJSON.error(.internalServerError, "internal-error")
+        }
+        let stored: MessageHeader
+        do {
+            guard let found = try await MessageStore.find(
+                remoteId: remoteId, accountId: accountId, db: db
+            ) else {
+                return RouteJSON.error(.notFound, "unknown-message")
+            }
+            stored = found
+        } catch {
+            logger.error("send message lookup failed", metadata: [
+                "accountId": .string(accountId.uuidString),
+                "remoteId": .string(remoteId),
+                "err": .string("\(error)")
+            ])
+            return RouteJSON.error(.internalServerError, "internal-error")
+        }
+        guard let provider = makeProvider(account) else {
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        }
+
+        // Threading: reply to the parent's Message-ID and extend the parent's
+        // chain with that id, so clients that only walk References still see
+        // this reply as part of the thread.
+        let references = [stored.references, stored.messageIdHeader]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let outbound = OutboundMessage(
+            fromEmail: account.email,
+            fromName: nil,
+            to: stored.fromAddress,
+            subject: stored.subject ?? "",
+            body: decoded.body,
+            inReplyTo: stored.messageIdHeader,
+            references: references.isEmpty ? nil : references
+        )
+
+        let providerMessageId: String?
+        do {
+            providerMessageId = try await provider.send(outbound)
+        } catch {
+            return Self.sendError(error, logger: logger, remoteId: remoteId)
+        }
+        // The reply is already on the wire: a failed audit write must not turn
+        // a delivered message into a 500 the client would retry.
+        do {
+            let _ = try await AIActionStore.record(
+                accountId: accountId,
+                kind: .send,
+                payload: ["remoteId": remoteId, "to": stored.fromAddress],
+                db: db
+            )
+        } catch {
+            logger.warning("send.auditFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "err": .string("\(error)")
+            ])
+        }
+        return RouteJSON.response(SendResponse(ok: true, providerMessageId: providerMessageId))
+    }
+
+    /// Send failures get their own labels: the client tells "wrong auth code"
+    /// apart from "mailbox unreachable" without seeing provider text.
+    static func sendError(_ error: Error, logger: Logger, remoteId: String) -> Response {
+        guard let mailError = error as? MailError else {
+            logger.error("smtp.sendFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "label": .string("\(type(of: error))"),
+            ])
+            return RouteJSON.error(.badGateway, "smtp-send-failed")
+        }
+        logger.warning("smtp.sendFailed", metadata: [
+            "remoteId": .string(remoteId),
+            "label": .string(mailError.logLabel),
+        ])
+        switch mailError {
+        case .authFailed:
+            return RouteJSON.error(.unauthorized, "smtp-auth-failed")
+        case .notConfigured:
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        case .messageGone:
+            return RouteJSON.error(.gone, "message-gone")
+        case .unreachable, .protocolError, .archiveUnavailable:
+            return RouteJSON.error(.badGateway, "smtp-send-failed")
         }
     }
 

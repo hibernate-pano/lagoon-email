@@ -142,4 +142,29 @@ final class LocalizationTests: XCTestCase {
         XCTAssertFalse(zh.archiveUnavailable.isEmpty)
         XCTAssertFalse(en.archiveUnavailable.isEmpty)
     }
+
+    // MARK: - T11: reply composer
+
+    func test_composerStrings_existInBothLanguages() {
+        let zhStrings = [
+            zh.reply, zh.replyHelp, zh.replyTitle, zh.replyTo, zh.replyBodyPlaceholder,
+            zh.send, zh.sending, zh.sendFailed, zh.sent, zh.emptyReply, zh.cancel,
+            zh.shortcutSend, zh.sentTo("a@b.com"),
+        ]
+        let enStrings = [
+            en.reply, en.replyHelp, en.replyTitle, en.replyTo, en.replyBodyPlaceholder,
+            en.send, en.sending, en.sendFailed, en.sent, en.emptyReply, en.cancel,
+            en.shortcutSend, en.sentTo("a@b.com"),
+        ]
+        for value in zhStrings + enStrings {
+            XCTAssertFalse(value.isEmpty)
+        }
+        for (chinese, english) in zip(zhStrings, enStrings) {
+            XCTAssertNotEqual(chinese, english, "untranslated string pair: \(chinese)")
+        }
+        XCTAssertEqual(zh.send, "发送")
+        XCTAssertEqual(en.send, "Send")
+        XCTAssertEqual(zh.sentTo("a@b.com"), "已发送给 a@b.com")
+        XCTAssertEqual(en.sentTo("a@b.com"), "Sent to a@b.com")
+    }
 }
