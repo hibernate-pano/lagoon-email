@@ -55,6 +55,9 @@ actor ScriptedTransport: StreamTransport {
     func connect(host: String, port: Int) async throws {
         connectedHost = host
         connectedPort = port
+        // A fresh connect is a fresh session: a client that reconnects after
+        // `close()` (SMTP retry/next send) must be able to write again.
+        isClosed = false
     }
 
     func write(_ bytes: Data) async throws {
