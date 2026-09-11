@@ -5,13 +5,16 @@ import PostgresNIO
 @testable import LagoonServer
 @testable import LagoonKit
 
-/// Drives the real `GmailPoller.tick()` against the guarded test DB with
+/// Drives the real `GmailProvider` against the guarded test DB with
 /// URLProtocol-stubbed `GmailClient` / `GoogleOAuthClient` sessions. No network.
 ///
-/// `tick()` polls *every* account row, so assertions filter the captured
-/// requests by this test's unique access/refresh tokens; other rows (if any
-/// survive from a crashed run) cannot inflate the counts.
-final class GmailPollerTests: XCTestCase {
+/// One `pullChanges(after: .init(), waitUpTo: .milliseconds(1))` is the `tick()`
+/// equivalent: the budget sits below the provider's poll interval, so exactly
+/// one `messages.list` round happens and the call never blocks on a sleep.
+///
+/// Assertions filter the captured requests by this test's unique tokens; other
+/// account rows (if any survive from a crashed run) cannot inflate the counts.
+final class GmailProviderTests: XCTestCase {
     override func tearDown() {
         URLProtocolStub.reset()
         super.tearDown()
@@ -34,7 +37,10 @@ final class GmailPollerTests: XCTestCase {
         from: String,
         subject: String,
         unread: Bool,
-        listUnsubscribe: Bool
+        listUnsubscribe: Bool,
+        messageId: String? = nil,
+        inReplyTo: String? = nil,
+        references: String? = nil
     ) -> Data {
         var headers: [[String: String]] = [
             ["name": "From", "value": from],
@@ -42,6 +48,15 @@ final class GmailPollerTests: XCTestCase {
         ]
         if listUnsubscribe {
             headers.append(["name": "List-Unsubscribe", "value": "<mailto:unsub@example.com>"])
+        }
+        if let messageId {
+            headers.append(["name": "Message-ID", "value": messageId])
+        }
+        if let inReplyTo {
+            headers.append(["name": "In-Reply-To", "value": inReplyTo])
+        }
+        if let references {
+            headers.append(["name": "References", "value": references])
         }
         var message: [String: Any] = [
             "id": remoteId,
@@ -75,7 +90,7 @@ final class GmailPollerTests: XCTestCase {
     private func installStub(
         tokenBody: Data,
         rejectAccessTokens: Set<String> = [],
-        listBody: Data = GmailPollerTests.emptyListBody,
+        listBody: Data = GmailProviderTests.emptyListBody,
         metadata: [String: Data] = [:]
     ) {
         URLProtocolStub.install { request in
@@ -101,19 +116,28 @@ final class GmailPollerTests: XCTestCase {
         }
     }
 
-    private func makePoller(db: PostgresConnection) -> GmailPoller {
+    private func makeProvider(account: Account, db: PostgresConnection) -> GmailProvider {
         let session = makeSession()
-        return GmailPoller(
-            db: db,
+        return GmailProvider(
+            account: account,
             client: GmailClient(session: session),
-            oauth: GoogleOAuthClient(
-                clientID: "test-client",
-                clientSecret: "test-secret",
-                redirectURI: "http://127.0.0.1:9999/callback",
-                session: session
+            tokens: GmailTokenService(
+                db: db,
+                oauth: GoogleOAuthClient(
+                    clientID: "test-client",
+                    clientSecret: "test-secret",
+                    redirectURI: "http://127.0.0.1:9999/callback",
+                    session: session
+                ),
+                logger: Logger(label: "gmail-provider-tests")
             ),
-            logger: Logger(label: "gmail-poller-tests")
+            logger: Logger(label: "gmail-provider-tests")
         )
+    }
+
+    /// One non-blocking pull — the `GmailPoller.tick()` equivalent.
+    private func pull(_ provider: GmailProvider) async throws -> MailChangeSet {
+        try await provider.pullChanges(after: MailSyncState(), waitUpTo: .milliseconds(1))
     }
 
     private func tokenBody(
@@ -207,7 +231,7 @@ final class GmailPollerTests: XCTestCase {
 
     /// (a) expired token -> exactly one refresh POST, new access token + expiry persisted.
     func test_expiredToken_refreshesOnceAndPersistsNewAccessTokenAndExpiry() async throws {
-        let oauthUser = "poller-\(UUID().uuidString)"
+        let oauthUser = "provider-\(UUID().uuidString)"
         let oldAccess = "old-access-\(UUID().uuidString)"
         let oldRefresh = "rt-original-\(UUID().uuidString)"
         let newAccess = "new-access-\(UUID().uuidString)"
@@ -225,7 +249,7 @@ final class GmailPollerTests: XCTestCase {
                 )
                 installStub(tokenBody: tokenBody(accessToken: newAccess, refreshToken: newRefresh))
 
-                await makePoller(db: conn).tick()
+                _ = try await pull(makeProvider(account: account, db: conn))
 
                 XCTAssertEqual(
                     refreshRequests(forRefreshToken: oldRefresh).count, 1,
@@ -249,7 +273,7 @@ final class GmailPollerTests: XCTestCase {
 
     /// (b) a 401 from Gmail triggers exactly one refresh + exactly one retry.
     func test_unauthorized_refreshesOnceAndRetriesSameAccountOnce() async throws {
-        let oauthUser = "poller-\(UUID().uuidString)"
+        let oauthUser = "provider-\(UUID().uuidString)"
         let oldAccess = "old-access-\(UUID().uuidString)"
         let oldRefresh = "rt-original-\(UUID().uuidString)"
         let newAccess = "new-access-\(UUID().uuidString)"
@@ -272,7 +296,7 @@ final class GmailPollerTests: XCTestCase {
                     rejectAccessTokens: ["Bearer \(oldAccess)"]
                 )
 
-                await makePoller(db: conn).tick()
+                _ = try await pull(makeProvider(account: account, db: conn))
 
                 XCTAssertEqual(
                     refreshRequests(forRefreshToken: oldRefresh).count, 1,
@@ -301,7 +325,7 @@ final class GmailPollerTests: XCTestCase {
 
     /// (c) refresh response omitting refresh_token must not drop the stored one.
     func test_refreshWithoutRefreshToken_keepsStoredRefreshToken() async throws {
-        let oauthUser = "poller-\(UUID().uuidString)"
+        let oauthUser = "provider-\(UUID().uuidString)"
         let oldAccess = "old-access-\(UUID().uuidString)"
         let oldRefresh = "rt-original-\(UUID().uuidString)"
         let newAccess = "new-access-\(UUID().uuidString)"
@@ -319,7 +343,7 @@ final class GmailPollerTests: XCTestCase {
                 // Google omits refresh_token on refresh grants.
                 installStub(tokenBody: tokenBody(accessToken: newAccess))
 
-                await makePoller(db: conn).tick()
+                _ = try await pull(makeProvider(account: account, db: conn))
 
                 XCTAssertEqual(refreshRequests(forRefreshToken: oldRefresh).count, 1)
                 let stored = try await gmailTokens(account.id, db: conn)
@@ -334,7 +358,7 @@ final class GmailPollerTests: XCTestCase {
 
     /// (d) a still-valid token triggers zero refresh POSTs.
     func test_validToken_triggersZeroRefreshes() async throws {
-        let oauthUser = "poller-\(UUID().uuidString)"
+        let oauthUser = "provider-\(UUID().uuidString)"
         let oldAccess = "old-access-\(UUID().uuidString)"
         let oldRefresh = "rt-original-\(UUID().uuidString)"
         let newAccess = "new-access-\(UUID().uuidString)"
@@ -351,7 +375,7 @@ final class GmailPollerTests: XCTestCase {
                 )
                 installStub(tokenBody: tokenBody(accessToken: newAccess))
 
-                await makePoller(db: conn).tick()
+                _ = try await pull(makeProvider(account: account, db: conn))
 
                 XCTAssertEqual(
                     refreshRequests(forRefreshToken: oldRefresh).count, 0,
@@ -366,8 +390,10 @@ final class GmailPollerTests: XCTestCase {
     }
 
     /// (N5) proactive expiry refresh followed by a 401 must not refresh twice.
+    /// The pull surfaces `authFailed`: the token minted seconds ago was
+    /// rejected, so retrying the same credential would only burn quota.
     func test_proactiveRefreshThenUnauthorized_doesNotRefreshASecondTime() async throws {
-        let oauthUser = "poller-\(UUID().uuidString)"
+        let oauthUser = "provider-\(UUID().uuidString)"
         let oldAccess = "old-access-\(UUID().uuidString)"
         let oldRefresh = "rt-original-\(UUID().uuidString)"
         let newAccess = "new-access-\(UUID().uuidString)"
@@ -389,7 +415,10 @@ final class GmailPollerTests: XCTestCase {
                     rejectAccessTokens: ["Bearer \(newAccess)"]
                 )
 
-                await makePoller(db: conn).tick()
+                let thrown = await XCTAssertThrowsErrorAsync {
+                    try await pull(makeProvider(account: account, db: conn))
+                }
+                XCTAssertEqual(thrown as? MailError, .authFailed)
 
                 XCTAssertEqual(
                     refreshRequests(forRefreshToken: oldRefresh).count, 1,
@@ -397,7 +426,7 @@ final class GmailPollerTests: XCTestCase {
                 )
                 XCTAssertEqual(
                     refreshRequests(forRefreshToken: newRefresh).count, 0,
-                    "the 401 path must not issue a second refresh in the same tick"
+                    "the 401 path must not issue a second refresh in the same pull"
                 )
                 XCTAssertEqual(
                     listRequests(accessTokens: ["Bearer \(newAccess)"]).count, 1,
@@ -407,11 +436,11 @@ final class GmailPollerTests: XCTestCase {
         }
     }
 
-    /// (e) a non-empty page is fetched in bounded concurrent batches and every
-    /// message is persisted with headers, read state and the List-Unsubscribe
-    /// signal intact. Covers the concurrent fetch path added to syncMessages.
+    /// (e) a non-empty page is fetched in bounded concurrent batches and applied
+    /// through `SyncEngine`, which persists headers, read state and the
+    /// List-Unsubscribe signal.
     func test_listWithMessages_persistsEveryHeader() async throws {
-        let oauthUser = "poller-\(UUID().uuidString)"
+        let oauthUser = "provider-\(UUID().uuidString)"
         let access = "access-\(UUID().uuidString)"
         let refresh = "rt-\(UUID().uuidString)"
         let ids = (0..<12).map { "msg-\($0)-\(UUID().uuidString)" }
@@ -426,6 +455,8 @@ final class GmailPollerTests: XCTestCase {
                     expiresAt: Date().addingTimeInterval(3600),
                     db: conn
                 )
+                // The engine always syncs the single active account.
+                try await AccountStore.setActive(accountId: account.id, db: conn)
 
                 var metadata: [String: Data] = [:]
                 for (index, id) in ids.enumerated() {
@@ -443,7 +474,14 @@ final class GmailPollerTests: XCTestCase {
                     metadata: metadata
                 )
 
-                await makePoller(db: conn).tick()
+                let provider = makeProvider(account: account, db: conn)
+                let engine = SyncEngine(
+                    db: conn,
+                    logger: Logger(label: "gmail-provider-tests"),
+                    providers: { _ in provider },
+                    sleep: { _ in }
+                )
+                await engine.tickOnce(waitBudget: .milliseconds(1))
 
                 let stored = try await MessageStore.recent(
                     forAccount: account.id,
@@ -480,5 +518,75 @@ final class GmailPollerTests: XCTestCase {
                 )
             }
         }
+    }
+
+    /// (f) threading headers reach the change set so a reply can carry
+    /// In-Reply-To/References (there is no threads API on IMAP, so both
+    /// providers share this contract).
+    func test_threadingHeaders_areMapped() async throws {
+        let oauthUser = "provider-\(UUID().uuidString)"
+        let access = "access-\(UUID().uuidString)"
+        let refresh = "rt-\(UUID().uuidString)"
+        let id = "msg-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(
+                    account,
+                    accessToken: access,
+                    refreshToken: refresh,
+                    expiresAt: Date().addingTimeInterval(3600),
+                    db: conn
+                )
+                installStub(
+                    tokenBody: tokenBody(accessToken: access),
+                    listBody: Self.listBody(ids: [id]),
+                    metadata: [
+                        id: Self.metadataBody(
+                            remoteId: id,
+                            from: "Alice Zhang <alice@example.com>",
+                            subject: "Re: lunch",
+                            unread: false,
+                            listUnsubscribe: false,
+                            messageId: "<abc@example.com>",
+                            inReplyTo: "<parent@example.com>",
+                            references: "<root@example.com> <parent@example.com>"
+                        )
+                    ]
+                )
+
+                let changes = try await pull(makeProvider(account: account, db: conn))
+
+                XCTAssertEqual(changes.upserts.count, 1)
+                let header = try XCTUnwrap(changes.upserts.first)
+                XCTAssertEqual(header.remoteId, id)
+                XCTAssertEqual(header.threadId, "thread-\(id)")
+                XCTAssertEqual(header.fromAddress, "alice@example.com")
+                XCTAssertEqual(header.fromName, "Alice Zhang")
+                XCTAssertEqual(header.messageIdHeader, "<abc@example.com>")
+                XCTAssertEqual(header.inReplyTo, "<parent@example.com>")
+                XCTAssertEqual(
+                    header.references,
+                    "<root@example.com> <parent@example.com>"
+                )
+                XCTAssertFalse(changes.resetRequired)
+            }
+        }
+    }
+}
+
+/// Async form of `XCTAssertThrowsError` (its autoclosure cannot await).
+func XCTAssertThrowsErrorAsync<T>(
+    _ body: () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async -> Error? {
+    do {
+        _ = try await body()
+        XCTFail("expected an error to be thrown", file: file, line: line)
+        return nil
+    } catch {
+        return error
     }
 }
