@@ -1,20 +1,22 @@
 import SwiftUI
 import LagoonKit
 
-/// Full message reader (spec §3): subject, sender, date and the plain-text body
-/// in a readable column. Fires `markRead` once on appear, offers pin/unpin, and
-/// can ask the server for an AI summary + action items.
+/// Full message reader (spec §3). Loads body, fires markRead on appear,
+/// and exposes the M2 actions: pin, archive, summarize, draft (3 variants),
+/// override, unsubscribe.
 struct MessageDetailView: View {
     let gmailId: String
     let accountId: UUID
     let header: MessageHeader?
     let initiallyPinned: Bool
-
-    /// Called when the optimistic read flip succeeds or is reverted, so the
-    /// feed row reflects the change without a full refresh.
+    /// Optional sibling list for j/k navigation and auto-advance on archive.
+    var siblings: [String]? = nil
+    /// Called after a successful archive/undo so the list row can disappear/return.
+    var onArchived: ((String, Bool) -> Void)? = nil  // (gmailId, isArchived)
     var onReadStateChange: (String, Bool) -> Void = { _, _ in }
-    /// Called after a successful pin change so the feed can re-group.
     var onPinnedChanged: (Bool) -> Void = { _ in }
+    /// Called after a successful archive with the next sibling gmailId.
+    var onAdvanceTo: ((String) -> Void)? = nil
 
     @State private var messageBody: MessageBody?
     @State private var isLoadingBody = true
@@ -30,14 +32,30 @@ struct MessageDetailView: View {
 
     @State private var summaryState: SummaryState = .idle
 
+    @State private var draftState: DraftState = .idle
+    @State private var showDraftPicker = false
+
+    @State private var showOverrideMenu = false
+
+    @State private var archivedLocal = false
+
     @Environment(\.l10n) private var l10n
+    @EnvironmentObject private var accounts: AccountStore
+    @EnvironmentObject private var undo: UndoController
     private let api = APIClient()
 
     private enum SummaryState: Equatable {
         case idle
         case loading
         case loaded(MessageSummary)
-        /// Server answered 503: no LLM provider configured.
+        case unavailable
+        case failed(String)
+    }
+
+    private enum DraftState: Equatable {
+        case idle
+        case loading
+        case loaded(DraftReply)
         case unavailable
         case failed(String)
     }
@@ -47,6 +65,9 @@ struct MessageDetailView: View {
         accountId: UUID,
         header: MessageHeader?,
         initiallyPinned: Bool,
+        siblings: [String]? = nil,
+        onArchived: ((String, Bool) -> Void)? = nil,
+        onAdvanceTo: ((String) -> Void)? = nil,
         onReadStateChange: @escaping (String, Bool) -> Void = { _, _ in },
         onPinnedChanged: @escaping (Bool) -> Void = { _ in }
     ) {
@@ -54,6 +75,9 @@ struct MessageDetailView: View {
         self.accountId = accountId
         self.header = header
         self.initiallyPinned = initiallyPinned
+        self.siblings = siblings
+        self.onArchived = onArchived
+        self.onAdvanceTo = onAdvanceTo
         self.onReadStateChange = onReadStateChange
         self.onPinnedChanged = onPinnedChanged
         _isRead = State(initialValue: header?.isRead ?? false)
@@ -64,52 +88,111 @@ struct MessageDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 metadata
-                if let readError {
-                    inlineNotice(readError, systemImage: "envelope.badge")
-                }
-                if let pinError {
-                    inlineNotice(pinError, systemImage: "pin.slash")
-                }
+                if let readError { inlineNotice(readError, systemImage: "envelope.badge") }
+                if let pinError { inlineNotice(pinError, systemImage: "pin.slash") }
+                if archivedLocal { inlineNotice(l10n.archivedLocallyOnly, systemImage: "tray.and.arrow.down") }
                 summarySection
+                draftSection
                 Divider()
                 bodySection
             }
             .frame(maxWidth: 680, alignment: .leading)
             .padding(24)
-            .frame(maxWidth: .infinity, alignment: .center)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .navigationTitle(subjectText)
-        .toolbar {
-            ToolbarItemGroup {
-                Button {
-                    Task { await togglePin() }
-                } label: {
-                    Label(isPinned ? l10n.unpin : l10n.pin, systemImage: isPinned ? "pin.slash" : "pin")
-                }
-                .disabled(isPinBusy)
-                .help(isPinned ? l10n.unpinHelp : l10n.pinHelp)
-
-                Button {
-                    Task { await loadSummary() }
-                } label: {
-                    if summaryState == .loading {
-                        HStack(spacing: 6) {
-                            ProgressView().controlSize(.small)
-                            Text(l10n.summarizing)
-                        }
-                    } else {
-                        Label(l10n.summarize, systemImage: "sparkles")
-                    }
-                }
-                .disabled(summaryState == .loading)
-                .help(l10n.summarizeHelp)
-            }
-        }
+        .toolbar { toolbarContent }
         .task { await loadBody() }
         .task { await markReadOnce() }
+        .sheet(isPresented: $showDraftPicker) {
+            if let draft = draftPick {
+                DraftPickerSheet(draft: draft, onPick: handleDraftPick)
+            }
+        }
+        .confirmationDialog(l10n.overrideGroup, isPresented: $showOverrideMenu, titleVisibility: .visible) {
+            ForEach(BriefingGroup.allCases.filter { $0 != .pinned }, id: \.self) { group in
+                Button(l10n.groupTitle(group)) { overrideClassification(to: group) }
+            }
+            Button(l10n.retry, role: .cancel) {}
+        }
     }
 
-    // MARK: - Metadata
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItemGroup {
+            Button { Task { await togglePin() } } label: {
+                Label(isPinned ? l10n.unpin : l10n.pin, systemImage: isPinned ? "pin.slash" : "pin")
+            }
+            .disabled(isPinBusy)
+            .help(isPinned ? l10n.unpinHelp : l10n.pinHelp)
+            .keyboardShortcut("p", modifiers: .command)
+
+            Button {
+                Task { await loadSummary() }
+            } label: {
+                if summaryState == .loading {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(l10n.summarizing)
+                    }
+                } else {
+                    Label(l10n.summarize, systemImage: "sparkles")
+                }
+            }
+            .disabled(summaryState == .loading)
+            .help(l10n.summarizeHelp)
+            .keyboardShortcut("d", modifiers: .command)
+
+            Button { Task { await generateDrafts() } } label: {
+                Label(l10n.draftVariants, systemImage: "text.bubble")
+            }
+            .disabled(draftState == .loading)
+            .keyboardShortcut("d", modifiers: [.command, .shift])
+            .help(l10n.shortcutDraft)
+
+            Menu {
+                Button(l10n.markRead) { Task { await markReadOnce(force: true) } }
+                    .disabled(isRead)
+                Button(l10n.overrideGroup) { showOverrideMenu = true }
+                Button(l10n.unsubscribe, role: .destructive) { Task { await unsubscribe() } }
+                    .disabled(header == nil)
+            } label: {
+                Label(l10n.refresh, systemImage: "ellipsis.circle")
+            }
+
+            Button { Task { await archiveAndAdvance() } } label: {
+                Label(l10n.archiveAndNext, systemImage: "tray.and.arrow.down")
+            }
+            .keyboardShortcut("e", modifiers: .command)
+            .help(l10n.shortcutArchiveNext)
+        }
+    }
+
+    // MARK: - Sections
+
+    private var toDisplay: String? {
+        guard let to = messageBody?.toAddress, !to.isEmpty else { return nil }
+        return to
+    }
+
+    private var receivedAt: Date? {
+        messageBody?.receivedAt ?? header?.receivedAt
+    }
+
+    private var metadata: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(subjectText).font(.title2).bold().textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            Text(fromDisplay).font(.callout).textSelection(.enabled)
+            if let toDisplay { Text(l10n.recipient(toDisplay)).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+            if let receivedAt {
+                Text(receivedAt.formatted(date: .complete, time: .shortened))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let snippet = header?.snippet ?? messageBody?.text {
+                Text(snippet.prefix(140)).font(.caption).foregroundStyle(.tertiary)
+            }
+        }
+    }
 
     private var subjectText: String {
         messageBody?.subject ?? header?.subject ?? l10n.noSubject
@@ -125,142 +208,97 @@ struct MessageDetailView: View {
         return l10n.unknownSender
     }
 
-    private var toDisplay: String? {
-        guard let to = messageBody?.toAddress, !to.isEmpty else { return nil }
-        return to
-    }
-
-    private var receivedAt: Date? {
-        messageBody?.receivedAt ?? header?.receivedAt
-    }
-
-    private var metadata: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(subjectText)
-                .font(.title2)
-                .bold()
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            Text(fromDisplay)
-                .font(.callout)
-                .textSelection(.enabled)
-
-            if let toDisplay {
-                Text(l10n.recipient(toDisplay))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-
-            if let receivedAt {
-                Text(receivedAt.formatted(date: .complete, time: .shortened))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    // MARK: - Body
-
-    @ViewBuilder
     private var bodySection: some View {
-        if isLoadingBody && messageBody == nil {
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text(l10n.loadingMessage).foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        } else if let bodyError {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(l10n.couldNotLoadMessage)
-                    .font(.headline)
-                Text(bodyError)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                Button(l10n.retry) { Task { await loadBody() } }
-            }
-        } else if let messageBody {
-            if messageBody.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text(l10n.noPlainTextBody)
-                    .foregroundStyle(.secondary)
+        Group {
+            if isLoadingBody && messageBody == nil {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(l10n.opening).foregroundStyle(.secondary)
+                }
+            } else if let bodyError {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(bodyError).font(.headline)
+                    Text(l10n.couldNotLoadMessage).font(.callout).foregroundStyle(.secondary)
+                    Button(l10n.retry) { Task { await loadBody() } }
+                }
+            } else if let messageBody, !messageBody.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(messageBody.text).font(.body).lineSpacing(3).textSelection(.enabled)
             } else {
-                Text(messageBody.text)
-                    .font(.body)
-                    .lineSpacing(3)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text(l10n.noPlainTextBody).foregroundStyle(.secondary)
             }
         }
     }
-
-    // MARK: - Summary
 
     @ViewBuilder
     private var summarySection: some View {
         switch summaryState {
-        case .idle:
-            EmptyView()
-        case .loading:
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text(l10n.summarizing).foregroundStyle(.secondary)
-            }
+        case .idle, .loading: EmptyView()
         case .unavailable:
-            // 503 is a configuration state, not a failure: keep it muted.
-            Text(l10n.aiNotConfigured)
-                .font(.callout)
-                .foregroundStyle(.secondary)
+            Text(l10n.aiNotConfigured).font(.callout).foregroundStyle(.secondary)
         case .failed(let message):
-            Text(message)
-                .font(.callout)
-                .foregroundStyle(.red)
-                .textSelection(.enabled)
+            Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
         case .loaded(let summary):
             GroupBox {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text(summary.summary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
+                    Text(summary.summary).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                     if !summary.actionItems.isEmpty {
                         Divider()
-                        Text(l10n.actionItems)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text(l10n.actionItems).font(.caption).foregroundStyle(.secondary)
                         ForEach(Array(summary.actionItems.enumerated()), id: \.offset) { _, item in
-                            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                Text("•")
-                                Text(item)
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
+                            HStack(alignment: .firstTextBaseline, spacing: 6) { Text("•"); Text(item).textSelection(.enabled) }
                         }
                     }
-
                     if let provider = summary.provider, !provider.isEmpty {
-                        Text(l10n.viaProvider(provider))
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                        Text(l10n.viaProvider(provider)).font(.caption2).foregroundStyle(.tertiary)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } label: {
-                Label(l10n.aiSummary, systemImage: "sparkles")
-            }
+            } label: { Label(l10n.aiSummary, systemImage: "sparkles") }
         }
     }
 
-    private func inlineNotice(_ message: String, systemImage: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: systemImage)
-                .foregroundStyle(.orange)
-            Text(message)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
-            Spacer()
+    @ViewBuilder
+    private var draftSection: some View {
+        switch draftState {
+        case .idle, .loading, .unavailable: EmptyView()
+        case .failed(let message):
+            Text(message).font(.callout).foregroundStyle(.red)
+        case .loaded(let draft):
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label(l10n.draftVariants, systemImage: "text.bubble").font(.headline)
+                    Spacer()
+                    Button(l10n.pickOne) { showDraftPicker = true }
+                        .buttonStyle(.borderedProminent)
+                }
+                ForEach(Array(draft.variants.enumerated()), id: \.offset) { index, variant in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(l10n.variant + " " + "\(index + 1)").font(.caption2).foregroundStyle(.secondary)
+                        Text(variant).font(.callout).textSelection(.enabled).padding(8)
+                            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
+                    }
+                }
+            }
+            .padding(12)
+            .background(.background, in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    private var draftPick: DraftReply? {
+        if case .loaded(let d) = draftState { return d }
+        return nil
+    }
+
+    private func handleDraftPick(variant: Int, pushToGmail: Bool) {
+        guard let draft = draftPick else { return }
+        showDraftPicker = false
+        Task {
+            do {
+                _ = try await api.chooseDraft(
+                    draftId: draft.id, variant: variant, pushToGmail: pushToGmail
+                )
+            } catch {
+                draftState = .failed(l10n.draftFailed + error.lagoonUIMessage)
+            }
         }
     }
 
@@ -277,20 +315,13 @@ struct MessageDetailView: View {
         isLoadingBody = false
     }
 
-    /// Fires exactly once per appearance. The feed row flips immediately; if the
-    /// call fails we revert the row and surface the reason.
-    private func markReadOnce() async {
-        guard !didMarkRead else { return }
+    private func markReadOnce(force: Bool = false) async {
+        if !force && didMarkRead { return }
         didMarkRead = true
         guard !isRead else { return }
-
         isRead = true
-        readError = nil
         onReadStateChange(gmailId, true)
-
-        do {
-            try await api.markRead(gmailId: gmailId, accountId: accountId)
-        } catch {
+        do { try await api.markRead(gmailId: gmailId, accountId: accountId) } catch {
             isRead = false
             onReadStateChange(gmailId, false)
             readError = l10n.markReadFailed + error.lagoonUIMessage
@@ -298,34 +329,102 @@ struct MessageDetailView: View {
     }
 
     private func togglePin() async {
-        guard !isPinBusy else { return }
         let target = !isPinned
         isPinned = target
+        onPinnedChanged(target)
         isPinBusy = true
-        pinError = nil
         do {
             try await api.setPinned(gmailId: gmailId, accountId: accountId, pinned: target)
-            onPinnedChanged(target)
         } catch {
             isPinned = !target
+            onPinnedChanged(!target)
             pinError = (target ? l10n.pinFailed : l10n.unpinFailed) + error.lagoonUIMessage
         }
         isPinBusy = false
     }
 
     private func loadSummary() async {
-        guard summaryState != .loading else { return }
         summaryState = .loading
         do {
-            summaryState = .loaded(try await api.fetchSummary(
-                gmailId: gmailId,
-                accountId: accountId,
+            let summary = try await api.fetchSummary(
+                gmailId: gmailId, accountId: accountId,
                 language: l10n.language.rawValue
-            ))
+            )
+            summaryState = .loaded(summary)
         } catch APIError.badStatus(let code, _) where code == 503 {
             summaryState = .unavailable
         } catch {
             summaryState = .failed(l10n.summaryFailed + error.lagoonUIMessage)
+        }
+    }
+
+    private func generateDrafts() async {
+        draftState = .loading
+        do {
+            let draft = try await api.generateDrafts(
+                gmailId: gmailId, accountId: accountId,
+                language: l10n.language.rawValue
+            )
+            draftState = .loaded(draft)
+            showDraftPicker = true
+        } catch APIError.badStatus(let code, _) where code == 503 {
+            draftState = .unavailable
+        } catch {
+            draftState = .failed(l10n.draftFailed + error.lagoonUIMessage)
+        }
+    }
+
+    private func archiveAndAdvance() async {
+        do {
+            let response = try await api.archiveMessage(gmailId: gmailId, accountId: accountId)
+            onArchived?(gmailId, true)
+            // Find the next sibling for auto-advance.
+            if let siblings, let index = siblings.firstIndex(of: gmailId) {
+                let nextIndex = siblings.index(after: index)
+                if nextIndex < siblings.endIndex {
+                    onAdvanceTo?(siblings[nextIndex])
+                }
+            }
+            // Fetch the latest action so undo targets the right row.
+            if let actions = try? await api.fetchActions(accountId: accountId, since: Date().addingTimeInterval(-30)),
+               let latest = actions.first {
+                let msg = response.remote ? l10n.archived : l10n.archivedLocallyOnly
+                undo.show(UndoItem(id: latest.id, message: msg, systemImage: "tray.and.arrow.down"))
+            }
+        } catch {
+            // leave the row in place; user can retry
+        }
+    }
+
+    private func unsubscribe() async {
+        do {
+            let response = try await api.unsubscribeMessage(gmailId: gmailId, accountId: accountId)
+            let msg = response.unsubscribed
+                ? "\(l10n.unsubscribed) · \(response.publisher)"
+                : "\(response.publisher) \(l10n.unsubscribed.lowercased()) — server kept it"
+            if let actions = try? await api.fetchActions(accountId: accountId, since: Date().addingTimeInterval(-30)),
+               let latest = actions.first {
+                undo.show(UndoItem(id: latest.id, message: msg, systemImage: "minus.circle"))
+            }
+        } catch { }
+    }
+
+    private func overrideClassification(to group: BriefingGroup) {
+        Task {
+            do {
+                try await api.overrideClassification(
+                    gmailId: gmailId, accountId: accountId,
+                    to: group
+                )
+            } catch { /* non-fatal */ }
+        }
+    }
+
+    private func inlineNotice(_ message: String, systemImage: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: systemImage).foregroundStyle(.orange)
+            Text(message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            Spacer()
         }
     }
 }

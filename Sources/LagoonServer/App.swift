@@ -88,6 +88,14 @@ struct LagoonServerMain {
             summarizer: ai
         )
         BriefingRoutes.register(on: router, db: db, logger: logger, classifier: ai)
+        ActionsRoutes.register(
+            on: router, db: db, client: gmailClient, tokens: tokens, logger: logger
+        )
+        DraftRoutes.register(
+            on: router, db: db, client: gmailClient, tokens: tokens, summarizer: ai, logger: logger
+        )
+        SearchRoutes.register(on: router, db: db)
+        BudgetRoutes.register(on: router, budget: usageBudget)
         GmailWebhookRoutes.register(on: router)
 
         let app = Application(

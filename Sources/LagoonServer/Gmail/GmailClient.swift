@@ -119,6 +119,83 @@ public final class GmailClient: Sendable {
         return try JSONDecoder().decode(RawGmailMessage.self, from: data)
     }
 
+    /// `users.messages.modify` — add/remove labels. Requires `gmail.modify`
+    /// scope; returns 403 otherwise. Caller catches and degrades.
+    public func modifyMessageLabels(
+        accessToken: String,
+        gmailId: String,
+        addLabelIds: [String] = [],
+        removeLabelIds: [String] = []
+    ) async throws {
+        var c = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")!
+        c.path += "/\(Self.percentEncodePath(gmailId))/modify"
+        var req = URLRequest(url: c.url!)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        try OutboundGuard.validate(req.url!)
+        let body: [String: Any] = [
+            "addLabelIds": addLabelIds,
+            "removeLabelIds": removeLabelIds,
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await session.outboundData(for: req)
+        try Self.assertOK(resp, data)
+    }
+
+    /// `users.drafts.create` with `threadId` — places a reply draft in the
+    /// same thread. Requires `gmail.compose` scope; 403 without it.
+    public func createDraft(
+        accessToken: String,
+        threadId: String,
+        to: String,
+        subject: String,
+        body: String
+    ) async throws -> String {
+        var c = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/drafts")!
+        var req = URLRequest(url: c.url!)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        try OutboundGuard.validate(req.url!)
+        let raw = "To: \(to)\r\nSubject: \(subject)\r\n\r\n\(body)"
+        let payload: [String: Any] = [
+            "message": [
+                "threadId": threadId,
+                "raw": raw.data(using: .utf8)!.base64EncodedString(),
+            ]
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        let (data, resp) = try await session.outboundData(for: req)
+        try Self.assertOK(resp, data)
+        struct R: Codable { let id: String }
+        return try JSONDecoder().decode(R.self, from: data).id
+    }
+
+    /// `users.messages.send` — actually send a message. Requires `gmail.send`
+    /// scope. M0.1 doesn't use this; kept for the post-approval build.
+    public func sendMessage(
+        accessToken: String,
+        threadId: String,
+        rawRFC822: String
+    ) async throws -> String {
+        var c = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages/send")!
+        var req = URLRequest(url: c.url!)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        try OutboundGuard.validate(req.url!)
+        let payload: [String: Any] = [
+            "threadId": threadId,
+            "raw": rawRFC822.data(using: .utf8)!.base64EncodedString(),
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        let (data, resp) = try await session.outboundData(for: req)
+        try Self.assertOK(resp, data)
+        struct R: Codable { let id: String }
+        return try JSONDecoder().decode(R.self, from: data).id
+    }
+
     public func getProfileEmail(accessToken: String) async throws -> String {
         var req = URLRequest(url: URL(string: "https://gmail.googleapis.com/gmail/v1/users/me/profile")!)
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")

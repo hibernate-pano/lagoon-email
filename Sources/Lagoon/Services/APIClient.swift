@@ -114,6 +114,118 @@ public final class APIClient: Sendable {
         return try Self.decode(MessageBody.self, from: data)
     }
 
+    // MARK: - M2+ actions
+
+    /// POST /api/messages/{gmailId}/archive?accountId= → {ok, gmailId, remote}.
+    public func archiveMessage(gmailId: String, accountId: UUID) async throws -> ArchiveResponse {
+        let url = try makeURL(path: ["api", "messages", gmailId, "archive"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        let (data, resp) = try await session.data(for: request)
+        try Self.validate(resp, data: data)
+        return try Self.decode(ArchiveResponse.self, from: data)
+    }
+
+    /// POST /api/messages/{gmailId}/unsubscribe?accountId= → {ok, unsubscribed, publisher}.
+    public func unsubscribeMessage(gmailId: String, accountId: UUID) async throws -> UnsubscribeResponse {
+        let url = try makeURL(path: ["api", "messages", gmailId, "unsubscribe"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        let (data, resp) = try await session.data(for: request)
+        try Self.validate(resp, data: data)
+        return try Self.decode(UnsubscribeResponse.self, from: data)
+    }
+
+    /// POST /api/messages/{gmailId}/classify {toGroup}.
+    public func overrideClassification(gmailId: String, accountId: UUID, to: BriefingGroup) async throws {
+        let url = try makeURL(path: ["api", "messages", gmailId, "classify"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = ["toGroup": to.rawValue]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await session.data(for: request)
+        try Self.validate(resp, data: data)
+    }
+
+    /// GET /api/actions?accountId=&since=
+    public func fetchActions(accountId: UUID, since: Date? = nil) async throws -> [AIAction] {
+        var items: [URLQueryItem] = [.init(name: "accountId", value: accountId.uuidString)]
+        if let since {
+            let f = ISO8601DateFormatter()
+            f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            items.append(.init(name: "since", value: f.string(from: since)))
+        }
+        let url = try makeURL(path: ["api", "actions"], query: items)
+        let (data, resp) = try await session.data(from: url)
+        try Self.validate(resp, data: data)
+        return try Self.decode(AIActionListResponse.self, from: data).actions
+    }
+
+    /// POST /api/actions/{id}/undo.
+    public func undoAction(id: Int64, accountId: UUID) async throws {
+        let url = try makeURL(path: ["api", "actions", "\(id)", "undo"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        let (data, resp) = try await session.data(for: request)
+        try Self.validate(resp, data: data)
+    }
+
+    /// POST /api/messages/{gmailId}/draft → DraftReply.
+    public func generateDrafts(gmailId: String, accountId: UUID, language: String? = nil) async throws -> DraftReply {
+        let url = try makeURL(path: ["api", "messages", gmailId, "draft"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        if let language, !language.isEmpty {
+            request.setValue(language, forHTTPHeaderField: "Accept-Language")
+        }
+        let (data, resp) = try await session.data(for: request)
+        try Self.validate(resp, data: data)
+        return try Self.decode(DraftReply.self, from: data)
+    }
+
+    /// POST /api/drafts/{id}/choose {variant, pushToGmail}.
+    public func chooseDraft(draftId: Int64, variant: Int, pushToGmail: Bool) async throws -> ChooseDraftResponse {
+        let url = try makeURL(path: ["api", "drafts", "\(draftId)", "choose"], query: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = ["variant": variant, "pushToGmail": pushToGmail]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await session.data(for: request)
+        try Self.validate(resp, data: data)
+        return try Self.decode(ChooseDraftResponse.self, from: data)
+    }
+
+    /// GET /api/search?q=&accountId=
+    public func search(query: String, accountId: UUID) async throws -> [MessageHeader] {
+        let url = try makeURL(path: ["api", "search"], query: [
+            .init(name: "accountId", value: accountId.uuidString),
+            .init(name: "q", value: query)
+        ])
+        let (data, resp) = try await session.data(from: url)
+        try Self.validate(resp, data: data)
+        return try Self.decode(SearchResponse.self, from: data).results
+    }
+
+    /// GET /api/usage → UsageReport.
+    public func fetchUsage() async throws -> UsageReport {
+        let url = baseURL.appendingPathComponent("api/usage")
+        let (data, resp) = try await session.data(from: url)
+        try Self.validate(resp, data: data)
+        return try Self.decode(UsageReport.self, from: data)
+    }
+
     /// POST /api/messages/{gmailId}/read?accountId= → 204.
     public func markRead(gmailId: String, accountId: UUID) async throws {
         try await post(path: ["api", "messages", gmailId, "read"], query: [

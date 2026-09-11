@@ -140,6 +140,7 @@ public struct L10n: Sendable, Equatable {
     public var pinHelp: String { pick("置顶这封邮件", "Pin this message") }
     public var unpinHelp: String { pick("取消置顶这封邮件", "Unpin this message") }
     public var markReadFailed: String { pick("标记已读失败：", "Could not mark as read: ") }
+    public var markRead: String { pick("标为已读", "Mark read") }
     public var pinFailed: String { pick("置顶失败：", "Could not pin: ") }
     public var unpinFailed: String { pick("取消置顶失败：", "Could not unpin: ") }
     public var summaryFailed: String { pick("摘要失败：", "Summary failed: ") }
@@ -159,6 +160,60 @@ public struct L10n: Sendable, Equatable {
     public var checkConnectionFailed: String {
         pick("检查连接失败：", "Could not check connection: ")
     }
+
+    // MARK: - Actions
+    public var undo: String { pick("撤销", "Undo") }
+    public var undoLastAction: String { pick("撤销上一操作", "Undo last action") }
+    public var nothingToUndo: String { pick("没有可撤销的操作", "Nothing to undo") }
+    public var archived: String { pick("已归档", "Archived") }
+    public var archivedLocallyOnly: String { pick("已在本地归档（远端需 Gmail.modify 权限）",
+                                              "Archived locally; remote needs Gmail.modify") }
+    public var unsubscribed: String { pick("已退订", "Unsubscribed") }
+    public var unsubscribe: String { pick("退订", "Unsubscribe") }
+    public var pinning: String { pick("正在置顶…", "Pinning…") }
+    public var draftVariants: String { pick("AI 草稿（3 个版本）", "AI drafts (3 variants)") }
+    public var chooseAndSendToGmail: String { pick("选这个 → 存到 Gmail Drafts",
+                                              "Use this → save to Gmail Drafts") }
+    public var chooseOnly: String { pick("只选中", "Select only") }
+    public var generatingDrafts: String { pick("正在生成 3 个草稿…", "Generating 3 drafts…") }
+    public var draftFailed: String { pick("生成草稿失败：", "Draft generation failed: ") }
+    public var pickOne: String { pick("选一个版本", "Pick a version") }
+    public var variant: String { pick("版本", "Variant") }
+    public var search: String { pick("搜索", "Search") }
+    public var searchPlaceholder: String { pick("搜索邮件（发件人、主题、正文）", "Search mail (sender, subject, body)") }
+    public var noResults: String { pick("没找到匹配邮件", "No matching messages") }
+    public var budgetThisMonth: String { pick("本月 LLM 用量", "This month's LLM usage") }
+    public var budgetCap: String { pick("上限", "Cap") }
+    public var budgetDisabled: String { pick("未启用（上限设为 0）", "Disabled (cap is 0)") }
+    public var overrideGroup: String { pick("改分组为…", "Change group to…") }
+    public var overrideApplied: String { pick("已记录你的偏好", "Noted your preference") }
+    public var newMail: String { pick("新邮件！", "New mail!") }
+    public var collapse: String { pick("收起", "Collapse") }
+    public var expand: String { pick("展开", "Expand") }
+    public var sender: String { pick("发件人", "Sender") }
+    public var newer: String { pick("更新的", "Newer") }
+    public var older: String { pick("更早的", "Older") }
+    public var nextInGroup: String { pick("下一封", "Next") }
+    public var previousInGroup: String { pick("上一封", "Previous") }
+    public var archiveAndNext: String { pick("归档并跳到下一封", "Archive & next") }
+    public var markUnread: String { pick("标为未读", "Mark unread") }
+    public var mailArchivedLocally: String { pick("已在本地归档（远端需要 gmail.modify scope）",
+                                              "Archived locally (remote needs gmail.modify)") }
+    public var opening: String { pick("正在打开…", "Opening…") }
+    public var nothingHereYet: String { pick("还没有内容", "Nothing here yet") }
+    public var inboxZero: String { pick("收件箱已清空 🎉", "Inbox zero 🎉") }
+    public var tapGmailToSync: String { pick("点击 Gmail 让 Lagoon 开始同步。", "Connect Gmail to start syncing.") }
+    public var copiedToClipboard: String { pick("已复制", "Copied") }
+    public var commandPalette: String { pick("命令面板", "Command palette") }
+    public var shortcutArchiveNext: String { pick("E = 归档并下一封", "E = archive & next") }
+    public var shortcutJ: String { pick("J = 下一封", "J = next") }
+    public var shortcutK: String { pick("K = 上一封", "K = previous") }
+    public var shortcutZ: String { pick("⌘Z = 撤销", "⌘Z = undo") }
+    public var shortcutRefresh: String { pick("⌘R = 刷新", "⌘R = refresh") }
+    public var shortcutSummarize: String { pick("⌘D = AI 摘要", "⌘D = AI summary") }
+    public var shortcutDraft: String { pick("⌘⇧D = 起草回复", "⌘⇧D = draft reply") }
+    public var shortcutSearch: String { pick("⌘F = 搜索", "⌘F = search") }
+    public var shortcutHelp: String { pick("? = 快捷键", "? = shortcuts") }
 
     // MARK: - Infrastructure errors
 
