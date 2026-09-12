@@ -164,6 +164,12 @@ struct ConnectView: View {
         errorMessage = nil
         defer { isPolling = false }
 
+        // Snapshot at poll start: only a row that appears or recovers *after*
+        // this moment counts as landed. Without the baseline the poll would
+        // steal a pre-existing row within one cycle, bouncing "add account"
+        // straight back to the feed before the form can be used.
+        let baseline = (try? await api.fetchAccounts()) ?? []
+
         let deadline = ContinuousClock.now + Self.pollTimeout
         while !Task.isCancelled {
             if ContinuousClock.now >= deadline {
@@ -173,10 +179,9 @@ struct ConnectView: View {
 
             do {
                 let connected = try await api.fetchAccounts()
-                if let first = connected.first {
-                    // M0 is single-user local, so always take the first account.
+                if let landed = Self.landedGmailAccount(current: connected, baseline: baseline) {
                     do {
-                        try accounts.set(accountId: first.id)
+                        try accounts.set(accountId: landed.id)
                         return
                     } catch {
                         errorMessage = l10n.saveAccountFailed + error.lagoonUIMessage
@@ -193,5 +198,29 @@ struct ConnectView: View {
                 return // view disappeared / task cancelled
             }
         }
+    }
+
+    /// The account the Gmail OAuth round-trip just landed, if any: a gmail row
+    /// that is new since the poll started (first connect), or a previously
+    /// unhealthy gmail row that now reads `.ok` — the callback upserts
+    /// credentials in place (same id) and ticks the sync engine, so recovery
+    /// is visible within seconds. Rows that were healthy at baseline are never
+    /// selected: the connect surface is reachable while accounts exist, and
+    /// stealing one would yank the user out of the form.
+    static func landedGmailAccount(
+        current: [ConnectedAccount],
+        baseline: [ConnectedAccount]
+    ) -> ConnectedAccount? {
+        let baselineById = Dictionary(
+            baseline.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        for account in current where account.provider == .gmail {
+            guard let before = baselineById[account.id] else { return account }
+            if before.syncHealth.status != .ok, account.syncHealth.status == .ok {
+                return account
+            }
+        }
+        return nil
     }
 }
