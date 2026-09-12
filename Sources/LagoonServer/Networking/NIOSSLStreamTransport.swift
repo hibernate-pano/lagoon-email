@@ -9,19 +9,23 @@ import NIOSSL
 /// there is deliberately no "skip verification" switch. Hosts come from
 /// server-side presets, never from user input.
 public actor NIOSSLStreamTransport: StreamTransport {
-    private static let allowedPorts: Set<Int> = [993, 465]
+    private let allowedPorts: Set<Int>
 
     private let group: EventLoopGroup
     private var channel: Channel?
     private var inbound: IteratorBox?
     private var pending = ByteBuffer()
 
-    public init(group: EventLoopGroup = MultiThreadedEventLoopGroup.singleton) {
+    public init(
+        group: EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
+        allowedPorts: Set<Int> = [993, 465]
+    ) {
         self.group = group
+        self.allowedPorts = allowedPorts
     }
 
     public func connect(host: String, port: Int) async throws {
-        guard Self.allowedPorts.contains(port) else {
+        guard allowedPorts.contains(port) else {
             throw MailError.notConfigured("port \(port) is not an approved implicit-TLS port")
         }
         let sslContext: NIOSSLContext
@@ -63,9 +67,16 @@ public actor NIOSSLStreamTransport: StreamTransport {
             // The scoped `executeThenClose` API cannot express a transport that
             // stays open across many calls, so the (deprecated) long-lived
             // inbound stream accessor is the intended fit here.
-            let asyncChannel = try NIOAsyncChannel<ByteBuffer, Never>(
-                wrappingChannelSynchronously: channel
-            )
+            //
+            // `wrappingChannelSynchronously` must run on the channel's event
+            // loop (it precondition-checks); this actor method runs on the
+            // cooperative pool, so hop over first. Off-loop wrapping crashes
+            // the process on the FIRST real connection.
+            let asyncChannel = try await channel.eventLoop.submit {
+                try NIOAsyncChannel<ByteBuffer, Never>(
+                    wrappingChannelSynchronously: channel
+                )
+            }.get()
             self.inbound = IteratorBox(asyncChannel.inbound.makeAsyncIterator())
             self.channel = channel
         } catch {
