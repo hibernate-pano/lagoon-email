@@ -81,6 +81,8 @@ swift run Lagoon
 | — （计划外发现）`PostgresData(jsonb:)` 的 `Encodable` 重载 | `AIActionStore.encode` 改为返回 `Data` | 传 `String` 会被二次 JSON 编码，审计 payload 变成 jsonb 里的**字符串**，撤销读不回 `remoteId`。T11 修复并加注释 |
 | — （计划外发现）归档审计键 `remoteWrite` vs 撤销读 `remote` | 统一为 `remoteWrite` | 键不匹配导致撤销只改本地、**不还原远端**；T12 修复 + 回归测试 |
 | — （计划外发现）分类审计 `fromGroup` 存了 `BriefingReason.needsReply.rawValue`（`"needs-reply"`） | 改存 `BriefingGroup.needsReply.rawValue`（`"needsReply"`） | 前者不是合法的 `BriefingGroup` raw value，撤销的反向覆盖**永远静默跳过**；T12 修复 + 回归测试 |
+| — （首次真实连接即崩 #1）`NIOAsyncChannel` 包装在 actor 协程池上执行 | 包装前 `channel.eventLoop.submit` 跳转到事件循环 | `wrappingChannelSynchronously` 必须在事件循环上运行（precondition），脚本传输测试从不触发该路径；修复 + `NIOSSLStreamTransportTests` 回归 |
+| — （首次真实连接即崩 #2）IDLE 读与并发命令读重叠在同一 inbound 迭代器 | `NIOSSLStreamTransport` 改为**单后台 pump** 独占迭代器，读取方在缓冲上等待 | 读超时取消的旧读与 `capabilities()` 等并发读撞出 `NIOThrowingAsyncSequenceProducer` 单迭代器 precondition（exit 133）；pump 按 epoch 失效，`fillBuffer` 可取消且不再吞掉后续字节；修复 + 回环 TLS 并发回归测试 |
 
 ## 14 天浸泡记录（2026-09-12 → 2026-09-25）
 
