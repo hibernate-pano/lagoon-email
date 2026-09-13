@@ -5,7 +5,11 @@ import NIOCore
 import LagoonKit
 
 public enum SyncRoutes {
-    public static func register(on router: Router<BasicRequestContext>, db: PostgresConnection) {
+    public static func register(
+        on router: Router<BasicRequestContext>,
+        db: PostgresConnection,
+        sync: SyncEngine? = nil
+    ) {
         router.get("api/messages") { req, _ -> Response in
             // accountId is untrusted input; validated by UUID parsing (spec §6.6 rule 2).
             guard let raw = req.uri.queryParameters["accountId"].map(String.init),
@@ -29,6 +33,11 @@ public enum SyncRoutes {
                 headers: [.contentType: "application/json; charset=utf-8"],
                 body: .init(byteBuffer: ByteBuffer(data: data))
             )
+        }
+
+        router.post("api/sync") { _, _ -> Response in
+            await sync?.requestImmediateSync()
+            return Response(status: .noContent)
         }
     }
 }

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL and pgvector
+        run: brew install postgresql@17 pgvector
+
+      - name: Start test database
+        run: |
+          PG_BIN="$(brew --prefix postgresql@17)/bin"
+          echo "$PG_BIN" >> "$GITHUB_PATH"
+          export PATH="$PG_BIN:$PATH"
+          initdb -D /tmp/lagoon-postgres --auth=trust
+          pg_ctl -D /tmp/lagoon-postgres \
+            -o "-p 5433 -h 127.0.0.1" \
+            -l /tmp/lagoon-postgres.log \
+            start
+          createuser -h 127.0.0.1 -p 5433 -s lagoon
+          createdb -h 127.0.0.1 -p 5433 -O lagoon lagoon_test
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Run full checks
+        env:
+          DATABASE_URL: postgres://lagoon:lagoon@127.0.0.1:5433/lagoon_test
+        run: bash scripts/run-all-tests.sh

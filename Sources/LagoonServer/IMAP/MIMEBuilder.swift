@@ -1,22 +1,47 @@
 import Foundation
 
-/// Builds the RFC 5322 reply that both write paths send: SMTP flushes these
+/// Builds the RFC 5322 message that both write paths send: SMTP flushes these
 /// bytes verbatim, Gmail wraps them in `raw`. Everything is CRLF-framed and the
 /// body is base64, so no line can ever need dot-stuffing or folding.
 public enum MIMEBuilder {
     /// A reply to `outbound`, with `messageId` used verbatim (the caller owns
     /// generating and remembering `<uuid@lagoon>`).
     public static func reply(_ outbound: OutboundMessage, messageId: String) -> Data {
+        build(
+            outbound,
+            messageId: messageId,
+            subject: subjectHeader(outbound.subject),
+            includeThreading: true
+        )
+    }
+
+    /// A new message keeps the subject exactly as typed and carries no thread
+    /// headers.
+    public static func newMessage(_ outbound: OutboundMessage, messageId: String) -> Data {
+        build(
+            outbound,
+            messageId: messageId,
+            subject: subjectHeader(outbound.subject, addReplyPrefix: false),
+            includeThreading: false
+        )
+    }
+
+    private static func build(
+        _ outbound: OutboundMessage,
+        messageId: String,
+        subject: String,
+        includeThreading: Bool
+    ) -> Data {
         var lines: [String] = []
         lines.append("From: \(address(outbound.fromEmail, name: outbound.fromName))")
         lines.append("To: \(address(outbound.to, name: nil))")
-        lines.append("Subject: \(Self.subjectHeader(outbound.subject))")
+        lines.append("Subject: \(subject)")
         lines.append("Date: \(Self.dateHeader())")
         lines.append("Message-ID: \(messageId)")
-        if let inReplyTo = outbound.inReplyTo, !inReplyTo.isEmpty {
+        if includeThreading, let inReplyTo = outbound.inReplyTo, !inReplyTo.isEmpty {
             lines.append("In-Reply-To: \(inReplyTo)")
         }
-        if let references = outbound.references, !references.isEmpty {
+        if includeThreading, let references = outbound.references, !references.isEmpty {
             lines.append("References: \(references)")
         }
         lines.append("MIME-Version: 1.0")
@@ -41,8 +66,8 @@ public enum MIMEBuilder {
     /// The `Re:` prefix is ASCII, so only the run from the first non-ASCII
     /// character onward becomes an encoded word — `Re: =?UTF-8?B?…?=`, which is
     /// what a receiving client renders as "Re: 会议纪要".
-    static func subjectHeader(_ value: String) -> String {
-        let prefixed = subject(value)
+    static func subjectHeader(_ value: String, addReplyPrefix: Bool = true) -> String {
+        let prefixed = addReplyPrefix ? subject(value) : value
         guard let firstNonASCII = prefixed.firstIndex(where: { !$0.isASCII }) else {
             return prefixed
         }

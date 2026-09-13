@@ -362,12 +362,29 @@ final class IMAPClientTests: XCTestCase {
         XCTAssertEqual(lines, ["A0001 UID FETCH 5:12 (UID FLAGS)"])
     }
 
+    func test_searchUID_quotesMessageIDAndReturnsHighestMatch() async throws {
+        let transport = ScriptedTransport()
+        let client = try await makeClient(transport: transport)
+
+        await transport.enqueue(#"* SEARCH 44 91"#)
+        await transport.enqueue("A0001 OK SEARCH completed")
+
+        let uid = try await client.searchUID(messageID: "<abc@example.com>")
+
+        XCTAssertEqual(uid, 91)
+        let lines = await wire(transport)
+        XCTAssertEqual(
+            lines,
+            [#"A0001 UID SEARCH HEADER Message-ID "<abc@example.com>""#]
+        )
+    }
+
     func test_fetchTextSnippet_readsLiteralBytes() async throws {
         let transport = ScriptedTransport()
         let client = try await makeClient(transport: transport)
 
         let snippet = Data("Hello Lagoon".utf8)
-        await transport.enqueue("* 1 FETCH (UID 5 BODY[TEXT]<0> {\(snippet.count)}")
+        await transport.enqueue("* 1 FETCH (UID 5 BODY[]<0> {\(snippet.count)}")
         await transport.enqueueLiteral(snippet)
         await transport.enqueue(")")
         await transport.enqueue("A0001 OK FETCH completed")
@@ -376,7 +393,7 @@ final class IMAPClientTests: XCTestCase {
 
         XCTAssertEqual(fetched, [IMAPFetchedText(uid: 5, snippet: snippet)])
         let lines = await wire(transport)
-        XCTAssertEqual(lines, ["A0001 UID FETCH 5 (UID BODY.PEEK[TEXT]<0.256>)"])
+        XCTAssertEqual(lines, ["A0001 UID FETCH 5 (UID BODY.PEEK[]<0.32768>)"])
     }
 
     func test_fetchFullBody_returnsRawBytes() async throws {
@@ -484,6 +501,25 @@ final class IMAPClientTests: XCTestCase {
             lines,
             [#"A0001 UID COPY 7 "Archive""#, #"A0002 CREATE "La\"goon""#]
         )
+    }
+
+    func test_append_sendsLiteralAfterContinuation() async throws {
+        let transport = ScriptedTransport()
+        let client = try await makeClient(transport: transport)
+        let message = Data("Subject: test\r\n\r\nbody\r\n".utf8)
+
+        await transport.enqueue("+ Ready for literal")
+        await transport.enqueue("A0001 OK APPEND completed")
+
+        try await client.append(mailbox: "Sent Messages", message: message)
+
+        let writes = await transport.writes
+        XCTAssertEqual(
+            String(decoding: writes[0], as: UTF8.self),
+            "A0001 APPEND \"Sent Messages\" (\\Seen) {\(message.count)}\r\n"
+        )
+        XCTAssertEqual(writes[1], message)
+        XCTAssertEqual(String(decoding: writes[2], as: UTF8.self), "\r\n")
     }
 
     // MARK: - IDLE / LOGOUT

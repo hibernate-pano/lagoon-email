@@ -219,26 +219,44 @@ public actor NIOSSLStreamTransport: StreamTransport {
         return line
     }
 
+    /// Parks until the pump delivers another chunk, then returns. Deliberately a
+    /// single wait, NOT `while pending.readableBytes == 0`.
+    ///
+    /// Both callers already carry their own completion condition: `readLine`
+    /// loops until `extractLine()` yields a whole line, `readExactly` loops
+    /// until the buffer holds `count` bytes. `fillBuffer`'s only job is therefore
+    /// "block until there is *new* data". A non-empty buffer does not imply the
+    /// caller is satisfied — a partial line, or a partial `{N}` literal, leaves
+    /// bytes present while the read is still unfinished. The old zero-length
+    /// guard mistook "buffer non-empty" for "data is sufficient", returned
+    /// immediately on that partial input, and made both callers spin at 100% CPU:
+    /// the spin never reached `Task.checkCancellation()`, so a read timeout could
+    /// not drain its task group (the sync never finished), and the spinning
+    /// tasks starved the pump off the cooperative pool, so the bytes that would
+    /// have completed the read were never delivered. A single wait parks the
+    /// reader until the pump wakes it, and throws on failure/close instead of
+    /// ever returning with the caller's condition unmet.
     private func fillBuffer() async throws {
-        while pending.readableBytes == 0 {
-            if let readFailure { throw readFailure }
-            guard pumpRunning else { throw StreamTransportError.notConnected }
-            // A read abandoned by IMAPConnection's read timeout is cancelled:
-            // exit promptly instead of re-arming the wait, so the bytes the
-            // pump keeps delivering stay in `pending` for the next reader.
-            try Task.checkCancellation()
-            let waiter = ReadWaiter()
-            try await withTaskCancellationHandler {
-                await withCheckedContinuation { continuation in
-                    waiter.store(continuation)
-                    readWaiters.append(waiter)
-                }
-            } onCancel: {
-                // Resume the abandoned wait ourselves; the wake path takes the
-                // continuation back first, so resumption stays single-owner.
-                waiter.take()?.resume()
+        if let readFailure { throw readFailure }
+        guard pumpRunning else { throw StreamTransportError.notConnected }
+        // A read abandoned by IMAPConnection's read timeout is cancelled:
+        // surface that here instead of parking again.
+        try Task.checkCancellation()
+        let waiter = ReadWaiter()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                waiter.store(continuation)
+                readWaiters.append(waiter)
             }
+        } onCancel: {
+            // Already-cancelled task: `store` may not have run yet. `cancel()`
+            // covers both orderings (see `ReadWaiter`) so the continuation is
+            // always resumed exactly once.
+            waiter.cancel()
         }
+        // A cancellation that raced the wake-up must not let a caller keep
+        // looping as if fresh bytes had arrived; bail out to the next check.
+        try Task.checkCancellation()
     }
 }
 
@@ -257,18 +275,43 @@ private final class IteratorBox: @unchecked Sendable {
 }
 
 /// Registration handle for a reader blocked in `fillBuffer`. Cancellation can
-/// fire on any thread while the wake path runs on the actor, so the
-/// continuation swap is lock-guarded and single-owner via `take()`.
+/// fire on any thread (and even before `store` runs, when the task is already
+/// cancelled on entry), so the continuation swap is lock-guarded.
+///
+/// Invariant: the continuation is resumed **exactly once**, for any interleaving
+/// of `store()`, `cancel()` and the pump's `take()`. Whichever of `store`/
+/// `cancel` observes the lock first wins: `cancel` marks itself and resumes a
+/// stored continuation (or `store` sees the flag and resumes in place), and
+/// `take` never hands the same continuation to two owners.
 private final class ReadWaiter: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Never>?
+    private var cancelled = false
 
     func store(_ continuation: CheckedContinuation<Void, Never>) {
         lock.lock()
+        if cancelled {
+            lock.unlock()
+            continuation.resume()
+            return
+        }
         self.continuation = continuation
         lock.unlock()
     }
 
+    /// Called from `onCancel`. If the continuation is not stored yet, the
+    /// `cancelled` flag makes the later `store` resume it immediately.
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let taken = continuation
+        continuation = nil
+        lock.unlock()
+        taken?.resume()
+    }
+
+    /// Pump wake-up path: atomically claims the continuation. Returns nil when
+    /// `cancel` already resumed it.
     func take() -> CheckedContinuation<Void, Never>? {
         lock.lock()
         defer { lock.unlock() }

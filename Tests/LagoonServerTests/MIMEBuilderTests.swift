@@ -13,7 +13,8 @@ final class MIMEBuilderTests: XCTestCase {
         subject: String = "Hello",
         body: String = "Plain text body",
         inReplyTo: String? = nil,
-        references: String? = nil
+        references: String? = nil,
+        isReply: Bool = true
     ) -> OutboundMessage {
         OutboundMessage(
             fromEmail: fromEmail,
@@ -22,7 +23,8 @@ final class MIMEBuilderTests: XCTestCase {
             subject: subject,
             body: body,
             inReplyTo: inReplyTo,
-            references: references
+            references: references,
+            isReply: isReply
         )
     }
 
@@ -99,6 +101,23 @@ final class MIMEBuilderTests: XCTestCase {
         let added = MIMEBuilder.reply(outbound(subject: "Lunch?"), messageId: "<m1@lagoon>")
         let (addedHeaders, _) = try parts(added)
         XCTAssertEqual(addedHeaders["subject"], "Re: Lunch?")
+    }
+
+    func test_newMessage_keepsSubjectAndOmitsThreadingHeaders() throws {
+        let data = MIMEBuilder.newMessage(
+            outbound(
+                subject: "Project kickoff",
+                inReplyTo: "<ignored@example.com>",
+                references: "<ignored@example.com>",
+                isReply: false
+            ),
+            messageId: "<new@lagoon>"
+        )
+        let (headers, _) = try parts(data)
+
+        XCTAssertEqual(headers["subject"], "Project kickoff")
+        XCTAssertNil(headers["in-reply-to"])
+        XCTAssertNil(headers["references"])
     }
 
     func test_reply_threadHeadersPassThroughWhenPresent() throws {

@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 import NIOCore
 import NIOPosix
@@ -84,6 +85,80 @@ final class NIOSSLStreamTransportConcurrencyTests: XCTestCase {
         let late = try await transport.readLine()
         XCTAssertEqual(late, "LATE")
     }
+
+    /// Regression for the P0 read-pump livelock. `fillBuffer()` used to return
+    /// as soon as the buffer was non-empty, so a partial line (bytes present,
+    /// but no `\n` yet) made `readLine`'s own completion loop spin at 100% CPU
+    /// instead of parking until the pump delivered the rest. Before the fix
+    /// this test never returns.
+    func test_readLine_waitsForTheRestOfAPartialLine() async throws {
+        let server = try await ScriptedTLSServer(script: [
+            (.milliseconds(0), "partial-line-without-crlf"),
+            (.milliseconds(200), "-tail\r\n"),
+        ])
+        defer { Task { await server.shutdown() } }
+
+        let transport = server.makeClientTransport()
+        defer { Task { await transport.close() } }
+        try await transport.connect(host: "localhost", port: server.port)
+
+        let line = try await transport.readLine()
+        XCTAssertEqual(line, "partial-line-without-crlf-tail")
+    }
+
+    /// Same trigger for the literal path: `readExactly(N)` must park while the
+    /// buffer holds fewer than `N` bytes rather than spin on its own count loop.
+    /// The `{N}` literal is delivered in two halves 200 ms apart.
+    func test_readExactly_waitsForTheRestOfAPartialLiteral() async throws {
+        let server = try await ScriptedTLSServer(script: [
+            (.milliseconds(0), "01234"),
+            (.milliseconds(200), "56789"),
+        ])
+        defer { Task { await server.shutdown() } }
+
+        let transport = server.makeClientTransport()
+        defer { Task { await transport.close() } }
+        try await transport.connect(host: "localhost", port: server.port)
+
+        let data = try await transport.readExactly(10)
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), "0123456789")
+    }
+
+    /// A read parked on partial data must still be cancellable. Before the fix
+    /// the spin never reached `Task.checkCancellation()`, so an abandoned read
+    /// (IMAPConnection's read timeout) kept the task group alive forever and
+    /// starved the pump. After the fix the cancel channel resumes the parked
+    /// continuation and the read throws promptly.
+    func test_readParkedOnPartialData_honoursCancellation() async throws {
+        let server = try await ScriptedTLSServer(script: [
+            (.milliseconds(0), "PARTIAL"),
+            (.milliseconds(250), "TAIL\r\n"),
+        ])
+        defer { Task { await server.shutdown() } }
+
+        let transport = server.makeClientTransport()
+        defer { Task { await transport.close() } }
+        try await transport.connect(host: "localhost", port: server.port)
+
+        let read = Task { try await transport.readLine() }
+        // Let the read observe "PARTIAL" and park in `fillBuffer`.
+        try await Task.sleep(for: .milliseconds(50))
+        read.cancel()
+
+        do {
+            _ = try await read.value
+            XCTFail("expected the cancelled read to throw")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+
+        // The abandoned read must not have poisoned the transport nor eaten the
+        // buffered bytes: the next read sees the whole line once the tail lands.
+        let line = try await transport.readLine()
+        XCTAssertEqual(line, "PARTIALTAIL")
+    }
 }
 
 // MARK: - Scripted TLS server
@@ -92,66 +167,15 @@ final class NIOSSLStreamTransportConcurrencyTests: XCTestCase {
 /// every accepted connection. The client side gets `trustRoots` pointed at
 /// the embedded CA, so certificate verification still runs end to end.
 private final class ScriptedTLSServer: @unchecked Sendable {
-    private static let certPEM = """
-    -----BEGIN CERTIFICATE-----
-    MIIDHzCCAgegAwIBAgIUElLZSha+AG4v9CqcT9QdgfS33AMwDQYJKoZIhvcNAQEL
-    BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDkxMjEyNTQyOVoXDTM2MDkw
-    OTEyNTQyOVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
-    AAOCAQ8AMIIBCgKCAQEAx3Z/AblL3GU22rduwXhncGk9vjPOkZ7NS4nxEfHVcBxt
-    yuWLRBmRu4IjkMpebu68yApU23ggVzHVNAY3WgxuwNCpDnP8kaMMvaxsDfzDLTCV
-    fTB9X9RfaKf5swSdOVimNpUSQIwmVuS2yRuFbwowi1pQ+COz5ZBGi5cdEmQejmZy
-    gxbeZWouupQkO8rYfHaYDcC1cTpKyY1fRaV7gDoaB4sHChcHEa7Zubmn66Htw5UM
-    t7WZvlMf8zX8FV0Y23abDwvi8uzNFwD6++lBIRGL/meDnz5u5th4zwkfauvOfQo/
-    kKPPTXn9R/A5yhqIA33jNGMEbWbGKZQjvjRieNFTEwIDAQABo2kwZzAdBgNVHQ4E
-    FgQUMywT5RG6JMnpmfPXkoC6QtKJxZUwHwYDVR0jBBgwFoAUMywT5RG6JMnpmfPX
-    koC6QtKJxZUwDwYDVR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3Qw
-    DQYJKoZIhvcNAQELBQADggEBAGvoA2vV5oOS9v02PZ21VHt9uA8j3FK7GL+UeLNi
-    p7S4wvxb4rqIi0unrdCQCqgaDMnVr3ZnYTtxjs7Ppu4oZwebbjdYqYV2AjRdXWvU
-    aBgaVrOjWQzEW1P4jvBceEqHw+nqWPq2xIu7a3mXwyzcSGEXv7bpAVu83kpnsAZx
-    eUsSJhGvVNL4sD5F9Em0N9XXr7d9OK+ml+xDkO5YQ051mzpp7D4vvnU1TsPH1xoL
-    GwGI2CxtjU2GEiVI8l7HxpppOj/vPZjPuCWS96/vIcAwI3ZCyUHuektmLtVNJAsZ
-    /zWQHAZ1PKJSgT/oRsH6mLK96z98l2eFdXiCaW/z0sUz2Uo=
-    -----END CERTIFICATE-----
-    """
-
-    private static let keyPEM = """
-    -----BEGIN PRIVATE KEY-----
-    MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDHdn8BuUvcZTba
-    t27BeGdwaT2+M86Rns1LifER8dVwHG3K5YtEGZG7giOQyl5u7rzIClTbeCBXMdU0
-    BjdaDG7A0KkOc/yRowy9rGwN/MMtMJV9MH1f1F9op/mzBJ05WKY2lRJAjCZW5LbJ
-    G4VvCjCLWlD4I7PlkEaLlx0SZB6OZnKDFt5lai66lCQ7yth8dpgNwLVxOkrJjV9F
-    pXuAOhoHiwcKFwcRrtm5uafroe3DlQy3tZm+Ux/zNfwVXRjbdpsPC+Ly7M0XAPr7
-    6UEhEYv+Z4OfPm7m2HjPCR9q6859Cj+Qo89Nef1H8DnKGogDfeM0YwRtZsYplCO+
-    NGJ40VMTAgMBAAECggEAE4+plVEx6+DZ4tQ8yT4reB48vw5UnU+uFtDl3UUoEfEa
-    drH77kdK//vGIiPT5Abcvl9+V/GtdkT9rDb0hGEWFtRqfUTfCadXD149UJfadPA/
-    +4GJt3Vb5VHH5Ahj+jpD6V7FkKKjUJU93yDS/VifTyNMhTFMf2Bz/VTqCyIveaEi
-    RiDWsG1XqejOKIlnPsh9wOMs/OZ9r7EZQ3HlcR/ApfvB9Qhew+KwN62xZ6lICL9z
-    mNuJJEdmvkGMTUfHATJGPT/zjw+OoDSEo7ucuZsxrwdaHIWIAhWZZh3wAgMhwLUg
-    xIQABKbMPtNja6oxqOZwKZesiohHobEmvthfCCAhGQKBgQD2J+/N+tkhduEkNHLN
-    lQRhNE4c/+mN4hi/piuZrgGFRWceDaiBSKxFVbOVGyT+sdGumhOUlSXtpdRilAoG
-    To/4Y0z+uoUt5rEueT/67or32Q4NrtqXgR5vSKG8I2/De2RYIlYOzUHVJqWfoIQ9
-    3UJuf10t2f3y/0hOvSMwqrYtuQKBgQDPcIfamcqjF3tCu1t6C3vU+6bmAPJQs+jd
-    f6Gtfu1DYz19lWwsilueGftKDWwC3u7NhGXlOUy6elofVKTyZQTgVbdv/I+SSv/U
-    yQToLKWwOXZwUj4FT6mpJT4qGpwERKRMap2GeyempDQlzQkMrgndJ+bWd9BTXLew
-    puYJN69NKwKBgQCcZym2fgGCgs9wuqaLO3jp7lsHkA8s6JEDDKk9X1N2A3AOp2z+
-    oFddQqP1RKcP8ZoiT6HLUa0kv64f6KIp+bb+gtHENG00ihTgS4g8f17rNg344bXg
-    d9kHqmWhbf6wfXF3knGNvBttPL4Vm98Kk9CG9wQUgyMZR90AsqpuXLmeeQKBgGPi
-    lrgPF8DifKrMVqb0wqLyrhHQYN21U6rcWziUhqDNN32yJo1n7ee6MQMeZWUYfbqe
-    RwZSSfz9D0pI0sgZFnkDLToSTfuue3O1e9RkM0Ag20QIhe6+xj45Pa6+c2OmvcpC
-    CCoKQTR/mtCc4v+lCgDgxsl8leaeHaFFLD1B//pTAoGAbIkQmM4XaQpMUezf31nP
-    6/qyasQnGQ/9bKhWXIRa39JMtW4ktM0UKKOcUojGu6F76H8H6AVufhGgn8Gl6Q+j
-    lq/tBIf12CaFpPvQ2QRqTm6NA7ER6OUp46Urm/p9qnZ65xnK6NYqtDLo0fXmQvFb
-    fwGbbLU4kRm8NmXJAP1zFI0=
-    -----END PRIVATE KEY-----
-    """
-
     let port: Int
     private let listener: Channel
     private let tracker: ChildTracker
+    private let certificates: [NIOSSLCertificate]
 
     init(script: [(delay: Duration, bytes: String)]) async throws {
-        let certificates = try NIOSSLCertificate.fromPEMBytes([UInt8](Self.certPEM.utf8))
-        let key = try NIOSSLPrivateKey(bytes: [UInt8](Self.keyPEM.utf8), format: .pem)
+        let material = try Self.generateCertificate()
+        let certificates = try NIOSSLCertificate.fromPEMBytes([UInt8](material.certificate.utf8))
+        let key = try NIOSSLPrivateKey(bytes: [UInt8](material.key.utf8), format: .pem)
         let configuration = TLSConfiguration.makeServerConfiguration(
             certificateChain: certificates.map { .certificate($0) },
             privateKey: .privateKey(key)
@@ -170,19 +194,49 @@ private final class ScriptedTLSServer: @unchecked Sendable {
             .bind(host: "127.0.0.1", port: 0)
             .get()
         self.tracker = tracker
+        self.certificates = certificates
         listener = channel
         port = Int(listener.localAddress!.port!)
     }
 
     func makeClientTransport() -> NIOSSLStreamTransport {
-        // swiftlint:disable:next force_try
-        let ca = try! NIOSSLCertificate.fromPEMBytes([UInt8](Self.certPEM.utf8))
-        return NIOSSLStreamTransport(allowedPorts: [port], trustRoots: .certificates(ca))
+        NIOSSLStreamTransport(allowedPorts: [port], trustRoots: .certificates(certificates))
     }
 
     func shutdown() async {
         await tracker.closeAll()
         try? await listener.close().get()
+    }
+
+    private static func generateCertificate() throws -> (certificate: String, key: String) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lagoon-test-tls-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let certificateURL = directory.appendingPathComponent("certificate.pem")
+        let keyURL = directory.appendingPathComponent("key.pem")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/openssl")
+        process.arguments = [
+            "req", "-x509", "-nodes", "-newkey", "rsa:2048",
+            "-keyout", keyURL.path,
+            "-out", certificateURL.path,
+            "-days", "1",
+            "-subj", "/CN=localhost",
+            "-addext", "subjectAltName=DNS:localhost",
+        ]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw StreamTransportError.notConnected
+        }
+        return (
+            try String(contentsOf: certificateURL, encoding: .utf8),
+            try String(contentsOf: keyURL, encoding: .utf8)
+        )
     }
 }
 

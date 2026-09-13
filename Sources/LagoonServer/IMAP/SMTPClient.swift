@@ -52,8 +52,30 @@ public actor SMTPClient {
         authCode: String
     ) async throws -> String? {
         let messageId = "<\(UUID().uuidString.lowercased())@lagoon>"
-        let message = MIMEBuilder.reply(outbound, messageId: messageId)
+        let message = outbound.isReply
+            ? MIMEBuilder.reply(outbound, messageId: messageId)
+            : MIMEBuilder.newMessage(outbound, messageId: messageId)
+        try await sendRaw(
+            message,
+            outbound: outbound,
+            host: host,
+            port: port,
+            username: username,
+            authCode: authCode
+        )
+        return messageId
+    }
 
+    /// Sends already-built RFC 5322 bytes. IMAP uses this so the exact same
+    /// message can be appended to the server's Sent mailbox.
+    public func sendRaw(
+        _ message: Data,
+        outbound: OutboundMessage,
+        host: String,
+        port: Int,
+        username: String,
+        authCode: String
+    ) async throws {
         var attempt = 0
         while true {
             attempt += 1
@@ -67,7 +89,7 @@ public actor SMTPClient {
                     authCode: authCode
                 )
                 await transport.close()
-                return messageId
+                return
             } catch let failure as SMTPFailure {
                 // A failed session is never resumed: close first, reconnect in
                 // the next attempt.
@@ -189,7 +211,7 @@ public actor SMTPClient {
         try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask { try await operation() }
             group.addTask {
-                try await Task.sleep(for: self.readTimeout)
+                try await AsyncTimeout.sleep(for: self.readTimeout)
                 throw StreamTransportError.timedOut
             }
             guard let result = try await group.next() else {

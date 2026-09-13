@@ -317,9 +317,153 @@ public enum MessageRoutes {
                 makeProvider: makeProvider, logger: logger
             )
         }
+
+        // POST /api/compose/send?accountId=<uuid>
+        // 200 SendResponse | 400 malformed-compose
+        // | 401 smtp-auth-failed | 502 smtp-send-failed | 503 provider-not-configured
+        router.post("api/compose/send") { request, _ -> Response in
+            return await Self.composeHandler(
+                request: request,
+                db: db,
+                makeProvider: makeProvider,
+                logger: logger
+            )
+        }
     }
 
     // MARK: - Send
+
+    private static func composeHandler(
+        request: Request,
+        db: PostgresConnection,
+        makeProvider: MailProviderFactory.Builder,
+        logger: Logger
+    ) async -> Response {
+        guard let accountId = RouteParams.accountId(from: request) else {
+            return RouteJSON.error(.badRequest, "malformed-accountId")
+        }
+        let rawBody: Data
+        do {
+            rawBody = try await RouteParams.collectBody(request)
+        } catch {
+            return RouteJSON.error(.badRequest, "malformed-compose")
+        }
+        struct ComposeRequest: Decodable {
+            let to: String
+            let subject: String
+            let body: String
+            let requestId: String?
+        }
+        guard let decoded = try? JSONDecoder().decode(ComposeRequest.self, from: rawBody)
+        else {
+            return RouteJSON.error(.badRequest, "malformed-compose")
+        }
+        let to = decoded.to.trimmingCharacters(in: .whitespacesAndNewlines)
+        let subject = decoded.subject.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = decoded.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.isValidRecipient(to),
+              !subject.containsHeaderInjection,
+              !body.isEmpty
+        else {
+            return RouteJSON.error(.badRequest, "malformed-compose")
+        }
+        let requestId = decoded.requestId.flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
+        if decoded.requestId != nil, requestId == nil {
+            return RouteJSON.error(.badRequest, "malformed-request-id")
+        }
+
+        let account: Account
+        do {
+            guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                return RouteJSON.error(.notFound, "unknown-account")
+            }
+            account = found
+        } catch {
+            logger.error("compose account lookup failed", metadata: [
+                "accountId": .string(accountId.uuidString),
+                "err": .string("\(error)"),
+            ])
+            return RouteJSON.error(.internalServerError, "internal-error")
+        }
+        guard let provider = makeProvider(account) else {
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        }
+        if let requestId {
+            do {
+                if let existing = try await AIActionStore.findSend(
+                    accountId: accountId,
+                    requestId: requestId,
+                    db: db
+                ) {
+                    return RouteJSON.response(SendResponse(
+                        ok: true,
+                        providerMessageId: existing.payload["providerMessageId"]
+                    ))
+                }
+            } catch {
+                logger.error("compose.idempotencyLookupFailed", metadata: [
+                    "accountId": .string(accountId.uuidString),
+                    "err": .string("\(error)"),
+                ])
+                return RouteJSON.error(.internalServerError, "internal-error")
+            }
+        }
+
+        let outbound = OutboundMessage(
+            fromEmail: account.email,
+            fromName: nil,
+            to: to,
+            subject: subject,
+            body: body,
+            inReplyTo: nil,
+            references: nil,
+            isReply: false
+        )
+        let providerMessageId: String?
+        do {
+            providerMessageId = try await provider.send(outbound)
+        } catch {
+            return Self.sendError(error, logger: logger, remoteId: "compose")
+        }
+        do {
+            var payload = ["to": to, "type": "compose"]
+            if let requestId {
+                payload["requestId"] = requestId
+            }
+            if let providerMessageId {
+                payload["providerMessageId"] = providerMessageId
+            }
+            _ = try await AIActionStore.record(
+                accountId: accountId,
+                kind: .send,
+                payload: payload,
+                db: db
+            )
+        } catch {
+            logger.warning("compose.auditFailed", metadata: [
+                "to": .string(to),
+                "err": .string("\(error)"),
+            ])
+        }
+        return RouteJSON.response(SendResponse(ok: true, providerMessageId: providerMessageId))
+    }
+
+    /// New-mail recipients cross a trust boundary. This deliberately accepts
+    /// one ordinary address only: no display names, lists, line breaks or
+    /// header injection.
+    private static func isValidRecipient(_ value: String) -> Bool {
+        guard !value.isEmpty, value.count <= 254, !value.containsHeaderInjection else {
+            return false
+        }
+        let parts = value.split(separator: "@", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              !parts[0].isEmpty,
+              !parts[1].isEmpty,
+              parts[1].contains("."),
+              !value.contains(where: \.isWhitespace)
+        else { return false }
+        return true
+    }
 
     /// Send a plain-text reply to the message's sender. Everything the wire
     /// needs (recipient, subject, threading headers) comes from the synced
@@ -345,11 +489,18 @@ public enum MessageRoutes {
         } catch {
             return RouteJSON.error(.badRequest, "malformed-body")
         }
-        struct SendRequest: Decodable { let body: String }
+        struct SendRequest: Decodable {
+            let body: String
+            let requestId: String?
+        }
         guard let decoded = try? JSONDecoder().decode(SendRequest.self, from: rawBody),
               !decoded.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
             return RouteJSON.error(.badRequest, "malformed-body")
+        }
+        let requestId = decoded.requestId.flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
+        if decoded.requestId != nil, requestId == nil {
+            return RouteJSON.error(.badRequest, "malformed-request-id")
         }
 
         let account: Account
@@ -384,6 +535,26 @@ public enum MessageRoutes {
         guard let provider = makeProvider(account) else {
             return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
         }
+        if let requestId {
+            do {
+                if let existing = try await AIActionStore.findSend(
+                    accountId: accountId,
+                    requestId: requestId,
+                    db: db
+                ) {
+                    return RouteJSON.response(SendResponse(
+                        ok: true,
+                        providerMessageId: existing.payload["providerMessageId"]
+                    ))
+                }
+            } catch {
+                logger.error("send.idempotencyLookupFailed", metadata: [
+                    "remoteId": .string(remoteId),
+                    "err": .string("\(error)")
+                ])
+                return RouteJSON.error(.internalServerError, "internal-error")
+            }
+        }
 
         // Threading: reply to the parent's Message-ID and extend the parent's
         // chain with that id, so clients that only walk References still see
@@ -411,10 +582,20 @@ public enum MessageRoutes {
         // The reply is already on the wire: a failed audit write must not turn
         // a delivered message into a 500 the client would retry.
         do {
+            var payload = [
+                "remoteId": remoteId,
+                "to": stored.fromAddress
+            ]
+            if let requestId {
+                payload["requestId"] = requestId
+            }
+            if let providerMessageId {
+                payload["providerMessageId"] = providerMessageId
+            }
             let _ = try await AIActionStore.record(
                 accountId: accountId,
                 kind: .send,
-                payload: ["remoteId": remoteId, "to": stored.fromAddress],
+                payload: payload,
                 db: db
             )
         } catch {
@@ -503,5 +684,11 @@ public enum MessageRoutes {
 
     static func providerLabel(_ error: Error) -> String {
         (error as? MailError)?.logLabel ?? "\(type(of: error))"
+    }
+}
+
+private extension String {
+    var containsHeaderInjection: Bool {
+        contains("\r") || contains("\n") || contains("\0")
     }
 }

@@ -88,6 +88,30 @@ public actor IMAPConnection {
         }
     }
 
+    /// APPEND one literal message to a mailbox. The command uses a
+    /// synchronizing literal: wait for `+`, write the exact bytes, then send
+    /// the CRLF that terminates the client command.
+    public func append(mailbox: String, message: Data) async throws {
+        guard isConnected else { throw StreamTransportError.notConnected }
+        let tag = nextTag()
+        try await write("\(tag) APPEND \(mailbox) (\\Seen) {\(message.count)}")
+
+        while true {
+            guard let response = try await readResponse(timeout: readTimeout) else { continue }
+            switch response.kind {
+            case .continuation:
+                try await transport.write(message)
+                try await transport.write(Data("\r\n".utf8))
+                try await awaitTaggedCompletion(tag: tag)
+                return
+            case .tagged(_, let status):
+                throw Self.error(for: status, raw: response.raw)
+            case .untagged:
+                continue
+            }
+        }
+    }
+
     /// Enters IDLE, waits up to `waitUpTo` for a mailbox event, then sends DONE
     /// and re-enters a clean state. Returns as soon as one EXISTS / EXPUNGE /
     /// FETCH arrives so new mail is not delayed by the rest of the budget;
@@ -173,6 +197,34 @@ public actor IMAPConnection {
         try await transport.write(Data("\(line)\r\n".utf8))
     }
 
+    private func awaitTaggedCompletion(tag: String) async throws {
+        while true {
+            guard let response = try await readResponse(timeout: readTimeout) else { continue }
+            if case .tagged(let received, let status) = response.kind {
+                guard received == tag else {
+                    logger.warning("imap.unexpectedTag")
+                    continue
+                }
+                if case .ok = status { return }
+                throw Self.error(for: status, raw: response.raw)
+            }
+        }
+    }
+
+    private static func error(for status: IMAPStatus, raw: String) -> MailError {
+        switch status {
+        case .ok:
+            return .protocolError("unexpected tagged OK")
+        case .no:
+            if raw.uppercased().contains("AUTHENTICATIONFAILED") {
+                return .authFailed
+            }
+            return .protocolError("tagged NO")
+        case .bad:
+            return .protocolError("tagged BAD")
+        }
+    }
+
     private func nextTag() -> String {
         commandCounter += 1
         return String(format: "A%04d", commandCounter)
@@ -193,13 +245,19 @@ public actor IMAPConnection {
         try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask { try await operation() }
             group.addTask {
-                try await Task.sleep(for: duration)
+                try await AsyncTimeout.sleep(for: duration)
                 throw StreamTransportError.timedOut
             }
             guard let result = try await group.next() else {
                 throw StreamTransportError.timedOut
             }
             group.cancelAll()
+            // Drain the losing child before leaving the task-group scope. This
+            // avoids a release-runtime teardown crash seen when the timeout
+            // child was still deallocating after the result was returned.
+            while !group.isEmpty {
+                _ = try? await group.next()
+            }
             return result
         }
     }

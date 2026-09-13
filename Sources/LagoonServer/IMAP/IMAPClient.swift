@@ -44,9 +44,9 @@ public struct IMAPFetchedHeader: Equatable, Sendable {
     }
 }
 
-/// A best-effort snippet: the raw first `octets` bytes of the body, still in
-/// whatever transfer encoding the message uses (the provider drops it when it
-/// cannot tell what the bytes mean).
+/// A best-effort snippet: the raw first `octets` bytes of the whole message,
+/// headers included, still in whatever transfer encoding the message uses (the
+/// provider decodes it and drops it when it cannot tell what the bytes mean).
 public struct IMAPFetchedText: Equatable, Sendable {
     public var uid: Int64
     public var snippet: Data?
@@ -232,10 +232,64 @@ public actor IMAPClient {
         return result
     }
 
-    /// First `octets` bytes of the body, still transfer-encoded.
-    public func fetchTextSnippet(uid: Int64, octets: Int = 256) async throws -> [IMAPFetchedText] {
+    /// Finds one message by its RFC 5322 `Message-ID`. Archive folders assign
+    /// their own UIDs on many servers, so this is the stable identity used to
+    /// reverse an archive move.
+    public func searchUID(messageID: String) async throws -> Int64? {
+        let quoted = try Self.quoted(messageID)
+        let responses = try await connection.execute("UID SEARCH HEADER Message-ID \(quoted)")
+        for response in responses {
+            guard case .untagged = response.kind,
+                  response.atoms.count >= 3,
+                  response.atoms[0] == "*",
+                  response.atoms[1].uppercased() == "SEARCH"
+            else { continue }
+            return response.atoms.dropFirst(2).compactMap(Int64.init).max()
+        }
+        return nil
+    }
+
+    /// How many bytes of a message the list-preview fetch asks for.
+    ///
+    /// This is a *byte* count, not a round-trip count: every message is still
+    /// fetched with exactly one `UID FETCH`, and the number of round trips is
+    /// independent of the window size. On a real 189-message QQ mailbox the
+    /// pull took 26–30 s with both a 256 B and a 32768 B window, i.e. the cost
+    /// is dominated by round-trip latency, so widening the window is nearly
+    /// free in wall-clock terms.
+    ///
+    /// 32768 is deliberately large. `BODY.PEEK[]<0.N>` starts at byte 0, the
+    /// RFC 2822 header block, and a real newsletter's `Received` / `DKIM` /
+    /// `ARC` headers alone can run to several KB. A window that ends inside
+    /// those headers leaves `splitHeadAndBody` without its blank separator, so
+    /// `plainText` returns "" and the list shows no preview: measured against
+    /// the same mailbox, 256 B produced previews for 13/189 messages and
+    /// 4096 B for 67/189, while 32768 B reached 178/189 (94%) with zero
+    /// raw-base64 leaks and zero two-character snippets — both of those were
+    /// just artifacts of the window clipping the top-level `content-type`
+    /// header, not independent decoding bugs.
+    ///
+    /// The price is at most ~32 KB more per message — a one-off ~16 MB while
+    /// backfilling 500 messages — and, per the measurement above, no extra
+    /// round trips.
+    ///
+    /// A cheaper fetch would be a small header slice plus the body:
+    /// `UID FETCH uid (UID BODY.PEEK[HEADER.FIELDS (CONTENT-TYPE
+    /// CONTENT-TRANSFER-ENCODING)] BODY.PEEK[TEXT]<0.N>)`. It cannot be used
+    /// today because `IMAPConnection.readResponse` appends every `{N}` literal
+    /// in a FETCH response into a single `Data`, so the header and body would
+    /// be concatenated. Fix that framing first; until then keep
+    /// `BODY.PEEK[]<0.N>`.
+    public static let snippetOctets = 32768
+
+    /// First `octets` bytes of the message — headers included so the MIME
+    /// decoder can tell what the body is — still transfer-encoded.
+    public func fetchTextSnippet(
+        uid: Int64,
+        octets: Int = IMAPClient.snippetOctets
+    ) async throws -> [IMAPFetchedText] {
         let responses = try await connection.execute(
-            "UID FETCH \(uid) (UID BODY.PEEK[TEXT]<0.\(octets)>)"
+            "UID FETCH \(uid) (UID BODY.PEEK[]<0.\(octets)>)"
         )
 
         var snippets: [IMAPFetchedText] = []
@@ -292,6 +346,10 @@ public actor IMAPClient {
     public func createMailbox(_ name: String) async throws {
         let quoted = try Self.quoted(name)
         _ = try await connection.execute("CREATE \(quoted)")
+    }
+
+    public func append(mailbox: String, message: Data) async throws {
+        try await connection.append(mailbox: try Self.quoted(mailbox), message: message)
     }
 
     public func idle(waitUpTo: Duration) async throws -> [IMAPResponse] {

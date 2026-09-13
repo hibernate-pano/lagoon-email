@@ -79,10 +79,9 @@ public enum OAuthRoutes {
                 )
                 // A freshly connected account becomes the one active account.
                 try await AccountStore.setActive(accountId: account.id, db: db)
-                // Pull once so the (polling) browser handshake finds mail
-                // already there. The tiny budget keeps this request from
-                // inheriting the sync loop's 5-minute idle wait.
-                await sync.tickOnce(waitBudget: .milliseconds(1))
+                // Restart the loop immediately without blocking the browser
+                // callback on the first full mailbox sync.
+                await sync.accountChanged()
                 return Response(
                     status: .ok,
                     body: .init(byteBuffer: ByteBuffer(

@@ -25,6 +25,14 @@ struct UsageSheet: View {
                     Text(" / ").foregroundStyle(.secondary)
                     Text(report.capUSD > 0 ? String(format: "$%.2f", report.capUSD) : l10n.budgetDisabled).foregroundStyle(.secondary)
                 }
+                Text(l10n.usageCallCount(report.callCount))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if report.capUSD > 0, !report.costTrackingAvailable {
+                    Text(l10n.costTrackingUnavailable)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             } else if let error {
                 Text(error).foregroundStyle(.red)
             } else {

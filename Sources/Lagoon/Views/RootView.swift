@@ -12,7 +12,17 @@ struct RootView: View {
     @StateObject private var undo = UndoController()
     @State private var showSearch = false
     @State private var showUsage = false
+    @State private var showActionHistory = false
+    @State private var showCompose = false
+    @State private var showConnect = false
+    /// Seeded by the "Reconnect" banner so the QQ form comes up pre-filled;
+    /// "Add account" deliberately leaves it nil.
+    @State private var connectPrefillEmail: String?
     @State private var switchError: String?
+    @State private var recoveredNotice: String?
+    @State private var composeNotice: String?
+    @State private var composeNoticeDismiss: Task<Void, Never>?
+    private let api = APIClient()
 
     enum Surface: String, CaseIterable, Identifiable {
         case briefing
@@ -34,6 +44,7 @@ struct RootView: View {
                     MessageListView(onShowBriefing: { surface = .briefing })
                 }
             }
+            .id(accounts.accountId)
         }
         .environment(\.l10n, l10n)
         .environmentObject(undo)
@@ -47,6 +58,23 @@ struct RootView: View {
         .sheet(isPresented: $showUsage) {
             UsageSheet()
         }
+        .sheet(isPresented: $showActionHistory) {
+            ActionHistorySheet()
+        }
+        .sheet(isPresented: $showCompose) {
+            if let accountId = accounts.accountId {
+                NewMessageSheet(accountId: accountId) { _ in
+                    showComposeNotice()
+                }
+            }
+        }
+        .sheet(isPresented: $showConnect, onDismiss: {
+            // A successful connect/reconnect can clear the health banner; refresh
+            // the directory immediately instead of waiting up to 30s.
+            Task { await directory.refresh() }
+        }) {
+            ConnectView(prefillEmail: connectPrefillEmail)
+        }
         // Binding the environment store (not a throwaway one): UndoController
         // holds it weakly, so the real owner must be the one bound.
         .onAppear { undo.bind(accounts) }
@@ -55,8 +83,40 @@ struct RootView: View {
         .task {
             while !Task.isCancelled {
                 await directory.refresh()
-                try? await Task.sleep(for: DirectoryStore.refreshInterval)
+                do {
+                    try await Task.sleep(for: DirectoryStore.refreshInterval)
+                } catch {
+                    return
+                }
             }
+        }
+        .onChange(of: directory.active?.syncHealth.status) { old, new in
+            guard let old, old != .ok, new == .ok else { return }
+            recoveredNotice = l10n.syncRecovered
+            Task {
+                try? await Task.sleep(for: .seconds(4))
+                recoveredNotice = nil
+            }
+        }
+        .onChange(of: directory.active?.id) { _, activeId in
+            do {
+                if let activeId {
+                    if accounts.accountId != activeId {
+                        try accounts.set(accountId: activeId)
+                    }
+                } else if accounts.accountId != nil {
+                    try accounts.clear()
+                }
+            } catch {
+                switchError = l10n.saveAccountFailed + error.lagoonUIMessage
+            }
+        }
+        .background {
+            Button(l10n.undoLastAction) { Task { await undo.undoLatest() } }
+                .keyboardShortcut("z", modifiers: .command)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .accessibilityHidden(true)
         }
     }
 
@@ -64,11 +124,37 @@ struct RootView: View {
 
     @ViewBuilder
     private var banner: some View {
-        if let switchError {
+        if let undoError = undo.errorMessage {
+            healthRow(
+                text: undoError,
+                color: .red,
+                action: (l10n.dismiss, { undo.clearError() })
+            )
+        } else if let recoveredNotice {
+            healthRow(
+                text: recoveredNotice,
+                color: .green,
+                systemImage: "checkmark.circle.fill",
+                action: nil
+            )
+        } else if let switchError {
             healthRow(
                 text: switchError,
                 color: .red,
                 action: nil
+            )
+        } else if let composeNotice {
+            healthRow(
+                text: composeNotice,
+                color: .green,
+                systemImage: "paperplane.fill",
+                action: nil
+            )
+        } else if let loadError = directory.loadError {
+            healthRow(
+                text: loadError,
+                color: .red,
+                action: (l10n.retry, { Task { await directory.refresh() } })
             )
         } else if let active = directory.active, active.syncHealth.status != .ok {
             switch active.syncHealth.status {
@@ -82,13 +168,13 @@ struct RootView: View {
                 healthRow(
                     text: l10n.healthDegraded + (active.syncHealth.lastError ?? l10n.unknownError),
                     color: .orange,
-                    action: nil
+                    action: (l10n.retry, { Task { await retrySync() } })
                 )
             case .error:
                 healthRow(
                     text: l10n.healthError + (active.syncHealth.lastError ?? l10n.unknownError),
                     color: .orange,
-                    action: nil
+                    action: (l10n.retry, { Task { await retrySync() } })
                 )
             case .ok:
                 EmptyView()
@@ -96,9 +182,14 @@ struct RootView: View {
         }
     }
 
-    private func healthRow(text: String, color: Color, action: (String, () -> Void)?) -> some View {
+    private func healthRow(
+        text: String,
+        color: Color,
+        systemImage: String = "exclamationmark.triangle.fill",
+        action: (String, () -> Void)?
+    ) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
+            Image(systemName: systemImage)
                 .foregroundStyle(color)
             Text(text)
                 .font(.caption)
@@ -159,30 +250,62 @@ struct RootView: View {
         }
     }
 
-    /// Switch account: persist the local id first (so the feed re-queries the
-    /// new account) and then flip it server-side.
+    /// Switch account: make the server's active row authoritative first, then
+    /// persist the same id locally. If Keychain fails, roll the server back.
     private func switchTo(_ account: ConnectedAccount) async {
+        let previous = directory.accounts.first { $0.id == accounts.accountId }
         do {
-            try accounts.set(accountId: account.id)
             switchError = nil
-            await directory.activate(account)
+            try await directory.activate(account)
+            try accounts.set(accountId: account.id)
         } catch {
+            if let previous, accounts.accountId != account.id {
+                try? await directory.activate(previous)
+            }
             switchError = l10n.saveAccountFailed + error.lagoonUIMessage
         }
     }
 
-    /// "Add account" and "Reconnect" both return to the connect surface; the
-    /// difference is only whether credentials still exist server-side.
-    private func addAccount() {
+    private func retrySync() async {
         do {
-            try accounts.clear()
+            try await api.requestSync()
+            await directory.refresh()
         } catch {
-            switchError = l10n.keychainError + error.lagoonUIMessage
+            switchError = l10n.syncFailed + error.lagoonUIMessage
         }
     }
 
+    private func showComposeNotice() {
+        composeNoticeDismiss?.cancel()
+        composeNotice = l10n.sent
+        composeNoticeDismiss = Task {
+            do {
+                try await Task.sleep(for: .seconds(4))
+            } catch {
+                return
+            }
+            composeNotice = nil
+        }
+    }
+
+    /// "Add account" and "Reconnect" both open the connect sheet. The stored
+    /// account id is deliberately left in place: clearing it here would unmount
+    /// RootView before the user submits any credentials and strand them with no
+    /// way back. The sheet's Cancel (shown while an account id exists) is the
+    /// exit, and the success paths call `accounts.set(accountId:)` themselves.
+    private func addAccount() {
+        switchError = nil
+        connectPrefillEmail = nil
+        showConnect = true
+    }
+
     private func reconnect() {
-        addAccount()
+        switchError = nil
+        // Only QQ re-auth is an in-app form; Gmail reconnect goes through the
+        // browser OAuth dance, so leaving the default Gmail tab is correct.
+        let active = directory.active
+        connectPrefillEmail = active?.provider == .qq ? active?.email : nil
+        showConnect = true
     }
 
     @ToolbarContentBuilder
@@ -200,6 +323,14 @@ struct RootView: View {
             .help(l10n.surfaceHelp)
         }
         ToolbarItem(placement: .primaryAction) {
+            Button { showCompose = true } label: {
+                Label(l10n.newMessage, systemImage: "square.and.pencil")
+            }
+            .keyboardShortcut("n", modifiers: .command)
+            .disabled(accounts.accountId == nil)
+            .help(l10n.newMessageHelp)
+        }
+        ToolbarItem(placement: .primaryAction) {
             Picker(l10n.languageLabel, selection: $languageTag) {
                 ForEach(AppLanguage.allCases) { language in
                     Text(language.displayName).tag(language.rawValue)
@@ -213,11 +344,14 @@ struct RootView: View {
             }
             .keyboardShortcut("f", modifiers: .command)
             .help(l10n.shortcutSearch)
-            Button { showUsage = true } label: {
-                Label(l10n.budgetThisMonth, systemImage: "chart.bar")
+            Menu {
+                Button(l10n.budgetThisMonth) { showUsage = true }
+                    .keyboardShortcut("b", modifiers: [.command])
+                Button(l10n.actionHistory) { showActionHistory = true }
+            } label: {
+                Label(l10n.moreActions, systemImage: "ellipsis.circle")
             }
-            .keyboardShortcut("b", modifiers: [.command])
-            .help(l10n.budgetThisMonth)
+            .help(l10n.moreActions)
         }
     }
 }

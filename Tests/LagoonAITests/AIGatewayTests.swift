@@ -51,6 +51,45 @@ final class StubURLProtocol: URLProtocol {
     }
 }
 
+private actor RecordingBudget: BudgetPolicy {
+    struct RecordedCall: Equatable {
+        let capability: String
+        let accountEmail: String
+        let promptTokens: Int
+        let completionTokens: Int
+    }
+
+    private(set) var checks: [String] = []
+    private(set) var records: [RecordedCall] = []
+
+    func checkBeforeCall(
+        capability: String,
+        model: String,
+        estimatedPromptTokens: Int,
+        estimatedCompletionTokens: Int,
+        promptRate: Double?,
+        completionRate: Double?
+    ) async throws {
+        checks.append(capability)
+    }
+
+    func record(
+        capability: String,
+        model: String,
+        accountEmail: String,
+        promptTokens: Int,
+        completionTokens: Int,
+        costMicrosUSD: Int64
+    ) async throws {
+        records.append(RecordedCall(
+            capability: capability,
+            accountEmail: accountEmail,
+            promptTokens: promptTokens,
+            completionTokens: completionTokens
+        ))
+    }
+}
+
 final class AIGatewayTests: XCTestCase {
     private var configURL: URL!
 
@@ -104,14 +143,18 @@ final class AIGatewayTests: XCTestCase {
         return URLSession(configuration: cfg)
     }
 
-    private func gateway() throws -> AIGateway {
+    private func gateway(budget: BudgetPolicy = NoBudgetPolicy()) throws -> AIGateway {
         let resolved = try ProviderRegistry.load(
             environment: ["STUB_LLM_KEY": "test-key"],
             fileURL: configURL
         )
         XCTAssertEqual(resolved.count, 1)
         let provider = try OpenAICompatibleProvider(resolved: resolved[0], session: stubSession())
-        return AIGateway(providers: [provider], routing: ["summary": "stub", "classify": "stub"])
+        return AIGateway(
+            providers: [provider],
+            routing: ["summary": "stub", "classify": "stub", "draft": "stub"],
+            budget: budget
+        )
     }
 
     private func message(remoteId: String, from: String = "alice@example.com") -> MessageHeader {
@@ -188,6 +231,33 @@ final class AIGatewayTests: XCTestCase {
         XCTAssertTrue(text.contains("g1"))
         XCTAssertFalse(text.lowercased().contains("\"body\""), "classify prompt must not carry a body field")
         XCTAssertEqual(StubURLProtocol.requests.first?.value(forHTTPHeaderField: "Authorization"), "Bearer test-key")
+    }
+
+    func test_classify_batchesLargeFeedsIntoParseableResponses() async throws {
+        nonisolated(unsafe) var call = 0
+        StubURLProtocol.set { _ in
+            let start = call * 12
+            call += 1
+            let content = try! JSONSerialization.data(
+                withJSONObject: Dictionary(uniqueKeysWithValues: (start..<min(start + 12, 25)).map {
+                    ("m\($0)", "needsReply")
+                })
+            )
+            let envelope: [String: Any] = [
+                "choices": [["message": ["content": String(decoding: content, as: UTF8.self)]]]
+            ]
+            let data = try! JSONSerialization.data(withJSONObject: envelope)
+            return (200, data)
+        }
+
+        let ai = try gateway()
+        let messages = (0..<25).map { message(remoteId: "m\($0)") }
+        let result = try await ai.classify(messages, accountEmail: "me@example.com", language: nil)
+
+        XCTAssertEqual(call, 3)
+        XCTAssertEqual(result.count, 25)
+        XCTAssertEqual(result["m0"], .needsReply)
+        XCTAssertEqual(result["m24"], .needsReply)
     }
 
     func test_classify_ignoresUnknownIdsAndGroups() async throws {
@@ -322,6 +392,61 @@ final class AIGatewayTests: XCTestCase {
         _ = try await ai.summarize(body, language: nil, accountEmail: "test@example.com")
         let text = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
         XCTAssertLessThan(text.count, 20_000, "body must be truncated before leaving the process")
+    }
+
+    // MARK: - draft
+
+    func test_draftReplies_usesDedicatedPromptAndRecordsBudget() async throws {
+        StubURLProtocol.set { _ in
+            (200, Data(#"{"choices":[{"message":{"content":"{\"variants\":[\"Short reply\",\"Warm reply\",\"Formal reply\"]}"}}],"usage":{"prompt_tokens":120,"completion_tokens":30}}"#.utf8))
+        }
+        let budget = RecordingBudget()
+        let ai = try gateway(budget: budget)
+        let body = MessageBody(
+            remoteId: "g1",
+            subject: "Project update",
+            fromAddress: "alice@example.com",
+            fromName: "Alice",
+            toAddress: "me@example.com",
+            receivedAt: Date(),
+            text: "Can you confirm the deadline?"
+        )
+
+        let variants = try await ai.draftReplies(
+            body,
+            language: "en",
+            accountEmail: "me@example.com",
+            count: 3
+        )
+
+        XCTAssertEqual(variants, ["Short reply", "Warm reply", "Formal reply"])
+        let prompt = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
+        XCTAssertTrue(prompt.contains("send-ready reply variants"))
+        XCTAssertTrue(prompt.contains("Do not summarize"))
+        let records = await budget.records
+        XCTAssertEqual(records, [
+            RecordingBudget.RecordedCall(
+                capability: "draft",
+                accountEmail: "me@example.com",
+                promptTokens: 120,
+                completionTokens: 30
+            )
+        ])
+    }
+
+    func test_classify_recordsBudgetAfterSuccessfulCall() async throws {
+        StubURLProtocol.set { _ in
+            (200, Data(#"{"choices":[{"message":{"content":"{\"g1\":\"needsReply\"}"}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#.utf8))
+        }
+        let budget = RecordingBudget()
+        let ai = try gateway(budget: budget)
+        _ = try await ai.classify(
+            [message(remoteId: "g1")],
+            accountEmail: "me@example.com",
+            language: nil
+        )
+        let records = await budget.records
+        XCTAssertEqual(records.map(\.capability), ["classify"])
     }
 
     // MARK: - reasoning-model robustness

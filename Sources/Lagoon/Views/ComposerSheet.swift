@@ -9,6 +9,7 @@ struct ComposerSheet: View {
     let accountId: UUID
     let to: String
     let subject: String
+    let quotedText: String
     /// Called with the provider-assigned message id (nil when it reports none)
     /// after the server accepted the reply.
     let onSent: (String?) -> Void
@@ -18,6 +19,9 @@ struct ComposerSheet: View {
     @State private var bodyText: String
     @State private var isSending = false
     @State private var error: String?
+    /// Stable across retries; changes only when the composer is created anew.
+    @State private var requestId = UUID().uuidString.lowercased()
+    private let draftKey: String
     private let api = APIClient()
 
     init(
@@ -26,14 +30,19 @@ struct ComposerSheet: View {
         to: String,
         subject: String,
         initialBody: String = "",
+        quotedText: String = "",
         onSent: @escaping (String?) -> Void
     ) {
         self.remoteId = remoteId
         self.accountId = accountId
         self.to = to
         self.subject = subject
+        self.quotedText = quotedText
         self.onSent = onSent
-        _bodyText = State(initialValue: initialBody)
+        let key = "lagoon.composer.\(accountId.uuidString).\(remoteId)"
+        self.draftKey = key
+        let saved = UserDefaults.standard.string(forKey: key) ?? ""
+        _bodyText = State(initialValue: initialBody.isEmpty ? saved : initialBody)
     }
 
     var body: some View {
@@ -53,6 +62,20 @@ struct ComposerSheet: View {
                 Text(subject).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
 
+            if !quotedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                DisclosureGroup {
+                    Text(String(quotedText.prefix(3_000)))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .padding(.top, 6)
+                } label: {
+                    Text(l10n.originalMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             TextEditor(text: $bodyText)
                 .font(.body)
                 .frame(minHeight: 220)
@@ -70,6 +93,14 @@ struct ComposerSheet: View {
                             .allowsHitTesting(false)
                     }
                 }
+                .onChange(of: bodyText) { _, newValue in
+                    let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmed.isEmpty {
+                        UserDefaults.standard.removeObject(forKey: draftKey)
+                    } else {
+                        UserDefaults.standard.set(newValue, forKey: draftKey)
+                    }
+                }
 
             if let error {
                 Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
@@ -77,8 +108,9 @@ struct ComposerSheet: View {
 
             HStack {
                 Text(l10n.shortcutSend).font(.caption).foregroundStyle(.tertiary)
+                Text(l10n.draftSaved).font(.caption2).foregroundStyle(.tertiary)
                 Spacer()
-                Button(l10n.cancel) { dismiss() }
+                Button(l10n.closeComposer) { dismiss() }
                 Button {
                     Task { await send() }
                 } label: {
@@ -110,8 +142,12 @@ struct ComposerSheet: View {
         error = nil
         do {
             let response = try await api.sendReply(
-                remoteId: remoteId, accountId: accountId, body: trimmed
+                remoteId: remoteId,
+                accountId: accountId,
+                body: trimmed,
+                requestId: requestId
             )
+            UserDefaults.standard.removeObject(forKey: draftKey)
             onSent(response.providerMessageId)
             dismiss()
         } catch {

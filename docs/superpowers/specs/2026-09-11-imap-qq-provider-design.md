@@ -363,7 +363,7 @@ connect smtp.qq.com:465 → TLS → greeting 220 → EHLO <client-host>
 - 4xx/超时 → 重试 1 次（**仅在 `DATA` 前可重试**；`DATA` 阶段后不重试以免重复投递）。
 - 5xx → 直接失败，原文映射为中文提示（535 → “授权码/发信权限异常”）。
 - QQ 是否把 SMTP 发出的信自动存入“已发送”：**待实测**（§5.5）；无论结果 v1 都不做 `APPEND`，避免重复。
-- 发送**不可撤销**：`ai_actions` 记 `kind="send"` 审计行（payload `{remoteId, to}`），Undo 面板不提供回放
+- 发送**不可撤销**：`ai_actions` 记 `kind="send"` 审计行（payload `{remoteId, to, requestId, providerMessageId?}`），Undo 面板不提供回放
   ——符合 spec「人做最终确认的动作不进撤销队列」的原则。
 
 ### 4.2 回复内容的组装（`MIMEBuilder`）
@@ -379,22 +379,22 @@ connect smtp.qq.com:465 → TLS → greeting 220 → EHLO <client-host>
 |------|-------|---------|
 | archive | `modify` 去 `INBOX`（现状不变） | `UID MOVE <uid> <Archive>`；无 `MOVE` 则 `COPY`+`STORE +FLAGS \Deleted`+`EXPUNGE` |
 | unarchive（撤销） | `modify` 加回 `INBOX` | `UID MOVE <uid> "INBOX"` |
-| 本地先写 | `is_archived=TRUE` + `ai_actions(kind=archive)`（现状不变） | 同左 |
+| 本地落库 | 远端成功后才写 `is_archived=TRUE` + `ai_actions(kind=archive)` | 同左 |
 
 - **归档文件夹解析顺序**：`\Archive`（SPECIAL-USE）→ 名称匹配 `Archive`/`归档` → `CREATE "Archive"`（一次性，成功则记入
   `capabilities.archiveFolder=true`）→ 都不行 → `false`，客户端**禁用**归档按钮并附说明“该邮箱无归档文件夹”。
   禁用即“诚实降级”，不做 archive→Trash 的语义错配。
-- 远端写失败时本地仍归档（现状行为），`ai_actions.payload.remoteWrite=false` 记录，撤销时再尝试远端还原。
+- 远端写失败时返回错误且本地状态不变，不再产生“本地已归档、远端仍在收件箱”的分裂状态。
 
 ### 4.4 API 变化一览
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `POST` | `/api/accounts/imap` | 新。body `{provider:"qq", email, authCode}`；`probe()` 通过才落库（201 返回账号）；错误：400 参数缺失、401 `imap-auth-failed`、502 `imap-unreachable`、409 `account-exists`（提示改为切换） |
+| `POST` | `/api/accounts/imap` | 新。body `{provider:"qq", email, authCode}`；`probe()` 通过才落库（201 返回账号，`id` 为 DB 中的权威行 id）；错误：400 参数缺失、401 `imap-auth-failed`、502 `imap-unreachable`、409 `account-exists`（已存在且 `syncHealth.status == .ok` → 提示切换；已存在但不健康（`needsReconnect`/`degraded`/`error`）→ 用本次提交的新授权码就地重认证并返回**同一 id**，probe 失败则返回 401/502 且原行完全不动） |
 | `GET` | `/api/accounts` | 增 `isActive` / `syncHealth` / `capabilities`；credentials 永不回显 |
 | `POST` | `/api/accounts/{id}/activate` | 新。切活跃账号（204） |
 | `DELETE` | `/api/accounts/{id}` | 新。级联删除该账号邮件与动作（FK 已 `ON DELETE CASCADE`） |
-| `POST` | `/api/messages/{remoteId}/send` | 新。body `{body}`；200 `{ok, providerMessageId?}`；401 `smtp-auth-failed` / 502 `smtp-send-failed` |
+| `POST` | `/api/messages/{remoteId}/send` | 新。body `{body, requestId}`；200 `{ok, providerMessageId?}`；401 `smtp-auth-failed` / 502 `smtp-send-failed` |
 | 其余 messages/actions/drafts 路由 | | 参数 `:gmailId` → `:remoteId`，JSON 键同名替换 |
 
 ### 4.5 客户端改动

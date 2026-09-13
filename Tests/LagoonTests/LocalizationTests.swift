@@ -85,11 +85,15 @@ final class LocalizationTests: XCTestCase {
             zh.connectQQTab, zh.connectQQTitle, zh.qqEmailPlaceholder, zh.qqAuthCodePlaceholder,
             zh.qqHelp, zh.qqConnectButton, zh.qqMissingFields, zh.qqAuthFailed,
             zh.qqUnreachable, zh.qqAccountExists, zh.connectFailed,
+            zh.useThisAccount, zh.qqProviderNotConfigured, zh.qqInternalError,
+            zh.serverTimedOut, zh.serverUnreachable,
         ]
         let enStrings = [
             en.connectQQTab, en.connectQQTitle, en.qqEmailPlaceholder, en.qqAuthCodePlaceholder,
             en.qqHelp, en.qqConnectButton, en.qqMissingFields, en.qqAuthFailed,
             en.qqUnreachable, en.qqAccountExists, en.connectFailed,
+            en.useThisAccount, en.qqProviderNotConfigured, en.qqInternalError,
+            en.serverTimedOut, en.serverUnreachable,
         ]
         for value in zhStrings + enStrings {
             XCTAssertFalse(value.isEmpty)
@@ -168,5 +172,24 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(en.send, "Send")
         XCTAssertEqual(zh.sentTo("a@b.com"), "已发送给 a@b.com")
         XCTAssertEqual(en.sentTo("a@b.com"), "Sent to a@b.com")
+    }
+
+    func test_newMessageStrings_existInBothLanguages() {
+        let zhStrings = [
+            zh.newMessage, zh.newMessageHelp, zh.newMessageTitle,
+            zh.newMessageToPlaceholder, zh.newMessageSubjectPlaceholder,
+            zh.newMessageBodyPlaceholder, zh.emptyRecipient, zh.emptyMessage,
+        ]
+        let enStrings = [
+            en.newMessage, en.newMessageHelp, en.newMessageTitle,
+            en.newMessageToPlaceholder, en.newMessageSubjectPlaceholder,
+            en.newMessageBodyPlaceholder, en.emptyRecipient, en.emptyMessage,
+        ]
+        for value in zhStrings + enStrings {
+            XCTAssertFalse(value.isEmpty)
+        }
+        for (chinese, english) in zip(zhStrings, enStrings) {
+            XCTAssertNotEqual(chinese, english, "untranslated string pair: \(chinese)")
+        }
     }
 }

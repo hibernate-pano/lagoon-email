@@ -11,12 +11,18 @@ import LagoonKit
 /// returns; if it throws, the heuristics stand and the briefing still returns
 /// 200 (a classifier outage must never 500 the whole feed).
 public enum BriefingRoutes {
+    public enum ClassificationMode: Sendable {
+        case synchronous
+        case background
+    }
+
     public static func register(
         on router: Router<BasicRequestContext>,
         db: PostgresConnection,
         logger: Logger,
         classifier: (any BriefingClassifying)? = nil,
-        cache: BriefingClassificationCache = BriefingClassificationCache()
+        cache: BriefingClassificationCache = BriefingClassificationCache(),
+        classificationMode: ClassificationMode = .synchronous
     ) {
         router.get("api/briefing") { request, _ -> Response in
             guard let accountId = RouteParams.accountId(from: request) else {
@@ -42,10 +48,15 @@ public enum BriefingRoutes {
             let messages: [MessageHeader]
             let pinned: Set<String>
             let listUnsubscribe: Set<String>
+            let userOverrides: [String: BriefingGroup]
             do {
                 messages = try await MessageStore.recent(forAccount: accountId, limit: limit, db: db)
                 pinned = try await MessageStore.pinnedIds(forAccount: accountId, db: db)
                 listUnsubscribe = try await MessageStore.listUnsubscribeIds(forAccount: accountId, db: db)
+                userOverrides = try await AIActionStore.overridesBySender(
+                    accountId: accountId,
+                    db: db
+                )
             } catch {
                 logger.error("briefing query failed", metadata: [
                     "accountId": .string(accountId.uuidString),
@@ -72,25 +83,54 @@ public enum BriefingRoutes {
                 let (known, pending) = await cache.cached(for: messages)
                 var overrides = known
                 if !pending.isEmpty {
-                    do {
-                        let fresh = try await classifier.classify(
-                            pending,
-                            accountEmail: account.email,
-                            language: nil
-                        )
-                        await cache.store(fresh, for: pending)
-                        for (remoteId, group) in fresh { overrides[remoteId] = group }
-                    } catch {
-                        // Fail open: heuristic grouping is still useful, and
-                        // nothing is cached so the next refresh retries.
-                        logger.warning("briefing classifier failed; using heuristics", metadata: [
-                            "accountId": .string(accountId.uuidString),
-                            "err": .string("\(error)")
-                        ])
+                    switch classificationMode {
+                    case .synchronous:
+                        do {
+                            let fresh = try await classifier.classify(
+                                pending,
+                                accountEmail: account.email,
+                                language: nil
+                            )
+                            await cache.store(fresh, for: pending)
+                            for (remoteId, group) in fresh { overrides[remoteId] = group }
+                        } catch {
+                            logger.warning("briefing classifier failed; using heuristics", metadata: [
+                                "accountId": .string(accountId.uuidString),
+                                "err": .string("\(error)")
+                            ])
+                        }
+                    case .background:
+                        await cache.markInFlight(pending)
+                        Task {
+                            do {
+                                let fresh = try await classifier.classify(
+                                    pending,
+                                    accountEmail: account.email,
+                                    language: nil
+                                )
+                                await cache.store(fresh, for: pending)
+                            } catch {
+                                await cache.clearInFlight(pending)
+                                logger.warning("briefing background classifier failed", metadata: [
+                                    "accountId": .string(accountId.uuidString),
+                                    "err": .string("\(error)")
+                                ])
+                            }
+                        }
                     }
                 }
                 for (remoteId, group) in overrides where classified[remoteId] != nil {
                     classified[remoteId] = (group, .ai)
+                }
+            }
+
+            // User intent has final authority over both the heuristic and AI,
+            // except for a pin, which is itself an explicit user action.
+            for message in messages {
+                if pinned.contains(message.remoteId) {
+                    classified[message.remoteId] = (.pinned, .pinned)
+                } else if let override = userOverrides[message.fromAddress] {
+                    classified[message.remoteId] = (override, .userOverride)
                 }
             }
 

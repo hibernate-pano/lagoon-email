@@ -21,7 +21,7 @@ Docs: [M1.5 spec](docs/superpowers/specs/2026-09-11-imap-qq-provider-design.md) 
 | Classify / summarize | same server pipeline (heuristics + optional LLM) | same |
 | Reply (send) | SMTP implicit TLS 465, `MIMEBuilder` output | Gmail `messages.send` with the same `MIMEBuilder` output |
 | Archive | `UID MOVE` into the server's archive role folder (creates it if absent; falls back to COPY+EXPUNGE); gated on `capabilities.archiveFolder` | label change |
-| Undo | local flip + remote move back (`unarchive`); sent/unsubscribed/drafted are explicitly not undoable | same |
+| Undo | remote move back (`unarchive`) then local flip; sent/unsubscribed/drafted are explicitly not undoable | same |
 | Capability discovery | `probe` at connect + `capabilities` refresh in the sync loop | all-true (REST always supports it) |
 
 ## What M0 proves
@@ -84,6 +84,13 @@ swift run LagoonServer
 
 # Terminal 2 — macOS app (LAGOON_SERVER_URL defaults to http://127.0.0.1:8080)
 swift run Lagoon
+
+# Optional: build a locally runnable app bundle
+bash scripts/build-app.sh
+open dist/Lagoon.app
+
+# Optional: keep the local server running after login
+bash scripts/install-server-agent.sh
 ```
 
 The server binds `LAGOON_SERVER_HOST` (default `127.0.0.1`). A non-loopback
@@ -95,7 +102,9 @@ if you changed the host/port:
 LAGOON_SERVER_URL=http://127.0.0.1:8080 swift run Lagoon
 ```
 
-Click **Connect Gmail** → approve in browser → return to the app. The app polls
+The connect sheet opens on **QQ Mail**. Enter the address and authorization code;
+the server probes IMAP before storing anything. Gmail remains available in the
+same sheet: click **Connect Gmail** → approve in browser → return to the app. The app polls
 `GET /api/accounts` every ~2 s and switches from the Connect screen to the list
 as soon as the account appears (a bare `swift run` executable cannot register a
 URL scheme, so the browser cannot call back into the app directly). Your 50 most
@@ -136,9 +145,9 @@ bash scripts/test-guardrails.sh # prove the guardrail rules catch fixtures
 - **No secrets in git** — `.env` is gitignored; `.env.example` ships empty; the
   guardrails scan every tracked file for AWS / GCP / GitHub / OpenAI /
   private-key shaped values and print only redacted matches.
-- **OAuth tokens encrypted at rest with AES-GCM**, keyed by `LAGOON_TOKEN_KEY`
+- **Credentials encrypted at rest with AES-GCM**, keyed by `LAGOON_TOKEN_KEY`
   (32 random bytes, base64). The server refuses to start without a valid key.
-  This protects the `accounts.access_token` / `refresh_token` columns in
+  This protects Gmail OAuth tokens and QQ authorization codes in `accounts.credentials`
   Postgres. It is **not** end-to-end encryption: the key lives in the server's
   environment next to the database.
 - **IMAP/SMTP only 993/465 with implicit TLS and full certificate
@@ -242,27 +251,44 @@ Provider routing and defaults live in `config/providers.json`; see
   `MailProviderFactory`; tests inject a scripted stub.
 - **Migration 008**: `gmail_id` → `remote_id` everywhere, sealed `credentials`
   blob, `sync_state` / `capabilities` / `is_active` / health columns.
+- **Migrations 009/010**: send idempotency keys, then stable IMAP identities
+  using RFC 5322 `Message-ID` instead of a mailbox-local UID that changes after
+  `MOVE`.
 - **Sync engine** (`Sources/LagoonServer/Sync/SyncEngine.swift`): one active
   account, IDLE-or-poll pull, `UIDVALIDITY`-change full resync, backoff
   1→2→…→300 s, auth failures stop the loop and surface `needsReconnect`.
-- **Reply send**: `POST /api/messages/{remoteId}/send {body}` → `MIMEBuilder`
+- **Reply send**: `POST /api/messages/{remoteId}/send {body,requestId}` → `MIMEBuilder`
   thread-correct message (Re: de-dup, RFC 2047 subjects, base64 body) over SMTP
-  (`smtp.qq.com:465`) or Gmail `messages.send`. Client sheet with ⌘↩.
+  (`smtp.qq.com:465`) or Gmail `messages.send`. QQ copies are `APPEND`ed to
+  `Sent Messages` because SMTP does not do that automatically. Client sheet
+  with ⌘↩; the stable `requestId` prevents a retry after a lost response from
+  sending twice.
+- **New-message send**: the toolbar's “New message” action posts
+  `POST /api/compose/send {to,subject,body,requestId}`. The server validates a
+  single RFC-style recipient, keeps the subject unprefixed, sends through the
+  same SMTP path and appends the QQ Sent copy.
 - **Archive + undo**: provider-side move into the archive folder, gated on
   `capabilities.archiveFolder` (client disables the button, server answers
-  409 `archive-unavailable`); ⌘Z reverses locally **and** remotely.
+  409 `archive-unavailable`); ⌘Z reverses locally **and** remotely. Undo
+  resolves the stable Message-ID again because QQ assigns a new UID in the
+  archive mailbox.
 - **Account directory**: `GET /api/accounts` with per-account `syncHealth` +
   `capabilities`; activate/delete; connect UI for both providers.
+- **Route provider pool + serialized IMAP commands**: reading mail reuses one
+  authenticated QQ connection instead of logging in per message; an async lock
+  prevents concurrent UI actions from interleaving tagged IMAP commands.
+- **Batched AI classification**: briefing classification runs in small batches
+  so large mailboxes cannot truncate the model's JSON at the completion cap.
 
 ### Not in this slice
 
-- **QQ `\Sent` append** — a reply sent over SMTP relies on the server's own
-  Sent-folder behaviour; we do not `APPEND` a copy (see `m1-5-smoke.md`).
 - Multi-draft composer tabs, time-saved status bar, whitelist autonomy,
   SwiftData local cache, Pub/Sub push, Postgres pool, iOS.
-- **Real-account QQ verification** — the protocol/logic layer is covered by 323
-  automated tests, but no real QQ mailbox has been exercised yet; the checklist
-  lives in `docs/superpowers/m1-5-smoke.md`.
+- **Real-account QQ verification** — the protocol/logic layer is covered by 373
+  automated tests. A real QQ self-test has verified send, receive fallback,
+  archive, unarchive and Sent-folder append; the 14-day daily-use soak is still
+  recorded manually in
+  `docs/superpowers/m1-5-smoke.md`.
 
 ## Known limitations (by design)
 
@@ -278,5 +304,17 @@ Provider routing and defaults live in `config/providers.json`; see
 - Body is fetched on demand and never stored server-side (headers/snippets only)
 - Postgres: single connection, no pool
 - macOS only; one active account at a time (the directory can hold several)
-- Archive undo is best-effort on the remote side: if the remote move back fails,
-  the local state still flips and the next sync reconciles
+
+## Reliability hardening
+
+- Archive and unsubscribe are remote-first. A remote failure returns an error and
+  leaves local state unchanged; the old “archived locally only” behavior is gone.
+- Every archive response carries the exact `actionId`; the client no longer
+  guesses the latest action when showing Undo.
+- User classification overrides are applied to subsequent Briefing responses,
+  with pins taking precedence.
+- Undo enforces the database `expires_at` window and restores remote read/archive
+  state before changing the local row.
+- AI reply drafting uses a dedicated reply prompt instead of wrapping a summary.
+- The monthly budget is wired into the real AI Gateway. If token rates are unset,
+  the usage panel explicitly says the dollar cap cannot be enforced.

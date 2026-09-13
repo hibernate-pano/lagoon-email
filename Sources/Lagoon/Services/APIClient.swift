@@ -26,6 +26,24 @@ public enum APIError: LocalizedError, Sendable {
             return L10n.current.httpStatus(code) + bodySnippet
         }
     }
+
+    /// Best-effort extraction of the server's error code from the
+    /// `{"error":"<code>"}` envelope returned by `RouteJSON.error`.
+    ///
+    /// `bodySnippet` is capped at 200 bytes and the envelope is always far
+    /// smaller, so parsing the snippet is safe. When the body is not the
+    /// envelope (or was truncated) this returns nil and callers fall back to
+    /// the numeric HTTP status.
+    public var serverErrorCode: String? {
+        guard case .badStatus(_, let bodySnippet) = self,
+              let data = bodySnippet.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let code = object["error"] as? String,
+              !code.isEmpty else {
+            return nil
+        }
+        return code
+    }
 }
 
 public final class APIClient: Sendable {
@@ -51,7 +69,11 @@ public final class APIClient: Sendable {
         } else {
             let config = URLSessionConfiguration.default
             config.timeoutIntervalForRequest = 10
-            config.timeoutIntervalForResource = 30
+            // Per-request inactivity still fails after 10s, but the resource cap
+            // bounds the whole task. It must exceed the connect route's per-request
+            // timeout (60s below) or a long IMAP probe would be killed early and
+            // recreate the false-timeout window this fix is meant to close.
+            config.timeoutIntervalForResource = 75
             self.session = URLSession(configuration: config)
         }
     }
@@ -79,6 +101,11 @@ public final class APIClient: Sendable {
         return try dec.decode(SyncResponse.self, from: data)
     }
 
+    /// Ask the server sync loop to wake immediately.
+    public func requestSync() async throws {
+        try await post(path: ["api", "sync"], query: [])
+    }
+
     /// OAuth completion handshake (M0): polled by ConnectView because the
     /// app is a bare SwiftPM executable and cannot register a URL scheme.
     public func fetchAccounts() async throws -> [ConnectedAccount] {
@@ -102,6 +129,14 @@ public final class APIClient: Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // The server probes IMAP before persisting anything: TLS + LOGIN +
+        // resolveArchiveFolder + selectInbox can exceed the 10s inactivity
+        // default. This request-level timeout lifts the per-request ceiling to
+        // 60s, and the session's `timeoutIntervalForResource` (75s) keeps the
+        // whole task from being capped below it. Together they close the
+        // false-timeout window where the client reports failure but the server
+        // still writes the account.
+        request.timeoutInterval = 60
         let body: [String: Any] = [
             "provider": MailProviderKind.qq.rawValue,
             "email": email,
@@ -148,7 +183,12 @@ public final class APIClient: Sendable {
         let url = try makeURL(path: ["api", "messages", remoteId, "body"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
-        let (data, resp) = try await session.data(from: url)
+        var request = URLRequest(url: url)
+        // The first body fetch may need a fresh QQ TLS + login round trip while
+        // background IDLE is already connected. Ten seconds is too close to
+        // that tail latency; once warm, the route pool reuses the session.
+        request.timeoutInterval = 30
+        let (data, resp) = try await session.data(for: request)
         try Self.validate(resp, data: data)
         return try Self.decode(MessageBody.self, from: data)
     }
@@ -179,15 +219,23 @@ public final class APIClient: Sendable {
         return try Self.decode(UnsubscribeResponse.self, from: data)
     }
 
-    /// POST /api/messages/{remoteId}/classify {toGroup}.
-    public func overrideClassification(remoteId: String, accountId: UUID, to: BriefingGroup) async throws {
+    /// POST /api/messages/{remoteId}/classify {fromGroup,toGroup}.
+    public func overrideClassification(
+        remoteId: String,
+        accountId: UUID,
+        from: BriefingGroup?,
+        to: BriefingGroup
+    ) async throws {
         let url = try makeURL(path: ["api", "messages", remoteId, "classify"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: Any] = ["toGroup": to.rawValue]
+        var body: [String: Any] = ["toGroup": to.rawValue]
+        if let from {
+            body["fromGroup"] = from.rawValue
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await session.data(for: request)
         try Self.validate(resp, data: data)
@@ -222,14 +270,47 @@ public final class APIClient: Sendable {
     ///
     /// Recipient, subject and threading headers are taken from the stored
     /// message on the server; only the body travels from here.
-    public func sendReply(remoteId: String, accountId: UUID, body: String) async throws -> SendResponse {
+    public func sendReply(
+        remoteId: String,
+        accountId: UUID,
+        body: String,
+        requestId: String
+    ) async throws -> SendResponse {
         let url = try makeURL(path: ["api", "messages", remoteId, "send"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["body": body])
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "body": body,
+            "requestId": requestId,
+        ])
+        let (data, resp) = try await session.data(for: request)
+        try Self.validate(resp, data: data)
+        return try Self.decode(SendResponse.self, from: data)
+    }
+
+    /// POST /api/compose/send {to,subject,body,requestId} → SendResponse.
+    public func sendNewMessage(
+        to: String,
+        subject: String,
+        body: String,
+        accountId: UUID,
+        requestId: String
+    ) async throws -> SendResponse {
+        let url = try makeURL(path: ["api", "compose", "send"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "to": to,
+            "subject": subject,
+            "body": body,
+            "requestId": requestId,
+        ])
         let (data, resp) = try await session.data(for: request)
         try Self.validate(resp, data: data)
         return try Self.decode(SendResponse.self, from: data)

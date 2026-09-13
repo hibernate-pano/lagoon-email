@@ -115,6 +115,13 @@ struct MessageListView: View {
                 // We don't render pin state in the raw list; the detail
                 // still loads / toggles it via the server.
                 initiallyPinned: false,
+                siblings: messages.map(\.remoteId),
+                onArchived: { id, _ in
+                    messages.removeAll { $0.remoteId == id }
+                },
+                onAdvanceTo: { next in
+                    path = next.map { [$0] } ?? []
+                },
                 onReadStateChange: { remoteId, isRead in
                     setRead(remoteId: remoteId, isRead: isRead)
                 },
@@ -122,6 +129,7 @@ struct MessageListView: View {
                     Task { await refresh() }
                 }
             )
+            .id(remoteId)
         } else {
             ContentUnavailableView(
                 l10n.notConnected,

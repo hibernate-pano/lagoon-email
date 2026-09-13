@@ -194,6 +194,16 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(items.first { $0.name == "limit" }?.value, "25")
     }
 
+    func test_requestSync_postsToTheSyncWakeEndpoint() async throws {
+        stub(status: 204, body: Data())
+
+        try await makeClient().requestSync()
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/api/sync")
+    }
+
     // MARK: - M1 APIClient surface
 
     func test_fetchBriefing_buildsQueryAndDecodesAllFiveGroups() async throws {
@@ -418,6 +428,22 @@ final class APIClientTests: XCTestCase {
         }
     }
 
+    // MARK: - Server error-envelope parsing (guards the connect error mapping)
+
+    func test_serverErrorCode_parsesTheSmallErrorEnvelope() {
+        let error = APIError.badStatus(code: 409, bodySnippet: #"{"error":"account-exists"}"#)
+        XCTAssertEqual(error.serverErrorCode, "account-exists")
+    }
+
+    func test_serverErrorCode_isNilWhenTheBodyIsNotTheEnvelope() {
+        XCTAssertNil(APIError.badStatus(code: 502, bodySnippet: "upstream exploded").serverErrorCode)
+        XCTAssertNil(APIError.badStatus(code: 500, bodySnippet: "").serverErrorCode)
+        XCTAssertNil(APIError.badStatus(code: 500, bodySnippet: "(empty body)").serverErrorCode)
+        XCTAssertNil(APIError.badStatus(code: 400, bodySnippet: #"{"error":""}"#).serverErrorCode)
+        XCTAssertNil(APIError.badStatus(code: 400, bodySnippet: #"{"error":123}"#).serverErrorCode)
+        XCTAssertNil(APIError.invalidResponse.serverErrorCode)
+    }
+
     func test_activateAccount_postsToActivateAndTreats204AsSuccess() async throws {
         let id = UUID()
         stub(status: 204, body: Data())
@@ -459,10 +485,14 @@ final class APIClientTests: XCTestCase {
     func test_sendReply_postsBodyAndDecodesProviderMessageId() async throws {
         let accountId = UUID()
         let remoteId = "1234"
+        let requestId = UUID().uuidString.lowercased()
         stub(status: 200, body: Data(#"{"ok":true,"providerMessageId":"<smtp-1@qq.com>"}"#.utf8))
 
         let response = try await makeClient().sendReply(
-            remoteId: remoteId, accountId: accountId, body: "好的，我周五前给答复。"
+            remoteId: remoteId,
+            accountId: accountId,
+            body: "好的，我周五前给答复。",
+            requestId: requestId
         )
 
         XCTAssertTrue(response.ok)
@@ -476,14 +506,20 @@ final class APIClientTests: XCTestCase {
         let sent = try XCTUnwrap(
             try JSONSerialization.jsonObject(with: bodyData(of: request)) as? [String: String]
         )
-        XCTAssertEqual(sent, ["body": "好的，我周五前给答复。"])
+        XCTAssertEqual(sent, [
+            "body": "好的，我周五前给答复。",
+            "requestId": requestId,
+        ])
     }
 
     func test_sendReply_acceptsNullProviderMessageId() async throws {
         stub(status: 200, body: Data(#"{"ok":true,"providerMessageId":null}"#.utf8))
 
         let response = try await makeClient().sendReply(
-            remoteId: "42", accountId: UUID(), body: "hi"
+            remoteId: "42",
+            accountId: UUID(),
+            body: "hi",
+            requestId: UUID().uuidString
         )
 
         XCTAssertTrue(response.ok)
@@ -494,7 +530,12 @@ final class APIClientTests: XCTestCase {
         stub(status: 401, body: Data("{\"error\":\"smtp-auth-failed\"}".utf8))
 
         do {
-            _ = try await makeClient().sendReply(remoteId: "42", accountId: UUID(), body: "hi")
+            _ = try await makeClient().sendReply(
+                remoteId: "42",
+                accountId: UUID(),
+                body: "hi",
+                requestId: UUID().uuidString
+            )
             XCTFail("expected APIError.badStatus(401)")
         } catch APIError.badStatus(let code, let snippet) {
             XCTAssertEqual(code, 401)
@@ -502,5 +543,35 @@ final class APIClientTests: XCTestCase {
         } catch {
             XCTFail("unexpected error: \(error)")
         }
+    }
+
+    func test_sendNewMessage_postsEnvelopeAndDecodesProviderMessageId() async throws {
+        let accountId = UUID()
+        let requestId = UUID().uuidString.lowercased()
+        stub(status: 200, body: Data(#"{"ok":true,"providerMessageId":"<new-1@qq.com>"}"#.utf8))
+
+        let response = try await makeClient().sendNewMessage(
+            to: "alice@example.com",
+            subject: "Project kickoff",
+            body: "First note",
+            accountId: accountId,
+            requestId: requestId
+        )
+
+        XCTAssertTrue(response.ok)
+        XCTAssertEqual(response.providerMessageId, "<new-1@qq.com>")
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/api/compose/send")
+        XCTAssertEqual(queryValue("accountId", in: request), accountId.uuidString)
+        let sent = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: bodyData(of: request)) as? [String: String]
+        )
+        XCTAssertEqual(sent, [
+            "to": "alice@example.com",
+            "subject": "Project kickoff",
+            "body": "First note",
+            "requestId": requestId,
+        ])
     }
 }

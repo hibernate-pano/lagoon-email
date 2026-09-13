@@ -241,10 +241,10 @@ public actor GmailProvider: MailProvider {
     /// through the Gmail `raw` endpoint. Gmail threads on the References chain
     /// in the message itself, so no threadId is needed.
     public func send(_ outbound: OutboundMessage) async throws -> String? {
-        let message = MIMEBuilder.reply(
-            outbound,
-            messageId: "<\(UUID().uuidString.lowercased())@lagoon>"
-        )
+        let messageId = "<\(UUID().uuidString.lowercased())@lagoon>"
+        let message = outbound.isReply
+            ? MIMEBuilder.reply(outbound, messageId: messageId)
+            : MIMEBuilder.newMessage(outbound, messageId: messageId)
         // MIMEBuilder output is pure ASCII (base64 body, encoded-word headers).
         let raw = String(decoding: message, as: UTF8.self)
         return try await perform { token in

@@ -64,5 +64,8 @@ the Briefing Feed and `GET /api/messages/{id}/summary` returns
   completion tokens, latency, outcome. **Bodies are never logged.**
 - `classify` prompts carry headers/snippet/age only — never a message body
   (spec §6.6 rule 5). `summarize` carries the body because that is the task.
-- Per-account monthly budget cap is **not implemented** (`ponytail:` ceiling in
-  `AIGateway.swift`) — there is no cost-accounting source yet.
+- The monthly budget is recorded in `usage_log` and enforced before calls when
+  both provider token rates are configured. If either rate is `null`, calls are
+  still counted, but the usage panel reports that the dollar cap cannot be
+  enforced.
+- `draft` is a dedicated reply-generation task. It never reuses summary output.

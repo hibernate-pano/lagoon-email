@@ -44,6 +44,59 @@ struct LagoonServerMain {
         let elg = LagoonPostgres.makeEventLoopGroup()
         let db = try await LagoonPostgres.connect(pgCfg, on: elg.any())
 
+        if CommandLine.arguments.contains("--self-test") {
+            do {
+                try await LagoonSelfTest.run(db: db, logger: logger)
+                try await db.close()
+                return
+            } catch {
+                die("self-test failed: \(error)")
+            }
+        }
+        if let flag = CommandLine.arguments.firstIndex(of: "--restore") {
+            let valueIndex = CommandLine.arguments.index(after: flag)
+            guard valueIndex < CommandLine.arguments.endIndex else {
+                die("--restore requires an IMAP UID")
+            }
+            do {
+                try await LagoonSelfTest.restore(
+                    remoteId: CommandLine.arguments[valueIndex],
+                    db: db,
+                    logger: logger
+                )
+                try await db.close()
+                return
+            } catch {
+                die("restore failed: \(error)")
+            }
+        }
+        if CommandLine.arguments.contains("--list-mailboxes") {
+            do {
+                try await LagoonSelfTest.listMailboxes(db: db, logger: logger)
+                try await db.close()
+                return
+            } catch {
+                die("mailbox listing failed: \(error)")
+            }
+        }
+        if let flag = CommandLine.arguments.firstIndex(of: "--find-subject") {
+            let valueIndex = CommandLine.arguments.index(after: flag)
+            guard valueIndex < CommandLine.arguments.endIndex else {
+                die("--find-subject requires a subject")
+            }
+            do {
+                try await LagoonSelfTest.find(
+                    subject: CommandLine.arguments[valueIndex],
+                    db: db,
+                    logger: logger
+                )
+                try await db.close()
+                return
+            } catch {
+                die("message lookup failed: \(error)")
+            }
+        }
+
         let google = GoogleOAuthClient(
             clientID: cfg.googleClientID,
             clientSecret: cfg.googleClientSecret,
@@ -77,7 +130,10 @@ struct LagoonServerMain {
         let capUSD = Double(ProcessInfo.processInfo.environment["LAGOON_BUDGET_USD_PER_MONTH"] ?? "") ?? 0
         let usageBudget = try await UsageBudget(db: db, capUSDPerMonth: capUSD, logger: logger)
         let ai: AIGateway? = {
-            guard let gateway = AIGateway.fromEnvironment(logger: logger) else { return nil }
+            guard let gateway = AIGateway.fromEnvironment(
+                budget: usageBudget,
+                logger: logger
+            ) else { return nil }
             return gateway
         }()
         if ai == nil {
@@ -102,7 +158,7 @@ struct LagoonServerMain {
         AccountsRoutes.register(
             on: router, db: db, logger: logger, sync: syncEngine, makeProvider: makeProvider
         )
-        SyncRoutes.register(on: router, db: db)
+        SyncRoutes.register(on: router, db: db, sync: syncEngine)
         MessageRoutes.register(
             on: router,
             db: db,
@@ -112,17 +168,27 @@ struct LagoonServerMain {
             summarizer: ai,
             makeProvider: makeProvider
         )
-        BriefingRoutes.register(on: router, db: db, logger: logger, classifier: ai)
+        BriefingRoutes.register(
+            on: router,
+            db: db,
+            logger: logger,
+            classifier: ai,
+            classificationMode: .background
+        )
         ActionsRoutes.register(
             on: router, db: db, client: gmailClient, tokens: tokens, logger: logger,
             makeProvider: makeProvider
         )
         DraftRoutes.register(
-            on: router, db: db, client: gmailClient, tokens: tokens, summarizer: ai,
+            on: router, db: db, client: gmailClient, tokens: tokens, draftGenerator: ai,
             logger: logger, makeProvider: makeProvider
         )
         SearchRoutes.register(on: router, db: db)
-        BudgetRoutes.register(on: router, budget: usageBudget)
+        BudgetRoutes.register(
+            on: router,
+            budget: usageBudget,
+            costTrackingAvailable: ai?.hasConfiguredRates ?? false
+        )
         GmailWebhookRoutes.register(on: router)
 
         let app = Application(

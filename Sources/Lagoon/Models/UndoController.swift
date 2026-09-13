@@ -24,7 +24,6 @@ public struct UndoToast: View {
                     Button(l10n.undo) {
                         Task { await controller.undo() }
                     }
-                    .keyboardShortcut("z", modifiers: .command)
                     .foregroundStyle(.white)
                     Button {
                         controller.dismiss()
@@ -61,6 +60,7 @@ public struct UndoItem: Equatable {
 @MainActor
 public final class UndoController: ObservableObject {
     @Published public private(set) var current: UndoItem?
+    @Published public private(set) var errorMessage: String?
 
     private let api: APIClient
     private weak var accounts: AccountStore?
@@ -77,6 +77,7 @@ public final class UndoController: ObservableObject {
     /// Show a new undo toast; older toasts are replaced.
     public func show(_ item: UndoItem, autoDismissAfter seconds: TimeInterval = 6) {
         dismissTask?.cancel()
+        errorMessage = nil
         current = item
         dismissTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(seconds))
@@ -92,16 +93,48 @@ public final class UndoController: ObservableObject {
         current = nil
     }
 
+    public func clearError() {
+        errorMessage = nil
+    }
+
     /// Undo the most recent action by id. The action record on the server
     /// holds the inverse (archive → INBOX back, mark-read → unread, etc.).
     public func undo() async {
         guard let item = current, let accounts, let accountId = accounts.accountId else { return }
         current = nil
         dismissTask?.cancel()
+        await perform(actionId: item.id, accountId: accountId)
+    }
+
+    /// Undo the newest still-reversible action, even after the toast expires.
+    public func undoLatest() async {
+        guard let accounts, let accountId = accounts.accountId else { return }
         do {
-            try await api.undoAction(id: item.id, accountId: accountId)
+            let actions = try await api.fetchActions(
+                accountId: accountId,
+                since: Date().addingTimeInterval(-30 * 24 * 60 * 60)
+            )
+            guard let action = actions.first(where: {
+                $0.kind.isUndoable && ($0.expiresAt.map { $0 > Date() } ?? true)
+            }) else {
+                errorMessage = L10n.current.nothingToUndo
+                return
+            }
+            current = nil
+            dismissTask?.cancel()
+            await perform(actionId: action.id, accountId: accountId)
+        } catch {
+            errorMessage = L10n.current.undoFailed + error.lagoonUIMessage
+        }
+    }
+
+    private func perform(actionId: Int64, accountId: UUID) async {
+        do {
+            try await api.undoAction(id: actionId, accountId: accountId)
+            errorMessage = nil
             NotificationCenter.default.post(name: .lagoonDidUndo, object: nil)
         } catch {
+            errorMessage = L10n.current.undoFailed + error.lagoonUIMessage
         }
     }
 }
@@ -109,4 +142,6 @@ public final class UndoController: ObservableObject {
 public extension Notification.Name {
     /// Posted after a successful undo. Views refresh in response.
     static let lagoonDidUndo = Notification.Name("lagoon.didUndo")
+    /// Posted when a non-undo action changes feed grouping or local state.
+    static let lagoonDidChangeData = Notification.Name("lagoon.didChangeData")
 }

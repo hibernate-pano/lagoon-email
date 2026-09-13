@@ -4,9 +4,19 @@ import Logging
 import PostgresNIO
 import LagoonKit
 
-struct ArchiveResponse: Encodable { let ok: Bool; let remoteId: String; let remote: Bool }
-struct OkResponse: Encodable { let ok: Bool }
-struct UnsubscribeResponse: Encodable { let ok: Bool; let unsubscribed: Bool; let publisher: String }
+struct ArchiveResponse: Encodable { let ok: Bool; let remoteId: String; let remote: Bool; let actionId: Int64 }
+struct ClassifyResponse: Encodable {
+    let ok: Bool
+    let actionId: Int64
+    let fromGroup: String
+    let toGroup: String
+}
+struct UnsubscribeResponse: Encodable {
+    let ok: Bool
+    let unsubscribed: Bool
+    let publisher: String
+    let actionId: Int64
+}
 struct UndoResponse: Encodable { let ok: Bool; let undone: Int64 }
 
 /// Some actions have no inverse — a sent reply is gone, an unsubscribe already
@@ -65,8 +75,7 @@ public enum ActionsRoutes {
         }
 
         // POST /api/actions/{id}/undo
-        // Reverses the recorded inverse and records the new "undo" action
-        // (so undoing the undo is itself undoable).
+        // Reverses the recorded inverse and records an audit-only undo action.
         router.post("api/actions/:id/undo") { request, context -> Response in
             return await undoActionHandler(
                 request: request, context: context, db: db,
@@ -106,44 +115,54 @@ public enum ActionsRoutes {
         guard let provider = makeProvider(account) else {
             return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
         }
-        let writeSucceeded: Bool
         do {
             try await provider.archive(remoteId: remoteId)
-            writeSucceeded = true
-        } catch MailError.archiveUnavailable {
-            return RouteJSON.error(.conflict, "archive-unavailable")
-        } catch MailError.authFailed {
-            return RouteJSON.error(.unauthorized, "provider-auth-failed")
+        } catch let error as MailError {
+            return MessageRoutes.providerError(error, logger: logger, remoteId: remoteId)
         } catch {
-            // Degrade like the old Gmail scope-missing path: archive locally and
-            // record remoteWrite=false so undo stays local-only too.
             logger.warning("archive.remoteFailed", metadata: [
                 "remoteId": .string(remoteId),
                 "label": .string(MessageRoutes.providerLabel(error)),
             ])
-            writeSucceeded = false
+            return RouteJSON.error(.badGateway, "provider-unreachable")
         }
 
+        let action: AIAction
         do {
-            // Local state always flips so the UI re-groups immediately.
-            try await db.query(
-                "UPDATE message_headers SET is_archived = TRUE WHERE remote_id = $1 AND account_id = $2",
-                [PostgresData(string: remoteId), PostgresData(uuid: accountId)]
-            ).get()
-            let _ = try await AIActionStore.record(
-                accountId: accountId,
-                kind: .archive,
-                payload: ["remoteId": remoteId, "remoteWrite": writeSucceeded ? "true" : "false"],
-                db: db
-            )
+            action = try await db.withTransaction(logger: logger) { transaction in
+                try await transaction.query(
+                    "UPDATE message_headers SET is_archived = TRUE WHERE remote_id = $1 AND account_id = $2",
+                    [PostgresData(string: remoteId), PostgresData(uuid: accountId)]
+                ).get()
+                return try await AIActionStore.record(
+                    accountId: accountId,
+                    kind: .archive,
+                    payload: ["remoteId": remoteId, "remoteWrite": "true"],
+                    db: transaction
+                )
+            }
         } catch {
+            // Do not leave a remote-only move behind if the local commit failed.
+            do {
+                try await provider.unarchive(remoteId: remoteId)
+            } catch {
+                logger.error("archive.compensationFailed", metadata: [
+                    "remoteId": .string(remoteId),
+                    "err": .string("\(error)"),
+                ])
+            }
             logger.error("archive.localUpdateFailed", metadata: [
                 "remoteId": .string(remoteId),
                 "err": .string("\(error)"),
             ])
             return RouteJSON.error(.internalServerError, "internal-error")
         }
-        return RouteJSON.response(ArchiveResponse(ok: true, remoteId: remoteId, remote: writeSucceeded))
+        return RouteJSON.response(ArchiveResponse(
+            ok: true,
+            remoteId: remoteId,
+            remote: true,
+            actionId: action.id
+        ))
     }
 
     // MARK: - Unsubscribe
@@ -170,43 +189,74 @@ public enum ActionsRoutes {
 
         // The List-Unsubscribe value is fetched on demand — it costs one
         // provider round-trip and only when the user actually clicks.
-        var unsubscribed = false
-        var publisher: String? = nil
-        if let provider = makeProvider(account) {
-            do {
-                let headers = try await provider.fetchRawHeaderValues(remoteId: remoteId)
-                if let raw = headers.first(where: { $0.key.lowercased() == "list-unsubscribe" })?.value,
-                   let url = firstUnsubscribeURL(raw) {
-                    publisher = extractPublisher(raw)
-                    unsubscribed = (try? await hitUnsubscribe(url: url)) ?? false
-                }
-            } catch {
-                logger.warning("unsubscribe.fetchFailed", metadata: [
-                    "remoteId": .string(remoteId),
-                    "label": .string(MessageRoutes.providerLabel(error)),
-                ])
-            }
+        guard let provider = makeProvider(account) else {
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
         }
 
+        let publisher: String
+        let unsubscribeURL: URL
         do {
-            try await db.query(
-                "UPDATE message_headers SET is_archived = TRUE, is_read = TRUE WHERE remote_id = $1 AND account_id = $2",
-                [PostgresData(string: remoteId), PostgresData(uuid: accountId)]
-            ).get()
-            let _ = try await AIActionStore.record(
-                accountId: accountId,
-                kind: .unsubscribe,
-                payload: [
-                    "remoteId": remoteId,
-                    "publisher": publisher ?? "",
-                    "remote": unsubscribed ? "true" : "false",
-                ],
-                db: db
-            )
+            let headers = try await provider.fetchRawHeaderValues(remoteId: remoteId)
+            guard let raw = headers.first(where: { $0.key.lowercased() == "list-unsubscribe" })?.value,
+                  let url = firstUnsubscribeURL(raw) else {
+                return RouteJSON.error(.unprocessableContent, "unsubscribe-unavailable")
+            }
+            publisher = extractPublisher(raw) ?? ""
+            if url.scheme?.lowercased() == "mailto" {
+                return RouteJSON.error(.unprocessableContent, "unsubscribe-manual-required")
+            }
+            unsubscribeURL = url
+        } catch let error as MailError {
+            return MessageRoutes.providerError(error, logger: logger, remoteId: remoteId)
+        } catch {
+            logger.warning("unsubscribe.fetchFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "label": .string(MessageRoutes.providerLabel(error)),
+            ])
+            return RouteJSON.error(.badGateway, "provider-unreachable")
+        }
+
+        let unsubscribed: Bool
+        do {
+            unsubscribed = try await hitUnsubscribe(url: unsubscribeURL)
+        } catch {
+            logger.warning("unsubscribe.requestFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "label": .string(MessageRoutes.providerLabel(error)),
+            ])
+            return RouteJSON.error(.badGateway, "unsubscribe-failed")
+        }
+        guard unsubscribed else {
+            return RouteJSON.error(.badGateway, "unsubscribe-failed")
+        }
+
+        let action: AIAction
+        do {
+            action = try await db.withTransaction(logger: logger) { transaction in
+                try await transaction.query(
+                    "UPDATE message_headers SET is_archived = TRUE, is_read = TRUE WHERE remote_id = $1 AND account_id = $2",
+                    [PostgresData(string: remoteId), PostgresData(uuid: accountId)]
+                ).get()
+                return try await AIActionStore.record(
+                    accountId: accountId,
+                    kind: .unsubscribe,
+                    payload: [
+                        "remoteId": remoteId,
+                        "publisher": publisher,
+                        "remote": "true",
+                    ],
+                    db: transaction
+                )
+            }
         } catch {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
-        return RouteJSON.response(UnsubscribeResponse(ok: true, unsubscribed: unsubscribed, publisher: publisher ?? ""))
+        return RouteJSON.response(UnsubscribeResponse(
+            ok: true,
+            unsubscribed: true,
+            publisher: publisher,
+            actionId: action.id
+        ))
     }
 
     // MARK: - Classify override
@@ -224,7 +274,10 @@ public enum ActionsRoutes {
         do { body = try await collectBody(request) } catch {
             return RouteJSON.error(.badRequest, "missing-body")
         }
-        struct Req: Decodable { let toGroup: String }
+        struct Req: Decodable {
+            let toGroup: String
+            let fromGroup: String?
+        }
         let req: Req
         do { req = try JSONDecoder().decode(Req.self, from: body) } catch {
             return RouteJSON.error(.badRequest, "invalid-body")
@@ -234,32 +287,83 @@ public enum ActionsRoutes {
         else {
             return RouteJSON.error(.badRequest, "invalid-group")
         }
+        let account: Account
         do {
-            // `fromGroup` is best-effort: we don't have the current classifier
-            // group for this remoteId without a separate lookup. Most overrides
-            // come from the user seeing "AI classified wrong"; storing the
-            // nudge and updating by sender is enough.
-            try await AIActionStore.insertOverride(
-                accountId: accountId,
-                remoteId: remoteId,
-                fromGroup: .needsReply,
-                toGroup: toGroup,
-                db: db
-            )
-            let _ = try await AIActionStore.record(
-                accountId: accountId,
-                kind: .classifyOverride,
-                payload: [
-                    "remoteId": remoteId,
-                    "fromGroup": BriefingGroup.needsReply.rawValue,
-                    "toGroup": req.toGroup,
-                ],
-                db: db
-            )
+            guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                return RouteJSON.error(.notFound, "unknown-account")
+            }
+            account = found
         } catch {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
-        return RouteJSON.response(OkResponse(ok: true))
+        let fromGroup: BriefingGroup
+        do {
+            guard let message = try await MessageStore.find(
+                remoteId: remoteId,
+                accountId: accountId,
+                db: db
+            ) else {
+                return RouteJSON.error(.notFound, "unknown-message")
+            }
+            if let raw = req.fromGroup,
+               let explicit = BriefingGroup(rawValue: raw),
+               explicit != .pinned {
+                fromGroup = explicit
+            } else {
+                let overrides = try await AIActionStore.overridesBySender(
+                    accountId: accountId,
+                    db: db
+                )
+                let pinned = try await MessageStore.pinnedIds(forAccount: accountId, db: db)
+                let unsubscribed = try await MessageStore.listUnsubscribeIds(
+                    forAccount: accountId,
+                    db: db
+                )
+                let heuristic = HeuristicBriefingClassifier(
+                    signals: .init(
+                        pinnedGmailIds: pinned,
+                        listUnsubscribeGmailIds: unsubscribed
+                    )
+                ).group(for: message, accountEmail: account.email)
+                fromGroup = overrides[message.fromAddress] ?? heuristic.group
+            }
+        } catch {
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+        guard fromGroup != toGroup else {
+            return RouteJSON.error(.badRequest, "group-unchanged")
+        }
+
+        let action: AIAction
+        do {
+            action = try await db.withTransaction(logger: logger) { transaction in
+                try await AIActionStore.insertOverride(
+                    accountId: accountId,
+                    remoteId: remoteId,
+                    fromGroup: fromGroup,
+                    toGroup: toGroup,
+                    db: transaction
+                )
+                return try await AIActionStore.record(
+                    accountId: accountId,
+                    kind: .classifyOverride,
+                    payload: [
+                        "remoteId": remoteId,
+                        "fromGroup": fromGroup.rawValue,
+                        "toGroup": toGroup.rawValue,
+                    ],
+                    db: transaction
+                )
+            }
+        } catch {
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+        return RouteJSON.response(ClassifyResponse(
+            ok: true,
+            actionId: action.id,
+            fromGroup: fromGroup.rawValue,
+            toGroup: toGroup.rawValue
+        ))
     }
 
     // MARK: - List actions
@@ -315,25 +419,37 @@ public enum ActionsRoutes {
                   found.accountId == accountId else {
                 return RouteJSON.error(.notFound, "unknown-action")
             }
+            if let expiresAt = found.expiresAt, expiresAt <= Date() {
+                return RouteJSON.error(.gone, "action-expired")
+            }
             action = found
         } catch {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
 
-        // Reverse each action type. The inverse is best-effort; archive becomes
-        // "add the mailbox back"; mark-read becomes "mark unread"; pin/unpin flip;
-        // classify-override inserts a counter-override; unsubscribe is terminal.
+        // Reverse each action type. Archive/read restore the remote state first;
+        // pin/unpin flip locally; classify-override inserts a counter-override;
+        // unsubscribe, send, drafting and undo itself are terminal.
         do {
             try await reverse(
                 action: action, account: account,
                 makeProvider: makeProvider, db: db, logger: logger
             )
-            let _ = try await AIActionStore.record(
-                accountId: accountId,
-                kind: .archive, // 'undo' is itself an action; kind is informational
-                payload: ["undoOf": "\(actionId)"],
-                db: db
-            )
+            do {
+                let _ = try await AIActionStore.record(
+                    accountId: accountId,
+                    kind: .undo,
+                    payload: ["undoOf": "\(actionId)"],
+                    db: db
+                )
+            } catch {
+                // The inverse already completed; failing the response would make
+                // the user retry a successful undo.
+                logger.warning("undo.auditFailed", metadata: [
+                    "actionId": .string("\(actionId)"),
+                    "err": .string("\(error)"),
+                ])
+            }
         } catch let error as NotUndoable {
             logger.info("actions.notUndoable", metadata: [
                 "kind": .string(error.kind.rawValue),
@@ -354,24 +470,21 @@ public enum ActionsRoutes {
         let remoteId = action.payload["remoteId"] ?? ""
         switch action.kind {
         case .archive:
-            // Archive → put it back.
+            // Remote first: a local success must not hide a failed remote undo.
+            if action.payload["remoteWrite"] == "true", let provider = makeProvider(account) {
+                try await provider.unarchive(remoteId: remoteId)
+            } else if action.payload["remoteWrite"] == "true" {
+                throw MailError.notConfigured("provider missing during undo")
+            }
             try await db.query(
                 "UPDATE message_headers SET is_archived = FALSE WHERE remote_id = $1 AND account_id = $2",
                 [PostgresData(string: remoteId), PostgresData(uuid: account.id)]
             ).get()
-            if action.payload["remoteWrite"] == "true", let provider = makeProvider(account) {
-                do {
-                    try await provider.unarchive(remoteId: remoteId)
-                } catch {
-                    // Remote undo failed; local state already reactivated and the
-                    // next sync reconciles.
-                    logger.warning("undo.remoteFailed", metadata: [
-                        "remoteId": .string(remoteId),
-                        "label": .string(MessageRoutes.providerLabel(error)),
-                    ])
-                }
-            }
         case .markRead:
+            guard let provider = makeProvider(account) else {
+                throw MailError.notConfigured("provider missing during undo")
+            }
+            try await provider.setRead(remoteId: remoteId, isRead: false)
             try await db.query(
                 "UPDATE message_headers SET is_read = FALSE WHERE remote_id = $1 AND account_id = $2",
                 [PostgresData(string: remoteId), PostgresData(uuid: account.id)]
@@ -382,14 +495,16 @@ public enum ActionsRoutes {
             try await MessageStore.setPinned(true, remoteId: remoteId, accountId: account.id, db: db)
         case .classifyOverride:
             // Counter-override: flip back to the original group.
-            if let from = action.payload["fromGroup"].flatMap(BriefingGroup.init(rawValue:)),
-               let to = action.payload["toGroup"].flatMap(BriefingGroup.init(rawValue:)) {
-                try await AIActionStore.insertOverride(
-                    accountId: account.id, remoteId: remoteId,
-                    fromGroup: to, toGroup: from, db: db
-                )
+            guard let from = action.payload["fromGroup"].flatMap(BriefingGroup.init(rawValue:)),
+                  let to = action.payload["toGroup"].flatMap(BriefingGroup.init(rawValue:))
+            else {
+                throw MailError.protocolError("classification undo payload missing")
             }
-        case .unsubscribe, .draftCreate, .send:
+            try await AIActionStore.insertOverride(
+                accountId: account.id, remoteId: remoteId,
+                fromGroup: to, toGroup: from, db: db
+            )
+        case .unsubscribe, .draftCreate, .send, .undo:
             // Terminal: we can't take back an unsubscribe, an undraft, or a
             // reply that has already left the building. Tell the user why.
             throw NotUndoable(kind: action.kind)

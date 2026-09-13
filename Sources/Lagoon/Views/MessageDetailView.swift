@@ -9,14 +9,16 @@ struct MessageDetailView: View {
     let accountId: UUID
     let header: MessageHeader?
     let initiallyPinned: Bool
+    let initialGroup: BriefingGroup?
     /// Optional sibling list for j/k navigation and auto-advance on archive.
     var siblings: [String]? = nil
     /// Called after a successful archive/undo so the list row can disappear/return.
     var onArchived: ((String, Bool) -> Void)? = nil  // (remoteId, isArchived)
     var onReadStateChange: (String, Bool) -> Void = { _, _ in }
     var onPinnedChanged: (Bool) -> Void = { _ in }
-    /// Called after a successful archive with the next sibling remoteId.
-    var onAdvanceTo: ((String) -> Void)? = nil
+    /// Called after a successful archive with the next sibling, or nil when
+    /// the archived message was the last one in the current view.
+    var onAdvanceTo: ((String?) -> Void)? = nil
 
     @State private var messageBody: MessageBody?
     @State private var isLoadingBody = true
@@ -25,6 +27,7 @@ struct MessageDetailView: View {
     @State private var isRead: Bool
     @State private var didMarkRead = false
     @State private var readError: String?
+    @State private var actionError: String?
 
     @State private var isPinned: Bool
     @State private var isPinBusy = false
@@ -34,10 +37,9 @@ struct MessageDetailView: View {
 
     @State private var draftState: DraftState = .idle
     @State private var showDraftPicker = false
+    @State private var selectedDraftBody = ""
 
     @State private var showOverrideMenu = false
-
-    @State private var archivedLocal = false
 
     @State private var showComposer = false
     @State private var sentNotice: String?
@@ -70,9 +72,10 @@ struct MessageDetailView: View {
         accountId: UUID,
         header: MessageHeader?,
         initiallyPinned: Bool,
+        initialGroup: BriefingGroup? = nil,
         siblings: [String]? = nil,
         onArchived: ((String, Bool) -> Void)? = nil,
-        onAdvanceTo: ((String) -> Void)? = nil,
+        onAdvanceTo: ((String?) -> Void)? = nil,
         onReadStateChange: @escaping (String, Bool) -> Void = { _, _ in },
         onPinnedChanged: @escaping (Bool) -> Void = { _ in }
     ) {
@@ -80,6 +83,7 @@ struct MessageDetailView: View {
         self.accountId = accountId
         self.header = header
         self.initiallyPinned = initiallyPinned
+        self.initialGroup = initialGroup
         self.siblings = siblings
         self.onArchived = onArchived
         self.onAdvanceTo = onAdvanceTo
@@ -95,7 +99,7 @@ struct MessageDetailView: View {
                 metadata
                 if let readError { inlineNotice(readError, systemImage: "envelope.badge") }
                 if let pinError { inlineNotice(pinError, systemImage: "pin.slash") }
-                if archivedLocal { inlineNotice(l10n.archivedLocallyOnly, systemImage: "tray.and.arrow.down") }
+                if let actionError { inlineNotice(actionError, systemImage: "exclamationmark.triangle") }
                 if let sentNotice {
                     inlineNotice(sentNotice, systemImage: "paperplane.fill", color: .green)
                 }
@@ -110,11 +114,19 @@ struct MessageDetailView: View {
         }
         .navigationTitle(subjectText)
         .toolbar { toolbarContent }
-        .task { await loadBody() }
-        .task { await markReadOnce() }
+        .task {
+            await loadBody()
+            if bodyError == nil {
+                await markReadOnce()
+            }
+        }
         .sheet(isPresented: $showDraftPicker) {
             if let draft = draftPick {
-                DraftPickerSheet(draft: draft, onPick: handleDraftPick)
+                DraftPickerSheet(
+                    draft: draft,
+                    provider: directory.active?.provider ?? .gmail,
+                    onPick: handleDraftPick
+                )
             }
         }
         .sheet(isPresented: $showComposer) {
@@ -123,15 +135,17 @@ struct MessageDetailView: View {
                 accountId: accountId,
                 to: header?.fromAddress ?? "",
                 subject: subjectText,
-                initialBody: draftPick.map { draft in
-                    draft.variants.indices.contains(0) ? draft.variants[0] : ""
-                } ?? ""
+                initialBody: selectedDraftBody,
+                quotedText: messageBody?.text ?? ""
             ) { _ in
                 showSentNotice()
             }
         }
         .confirmationDialog(l10n.overrideGroup, isPresented: $showOverrideMenu, titleVisibility: .visible) {
-            ForEach(BriefingGroup.allCases.filter { $0 != .pinned }, id: \.self) { group in
+            ForEach(
+                BriefingGroup.allCases.filter { $0 != .pinned && $0 != initialGroup },
+                id: \.self
+            ) { group in
                 Button(l10n.groupTitle(group)) { overrideClassification(to: group) }
             }
             Button(l10n.retry, role: .cancel) {}
@@ -183,7 +197,7 @@ struct MessageDetailView: View {
                 Button(l10n.unsubscribe, role: .destructive) { Task { await unsubscribe() } }
                     .disabled(header == nil)
             } label: {
-                Label(l10n.refresh, systemImage: "ellipsis.circle")
+                Label(l10n.moreActions, systemImage: "ellipsis.circle")
             }
 
             Button { Task { await archiveAndAdvance() } } label: {
@@ -331,6 +345,10 @@ struct MessageDetailView: View {
                 _ = try await api.chooseDraft(
                     draftId: draft.id, variant: variant, pushToGmail: pushToGmail
                 )
+                selectedDraftBody = draft.variants.indices.contains(variant)
+                    ? draft.variants[variant]
+                    : ""
+                showComposer = true
             } catch {
                 draftState = .failed(l10n.draftFailed + error.lagoonUIMessage)
             }
@@ -413,21 +431,23 @@ struct MessageDetailView: View {
         do {
             let response = try await api.archiveMessage(remoteId: remoteId, accountId: accountId)
             onArchived?(remoteId, true)
-            // Find the next sibling for auto-advance.
+            // Find the next sibling for auto-advance. A nil tells the parent
+            // to close the detail view instead of leaving an archived message onscreen.
+            var next: String?
             if let siblings, let index = siblings.firstIndex(of: remoteId) {
                 let nextIndex = siblings.index(after: index)
                 if nextIndex < siblings.endIndex {
-                    onAdvanceTo?(siblings[nextIndex])
+                    next = siblings[nextIndex]
                 }
             }
-            // Fetch the latest action so undo targets the right row.
-            if let actions = try? await api.fetchActions(accountId: accountId, since: Date().addingTimeInterval(-30)),
-               let latest = actions.first {
-                let msg = response.remote ? l10n.archived : l10n.archivedLocallyOnly
-                undo.show(UndoItem(id: latest.id, message: msg, systemImage: "tray.and.arrow.down"))
-            }
+            onAdvanceTo?(next)
+            undo.show(UndoItem(
+                id: response.actionId,
+                message: l10n.archived,
+                systemImage: "tray.and.arrow.down"
+            ))
         } catch {
-            // leave the row in place; user can retry
+            actionError = l10n.archiveFailed + error.lagoonUIMessage
         }
     }
 
@@ -437,11 +457,20 @@ struct MessageDetailView: View {
             let msg = response.unsubscribed
                 ? "\(l10n.unsubscribed) · \(response.publisher)"
                 : "\(response.publisher) \(l10n.unsubscribed.lowercased()) — server kept it"
-            if let actions = try? await api.fetchActions(accountId: accountId, since: Date().addingTimeInterval(-30)),
-               let latest = actions.first {
-                undo.show(UndoItem(id: latest.id, message: msg, systemImage: "minus.circle"))
+            undo.show(UndoItem(
+                id: response.actionId,
+                message: msg,
+                systemImage: "minus.circle"
+            ))
+        } catch {
+            if (error as? APIError)?.serverErrorCode == "unsubscribe-manual-required" {
+                actionError = l10n.unsubscribeManualRequired
+            } else if (error as? APIError)?.serverErrorCode == "unsubscribe-unavailable" {
+                actionError = l10n.unsubscribeUnavailable
+            } else {
+                actionError = l10n.unsubscribeFailed + error.lagoonUIMessage
             }
-        } catch { }
+        }
     }
 
     private func overrideClassification(to group: BriefingGroup) {
@@ -449,17 +478,27 @@ struct MessageDetailView: View {
             do {
                 try await api.overrideClassification(
                     remoteId: remoteId, accountId: accountId,
+                    from: initialGroup,
                     to: group
                 )
-            } catch { /* non-fatal */ }
+                actionError = nil
+                showTransientNotice(l10n.overrideApplied)
+                NotificationCenter.default.post(name: .lagoonDidChangeData, object: nil)
+            } catch {
+                actionError = l10n.overrideFailed + error.lagoonUIMessage
+            }
         }
     }
 
     /// Announce the reply and clear itself: sending is final, so there is
     /// nothing to undo — only to confirm.
     private func showSentNotice() {
+        showTransientNotice(l10n.sentTo(header?.fromAddress ?? ""))
+    }
+
+    private func showTransientNotice(_ message: String) {
         sentNoticeDismiss?.cancel()
-        sentNotice = l10n.sentTo(header?.fromAddress ?? "")
+        sentNotice = message
         sentNoticeDismiss = Task {
             try? await Task.sleep(for: .seconds(6))
             guard !Task.isCancelled else { return }

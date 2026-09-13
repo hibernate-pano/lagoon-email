@@ -80,7 +80,9 @@ final class UsageBudgetTests: XCTestCase {
             costMicrosUSD: 200_000   // $0.20
         )
         let total = await f.budget.currentMonthUSD
+        let calls = await f.budget.callCount
         XCTAssertEqual(total, 0.30, accuracy: 0.0001)
+        XCTAssertEqual(calls, 2)
     }
 
     func test_overCap_preCheckThrows() async throws {
@@ -175,6 +177,8 @@ final class UsageBudgetTests: XCTestCase {
         let f2 = try await makeBudget(capUSD: 10)
         defer { Task { await f2.close() } }
         let total = await f2.budget.currentMonthUSD
+        let calls = await f2.budget.callCount
         XCTAssertEqual(total, 0.25, accuracy: 0.0001)
+        XCTAssertEqual(calls, 1)
     }
 }

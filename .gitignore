@@ -12,6 +12,7 @@ secrets/
 .build/
 .swiftpm/
 DerivedData/
+dist/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
 xcuserdata/

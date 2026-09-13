@@ -18,6 +18,7 @@ public actor BriefingClassificationCache {
     }
 
     private var entries: [String: Entry] = [:]
+    private var inFlight: Set<String> = []
     private let ttl: TimeInterval
     private let limit: Int
 
@@ -38,7 +39,9 @@ public actor BriefingClassificationCache {
         for message in messages {
             guard let entry = entries[key(message)], now.timeIntervalSince(entry.storedAt) < ttl
             else {
-                pending.append(message)
+                if !inFlight.contains(key(message)) {
+                    pending.append(message)
+                }
                 continue
             }
             if let group = entry.group { known[message.remoteId] = group }
@@ -54,7 +57,9 @@ public actor BriefingClassificationCache {
         now: Date = Date()
     ) {
         for message in messages {
-            entries[key(message)] = Entry(group: groups[message.remoteId], storedAt: now)
+            let cacheKey = key(message)
+            entries[cacheKey] = Entry(group: groups[message.remoteId], storedAt: now)
+            inFlight.remove(cacheKey)
         }
         if entries.count > limit {
             // Drop the oldest half rather than growing without bound.
@@ -66,6 +71,14 @@ public actor BriefingClassificationCache {
     }
 
     public func count() -> Int { entries.count }
+
+    public func markInFlight(_ messages: [MessageHeader]) {
+        inFlight.formUnion(messages.map(key))
+    }
+
+    public func clearInFlight(_ messages: [MessageHeader]) {
+        inFlight.subtract(messages.map(key))
+    }
 
     private func key(_ message: MessageHeader) -> String {
         "\(message.remoteId)|\(message.isRead ? 1 : 0)"

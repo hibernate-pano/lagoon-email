@@ -892,6 +892,7 @@ final class RouteTests: XCTestCase {
         private(set) var sentOutbounds: [OutboundMessage] = []
         private var sendResult: String? = "stub-provider-message-id"
         private var sendError: MailError?
+        private var probeHook: (@Sendable () async -> Void)?
 
         init(
             kind: MailProviderKind = .qq,
@@ -941,8 +942,11 @@ final class RouteTests: XCTestCase {
 
         func probe() async throws {
             probeCalls += 1
+            if let probeHook { await probeHook() }
             if let probeError { throw probeError }
         }
+
+        func setProbeHook(_ hook: (@Sendable () async -> Void)?) { probeHook = hook }
 
         func setSendResult(_ id: String?) { sendResult = id }
         func setSendError(_ error: MailError?) { sendError = error }
@@ -1097,6 +1101,204 @@ final class RouteTests: XCTestCase {
             }
             let calls = await provider.probeCalls
             XCTAssertEqual(calls, 0, "an existing account is reported before any network work")
+        }
+    }
+
+    /// Rule 2: a `needsReconnect` row is re-authenticated in place with the
+    /// submitted code and keeps its original id. This is the fix for the
+    /// "QQ account that can never be repaired" lock-out.
+    func test_postAccountsIMAP_unhealthyExistingAccount_reAuthsInPlaceWithSameId() async throws {
+        let email = "imap-\(UUID().uuidString)@qq.com"
+        let newAuthCode = "new-auth-code-\(UUID().uuidString)"
+        let seededId = UUID()
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: { conn in
+                try? await TestDatabase.deleteAccount(oauthUser: email, provider: .qq, db: conn)
+            }) { conn in
+                try await seedAccount(
+                    Account(
+                        id: seededId, provider: .qq, oauthUser: email, email: email,
+                        credentials: Data([1, 2, 3]), isActive: false,
+                        syncHealth: SyncHealth(status: .needsReconnect, lastError: "auth code rejected")
+                    ),
+                    db: conn
+                )
+                let provider = StubMailProvider()
+                let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
+                try await app.test(.router) { client in
+                    try await client.execute(
+                        uri: "/api/accounts/imap",
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: Self.jsonBody(["provider": "qq", "email": email, "authCode": newAuthCode])
+                    ) { response in
+                        XCTAssertEqual(response.status, .created)
+                        let raw = String(buffer: response.body)
+                        XCTAssertFalse(raw.contains(newAuthCode), "the auth code must never be echoed")
+                        let decoded = try Self.iso8601Decoder().decode(
+                            ConnectedAccount.self, from: Data(buffer: response.body)
+                        )
+                        XCTAssertEqual(decoded.id, seededId, "re-auth must keep the existing row id")
+                        XCTAssertEqual(decoded.email, email)
+                        XCTAssertTrue(decoded.isActive)
+                        XCTAssertEqual(decoded.syncHealth.status, .ok)
+                    }
+                }
+                let calls = await provider.probeCalls
+                XCTAssertGreaterThanOrEqual(calls, 1, "an unhealthy existing row must be probed with the new code")
+
+                let stored = try await AccountStore.find(byOAuthUser: email, provider: .qq, db: conn)
+                let account = try XCTUnwrap(stored)
+                XCTAssertEqual(account.id, seededId)
+                XCTAssertEqual(account.syncHealth.status, .ok)
+                XCTAssertNil(account.syncHealth.lastError, "the red reconnect banner must clear")
+                XCTAssertTrue(account.isActive)
+                let credentials = try await CredentialVault.read(accountId: account.id, db: conn)
+                XCTAssertEqual(credentials, .imap(username: email, authCode: newAuthCode))
+            }
+        }
+    }
+
+    /// Rule 2's safety guarantee: a failed re-auth probe must leave the
+    /// existing unhealthy row completely untouched (no credentials,
+    /// sync_status, capabilities or is_active write).
+    func test_postAccountsIMAP_unhealthyExistingAccount_probeFails_leavesRowUntouched() async throws {
+        let email = "imap-\(UUID().uuidString)@qq.com"
+        let seededId = UUID()
+        let seededCredentials = Data([7, 7, 7])
+        let seededCapabilities = MailCapabilities(
+            archiveFolder: false, idle: true, move: false, serverSnippet: true
+        )
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: { conn in
+                try? await TestDatabase.deleteAccount(oauthUser: email, provider: .qq, db: conn)
+            }) { conn in
+                try await seedAccount(
+                    Account(
+                        id: seededId, provider: .qq, oauthUser: email, email: email,
+                        credentials: nil, capabilities: seededCapabilities, isActive: true,
+                        syncHealth: SyncHealth(status: .needsReconnect, lastError: "old failure")
+                    ),
+                    credentials: seededCredentials,
+                    db: conn
+                )
+                let provider = StubMailProvider()
+                await provider.setProbeError(.authFailed)
+                let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
+                try await app.test(.router) { client in
+                    try await client.execute(
+                        uri: "/api/accounts/imap",
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: Self.jsonBody(["provider": "qq", "email": email, "authCode": "stale-code"])
+                    ) { response in
+                        XCTAssertEqual(response.status, .unauthorized)
+                        XCTAssertEqual(try Self.errorCode(from: response.body), "imap-auth-failed")
+                    }
+                }
+                let calls = await provider.probeCalls
+                XCTAssertGreaterThanOrEqual(calls, 1, "the submitted code must still be probed")
+
+                let stored = try await AccountStore.find(byOAuthUser: email, provider: .qq, db: conn)
+                let account = try XCTUnwrap(stored)
+                XCTAssertEqual(account.id, seededId)
+                XCTAssertEqual(account.credentials, seededCredentials, "a failed re-auth must not rewrite credentials")
+                XCTAssertEqual(account.syncHealth.status, .needsReconnect)
+                XCTAssertEqual(account.syncHealth.lastError, "old failure")
+                XCTAssertEqual(account.capabilities, seededCapabilities)
+                XCTAssertTrue(account.isActive)
+            }
+        }
+    }
+
+    /// MUST 2 regression: `upsert`'s `ON CONFLICT ... DO UPDATE` keeps the row
+    /// id already in the DB, so the route must answer with the row read back
+    /// after persisting rather than the request-local UUID. The probe hook
+    /// deterministically simulates the concurrent insert that a double-POST
+    /// would otherwise race.
+    func test_postAccountsIMAP_upsertConflict_returnsStoredId() async throws {
+        let email = "imap-\(UUID().uuidString)@qq.com"
+        let racedId = UUID()
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: { conn in
+                try? await TestDatabase.deleteAccount(oauthUser: email, provider: .qq, db: conn)
+            }) { conn in
+                let provider = StubMailProvider()
+                await provider.setProbeHook {
+                    try? await AccountStore.upsert(
+                        Account(
+                            id: racedId, provider: .qq, oauthUser: email, email: email,
+                            credentials: Data([9, 9, 9]), isActive: false
+                        ),
+                        credentials: Data([9, 9, 9]),
+                        db: conn
+                    )
+                }
+                let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
+                try await app.test(.router) { client in
+                    try await client.execute(
+                        uri: "/api/accounts/imap",
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: Self.jsonBody(["provider": "qq", "email": email, "authCode": "code"])
+                    ) { response in
+                        XCTAssertEqual(response.status, .created)
+                        let decoded = try Self.iso8601Decoder().decode(
+                            ConnectedAccount.self, from: Data(buffer: response.body)
+                        )
+                        XCTAssertEqual(decoded.id, racedId, "201 must echo the id the DB actually kept")
+                    }
+                }
+                let rows = try await AccountStore.all(db: conn).filter { $0.oauthUser == email }
+                XCTAssertEqual(rows.count, 1, "the conflict must update, not duplicate")
+                XCTAssertEqual(rows.first?.id, racedId)
+            }
+        }
+    }
+
+    /// MUST 2 regression, literal two-POST form: two concurrent POSTs for the
+    /// same email both return the single id the database kept.
+    func test_postAccountsIMAP_concurrentDoublePost_returnsSameStoredId() async throws {
+        let email = "imap-\(UUID().uuidString)@qq.com"
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: { conn in
+                try? await TestDatabase.deleteAccount(oauthUser: email, provider: .qq, db: conn)
+            }) { conn in
+                let gate = ProbeGate()
+                let provider = StubMailProvider()
+                await provider.setProbeHook { await gate.arriveAndWait() }
+                let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
+                try await app.test(.router) { client in
+                    async let first = client.executeRequest(
+                        uri: "/api/accounts/imap",
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: Self.jsonBody(["provider": "qq", "email": email, "authCode": "code-a"])
+                    )
+                    async let second = client.executeRequest(
+                        uri: "/api/accounts/imap",
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: Self.jsonBody(["provider": "qq", "email": email, "authCode": "code-b"])
+                    )
+                    // Never hang if the harness happens to serialize requests.
+                    let timeout = Task {
+                        try? await Task.sleep(for: .seconds(5))
+                        await gate.release()
+                    }
+                    let (r1, r2) = try await (first, second)
+                    timeout.cancel()
+                    XCTAssertEqual(r1.status, .created)
+                    XCTAssertEqual(r2.status, .created)
+                    let id1 = try Self.iso8601Decoder().decode(
+                        ConnectedAccount.self, from: Data(buffer: r1.body)
+                    ).id
+                    let id2 = try Self.iso8601Decoder().decode(
+                        ConnectedAccount.self, from: Data(buffer: r2.body)
+                    ).id
+                    XCTAssertEqual(id1, id2, "both POSTs must return the stored row id")
+                }
+            }
         }
     }
 
@@ -1284,6 +1486,9 @@ final class RouteTests: XCTestCase {
                     method: .post
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
+                    let object = try JSONSerialization.jsonObject(with: Data(buffer: response.body))
+                        as? [String: Any]
+                    XCTAssertNotNil(object?["actionId"] as? Int64)
                 }
             }
             let archived = await provider.archivedRemoteIds
@@ -1346,6 +1551,80 @@ final class RouteTests: XCTestCase {
 
     private func sendBody(_ json: String) -> ByteBuffer {
         ByteBuffer(data: Data(json.utf8))
+    }
+
+    func test_postCompose_sendsNewMessageIsIdempotentAndAudits() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let provider = StubMailProvider()
+            await provider.setSendResult("<compose-1@example.com>")
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+            let requestId = UUID().uuidString
+            let body = #"{"to":"alice@example.com","subject":"Project kickoff","body":"First note","requestId":"\#(requestId)"}"#
+
+            for _ in 0..<2 {
+                try await app.test(.router) { client in
+                    try await client.execute(
+                        uri: "/api/compose/send?accountId=\(account.id.uuidString)",
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: sendBody(body)
+                    ) { response in
+                        XCTAssertEqual(response.status, .ok)
+                        let decoded = try Self.iso8601Decoder().decode(
+                            SendResponse.self, from: response.body
+                        )
+                        XCTAssertEqual(decoded.providerMessageId, "<compose-1@example.com>")
+                    }
+                }
+            }
+
+            let sent = await provider.sentOutbounds
+            XCTAssertEqual(sent.count, 1)
+            let outbound = try XCTUnwrap(sent.first)
+            XCTAssertEqual(outbound.to, "alice@example.com")
+            XCTAssertEqual(outbound.subject, "Project kickoff")
+            XCTAssertEqual(outbound.body, "First note")
+            XCTAssertNil(outbound.inReplyTo)
+            XCTAssertNil(outbound.references)
+            XCTAssertFalse(outbound.isReply)
+
+            let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
+            let auditRow = try XCTUnwrap(actions.first { $0.kind == .send })
+            XCTAssertEqual(auditRow.payload["type"], "compose")
+            XCTAssertEqual(auditRow.payload["to"], "alice@example.com")
+            XCTAssertNil(auditRow.payload["remoteId"])
+        }
+    }
+
+    func test_postCompose_rejectsHeaderInjectionBeforeProvider() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/compose/send?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: sendBody(#"{"to":"alice@example.com\r\nBcc:evil@example.com","subject":"Hi","body":"Hello"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "malformed-compose")
+                }
+            }
+            let sent = await provider.sentOutbounds
+            XCTAssertTrue(sent.isEmpty)
+        }
     }
 
     func test_postSend_usesStoredThreadingHeadersAndRecordsAuditRow() async throws {
@@ -1449,6 +1728,50 @@ final class RouteTests: XCTestCase {
             let outbound = try XCTUnwrap(sent.first)
             XCTAssertEqual(outbound.inReplyTo, "<only@example.com>")
             XCTAssertEqual(outbound.references, "<only@example.com>")
+        }
+    }
+
+    func test_postSend_sameRequestId_doesNotSendTwice() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id,
+                remoteId: "send-idem-\(UUID())",
+                from: "alice@example.com",
+                messageIdHeader: "<idem@example.com>"
+            )
+            try await MessageStore.upsert(message, db: conn)
+
+            let requestId = UUID().uuidString
+            let body = #"{"body":"hello","requestId":"\#(requestId)"}"#
+            let provider = StubMailProvider()
+            await provider.setSendResult("<idem-1@example.com>")
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            for _ in 0..<2 {
+                try await app.test(.router) { client in
+                    try await client.execute(
+                        uri: "/api/messages/\(message.remoteId)/send?accountId=\(account.id.uuidString)",
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: sendBody(body)
+                    ) { response in
+                        XCTAssertEqual(response.status, .ok)
+                        let decoded = try Self.iso8601Decoder().decode(
+                            SendResponse.self,
+                            from: response.body
+                        )
+                        XCTAssertEqual(decoded.providerMessageId, "<idem-1@example.com>")
+                    }
+                }
+            }
+
+            let sent = await provider.sentOutbounds
+            XCTAssertEqual(sent.count, 1)
         }
     }
 
@@ -1686,9 +2009,9 @@ final class RouteTests: XCTestCase {
         }
     }
 
-    /// When the archive only landed locally (provider degraded), undo must not
-    /// invent a remote move.
-    func test_undoArchive_whenRemoteWriteFailed_staysLocalOnly() async throws {
+    /// A remote archive failure is a failed operation: no local state and no
+    /// audit row may claim success.
+    func test_postArchive_whenRemoteWriteFails_changesNothing() async throws {
         let account = makeAccount(
             oauthUser: "route-\(UUID().uuidString)",
             email: "me-\(UUID().uuidString)@example.com"
@@ -1708,30 +2031,19 @@ final class RouteTests: XCTestCase {
                     uri: "/api/messages/\(message.remoteId)/archive?accountId=\(account.id.uuidString)",
                     method: .post
                 ) { response in
-                    XCTAssertEqual(response.status, .ok, "a degraded archive still succeeds locally")
+                    XCTAssertEqual(response.status, .badGateway)
                 }
             }
+            let stored = try await MessageStore.find(
+                remoteId: message.remoteId,
+                accountId: account.id,
+                db: conn
+            )
+            XCTAssertEqual(stored?.isArchived, false)
             let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
-            let archiveRow = try XCTUnwrap(
-                actions.first { $0.kind == .archive && $0.payload["remoteId"] == message.remoteId }
-            )
-            XCTAssertEqual(archiveRow.payload["remoteWrite"], "false")
-
-            try await app.test(.router) { client in
-                try await client.execute(
-                    uri: "/api/actions/\(archiveRow.id)/undo?accountId=\(account.id.uuidString)",
-                    method: .post
-                ) { response in
-                    XCTAssertEqual(response.status, .ok)
-                }
-            }
-
-            let restored = try await MessageStore.find(
-                remoteId: message.remoteId, accountId: account.id, db: conn
-            )
-            XCTAssertEqual(restored?.isArchived, false)
-            let unarchived = await provider.unarchivedRemoteIds
-            XCTAssertTrue(unarchived.isEmpty, "there was no remote move to reverse")
+            XCTAssertTrue(actions.allSatisfy {
+                !($0.kind == .archive && $0.payload["remoteId"] == message.remoteId)
+            })
         }
     }
 
@@ -1789,7 +2101,9 @@ final class RouteTests: XCTestCase {
         }
     }
 
-    func test_undoUnsubscribe_isNotUndoable() async throws {
+    /// A saved override must affect the next Briefing request, not just the
+    /// ai_overrides table.
+    func test_classifyOverride_changesNextBriefingResponse() async throws {
         let account = makeAccount(
             oauthUser: "route-\(UUID().uuidString)",
             email: "me-\(UUID().uuidString)@example.com"
@@ -1797,22 +2111,99 @@ final class RouteTests: XCTestCase {
         try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
             try await seedAccount(account, db: conn)
             let message = makeHeader(
-                accountId: account.id, remoteId: "un-\(UUID())", from: "news@example.com"
+                accountId: account.id,
+                remoteId: "co-brief-\(UUID())",
+                from: "alice@example.com"
             )
             try await MessageStore.upsert(message, db: conn)
+
+            let provider = StubMailProvider()
+            let router = makeMessageRouter(db: conn, makeProvider: { _ in provider })
+            let (client, tokens) = makeGmailCollaborators(db: conn)
+            ActionsRoutes.register(
+                on: router, db: conn, client: client, tokens: tokens,
+                logger: Self.testLogger, makeProvider: { _ in provider }
+            )
+            BriefingRoutes.register(on: router, db: conn, logger: Self.testLogger)
+            let app = Application(router: router)
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/classify?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: sendBody(#"{"fromGroup":"needsReply","toGroup":"subscriptionNoise"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/briefing?accountId=\(account.id.uuidString)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        BriefingResponse.self,
+                        from: Data(buffer: response.body)
+                    )
+                    let item = try XCTUnwrap(decoded.items.first {
+                        $0.message.remoteId == message.remoteId
+                    })
+                    XCTAssertEqual(item.group, .subscriptionNoise)
+                    XCTAssertEqual(item.reason, .userOverride)
+                }
+            }
+        }
+    }
+
+    func test_undoExpiredAction_returns410() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let action = try await AIActionStore.record(
+                accountId: account.id,
+                kind: .archive,
+                payload: ["remoteId": "expired-1", "remoteWrite": "false"],
+                db: conn
+            )
+            try await conn.query(
+                "UPDATE ai_actions SET expires_at = now() - interval '1 second' WHERE id = $1",
+                [PostgresData(int64: action.id)]
+            ).get()
             let provider = StubMailProvider()
             let app = Application(router: makeSendRouter(db: conn, provider: provider))
 
             try await app.test(.router) { client in
                 try await client.execute(
-                    uri: "/api/messages/\(message.remoteId)/unsubscribe?accountId=\(account.id.uuidString)",
+                    uri: "/api/actions/\(action.id)/undo?accountId=\(account.id.uuidString)",
                     method: .post
                 ) { response in
-                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(response.status, .gone)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "action-expired")
                 }
             }
-            let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
-            let row = try XCTUnwrap(actions.first { $0.kind == .unsubscribe })
+        }
+    }
+
+    func test_undoUnsubscribe_isNotUndoable() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let row = try await AIActionStore.record(
+                accountId: account.id,
+                kind: .unsubscribe,
+                payload: ["remoteId": "un-1", "publisher": "example.com", "remote": "true"],
+                db: conn
+            )
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
 
             try await app.test(.router) { client in
                 try await client.execute(
@@ -1853,5 +2244,41 @@ final class RouteTests: XCTestCase {
                 }
             }
         }
+    }
+}
+
+/// Test-only rendezvous for the concurrent double-POST regression: both probes
+/// park here until both requests have arrived, guaranteeing both passed `find`
+/// (saw no row) before either `upsert`ed. `release()` is a safety valve so a
+/// serialized harness fails an assertion instead of hanging the suite.
+private actor ProbeGate {
+    private var arrivals = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+
+    func arriveAndWait() async {
+        if released { return }
+        arrivals += 1
+        if arrivals >= 2 {
+            released = true
+            let parked = waiters
+            waiters.removeAll()
+            for waiter in parked { waiter.resume() }
+        } else {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if released {
+                    continuation.resume()
+                } else {
+                    waiters.append(continuation)
+                }
+            }
+        }
+    }
+
+    func release() {
+        released = true
+        let parked = waiters
+        waiters.removeAll()
+        for waiter in parked { waiter.resume() }
     }
 }

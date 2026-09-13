@@ -32,6 +32,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     private let db: PostgresConnection?
     private let logger: Logger
     private let transportFactory: @Sendable () -> any StreamTransport
+    /// IMAP is single-command by design. Actor reentrancy alone does not keep
+    /// two route calls from interleaving tagged commands while one awaits I/O.
+    private let commandLock = AsyncMutex()
 
     private var client: IMAPClient?
     /// Capability names as negotiated by the live session.
@@ -42,11 +45,17 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     /// reconnect (spec §4.3).
     private var archiveResolved = false
     private var archiveName: String?
+    private var sentResolved = false
+    private var sentName: String?
     private var cachedCapabilities: MailCapabilities?
     /// `\Seen` as last reported to the store. Flips are only reported for UIDs
     /// in here: without a baseline a rescan says nothing about what the user
     /// has already seen.
     private var reportedRead: [Int64: Bool] = [:]
+    /// The pull path is otherwise silent, which makes "connected but nothing
+    /// arrived" indistinguishable from "empty mailbox" — the log only says
+    /// `imap.connected`. One SELECT/backfill summary per process per account.
+    private var loggedFirstRound = false
 
     public init(
         account: Account,
@@ -73,7 +82,8 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                     archiveFolder: folder != nil,
                     idle: negotiated.contains("IDLE"),
                     move: negotiated.contains("MOVE"),
-                    // Every IMAP body can be sampled with BODY.PEEK[TEXT].
+                    // Every IMAP body can be sampled from its message prefix
+                    // with BODY.PEEK[] and decoded by MIMEParser.
                     serverSnippet: true
                 )
             }
@@ -96,6 +106,61 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             }
         } catch {
             return nil
+        }
+    }
+
+    /// Diagnostics only: check whether a recently sent message reached the
+    /// server's Sent-role mailbox. This is used by `LagoonServer --self-test`.
+    public func diagnosticSentContains(subject: String, limit: Int = 30) async throws -> Bool {
+        try await withClient { client in
+            let mailboxes = try await client.listMailboxes()
+            guard let sent = mailboxes.first(where: { mailbox in
+                mailbox.attributes.contains {
+                    $0.caseInsensitiveCompare("\\Sent") == .orderedSame
+                } || ["sent", "sent messages", "已发送", "已发送邮件"].contains(
+                    mailbox.name.lowercased()
+                )
+            }) else {
+                return false
+            }
+            let state = try await client.select(sent.name)
+            let fromUid = max(1, state.uidNext - Int64(max(limit, 1)))
+            let headers = try await client.fetchHeaders(fromUid: fromUid)
+            let contains = headers.contains { fetched in
+                guard let raw = fetched.rawHeaders["subject"] else { return false }
+                let decoded = MIMEParser.decodeRFC2047(raw)
+                return decoded == subject || decoded == "Re: \(subject)"
+            }
+            selected = try await client.select(Self.inboxName)
+            return contains
+        }
+    }
+
+    public func diagnosticMailboxes() async throws -> [IMAPMailbox] {
+        try await withClient { client in
+            try await client.listMailboxes()
+        }
+    }
+
+    public func diagnosticFind(subject: String, perMailboxLimit: Int = 100) async throws -> [(String, Int64)] {
+        try await withClient { client in
+            var matches: [(String, Int64)] = []
+            let mailboxes = try await client.listMailboxes()
+            for mailbox in mailboxes where !mailbox.attributes.contains(where: {
+                $0.caseInsensitiveCompare("\\NoSelect") == .orderedSame
+            }) {
+                let state = try await client.select(mailbox.name)
+                let fromUid = max(1, state.uidNext - Int64(max(perMailboxLimit, 1)))
+                let headers = try await client.fetchHeaders(fromUid: fromUid)
+                for header in headers {
+                    guard let raw = header.rawHeaders["subject"],
+                          MIMEParser.decodeRFC2047(raw).contains(subject)
+                    else { continue }
+                    matches.append((mailbox.name, header.uid))
+                }
+            }
+            selected = nil
+            return matches
         }
     }
 
@@ -155,6 +220,17 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             let fromUid = cursor.lastUid.map { $0 + 1 }
                 ?? max(1, inbox.uidNext - Self.backfillWindow)
             let fetched = try await client.fetchHeaders(fromUid: fromUid)
+            if !loggedFirstRound {
+                loggedFirstRound = true
+                logger.info("imap.round", metadata: [
+                    "account": .string(account.email),
+                    "exists": .string("\(inbox.exists)"),
+                    "uidValidity": .string("\(inbox.uidValidity)"),
+                    "uidNext": .string("\(inbox.uidNext)"),
+                    "fromUid": .string("\(fromUid)"),
+                    "fetched": .string("\(fetched.count)"),
+                ])
+            }
 
             var upserts: [RemoteHeader] = []
             upserts.reserveCapacity(fetched.count)
@@ -219,18 +295,18 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     // MARK: - Body & headers
 
     public func fetchBody(remoteId: String) async throws -> String {
-        let uid = try Self.uid(from: remoteId)
         return try await withClient { client in
             try await selectInbox(client: client, force: false)
+            let uid = try await resolveUID(remoteId, client: client)
             let raw = try await client.fetchFullBody(uid: uid)
             return MIMEParser.plainText(from: raw)
         }
     }
 
     public func fetchRawHeaderValues(remoteId: String) async throws -> [String: String] {
-        let uid = try Self.uid(from: remoteId)
         return try await withClient { client in
             try await selectInbox(client: client, force: false)
+            let uid = try await resolveUID(remoteId, client: client)
             guard let header = try await client.fetchHeader(uid: uid).first else {
                 throw MailError.messageGone
             }
@@ -241,9 +317,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     // MARK: - Mutations
 
     public func setRead(remoteId: String, isRead: Bool) async throws {
-        let uid = try Self.uid(from: remoteId)
         try await withClient { client in
             try await selectInbox(client: client, force: false)
+            let uid = try await resolveUID(remoteId, client: client)
             try await client.store(
                 uid: uid,
                 add: isRead ? ["\\Seen"] : [],
@@ -256,21 +332,25 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     }
 
     public func archive(remoteId: String) async throws {
-        let uid = try Self.uid(from: remoteId)
         try await withClient { client in
             guard let folder = try await resolveArchiveFolder(client: client) else {
                 throw MailError.archiveUnavailable
             }
             try await selectInbox(client: client, force: false)
+            let uid = try await resolveUID(remoteId, client: client)
             try await move(client: client, uid: uid, to: folder)
         }
     }
 
     public func unarchive(remoteId: String) async throws {
-        let uid = try Self.uid(from: remoteId)
         try await withClient { client in
-            try await selectInbox(client: client, force: false)
-            try await move(client: client, uid: uid, to: Self.inboxName)
+            guard let folder = try await resolveArchiveFolder(client: client) else {
+                throw MailError.archiveUnavailable
+            }
+            selected = try await client.select(folder)
+            let archivedUID = try await resolveUID(remoteId, client: client)
+            try await move(client: client, uid: archivedUID, to: Self.inboxName)
+            selected = nil
         }
     }
 
@@ -283,13 +363,32 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         }
         let credentials = try await imapCredentials()
         let smtp = SMTPClient(transport: transportFactory(), logger: logger)
-        return try await smtp.send(
-            outbound,
+        let messageID = "<\(UUID().uuidString.lowercased())@lagoon>"
+        let message = outbound.isReply
+            ? MIMEBuilder.reply(outbound, messageId: messageID)
+            : MIMEBuilder.newMessage(outbound, messageId: messageID)
+        try await smtp.sendRaw(
+            message,
+            outbound: outbound,
             host: preset.smtpHost,
             port: preset.smtpPort,
             username: credentials.username,
             authCode: credentials.authCode
         )
+        do {
+            if let sent = try await resolveSentFolder() {
+                try await withClient { client in
+                    try await client.append(mailbox: sent, message: message)
+                }
+            }
+        } catch {
+            // Delivery already succeeded. Do not make the client retry a sent
+            // message just because the audit copy could not be appended.
+            logger.warning("imap.sent.appendFailed", metadata: [
+                "label": .string(Self.label(error)),
+            ])
+        }
+        return messageID
     }
 
     public func probe() async throws {
@@ -305,13 +404,19 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     /// provider-neutral surface, and the session is rebuilt on the next call
     /// unless the error is a verdict about the message rather than the socket.
     private func withClient<T>(_ body: (IMAPClient) async throws -> T) async throws -> T {
-        let client = try await connectedClient()
+        await commandLock.lock()
         do {
-            return try await body(client)
+            try Task.checkCancellation()
+            let client = try await connectedClient()
+            let result = try await body(client)
+            await commandLock.unlock()
+            return result
         } catch let error as MailError where error == .messageGone {
+            await commandLock.unlock()
             throw error
         } catch {
             dropConnection()
+            await commandLock.unlock()
             throw Self.map(error)
         }
     }
@@ -403,6 +508,22 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         return archiveName
     }
 
+    private func resolveSentFolder() async throws -> String? {
+        if sentResolved { return sentName }
+        return try await withClient { client in
+            let mailboxes = try await client.listMailboxes()
+            sentName = mailboxes.first(where: { mailbox in
+                mailbox.attributes.contains {
+                    $0.caseInsensitiveCompare("\\Sent") == .orderedSame
+                } || ["sent", "sent messages", "已发送", "已发送邮件"].contains(
+                    mailbox.name.lowercased()
+                )
+            })?.name
+            sentResolved = true
+            return sentName
+        }
+    }
+
     /// `UID MOVE` when the server has it, else the §4.3 fallback.
     private func move(client: IMAPClient, uid: Int64, to mailbox: String) async throws {
         do {
@@ -425,11 +546,12 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             return MIMEParser.decodeRFC2047(value)
         }
         let (address, name) = FromHeader.parse(decoded("from") ?? "")
+        let messageID = decoded("message-id")
         return RemoteHeader(
-            remoteId: "\(fetched.uid)",
+            remoteId: messageID ?? "uid:\(fetched.uid)",
             threadId: Self.threadId(
                 references: decoded("references"),
-                messageId: decoded("message-id"),
+                messageId: messageID,
                 uid: fetched.uid
             ),
             fromAddress: address,
@@ -439,10 +561,38 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             receivedAt: fetched.internalDate ?? Date(),
             isRead: Self.isRead(flags: fetched.flags),
             listUnsubscribe: decoded("list-unsubscribe") != nil,
-            messageIdHeader: decoded("message-id"),
+            messageIdHeader: messageID,
             inReplyTo: decoded("in-reply-to"),
             references: decoded("references")
         )
+    }
+
+    /// UID is a mailbox-local position and can change after MOVE. New IMAP rows
+    /// use Message-ID as the stable identity; numeric values remain supported
+    /// for rows created before the migration.
+    private func resolveUID(_ remoteId: String, client: IMAPClient) async throws -> Int64 {
+        if let uid = Int64(remoteId) {
+            return uid
+        }
+        if remoteId.hasPrefix("uid:"), let uid = Int64(remoteId.dropFirst(4)) {
+            return uid
+        }
+        if let uid = try await client.searchUID(messageID: remoteId) {
+            return uid
+        }
+        // QQ accepts HEADER SEARCH but can return an empty set even when the
+        // header is present. Scan the selected mailbox's recent window as a
+        // deterministic fallback.
+        if let selected {
+            let fromUid = max(1, selected.uidNext - 501)
+            let headers = try await client.fetchHeaders(fromUid: fromUid)
+            if let match = headers.first(where: {
+                $0.rawHeaders["message-id"] == remoteId
+            }) {
+                return match.uid
+            }
+        }
+        throw MailError.messageGone
     }
 
     static func isRead(flags: [String]) -> Bool {
@@ -462,17 +612,37 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         return "uid:\(uid)"
     }
 
-    /// `BODY[TEXT]<0.256>` bytes → preview text, or nil when the bytes are
-    /// multipart structure or a transfer-encoded chunk rather than prose.
+    /// `BODY[]<0.N>` message prefix → preview text, or nil when nothing
+    /// readable is inside the window.
+    ///
+    /// The bytes now start at the RFC 2822 header block, so the project's MIME
+    /// decoder does the work: `plainText` splits headers from body, reads the
+    /// content type and transfer encoding, and returns the preferred part's
+    /// text (base64 / quoted-printable / multipart / HTML all handled). The old
+    /// guards remain as a fallback for the cases the parser cannot resolve —
+    /// a window that stops inside the header block, or a single-part base64
+    /// message whose `content-type` fell outside the window, which
+    /// `preferredContent` would otherwise hand back as raw base64 under the
+    /// `text/plain` default. A mis-snippet is still worse than no snippet.
     static func snippetText(from data: Data?) -> String? {
-        guard let data, let text = String(data: data, encoding: .utf8) else { return nil }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        // A multipart body starts with its `--boundary`: those bytes are
-        // structure, and a mis-snippet is worse than no snippet.
-        guard !trimmed.isEmpty, !trimmed.hasPrefix("--"), !looksTransferEncoded(trimmed) else {
-            return nil
-        }
-        return String(trimmed.prefix(200))
+        guard let data else { return nil }
+        let decoded = MIMEParser.plainText(from: data)
+        // Header-only window or an attachment-only body: nothing readable.
+        guard !decoded.isEmpty else { return nil }
+        // The list shows one line, so runs of whitespace (including the raw
+        // body's newlines) collapse to single spaces.
+        let collapsed = decoded.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        // A single-part base64 message whose content-type header is outside the
+        // window comes back as raw base64 (the text/plain default). Guard after
+        // folding, and against the whitespace-free payload: line-folded base64
+        // carries CRLF (and sometimes spaces) between its lines, which breaks
+        // both the %4 length test and the alphabet test, so testing the raw
+        // or space-joined text lets a folded payload through as prose.
+        guard !looksTransferEncoded(collapsed.filter { !$0.isWhitespace }) else { return nil }
+        // A multipart body the parser could not route (missing content-type /
+        // boundary) survives as structure starting with `--boundary`.
+        guard !collapsed.hasPrefix("--") else { return nil }
+        return String(collapsed.prefix(200))
     }
 
     static func looksTransferEncoded(_ text: String) -> Bool {

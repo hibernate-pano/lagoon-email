@@ -5,12 +5,14 @@ public struct ArchiveResponse: Codable, Sendable, Equatable {
     public let ok: Bool
     public let remoteId: String
     public let remote: Bool
+    public let actionId: Int64
 }
 
 public struct UnsubscribeResponse: Codable, Sendable, Equatable {
     public let ok: Bool
     public let unsubscribed: Bool
     public let publisher: String
+    public let actionId: Int64
 }
 
 public struct ChooseDraftResponse: Codable, Sendable, Equatable {

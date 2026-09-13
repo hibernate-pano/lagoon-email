@@ -15,7 +15,7 @@ public enum DraftRoutes {
         db: PostgresConnection,
         client: GmailClient,
         tokens: GmailTokenService,
-        summarizer: (any MessageSummarizing)?,
+        draftGenerator: (any MessageDrafting)?,
         logger: Logger,
         makeProvider: MailProviderFactory.Builder? = nil
     ) {
@@ -26,7 +26,7 @@ public enum DraftRoutes {
             return await generateHandler(
                 request: request, context: context, db: db,
                 makeProvider: makeProvider,
-                summarizer: summarizer, logger: logger
+                draftGenerator: draftGenerator, logger: logger
             )
         }
 
@@ -45,7 +45,7 @@ public enum DraftRoutes {
     private static func generateHandler(
         request: Request, context: BasicRequestContext, db: PostgresConnection,
         makeProvider: MailProviderFactory.Builder,
-        summarizer: (any MessageSummarizing)?, logger: Logger
+        draftGenerator: (any MessageDrafting)?, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -53,7 +53,7 @@ public enum DraftRoutes {
         guard let remoteId = RouteParams.remoteId(from: context) else {
             return RouteJSON.error(.badRequest, "malformed-remoteId")
         }
-        guard let summarizer else {
+        guard let draftGenerator else {
             return RouteJSON.error(.serviceUnavailable, "ai-not-configured")
         }
         let account: Account
@@ -84,7 +84,10 @@ public enum DraftRoutes {
         let variants: [String]
         do {
             variants = try await generateVariants(
-                body: body, language: language, summarizer: summarizer
+                body: body,
+                language: language,
+                accountEmail: account.email,
+                draftGenerator: draftGenerator
             )
         } catch {
             return errorResponse(.badGateway, "ai-error", logger: logger, error: error)
@@ -243,35 +246,23 @@ public enum DraftRoutes {
         return try rows.rows.first.map { try DraftReplyStore.decode($0) }
     }
 
-    /// Build three variants by calling the summarizer with three different wrappers.
-    /// Falls back to a single variant if anything fails.
+    /// Ask the AI gateway for real reply variants. Summarization is a separate
+    /// task and must never be recycled as a reply draft.
     private static func generateVariants(
-        body: MessageBody, language: String?, summarizer: any MessageSummarizing
+        body: MessageBody,
+        language: String?,
+        accountEmail: String,
+        draftGenerator: any MessageDrafting
     ) async throws -> [String] {
-        let summary = try await summarizer.summarize(body, language: language, accountEmail: "")
-        let core = summary.summary
-        let subject = body.subject ?? "(no subject)"
-        return [
-            compose(core: core, tone: "concise", subject: subject),
-            compose(core: core, tone: "friendly", subject: subject),
-            compose(core: core, tone: "formal", subject: subject),
-        ]
-    }
-
-    private static func compose(core: String, tone: String, subject: String) -> String {
-        let greeting = "Hi,"
-        let sign = "\n\nBest,\nMe"
-        switch tone {
-        case "concise":
-            return greeting + "\n\n" + core + "\n\n" + sign
-        case "friendly":
-            let lower = core.lowercased()
-            return greeting + "\n\nThanks for the news — " + lower + "\n\n" + sign
-        case "formal":
-            return "Dear sender,\n\nThank you for your note on '" + subject + "'. " + core + "\n\n" + sign
-        default:
-            return core
-        }
+        let variants = try await draftGenerator.draftReplies(
+            body,
+            language: language,
+            accountEmail: accountEmail,
+            count: 3
+        )
+        return variants
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 
     private static func collectBody(_ request: Request) async throws -> Data {
@@ -352,11 +343,21 @@ public enum SearchRoutes {
 // MARK: - Budget / usage report
 
 public enum BudgetRoutes {
-    public static func register(on router: Router<BasicRequestContext>, budget: UsageBudget) {
+    public static func register(
+        on router: Router<BasicRequestContext>,
+        budget: UsageBudget,
+        costTrackingAvailable: Bool
+    ) {
         router.get("api/usage") { _, _ -> Response in
             let cap = await budget.capUSD
             let month = await budget.currentMonthUSD
-            let report = UsageReport(monthUSD: month, capUSD: cap, callCount: 0)
+            let calls = await budget.callCount
+            let report = UsageReport(
+                monthUSD: month,
+                capUSD: cap,
+                callCount: calls,
+                costTrackingAvailable: costTrackingAvailable
+            )
             return RouteJSON.response(report)
         }
     }

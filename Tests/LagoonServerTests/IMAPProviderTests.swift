@@ -107,17 +107,42 @@ final class IMAPProviderTests: XCTestCase {
         await transport.enqueue(")")
     }
 
-    /// `BODY[TEXT]<0.N>` answer for one UID.
+    /// `BODY[]<0.N>` answer for one UID: the message prefix (headers + body)
+    /// that `BODY.PEEK[]<0.32768>` returns, so the decoder can see the MIME
+    /// content type and transfer encoding.
     private func scriptSnippet(
         _ transport: ScriptedTransport,
         sequence: Int,
         uid: Int64,
-        text: String
+        message: String
     ) async {
-        let data = Data(text.utf8)
-        await transport.enqueue(#"* \#(sequence) FETCH (UID \#(uid) BODY[TEXT]<0> {\#(data.count)}"#)
+        let data = Data(message.utf8)
+        await transport.enqueue(#"* \#(sequence) FETCH (UID \#(uid) BODY[]<0> {\#(data.count)}"#)
         await transport.enqueueLiteral(data)
         await transport.enqueue(")")
+    }
+
+    /// Runs one pull round whose single message is `message` and returns the
+    /// snippet the provider derived from it. The message is delivered exactly
+    /// as authored, so a caller can hand over a truncated window on purpose.
+    private func pulledSnippet(_ message: String) async throws -> String? {
+        let transport = ScriptedTransport()
+        let (provider, _) = try makeProvider(transport: transport)
+        await scriptHandshake(transport)
+        await scriptList(transport, number: 4, mailboxes: [
+            (name: "INBOX", attribute: nil),
+            (name: "Archive", attribute: "\\Archive"),
+        ])
+        await scriptSelect(transport, number: 5, uidValidity: 42, uidNext: 1)
+        await scriptHeaderFetch(transport, sequence: 1, uid: 1, flags: "", headers: [
+            ("From", "zhangsan@qq.com"),
+            ("Subject", "snippet"),
+        ])
+        await transport.enqueue("A0006 OK FETCH completed")
+        await scriptSnippet(transport, sequence: 1, uid: 1, message: message)
+        await transport.enqueue("A0007 OK FETCH completed")
+        let change = try await provider.pullChanges(after: MailSyncState(), waitUpTo: .zero)
+        return try XCTUnwrap(change.upserts.first).snippet
     }
 
     // MARK: - probe
@@ -235,9 +260,16 @@ final class IMAPProviderTests: XCTestCase {
                 ("Subject", "第二封"),
             ])
             await transport.enqueue("A0006 OK FETCH completed")
-            await scriptSnippet(transport, sequence: 1, uid: 900, text: "Hello from QQ")
+            await scriptSnippet(
+                transport, sequence: 1, uid: 900,
+                message: "Content-Type: text/plain; charset=UTF-8\r\n\r\nHello from QQ"
+            )
             await transport.enqueue("A0007 OK FETCH completed")
-            await scriptSnippet(transport, sequence: 2, uid: 901, text: "SGVsbG8gd29ybGQhIHN0dWZm")
+            await scriptSnippet(
+                transport, sequence: 2, uid: 901,
+                message: "Content-Type: text/plain; charset=UTF-8\r\n"
+                    + "Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8gd29ybGQhIHN0dWZm"
+            )
             await transport.enqueue("A0008 OK FETCH completed")
 
             let change = try await provider.pullChanges(after: MailSyncState(), waitUpTo: .zero)
@@ -255,7 +287,7 @@ final class IMAPProviderTests: XCTestCase {
             XCTAssertFalse(change.resetRequired)
 
             let first = try XCTUnwrap(change.upserts.first)
-            XCTAssertEqual(first.remoteId, "900")
+            XCTAssertEqual(first.remoteId, "<m900@qq.com>")
             XCTAssertEqual(first.subject, "测试", "RFC 2047 encoded words are decoded")
             XCTAssertEqual(first.fromAddress, "zhangsan@qq.com")
             XCTAssertEqual(first.fromName, "Zhang San")
@@ -264,11 +296,15 @@ final class IMAPProviderTests: XCTestCase {
             XCTAssertEqual(first.snippet, "Hello from QQ")
 
             let second = try XCTUnwrap(change.upserts.last)
-            XCTAssertEqual(second.remoteId, "901")
+            XCTAssertEqual(second.remoteId, "uid:901")
             XCTAssertFalse(second.isRead)
             XCTAssertEqual(second.fromAddress, "lisi@qq.com")
             XCTAssertEqual(second.threadId, "uid:901", "no References and no Message-ID falls back to the UID")
-            XCTAssertNil(second.snippet, "transfer-encoded bytes are not a snippet")
+            XCTAssertEqual(
+                second.snippet,
+                "Hello world! stuff",
+                "the prefix now carries headers, so a base64 text part decodes to readable text"
+            )
         }
     }
 
@@ -324,7 +360,10 @@ final class IMAPProviderTests: XCTestCase {
                 ("Message-ID", "<m5@qq.com>"),
             ])
             await transport.enqueue("A0006 OK FETCH completed")
-            await scriptSnippet(transport, sequence: 1, uid: 5, text: "hello")
+            await scriptSnippet(
+                transport, sequence: 1, uid: 5,
+                message: "Content-Type: text/plain; charset=UTF-8\r\n\r\nhello"
+            )
             await transport.enqueue("A0007 OK FETCH completed")
 
             let first = try await provider.pullChanges(
@@ -359,7 +398,7 @@ final class IMAPProviderTests: XCTestCase {
             )
             XCTAssertEqual(second.upserts.count, 1)
             let flipped = try XCTUnwrap(second.upserts.first)
-            XCTAssertEqual(flipped.remoteId, "5")
+            XCTAssertEqual(flipped.remoteId, "<m5@qq.com>")
             XCTAssertTrue(flipped.isRead)
             XCTAssertEqual(flipped.subject, "未读", "the upsert must not blank the subject")
         }
@@ -417,13 +456,42 @@ final class IMAPProviderTests: XCTestCase {
             let transport = ScriptedTransport()
             let (provider, _) = try makeProvider(transport: transport)
             await scriptHandshake(transport)
-            await scriptSelect(transport, number: 4, uidValidity: 42, uidNext: 9)
-            await transport.enqueue("A0005 OK MOVE completed")
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+                (name: "归档", attribute: "\\Archive"),
+            ])
+            await scriptSelect(transport, number: 5, uidValidity: 42, uidNext: 9)
+            await transport.enqueue("A0006 OK MOVE completed")
 
             try await provider.unarchive(remoteId: "7")
 
             let lines = await wire(transport)
-            XCTAssertEqual(lines.last, #"A0005 UID MOVE 7 "INBOX""#)
+            XCTAssertTrue(lines.contains(#"A0005 SELECT "归档""#))
+            XCTAssertEqual(lines.last, #"A0006 UID MOVE 7 "INBOX""#)
+        }
+    }
+
+    func test_unarchive_stableMessageID_resolvesTheArchiveUID() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let transport = ScriptedTransport()
+            let (provider, _) = try makeProvider(transport: transport)
+            await scriptHandshake(transport)
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+                (name: "归档", attribute: "\\Archive"),
+            ])
+            await scriptSelect(transport, number: 5, uidValidity: 42, uidNext: 9)
+            await transport.enqueue("* SEARCH 77")
+            await transport.enqueue("A0006 OK SEARCH completed")
+            await transport.enqueue("A0007 OK MOVE completed")
+
+            try await provider.unarchive(remoteId: "<m7@qq.com>")
+
+            let lines = await wire(transport)
+            XCTAssertTrue(
+                lines.contains(#"A0006 UID SEARCH HEADER Message-ID "<m7@qq.com>""#)
+            )
+            XCTAssertEqual(lines.last, #"A0007 UID MOVE 77 "INBOX""#)
         }
     }
 
@@ -527,6 +595,139 @@ final class IMAPProviderTests: XCTestCase {
         }
     }
 
+    // MARK: - snippets
+
+    /// A multipart/alternative message whose base64 text part is cut in the
+    /// middle: the window ends inside the base64 payload, and the bytes that
+    /// did arrive must still decode to readable prose. This is the shape that
+    /// produced empty previews on the real mailbox.
+    func test_snippet_multipartBase64TruncatedMidStream_returnsReadablePrefix() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let plain = String(
+                repeating: "这是一封测试邮件的正文内容，用于验证列表预览解码。",
+                count: 10
+            )
+            let base64 = Data(plain.utf8).base64EncodedString()
+            let full = "Content-Type: multipart/alternative; boundary=\"b\"\r\n"
+                + "\r\n"
+                + "--b\r\n"
+                + "Content-Type: text/plain; charset=UTF-8\r\n"
+                + "Content-Transfer-Encoding: base64\r\n"
+                + "\r\n"
+                + base64
+                + "\r\n--b--\r\n"
+            // The header block ends around byte 137, so byte 300 lands well
+            // inside the base64 and never reaches the closing delimiter.
+            let cut = Data(full.utf8).prefix(300)
+            let window = String(decoding: cut, as: UTF8.self)
+
+            let snippet = try await pulledSnippet(window)
+
+            let unwrapped = try XCTUnwrap(snippet)
+            XCTAssertTrue(
+                unwrapped.hasPrefix("这是一封测试邮件的正文内容"),
+                "the decoded head of the base64 part is readable, got: \(unwrapped)"
+            )
+            XCTAssertFalse(unwrapped.contains("6L+Z"), "raw base64 must not survive as the snippet")
+        }
+    }
+
+    /// HTML-only mail: the snippet is the tag-stripped prose, not markup.
+    func test_snippet_htmlOnly_returnsStrippedText() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let snippet = try await pulledSnippet(
+                "Content-Type: text/html; charset=UTF-8\r\n\r\n"
+                    + "<html><body><p>只有 HTML 的正文</p><p>第二段</p></body></html>"
+            )
+
+            XCTAssertEqual(snippet, "只有 HTML 的正文 第二段")
+            XCTAssertFalse(snippet?.contains("<p>") ?? false, "markup is stripped")
+        }
+    }
+
+    /// An attachment-only message has no preview text: the fallback still
+    /// returns nil rather than dumping PDF bytes into the list.
+    func test_snippet_attachmentOnly_returnsNil() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let snippet = try await pulledSnippet(
+                "Content-Type: application/pdf\r\n"
+                    + "Content-Disposition: attachment; filename=\"a.pdf\"\r\n"
+                    + "\r\nJVBERi0xLjQK"
+            )
+
+            XCTAssertNil(snippet, "an attachment carries no preview text")
+        }
+    }
+
+    /// The ordinary case: a plain text body is the snippet.
+    func test_snippet_plainText_returnsBody() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let snippet = try await pulledSnippet(
+                "Content-Type: text/plain; charset=UTF-8\r\n\r\n普通纯文本正文"
+            )
+
+            XCTAssertEqual(snippet, "普通纯文本正文")
+        }
+    }
+
+    /// The list renders one line: the body's newlines and runs of whitespace
+    /// collapse to single spaces before the 200-character cut.
+    func test_snippet_collapsesWhitespaceToASingleLine() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let snippet = try await pulledSnippet(
+                "Content-Type: text/plain; charset=UTF-8\r\n\r\n"
+                    + "第一行\r\n\r\n第二行\t\t多个   空格"
+            )
+
+            XCTAssertEqual(snippet, "第一行 第二行 多个 空格")
+            XCTAssertFalse(snippet?.contains("\n") ?? true, "the list preview is one line")
+        }
+    }
+
+    /// A folded (multi-line) base64 body the parser could not route — its
+    /// `content-transfer-encoding` fell outside the window — must not leak
+    /// into the list as prose. The guard has to run after whitespace folding
+    /// and against the payload without the fold separators: the CRLF between
+    /// base64 lines otherwise breaks the %4/alphabet test and the base64
+    /// survives as a preview.
+    func test_snippet_foldedBase64_doesNotLeakAsSnippet() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            // 120 bytes → base64 length 160 with no padding, so only the
+            // payload shape can identify it.
+            let raw = Data((0..<120).map { UInt8($0 % 251 + 1) })
+            let base64 = raw.base64EncodedString()
+            XCTAssertFalse(base64.hasSuffix("="), "the fixture must be caught by shape, not padding")
+            var folded = ""
+            var index = base64.startIndex
+            while index < base64.endIndex {
+                let end = base64.index(index, offsetBy: 76, limitedBy: base64.endIndex) ?? base64.endIndex
+                folded += base64[index..<end]
+                if end < base64.endIndex { folded += "\r\n" }
+                index = end
+            }
+            XCTAssertTrue(folded.contains("\r\n"), "the fixture must actually be folded")
+
+            let snippet = try await pulledSnippet(
+                "Content-Type: text/plain; charset=UTF-8\r\n\r\n" + folded
+            )
+
+            XCTAssertNil(snippet, "folded base64 must not be shown as a preview")
+        }
+    }
+
+    /// A body the parser could not route as multipart still starts with its
+    /// `--boundary`; that structural text must never be shown.
+    func test_snippet_unroutedBoundary_returnsNil() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let snippet = try await pulledSnippet(
+                "Content-Type: text/plain; charset=UTF-8\r\n\r\n"
+                    + "--boundary\r\nContent-Type: text/plain\r\n\r\n部分正文"
+            )
+
+            XCTAssertNil(snippet, "an unrouted boundary is structure, not prose")
+        }
+    }
+
     // MARK: - connection lifecycle
 
     /// A dropped connection is rebuilt on the next call, and the fresh session
@@ -562,7 +763,10 @@ final class IMAPProviderTests: XCTestCase {
                 ("Subject", "reconnected"),
             ])
             await transport.enqueue("A0005 OK FETCH completed")
-            await scriptSnippet(transport, sequence: 1, uid: 1, text: "hello")
+            await scriptSnippet(
+                transport, sequence: 1, uid: 1,
+                message: "Content-Type: text/plain; charset=UTF-8\r\n\r\nhello"
+            )
             await transport.enqueue("A0006 OK FETCH completed")
 
             let change = try await provider.pullChanges(
@@ -600,7 +804,10 @@ final class IMAPProviderTests: XCTestCase {
                 ("Subject", "pushed"),
             ])
             await transport.enqueue("A0009 OK FETCH completed")
-            await scriptSnippet(transport, sequence: 1, uid: 1, text: "hi")
+            await scriptSnippet(
+                transport, sequence: 1, uid: 1,
+                message: "Content-Type: text/plain; charset=UTF-8\r\n\r\nhi"
+            )
             await transport.enqueue("A0010 OK FETCH completed")
 
             let change = try await provider.pullChanges(

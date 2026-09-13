@@ -9,14 +9,16 @@ public struct AIAction: Codable, Sendable, Identifiable, Equatable {
     /// Structured payload; schema depends on `kind` (see `AIActionPayload`).
     public let payload: [String: String]
     public let createdAt: Date
+    public let expiresAt: Date?
 
     public init(id: Int64, accountId: UUID, kind: AIActionKind,
-                payload: [String: String], createdAt: Date) {
+                payload: [String: String], createdAt: Date, expiresAt: Date? = nil) {
         self.id = id
         self.accountId = accountId
         self.kind = kind
         self.payload = payload
         self.createdAt = createdAt
+        self.expiresAt = expiresAt
     }
 }
 
@@ -29,6 +31,16 @@ public enum AIActionKind: String, Codable, Sendable, CaseIterable {
     case classifyOverride = "classify_override"
     case draftCreate = "draft_create"
     case send
+    case undo
+
+    public var isUndoable: Bool {
+        switch self {
+        case .archive, .markRead, .pin, .unpin, .classifyOverride:
+            true
+        case .unsubscribe, .draftCreate, .send, .undo:
+            false
+        }
+    }
 }
 
 /// AI-generated reply drafts. `variants` is three (or however many) tones;
@@ -86,9 +98,18 @@ public struct UsageReport: Codable, Sendable, Equatable {
     public let monthUSD: Double
     public let capUSD: Double
     public let callCount: Int
-    public init(monthUSD: Double, capUSD: Double, callCount: Int) {
+    /// False when the provider has no token rates. Tokens can still be counted,
+    /// but a dollar-denominated cap cannot be enforced truthfully.
+    public let costTrackingAvailable: Bool
+    public init(
+        monthUSD: Double,
+        capUSD: Double,
+        callCount: Int,
+        costTrackingAvailable: Bool = true
+    ) {
         self.monthUSD = monthUSD
         self.capUSD = capUSD
         self.callCount = callCount
+        self.costTrackingAvailable = costTrackingAvailable
     }
 }

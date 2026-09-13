@@ -985,7 +985,7 @@ Run: `swift test --filter MIMEParserTests` → FAIL。
 **Interfaces:**
 - Consumes: `MailProviderFactory`、`SyncEngine`、`CredentialVault`、`AccountStore.setActive/delete/reconcileActive`。
 - Produces（HTTP 契约）:
-  - `POST /api/accounts/imap` → 201 `ConnectedAccount`；400 `missing-field`、401 `imap-auth-failed`、502 `imap-unreachable`、409 `account-exists`
+  - `POST /api/accounts/imap` → 201 `ConnectedAccount`（`id` 为 DB 中的权威行 id）；400 `missing-field`、401 `imap-auth-failed`、502 `imap-unreachable`、409 `account-exists`（已存在且健康 → 409 提示切换；已存在但不健康 → 用新授权码就地重认证并返回同一 id，probe 失败则 401/502 且原行不动）
   - `GET /api/accounts` → `[ConnectedAccount]`（含 isActive/syncHealth/capabilities）
   - `POST /api/accounts/{id}/activate` → 204 `{ok}`；404 `unknown-account`
   - `DELETE /api/accounts/{id}` → 204

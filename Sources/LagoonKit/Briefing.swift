@@ -42,6 +42,7 @@ public enum BriefingReason: String, Codable, Sendable, CaseIterable {
     case readAndOld = "read-and-old"
     case needsReply = "needs-reply"
     case ai
+    case userOverride = "user-override"
     case unclassified
 }
 
@@ -150,4 +151,16 @@ func summarize(
         language: String?,
         accountEmail: String
     ) async throws -> MessageSummary
+}
+
+/// Generates send-ready reply variants for one message. This is deliberately
+/// separate from summarization: a summary answers "what does this say?", while
+/// a reply draft answers "what should I write back?".
+public protocol MessageDrafting: Sendable {
+    func draftReplies(
+        _ body: MessageBody,
+        language: String?,
+        accountEmail: String,
+        count: Int
+    ) async throws -> [String]
 }

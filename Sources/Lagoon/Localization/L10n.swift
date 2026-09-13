@@ -57,6 +57,7 @@ public struct L10n: Sendable, Equatable {
         case .readAndOld: pick("已读且超过 7 天", "Read and older than 7 days")
         case .needsReply: pick("需要你回复", "Needs your reply")
         case .ai: pick("AI 分类", "AI classification")
+        case .userOverride: pick("按你的分组偏好", "Uses your group preference")
         case .unclassified: pick("未分类", "Unclassified")
         }
     }
@@ -91,6 +92,9 @@ public struct L10n: Sendable, Equatable {
             "The server has not classified any messages yet. It keeps syncing in the background."
         )
     }
+    public var syncingFirstTime: String {
+        pick("正在首次同步邮箱…", "Syncing your mailbox for the first time…")
+    }
     public var briefingUnavailable: String { pick("简报不可用", "Briefing unavailable") }
     public func expandGroup(_ title: String) -> String {
         pick("展开 \(title)", "Expand \(title)")
@@ -101,7 +105,7 @@ public struct L10n: Sendable, Equatable {
     public var briefingFailed: String { pick("简报加载失败：", "Briefing failed: ") }
     public var notConnected: String { pick("未连接", "Not connected") }
     public var connectToRead: String {
-        pick("请先连接 Gmail 账号以阅读邮件。", "Connect a Gmail account to read messages.")
+        pick("请先添加邮箱账号以阅读邮件。", "Add an email account to read messages.")
     }
 
     // MARK: - Message list
@@ -178,13 +182,38 @@ public struct L10n: Sendable, Equatable {
         pick("请填写邮箱地址和授权码。", "Enter both the email address and the authorization code.")
     }
     public var qqAuthFailed: String {
-        pick("授权码被拒绝 —— 请重新生成后重试。", "The authorization code was rejected — generate a new one and retry.")
+        pick(
+            "授权码被拒绝 —— 请填写 QQ 邮箱的授权码（不是登录密码），确认没有多余空格，并在 QQ 邮箱设置中已开启 IMAP 服务。",
+            "The authorization code was rejected — enter the QQ Mail authorization code (not your login password), make sure it has no extra spaces, and confirm IMAP is enabled in QQ Mail settings."
+        )
     }
     public var qqUnreachable: String {
         pick("无法连接 QQ 邮箱服务器，请检查网络后重试。", "Could not reach the QQ Mail servers — check your network and retry.")
     }
     public var qqAccountExists: String { pick("该 QQ 邮箱已经接入过了。", "That QQ mailbox is already connected.") }
+    public var useThisAccount: String { pick("使用这个账号", "Use this account") }
+    public var qqProviderNotConfigured: String {
+        pick(
+            "服务器未配置该邮箱类型，请检查服务端 providers.json。",
+            "The server is not configured for this mailbox type — check providers.json on the server."
+        )
+    }
+    public var qqInternalError: String {
+        pick("服务器内部错误，请稍后重试。", "The server hit an internal error — please try again later.")
+    }
     public var connectFailed: String { pick("连接失败：", "Connect failed: ") }
+    public var serverTimedOut: String {
+        pick(
+            "服务器响应超时；账号可能其实已经接入成功，请点取消回到主界面查看，或稍后重试。",
+            "The server timed out; the account may already be connected — cancel to check the main screen, or try again later."
+        )
+    }
+    public var serverUnreachable: String {
+        pick(
+            "无法连接本地服务端 —— 请确认服务端正在运行（swift run LagoonServer）。",
+            "Can't reach the local server — make sure it's running (swift run LagoonServer)."
+        )
+    }
 
     // MARK: - Accounts directory
 
@@ -216,18 +245,47 @@ public struct L10n: Sendable, Equatable {
         pick("授权已失效 —— 重新连接后继续同步。", "Authorization expired — reconnect to keep syncing.")
     }
     public var healthError: String { pick("同步失败：", "Sync failed: ") }
+    public var syncRecovered: String { pick("同步已恢复", "Sync recovered") }
     public var archiveUnavailable: String {
         pick("这个邮箱没有可用的归档文件夹。", "This mailbox has no usable archive folder.")
     }
     public var archiveFailed: String { pick("归档失败：", "Archive failed: ") }
+    public var unsubscribeFailed: String { pick("退订失败：", "Unsubscribe failed: ") }
+    public var unsubscribeManualRequired: String {
+        pick(
+            "这封邮件只提供邮件形式的退订地址，需要你打开原邮件手动确认。",
+            "This message only offers a mail-based unsubscribe address. Open the original email to confirm manually."
+        )
+    }
+    public var unsubscribeUnavailable: String {
+        pick("这封邮件没有可用的退订链接。", "This message has no usable unsubscribe link.")
+    }
+    public var overrideFailed: String { pick("改分组失败：", "Could not change group: ") }
+    public var searchFailed: String { pick("搜索失败：", "Search failed: ") }
 
     // MARK: - Actions
     public var undo: String { pick("撤销", "Undo") }
     public var undoLastAction: String { pick("撤销上一操作", "Undo last action") }
     public var nothingToUndo: String { pick("没有可撤销的操作", "Nothing to undo") }
+    public var undoFailed: String { pick("撤销失败：", "Undo failed: ") }
+    public var actionHistory: String { pick("最近操作", "Recent actions") }
+    public var notUndoable: String { pick("不可撤销", "Not reversible") }
+    public var dismiss: String { pick("关闭", "Dismiss") }
+    public func actionTitle(_ kind: AIActionKind) -> String {
+        switch kind {
+        case .archive: pick("归档邮件", "Archived message")
+        case .markRead: pick("标记已读", "Marked as read")
+        case .pin: pick("置顶邮件", "Pinned message")
+        case .unpin: pick("取消置顶", "Unpinned message")
+        case .unsubscribe: pick("退订邮件", "Unsubscribed")
+        case .classifyOverride: pick("调整分组", "Changed group")
+        case .draftCreate: pick("生成草稿", "Generated drafts")
+        case .send: pick("发送邮件", "Sent message")
+        case .undo: pick("撤销操作", "Undid an action")
+        }
+    }
     public var archived: String { pick("已归档", "Archived") }
-    public var archivedLocallyOnly: String { pick("已在本地归档（远端需 Gmail.modify 权限）",
-                                              "Archived locally; remote needs Gmail.modify") }
+    public var archivedLocallyOnly: String { pick("归档未完成", "Archive did not complete") }
     public var unsubscribed: String { pick("已退订", "Unsubscribed") }
     public var unsubscribe: String { pick("退订", "Unsubscribe") }
     public var pinning: String { pick("正在置顶…", "Pinning…") }
@@ -245,7 +303,17 @@ public struct L10n: Sendable, Equatable {
     public var budgetThisMonth: String { pick("本月 LLM 用量", "This month's LLM usage") }
     public var budgetCap: String { pick("上限", "Cap") }
     public var budgetDisabled: String { pick("未启用（上限设为 0）", "Disabled (cap is 0)") }
+    public func usageCallCount(_ count: Int) -> String {
+        pick("本月调用 \(count) 次", "\(count) calls this month")
+    }
+    public var costTrackingUnavailable: String {
+        pick(
+            "供应商尚未配置 token 费率，当前只能统计次数，无法执行金额上限。",
+            "Provider token rates are not configured; calls are counted, but the dollar cap cannot be enforced."
+        )
+    }
     public var overrideGroup: String { pick("改分组为…", "Change group to…") }
+    public var moreActions: String { pick("更多操作", "More actions") }
     public var overrideApplied: String { pick("已记录你的偏好", "Noted your preference") }
     public var newMail: String { pick("新邮件！", "New mail!") }
     public var collapse: String { pick("收起", "Collapse") }
@@ -255,14 +323,16 @@ public struct L10n: Sendable, Equatable {
     public var older: String { pick("更早的", "Older") }
     public var nextInGroup: String { pick("下一封", "Next") }
     public var previousInGroup: String { pick("上一封", "Previous") }
+    public var openSelected: String { pick("打开选中的邮件", "Open selected message") }
     public var archiveAndNext: String { pick("归档并跳到下一封", "Archive & next") }
     public var markUnread: String { pick("标为未读", "Mark unread") }
-    public var mailArchivedLocally: String { pick("已在本地归档（远端需要 gmail.modify scope）",
-                                              "Archived locally (remote needs gmail.modify)") }
+    public var mailArchivedLocally: String { pick("归档未完成", "Archive did not complete") }
     public var opening: String { pick("正在打开…", "Opening…") }
     public var nothingHereYet: String { pick("还没有内容", "Nothing here yet") }
     public var inboxZero: String { pick("收件箱已清空 🎉", "Inbox zero 🎉") }
-    public var tapGmailToSync: String { pick("点击 Gmail 让 Lagoon 开始同步。", "Connect Gmail to start syncing.") }
+    public var tapGmailToSync: String {
+        pick("添加一个邮箱账号，让 Lagoon 开始同步。", "Add an email account to start syncing.")
+    }
     public var copiedToClipboard: String { pick("已复制", "Copied") }
     public var commandPalette: String { pick("命令面板", "Command palette") }
     public var shortcutArchiveNext: String { pick("E = 归档并下一封", "E = archive & next") }
@@ -277,11 +347,23 @@ public struct L10n: Sendable, Equatable {
 
     // MARK: - Reply composer
 
+    public var newMessage: String { pick("新邮件", "New message") }
+    public var newMessageHelp: String { pick("写一封新邮件（⌘N）", "Write a new message (⌘N)") }
+    public var newMessageTitle: String { pick("新邮件", "New message") }
+    public var newMessageToPlaceholder: String { pick("收件人邮箱", "Recipient email") }
+    public var newMessageSubjectPlaceholder: String { pick("主题", "Subject") }
+    public var newMessageBodyPlaceholder: String { pick("写邮件…", "Write your message…") }
+    public var emptyRecipient: String { pick("请填写收件人。", "Enter a recipient.") }
+    public var emptyMessage: String { pick("邮件内容不能为空。", "The message cannot be empty.") }
+
     public var reply: String { pick("回复", "Reply") }
     public var replyHelp: String { pick("回复这封邮件", "Reply to this message") }
     public var replyTitle: String { pick("回复邮件", "Reply") }
     public var replyTo: String { pick("收件人", "To") }
     public var replyBodyPlaceholder: String { pick("写回复…", "Write your reply…") }
+    public var originalMessage: String { pick("原邮件", "Original message") }
+    public var draftSaved: String { pick("草稿会自动保存", "Draft saves automatically") }
+    public var closeComposer: String { pick("稍后继续", "Continue later") }
     public var send: String { pick("发送", "Send") }
     public var sending: String { pick("发送中…", "Sending…") }
     public var sendFailed: String { pick("发送失败：", "Send failed: ") }

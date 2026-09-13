@@ -5,10 +5,10 @@ import LagoonKit
 /// The single module allowed to talk to LLM providers (spec §6.5). It receives
 /// tasks, never raw mailbox state beyond the prompt payload it must send.
 ///
-/// `ponytail:` ceiling — the per-account monthly budget cap from §6.5 is not
-/// implemented; there is no cost accounting source yet. Add it when a second
-/// account or a metered plan exists.
-public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecked Sendable {
+/// Cost accounting is injected through `BudgetPolicy`; the server supplies the
+/// database-backed implementation so the API and restart behavior share one
+/// monthly total.
+public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDrafting, @unchecked Sendable {
     /// Language the model must write user-facing text in. Group identifiers
     /// and JSON keys stay English because they are parsed, not displayed.
     public static let defaultOutputLanguage = "zh-Hans"
@@ -19,6 +19,14 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
     private let logger: Logger
     public let outputLanguage: String
     private let budget: BudgetPolicy
+
+    /// Dollar caps are enforceable only when every active provider exposes both
+    /// prompt and completion rates.
+    public var hasConfiguredRates: Bool {
+        !providers.isEmpty && providers.allSatisfy {
+            $0.costPer1kPromptUsd != nil && $0.costPer1kCompletionUsd != nil
+        }
+    }
 
     public init(
         providers: [LLMProvider],
@@ -39,6 +47,10 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
     /// estimation. The actual value is recorded after the call; this only
     /// prevents an obviously-too-large call from crossing the cap.
     private static let estimatedCompletionTokens = 1_500
+    /// A single 50-message response can exceed the provider's 4k completion
+    /// cap and arrive as truncated, unparseable text. Twelve keeps each strict
+    /// JSON answer comfortably below that ceiling.
+    private static let classificationBatchSize = 12
 
     /// Rough English token estimate: ~4 chars per token.
     private static func estimatePromptTokens(_ text: String) -> Int {
@@ -109,6 +121,38 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
         language: String?
     ) async throws -> [String: BriefingGroup] {
         guard !messages.isEmpty else { return [:] }
+        let provider = provider(for: .classify)
+        var result: [String: BriefingGroup] = [:]
+
+        for start in stride(from: 0, to: messages.count, by: Self.classificationBatchSize) {
+            let end = min(start + Self.classificationBatchSize, messages.count)
+            let batch = Array(messages[start..<end])
+            let user = classificationPrompt(for: batch)
+            try await chargeBudgetPreCheck(
+                capability: .classify,
+                provider: provider,
+                systemPrompt: systemPrompt,
+                userPrompt: user,
+                accountEmail: accountEmail
+            )
+            let (parsed, _) = try await completeJSON(
+                capability: .classify,
+                system: systemPrompt,
+                user: user,
+                accountEmail: accountEmail
+            )
+            for (id, raw) in parsed {
+                guard let raw = raw as? String,
+                      let group = BriefingGroup(rawValue: raw),
+                      group != .pinned
+                else { continue }
+                result[id] = group
+            }
+        }
+        return result
+    }
+
+    private func classificationPrompt(for messages: [MessageHeader]) -> String {
         // Only headers/snippet/age — never a body (spec §6.6 rule 5).
         let rows: [[String: Any]] = messages.map { message in
             var row: [String: Any] = [
@@ -121,7 +165,7 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
             if let snippet = message.snippet { row["snippet"] = String(snippet.prefix(200)) }
             return row
         }
-        let user = """
+        return """
             Classify each email into exactly one group.
             Groups: needsReply (a human is waiting on the user), awaitingReply (the \
             user sent the last message), safeToArchive (already handled / no action), \
@@ -131,29 +175,6 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
             Omit any email you are unsure about.
             Emails: \(jsonString(rows))
             """
-
-        let provider = provider(for: .classify)
-        try await chargeBudgetPreCheck(
-            capability: .classify,
-            provider: provider,
-            systemPrompt: systemPrompt,
-            userPrompt: user,
-            accountEmail: accountEmail
-        )
-        let (parsed, completion) = try await completeJSON(
-            capability: .classify,
-            system: systemPrompt,
-            user: user
-        )
-        var result: [String: BriefingGroup] = [:]
-        for (id, raw) in parsed {
-            guard let raw = raw as? String,
-                  let group = BriefingGroup(rawValue: raw),
-                  group != .pinned
-            else { continue }
-            result[id] = group
-        }
-        return result
     }
 
     // MARK: - MessageSummarizing
@@ -189,7 +210,8 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
         let (parsed, completion) = try await completeJSON(
             capability: .summary,
             system: systemPrompt,
-            user: user
+            user: user,
+            accountEmail: accountEmail
         )
         guard let summary = parsed["summary"] as? String, !summary.isEmpty else {
             throw LLMError.badResponse("summary: missing summary field")
@@ -197,18 +219,62 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
         let actionItems = (parsed["actionItems"] as? [Any])?
             .compactMap { $0 as? String }
             .filter { !$0.isEmpty } ?? []
-        await recordBudgetPostCall(
-            capability: .summary,
-            provider: provider,
-            accountEmail: accountEmail,
-            completion: completion
-        )
         return MessageSummary(
             remoteId: body.remoteId,
             summary: summary,
             actionItems: actionItems,
             provider: completion.model
         )
+    }
+
+    // MARK: - MessageDrafting
+
+    public func draftReplies(
+        _ body: MessageBody,
+        language: String?,
+        accountEmail: String,
+        count: Int
+    ) async throws -> [String] {
+        let languageTag = language.flatMap { $0.isEmpty ? nil : $0 } ?? outputLanguage
+        let requested = max(1, min(count, 5))
+        let text = String(body.text.prefix(12_000))
+        let user = """
+            Write \(requested) send-ready reply variants to this email. Each variant \
+            must contain only the reply body, ready to send as plain text. Do not \
+            summarize the email, do not explain your reasoning, and do not invent \
+            facts, commitments, dates, or attachments. If essential information is \
+            missing, keep the reply neutral and use a clear placeholder instead of \
+            guessing. Make the variants meaningfully different in tone: concise, \
+            warm, and formal. Keep signatures minimal. Write every variant in \
+            \(Self.languageName(for: languageTag)).
+            Reply with STRICT JSON only: {"variants":["...","..."]}.
+            From: \(body.fromAddress)
+            Subject: \(body.subject ?? "(none)")
+            Body:
+            \(text)
+            """
+        let provider = provider(for: .draft)
+        try await chargeBudgetPreCheck(
+            capability: .draft,
+            provider: provider,
+            systemPrompt: systemPrompt,
+            userPrompt: user,
+            accountEmail: accountEmail
+        )
+        let (parsed, _) = try await completeJSON(
+            capability: .draft,
+            system: systemPrompt,
+            user: user,
+            accountEmail: accountEmail
+        )
+        let variants = (parsed["variants"] as? [Any])?
+            .compactMap { $0 as? String }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty } ?? []
+        guard !variants.isEmpty else {
+            throw LLMError.badResponse("draft: missing variants")
+        }
+        return variants
     }
 
     // MARK: - Budget helpers
@@ -249,14 +315,23 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
         completion: LLMCompletion,
     ) async {
         guard provider != nil else { return }
-        try? await budget.record(
-            capability: capability.rawValue,
-            model: completion.model,
-            accountEmail: accountEmail,
-            promptTokens: completion.promptTokens ?? 0,
-            completionTokens: completion.completionTokens ?? 0,
-            costMicrosUSD: completion.costMicrosUSD ?? 0
-        )
+        do {
+            try await budget.record(
+                capability: capability.rawValue,
+                model: completion.model,
+                accountEmail: accountEmail,
+                promptTokens: completion.promptTokens ?? 0,
+                completionTokens: completion.completionTokens ?? 0,
+                costMicrosUSD: completion.costMicrosUSD ?? 0
+            )
+        } catch {
+            logger.error("llm.budget.recordFailed", metadata: [
+                "capability": .string(capability.rawValue),
+                "model": .string(completion.model),
+                "account": .string(accountEmail),
+                "err": .string("\(error)"),
+            ])
+        }
     }
 
     // MARK: - Provider call + observability
@@ -268,11 +343,18 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, @unchecke
         capability: LLMCapability,
         system: String,
         user: String,
+        accountEmail: String,
         attempts: Int = 2
     ) async throws -> (json: [String: Any], completion: LLMCompletion) {
         var lastError: Error = LLMError.badResponse("\(capability.rawValue): no attempt")
         for attempt in 1...max(1, attempts) {
             let completion = try await complete(capability: capability, system: system, user: user)
+            await recordBudgetPostCall(
+                capability: capability,
+                provider: provider(for: capability),
+                accountEmail: accountEmail,
+                completion: completion
+            )
             if let parsed = parseJSONObject(completion.text) {
                 return (parsed, completion)
             }

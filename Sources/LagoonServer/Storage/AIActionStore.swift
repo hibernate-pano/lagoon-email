@@ -14,7 +14,7 @@ public enum AIActionStore {
         let sql = """
             INSERT INTO ai_actions (account_id, kind, payload)
             VALUES ($1, $2, $3::jsonb)
-            RETURNING id, account_id, kind, payload, created_at
+            RETURNING id, account_id, kind, payload, created_at, expires_at
         """
         let rows = try await db.query(sql, [
             PostgresData(uuid: accountId),
@@ -33,10 +33,10 @@ public enum AIActionStore {
         let sql: String
         let params: [PostgresData]
         if let since {
-            sql = "SELECT id, account_id, kind, payload, created_at FROM ai_actions WHERE account_id = $1 AND created_at >= $2 ORDER BY created_at DESC LIMIT $3"
+            sql = "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE account_id = $1 AND created_at >= $2 ORDER BY created_at DESC LIMIT $3"
             params = [PostgresData(uuid: accountId), PostgresData(date: since), PostgresData(int: limit)]
         } else {
-            sql = "SELECT id, account_id, kind, payload, created_at FROM ai_actions WHERE account_id = $1 ORDER BY created_at DESC LIMIT $2"
+            sql = "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE account_id = $1 ORDER BY created_at DESC LIMIT $2"
             params = [PostgresData(uuid: accountId), PostgresData(int: limit)]
         }
         let rows = try await db.query(sql, params).get()
@@ -45,8 +45,29 @@ public enum AIActionStore {
 
     public static func find(id: Int64, db: PostgresConnection) async throws -> AIAction? {
         let rows = try await db.query(
-            "SELECT id, account_id, kind, payload, created_at FROM ai_actions WHERE id = $1",
+            "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE id = $1",
             [PostgresData(int64: id)]
+        ).get()
+        return try rows.rows.first.map { try Self.decode($0) }
+    }
+
+    /// Looks up a previously completed send by the client's idempotency key.
+    public static func findSend(
+        accountId: UUID,
+        requestId: String,
+        db: PostgresConnection
+    ) async throws -> AIAction? {
+        let rows = try await db.query(
+            """
+            SELECT id, account_id, kind, payload, created_at, expires_at
+            FROM ai_actions
+            WHERE account_id = $1 AND kind = 'send' AND payload->>'requestId' = $2
+            LIMIT 1
+            """,
+            [
+                PostgresData(uuid: accountId),
+                PostgresData(string: requestId),
+            ]
         ).get()
         return try rows.rows.first.map { try Self.decode($0) }
     }
@@ -104,12 +125,14 @@ public enum AIActionStore {
         let kindStr: String = try r["kind"].decode(String.self)
         let payloadStr: String = try r["payload"].decode(String.self)
         let createdAt: Date = try r["created_at"].decode(Date.self)
+        let expiresAt: Date? = try r["expires_at"].decode(Date?.self)
         return AIAction(
             id: id,
             accountId: accId,
             kind: AIActionKind(rawValue: kindStr) ?? .archive,
             payload: try Self.decodePayload(payloadStr),
-            createdAt: createdAt
+            createdAt: createdAt,
+            expiresAt: expiresAt
         )
     }
 

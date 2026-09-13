@@ -9,6 +9,7 @@ struct SearchSheet: View {
     @State private var query = ""
     @State private var results: [MessageHeader] = []
     @State private var isLoading = false
+    @State private var errorMessage: String?
     @State private var path: [String] = []
     private let api = APIClient()
 
@@ -25,12 +26,20 @@ struct SearchSheet: View {
                     }
                     .buttonStyle(.plain)
                 }
-                Button(l10n.retry) { Task { await run() } }
+                Button(l10n.search) { Task { await run() } }
                     .disabled(query.isEmpty || isLoading)
             }
             .padding(12)
             Divider()
-            if isLoading { ProgressView().padding(20) }
+            if let errorMessage {
+                VStack(spacing: 8) {
+                    Text(l10n.searchFailed + errorMessage)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                    Button(l10n.retry) { Task { await run() } }
+                }
+                .padding(20)
+            } else if isLoading { ProgressView().padding(20) }
             else if results.isEmpty { Text(l10n.noResults).foregroundStyle(.secondary).padding(20) }
             else {
                 List(results) { m in
@@ -49,7 +58,21 @@ struct SearchSheet: View {
         .frame(width: 640, height: 480)
         .navigationDestination(for: String.self) { remoteId in
             if let accountId = accounts.accountId {
-                NavigationStack { MessageDetailView(remoteId: remoteId, accountId: accountId, header: results.first { $0.remoteId == remoteId }, initiallyPinned: false) }
+                NavigationStack {
+                    MessageDetailView(
+                        remoteId: remoteId,
+                        accountId: accountId,
+                        header: results.first { $0.remoteId == remoteId },
+                        initiallyPinned: false,
+                        siblings: results.map(\.remoteId),
+                        onArchived: { id, _ in
+                            results.removeAll { $0.remoteId == id }
+                        },
+                        onAdvanceTo: { next in
+                            path = next.map { [$0] } ?? []
+                        }
+                    )
+                }
             }
         }
     }
@@ -57,9 +80,13 @@ struct SearchSheet: View {
     func run() async {
         guard let accountId = accounts.accountId, !query.isEmpty else { return }
         isLoading = true
+        errorMessage = nil
         do {
             results = try await api.search(query: query, accountId: accountId)
-        } catch {}
+        } catch {
+            results = []
+            errorMessage = error.lagoonUIMessage
+        }
         isLoading = false
     }
 }

@@ -43,15 +43,16 @@ public final class DirectoryStore: ObservableObject {
         }
     }
 
-    /// Switch the active account. Errors surface as `loadError` rather than
-    /// throwing: the menu is a fire-and-forget surface.
-    public func activate(_ account: ConnectedAccount) async {
+    /// Switch the active account. Throws so the caller can keep the local
+    /// account id and the server's `is_active` row in sync.
+    public func activate(_ account: ConnectedAccount) async throws {
         guard !account.isActive else { return }
         do {
             try await api.activateAccount(id: account.id)
             await refresh()
         } catch {
             loadError = L10n.current.activateAccountFailed + error.lagoonUIMessage
+            throw error
         }
     }
 

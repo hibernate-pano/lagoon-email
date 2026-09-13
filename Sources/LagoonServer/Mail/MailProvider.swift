@@ -71,6 +71,9 @@ public struct OutboundMessage: Sendable {
     public var body: String
     public var inReplyTo: String?
     public var references: String?
+    /// New-message sends keep the subject exactly as typed; replies add the
+    /// de-duplicated `Re:` prefix.
+    public var isReply: Bool
 
     public init(
         fromEmail: String,
@@ -79,7 +82,8 @@ public struct OutboundMessage: Sendable {
         subject: String,
         body: String,
         inReplyTo: String?,
-        references: String?
+        references: String?,
+        isReply: Bool = true
     ) {
         self.fromEmail = fromEmail
         self.fromName = fromName
@@ -88,6 +92,7 @@ public struct OutboundMessage: Sendable {
         self.body = body
         self.inReplyTo = inReplyTo
         self.references = references
+        self.isReply = isReply
     }
 }
 

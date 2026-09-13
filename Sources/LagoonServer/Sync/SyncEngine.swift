@@ -70,6 +70,14 @@ public actor SyncEngine {
         start()
     }
 
+    /// Wake the loop now without discarding the active provider connection.
+    public func requestImmediateSync() {
+        currentAccountId = nil
+        loop?.cancel()
+        loop = nil
+        start()
+    }
+
     /// One round: pull, persist, record health. Never throws — failures become
     /// state (`needsReconnect` / `error` / `degraded`) plus a backoff pause.
     ///

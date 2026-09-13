@@ -353,6 +353,24 @@ public enum MIMEParser {
         switch name {
         case "", "utf-8", "utf8":
             if let text = String(data: data, encoding: .utf8) { return text }
+            // The `BODY[]<0.N>` window is cut at an arbitrary byte, so a UTF-8
+            // body can end in the middle of a multi-byte sequence. Strict
+            // decoding then fails for the whole buffer, and falling straight
+            // through to the Latin-1 fallback at the bottom turns every CJK
+            // byte into two mojibake characters. Decode leniently (invalid
+            // bytes become U+FFFD) and keep that result only when almost
+            // nothing was replaced. A truncated tail costs one replacement
+            // scalar; genuine Latin-1 (or binary) text replaces every
+            // non-ASCII byte, so a 1% cut separates the two cleanly without
+            // needing a tuned threshold.
+            let lenient = String(decoding: data, as: UTF8.self)
+            let scalarCount = lenient.unicodeScalars.count
+            let replacementCount = lenient.unicodeScalars.reduce(0) {
+                $0 + ($1.value == 0xFFFD ? 1 : 0)
+            }
+            if scalarCount > 0, replacementCount * 100 <= scalarCount {
+                return lenient
+            }
         case "gbk", "gb2312", "gb-2312", "gb_2312", "x-gbk", "cp936", "ms936", "gb18030":
             if let text = String(data: data, encoding: gb18030) { return text }
         case "iso-8859-1", "iso8859-1", "latin-1", "latin1", "us-ascii", "ascii", "windows-1252":

@@ -44,12 +44,26 @@ struct BriefingFeedView: View {
             .navigationDestination(for: String.self) { remoteId in
                 destination(for: remoteId)
             }
-            .background(groupJumpShortcuts)
+            .background {
+                groupJumpShortcuts
+                keyboardNavigationShortcuts
+            }
             .safeAreaInset(edge: .bottom) { UndoToast(controller: undo) }
         }
         .frame(minWidth: 720, minHeight: 480)
-        .task { await refresh() ; await poll() }
+        .task {
+            await refresh()
+            await poll()
+        }
+        .onChange(of: path) { old, new in
+            if !old.isEmpty, new.isEmpty {
+                Task { await refresh() }
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .lagoonDidUndo)) { _ in
+            Task { await refresh() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .lagoonDidChangeData)) { _ in
             Task { await refresh() }
         }
     }
@@ -57,7 +71,11 @@ struct BriefingFeedView: View {
     private func poll() async {
         while !Task.isCancelled {
             do { try await Task.sleep(for: Self.refreshInterval) } catch { return }
-            await refresh()
+            // Never reorder the feed underneath an open message. The next
+            // refresh happens when the user returns to the feed.
+            if path.isEmpty {
+                await refresh()
+            }
         }
     }
 
@@ -153,17 +171,22 @@ struct BriefingFeedView: View {
 
 
     private var emptyState: some View {
-
-        ContentUnavailableView {
-
-            Label(l10n.inboxZero, systemImage: "checkmark.seal")
-
-        } description: {
-
-            Text(l10n.tapGmailToSync)
-
+        Group {
+            if directory.active?.syncHealth.lastSyncAt == nil {
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text(l10n.syncingFirstTime)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                ContentUnavailableView {
+                    Label(l10n.inboxZero, systemImage: "checkmark.seal")
+                } description: {
+                    Text(l10n.tapGmailToSync)
+                }
+            }
         }
-
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
 
@@ -262,6 +285,22 @@ struct BriefingFeedView: View {
 
     }
 
+    private var keyboardNavigationShortcuts: some View {
+        VStack {
+            Button(l10n.nextInGroup) { moveSelection(direction: .down) }
+                .keyboardShortcut("j", modifiers: [])
+            Button(l10n.previousInGroup) { moveSelection(direction: .up) }
+                .keyboardShortcut("k", modifiers: [])
+            Button(l10n.openSelected) {
+                if let selectedGmailId { path = [selectedGmailId] }
+            }
+            .keyboardShortcut(.return, modifiers: [])
+        }
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .accessibilityHidden(true)
+    }
+
 
 
     private func jump(to group: BriefingGroup) {
@@ -298,6 +337,8 @@ struct BriefingFeedView: View {
 
                 initiallyPinned: items.first { $0.message.remoteId == remoteId }?.group == .pinned,
 
+                initialGroup: items.first { $0.message.remoteId == remoteId }?.group,
+
                 siblings: siblings,
 
                 onArchived: { id, isArchived in
@@ -306,11 +347,7 @@ struct BriefingFeedView: View {
 
                 },
 
-                onAdvanceTo: { next in
-
-                    path = [next]
-
-                },
+                onAdvanceTo: { next in path = next.map { [$0] } ?? [] },
 
                 onReadStateChange: { id, isRead in
 
@@ -325,6 +362,7 @@ struct BriefingFeedView: View {
                 }
 
             )
+            .id(remoteId)
 
         } else {
 
@@ -406,9 +444,22 @@ struct BriefingFeedView: View {
 
         Task {
 
-            try? await api.setPinned(remoteId: item.message.remoteId, accountId: accountId, pinned: toPinned)
+            do {
 
-            await refresh()
+                try await api.setPinned(
+                    remoteId: item.message.remoteId,
+                    accountId: accountId,
+                    pinned: toPinned
+                )
+
+                await refresh()
+
+            } catch {
+
+                errorMessage = (toPinned ? l10n.pinFailed : l10n.unpinFailed)
+                    + error.lagoonUIMessage
+
+            }
 
         }
 
@@ -442,15 +493,11 @@ struct BriefingFeedView: View {
 
             items.removeAll { $0.message.remoteId == remoteId }
 
-            if let actions = try? await api.fetchActions(accountId: accountId, since: Date().addingTimeInterval(-30)),
-
-               let latest = actions.first {
-
-                let msg = response.remote ? l10n.archived : l10n.archivedLocallyOnly
-
-                undo.show(UndoItem(id: latest.id, message: msg, systemImage: "tray.and.arrow.down"))
-
-            }
+            undo.show(UndoItem(
+                id: response.actionId,
+                message: l10n.archived,
+                systemImage: "tray.and.arrow.down"
+            ))
 
         } catch APIError.badStatus(let code, _) where code == 409 {
 
@@ -541,4 +588,3 @@ private struct BriefingRow: View {
     }
 
 }
-

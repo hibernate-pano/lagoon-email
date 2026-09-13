@@ -15,6 +15,7 @@ public actor UsageBudget: BudgetPolicy {
     private let capMicrosUSD: Int64
     private let yearMonth: String
     private var totalMicrosUSD: Int64 = 0
+    private var callsThisMonth = 0
     /// First crossing of 80% within the current month is logged as a warning;
     /// later calls suppress the message.
     private var warnedAt80 = false
@@ -30,9 +31,10 @@ public actor UsageBudget: BudgetPolicy {
         self.capMicrosUSD = Int64((max(0, capUSDPerMonth) * 1_000_000).rounded())
         self.logger = logger
         self.yearMonth = Self.currentYearMonth()
-        let initial = try await Self.sum(db: db, yearMonth: yearMonth)
-        self.totalMicrosUSD = initial
-        self.warnedAt80 = initial >= capForWarn(capMicros: capMicrosUSD)
+        let summary = try await Self.summary(db: db, yearMonth: yearMonth)
+        self.totalMicrosUSD = summary.costMicrosUSD
+        self.callsThisMonth = summary.callCount
+        self.warnedAt80 = summary.costMicrosUSD >= capForWarn(capMicros: capMicrosUSD)
         if capMicrosUSD <= 0 {
             logger.warning("llm.budget.disabled", metadata: [
                 "reason": .string("LAGOON_BUDGET_USD_PER_MONTH is unset or <= 0"),
@@ -47,6 +49,7 @@ public actor UsageBudget: BudgetPolicy {
 
     public var capUSD: Double { Double(capMicrosUSD) / 1_000_000 }
     public var currentMonthUSD: Double { Double(totalMicrosUSD) / 1_000_000 }
+    public var callCount: Int { callsThisMonth }
     public var isEnforced: Bool { capMicrosUSD > 0 }
 
     /// Rough pre-call check using a known prompt size and a conservative
@@ -102,6 +105,7 @@ public actor UsageBudget: BudgetPolicy {
             costMicrosUSD: costMicrosUSD
         )
         totalMicrosUSD += costMicrosUSD
+        callsThisMonth += 1
         logger.info("llm.budget.charge", metadata: [
             "capability": .string(capability),
             "model": .string(model),
@@ -134,13 +138,24 @@ public actor UsageBudget: BudgetPolicy {
         return Int64((usd * 1_000_000).rounded())
     }
 
-    private static func sum(db: PostgresConnection, yearMonth: String) async throws -> Int64 {
+    private struct MonthSummary {
+        let costMicrosUSD: Int64
+        let callCount: Int
+    }
+
+    private static func summary(db: PostgresConnection, yearMonth: String) async throws -> MonthSummary {
         let rows = try await db.query(
-            "SELECT COALESCE(SUM(cost_micro_usd), 0)::bigint AS total FROM usage_log WHERE year_month = $1",
+            "SELECT COALESCE(SUM(cost_micro_usd), 0)::bigint AS total, COUNT(*)::int AS calls FROM usage_log WHERE year_month = $1",
             [PostgresData(string: yearMonth)]
         ).get()
-        guard let row = rows.rows.first else { return 0 }
-        return try row.makeRandomAccess()["total"].decode(Int64.self)
+        guard let row = rows.rows.first else {
+            return MonthSummary(costMicrosUSD: 0, callCount: 0)
+        }
+        let random = row.makeRandomAccess()
+        return MonthSummary(
+            costMicrosUSD: try random["total"].decode(Int64.self),
+            callCount: try random["calls"].decode(Int.self)
+        )
     }
 
     private static func insert(

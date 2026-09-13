@@ -126,6 +126,55 @@ final class MIMEParserTests: XCTestCase {
         )
     }
 
+    /// The `BODY[]<0.N>` window can end mid multi-byte sequence. Strict UTF-8
+    /// then fails for the whole buffer; without the tolerant path the entire
+    /// Chinese body was decoded as Latin-1 mojibake.
+    func test_charset_truncatedUTF8Tail_decodesReadableChineseNotLatin1() {
+        let full = String(repeating: "这是一封测试邮件的正文内容。", count: 20)
+        var bytes = Data(full.utf8)
+        bytes.removeLast() // drop the last byte, cutting the final 3-byte scalar
+
+        let decoded = MIMEParser.decodeCharset(bytes, charset: nil)
+
+        XCTAssertTrue(decoded.hasPrefix("这是一封测试邮件的正文内容"), "got: \(decoded.prefix(20))")
+        XCTAssertTrue(decoded.contains("\u{FFFD}"), "the truncated tail is marked, not invented")
+        for signature in ["Ã", "å", "ä", "æ", "ç", "é", "è"] {
+            XCTAssertFalse(decoded.contains(signature), "Latin-1 mojibake leaked: \(signature)")
+        }
+    }
+
+    /// A valid UTF-8 buffer must still take the strict path: the tolerance is
+    /// only for truncated input.
+    func test_charset_validUTF8_keepsStrictResult() {
+        let body = "合法的 UTF-8 正文：你好，世界。"
+        let decoded = MIMEParser.decodeCharset(Data(body.utf8), charset: "utf-8")
+        XCTAssertEqual(decoded, body)
+        XCTAssertFalse(decoded.contains("\u{FFFD}"))
+    }
+
+    /// Genuine Latin-1 (no charset declaration) must still fall through to the
+    /// Latin-1 fallback: each non-ASCII byte becomes a replacement scalar,
+    /// which is far above the 1% tolerance, so the tolerant UTF-8 result is
+    /// rejected.
+    func test_charset_latin1Bytes_noCharset_keepsLatin1Fallback() {
+        let short = Data([0x63, 0x61, 0x66, 0xE9]) // "caf" + é
+        XCTAssertEqual(MIMEParser.decodeCharset(short, charset: nil), "café")
+
+        // Even a long run of Latin-1 keeps the fallback: 200/200 replacements.
+        let long = Data(repeating: 0xE9, count: 200)
+        let decoded = MIMEParser.decodeCharset(long, charset: nil)
+        XCTAssertEqual(decoded.count, 200)
+        XCTAssertEqual(decoded.first, "é")
+    }
+
+    /// An explicit `gb18030`/`gbk` declaration is untouched by the UTF-8
+    /// tolerance.
+    func test_charset_explicitGB18030_unaffectedByUTF8Tolerance() {
+        let bytes = Data([0xD6, 0xD0, 0xCE, 0xC4])
+        XCTAssertEqual(MIMEParser.decodeCharset(bytes, charset: "gb18030"), "中文")
+        XCTAssertEqual(MIMEParser.decodeCharset(bytes, charset: "GBK"), "中文")
+    }
+
     func test_decodeQuotedPrintable_softBreakAndInvalidEscape() {
         let encoded = Data("line one=\r\nline two=0A=3Dend=ZZ".utf8)
         XCTAssertEqual(
