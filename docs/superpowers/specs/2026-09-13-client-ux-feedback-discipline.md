@@ -317,7 +317,7 @@ public enum SyncHealthViewState: Equatable {
 |---|---|
 | HEALTH-1 | `ok` 状态完全不渲染 banner |
 | HEALTH-2 | 关闭 `syncing` banner 后，下次 `directory.refresh()` 仍会重新出现，直到 `lastSyncAt != nil` |
-| HEALTH-3 | `degraded`/`error` 的「重试」按钮触发 `directory.refresh()` + `SyncEngine.requestImmediateTick()` |
+| HEALTH-3 | `degraded`/`error` 的「重试」按钮触发 `directory.refresh()`。**可选**额外调 `SyncEngine.requestImmediateTick()`，但该 hook 不在本 spec 范围（§4.7） |
 | HEALTH-4 | `needsReconnect` 的「重新连接」打开 `ConnectView`，传入 email 让字段预填 |
 | HEALTH-5 | 「查看详情」打开 `SyncHealthDetailSheet`（§4.5） |
 
@@ -623,7 +623,13 @@ echo "✅ No silent catches in Views"
 
 ```bash
 hits=$(grep -rn 'Gmail\|gmail' Sources/Lagoon/Localization/L10n.swift | \
-    grep -v 'pushToGmailDrafts\|gmailProvider\|connectGmail' || true)
+    grep -v 'pushToGmailDrafts\|connectGmail\|gmailProvider\|gmail\.modify' || true)
+if [[ -n "$hits" ]]; then
+    echo "❌ User-facing L10n string still mentions Gmail:"
+    echo "$hits"
+    exit 1
+fi
+echo "✅ L10n clean of stale Gmail references"
 ```
 
 ---
