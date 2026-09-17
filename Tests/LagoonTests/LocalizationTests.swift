@@ -177,12 +177,12 @@ final class LocalizationTests: XCTestCase {
     func test_newMessageStrings_existInBothLanguages() {
         let zhStrings = [
             zh.newMessage, zh.newMessageHelp, zh.newMessageTitle,
-            zh.newMessageToPlaceholder, zh.newMessageSubjectPlaceholder,
+            zh.newMessageToPlaceholder,
             zh.newMessageBodyPlaceholder, zh.emptyRecipient, zh.emptyMessage,
         ]
         let enStrings = [
             en.newMessage, en.newMessageHelp, en.newMessageTitle,
-            en.newMessageToPlaceholder, en.newMessageSubjectPlaceholder,
+            en.newMessageToPlaceholder,
             en.newMessageBodyPlaceholder, en.emptyRecipient, en.emptyMessage,
         ]
         for value in zhStrings + enStrings {

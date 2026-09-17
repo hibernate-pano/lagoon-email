@@ -10,7 +10,7 @@ struct ActionHistorySheet: View {
 
     @State private var actions: [AIAction] = []
     @State private var isLoading = false
-    @State private var errorMessage: String?
+    @State private var errorBanner: ErrorBanner?
     @State private var undoingId: Int64?
 
     private let api = APIClient()
@@ -21,22 +21,27 @@ struct ActionHistorySheet: View {
                 Label(l10n.actionHistory, systemImage: "clock.arrow.circlepath")
                     .font(.headline)
                 Spacer()
-                Button(l10n.refresh) { Task { await load() } }
-                    .disabled(isLoading)
+                HStack(spacing: 6) {
+                    Button(l10n.refresh) { Task { await load() } }
+                        .disabled(isLoading)
+                    if isLoading {
+                        ProgressView().controlSize(.small)
+                    }
+                }
                 Button { dismiss() } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .padding(4)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(l10n.dismiss)
             }
             .padding(16)
 
             Divider()
 
-            if let errorMessage {
-                Text(errorMessage)
-                    .foregroundStyle(.red)
-                    .padding()
-            } else if isLoading, actions.isEmpty {
+            if isLoading, actions.isEmpty {
                 ProgressView().padding(30)
             } else if actions.isEmpty {
                 Text(l10n.nothingToUndo)
@@ -56,18 +61,25 @@ struct ActionHistorySheet: View {
                         }
                         Spacer()
                         if canUndo(action) {
-                            Button(l10n.undo) { Task { await undo(action) } }
-                                .disabled(undoingId != nil)
+                            Button { Task { await undo(action) } } label: {
+                                if undoingId == action.id {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Text(l10n.undo)
+                                }
+                            }
+                            .disabled(undoingId != nil)
                         } else {
                             Text(l10n.notUndoable)
                                 .font(.caption)
-                                .foregroundStyle(.tertiary)
+                                .foregroundStyle(.secondary)
                         }
                     }
                     .padding(.vertical, 3)
                 }
             }
         }
+        .noticeBanner($errorBanner)
         .frame(width: 560, height: 460)
         .task { await load() }
     }
@@ -80,14 +92,20 @@ struct ActionHistorySheet: View {
     private func load() async {
         guard let accountId = accounts.accountId else { return }
         isLoading = true
-        errorMessage = nil
+        errorBanner = nil
         do {
             actions = try await api.fetchActions(
                 accountId: accountId,
                 since: Date().addingTimeInterval(-30 * 24 * 60 * 60)
             )
         } catch {
-            errorMessage = l10n.undoFailed + error.lagoonUIMessage
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.undoFailedTitle,
+                detail: l10n.undoFailedDetail,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.load() }
+            )
         }
         isLoading = false
     }
@@ -95,13 +113,19 @@ struct ActionHistorySheet: View {
     private func undo(_ action: AIAction) async {
         guard let accountId = accounts.accountId else { return }
         undoingId = action.id
-        errorMessage = nil
+        errorBanner = nil
         do {
             try await api.undoAction(id: action.id, accountId: accountId)
             actions.removeAll { $0.id == action.id }
             NotificationCenter.default.post(name: .lagoonDidUndo, object: nil)
         } catch {
-            errorMessage = l10n.undoFailed + error.lagoonUIMessage
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.undoFailedTitle,
+                detail: l10n.undoFailedDetail,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.undo(action) }
+            )
         }
         undoingId = nil
     }

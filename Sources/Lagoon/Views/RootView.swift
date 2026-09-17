@@ -1,27 +1,33 @@
 import SwiftUI
 import LagoonKit
 
-/// Top-level surface for a connected account. Owns the account menu, the sync
-/// health banner, the AI action undo controller and the language picker.
-/// Surfaces global shortcuts and a usage indicator.
+/// Top-level surface for a connected account. Owns the account menu, the
+/// global error banner (via `ErrorCenter.shared`), the AI action undo
+/// controller, the language picker, and the sync-health "view details"
+/// sheet. Surfaces global shortcuts and a usage indicator.
 struct RootView: View {
     @EnvironmentObject private var accounts: AccountStore
     @StateObject private var directory = DirectoryStore()
+    @StateObject private var errorCenter = ErrorCenter.shared
+    @StateObject private var undo = UndoController()
     @State private var surface: Surface = .briefing
     @AppStorage(LanguagePreference.defaultsKey) private var languageTag = AppLanguage.zhHans.rawValue
-    @StateObject private var undo = UndoController()
     @State private var showSearch = false
     @State private var showUsage = false
     @State private var showActionHistory = false
     @State private var showCompose = false
     @State private var showConnect = false
+    @State private var showHealthDetail = false
     /// Seeded by the "Reconnect" banner so the QQ form comes up pre-filled;
     /// "Add account" deliberately leaves it nil.
     @State private var connectPrefillEmail: String?
-    @State private var switchError: String?
-    @State private var recoveredNotice: String?
-    @State private var composeNotice: String?
-    @State private var composeNoticeDismiss: Task<Void, Never>?
+    /// User dismissed the current sync-health banner. Reset on the next
+    /// `directory.refresh()` so a fresh poll is allowed to re-surface the
+    /// banner if the underlying state is still bad.
+    @State private var syncHealthDismissed = false
+    /// The health state at the moment of the last `directory.refresh()`;
+    /// any transition into `.ok` fires a transient "Sync recovered" banner.
+    @State private var lastObservedHealth: SyncHealth.Status?
     private let api = APIClient()
 
     enum Surface: String, CaseIterable, Identifiable {
@@ -35,7 +41,9 @@ struct RootView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            banner
+            if let banner = priorityBanner {
+                NoticeBannerView(banner: banner, onDismiss: { dismissPriorityBanner(banner) })
+            }
             Group {
                 switch surface {
                 case .briefing:
@@ -46,12 +54,19 @@ struct RootView: View {
             }
             .id(accounts.accountId)
         }
+        // The global `ErrorCenter` banner — used for failures raised outside
+        // the view layer (undo, polling errors, etc.) and for transient
+        // confirmations like "Sent" / "Sync recovered".
+        .noticeBanner($errorCenter.banner)
         .environment(\.l10n, l10n)
         .environmentObject(undo)
         // Views gate verbs (archive) on the active account's negotiated
         // capabilities, so the directory must be reachable from the feed.
         .environmentObject(directory)
         .toolbar { toolbar }
+        // The undo toast lives at the RootView level so it is also visible on
+        // the "All messages" surface, not just the Briefing Feed.
+        .safeAreaInset(edge: .bottom) { UndoToast(controller: undo) }
         .sheet(isPresented: $showSearch) {
             SearchSheet()
         }
@@ -64,7 +79,11 @@ struct RootView: View {
         .sheet(isPresented: $showCompose) {
             if let accountId = accounts.accountId {
                 NewMessageSheet(accountId: accountId) { _ in
-                    showComposeNotice()
+                    errorCenter.report(.init(
+                        severity: .info,
+                        title: l10n.sent,
+                        autoDismissAfter: .seconds(4)
+                    ))
                 }
             }
         }
@@ -75,14 +94,26 @@ struct RootView: View {
         }) {
             ConnectView(prefillEmail: connectPrefillEmail)
         }
+        .sheet(isPresented: $showHealthDetail) {
+            if let active = directory.active {
+                SyncHealthDetailSheet(
+                    health: active.syncHealth,
+                    capabilities: active.capabilities
+                )
+            }
+        }
         // Binding the environment store (not a throwaway one): UndoController
         // holds it weakly, so the real owner must be the one bound.
-        .onAppear { undo.bind(accounts) }
+        .onAppear {
+            undo.bind(accounts)
+            lastObservedHealth = directory.active?.syncHealth.status
+        }
         // The directory is the account list + health source; poll it while the
         // window is open (the server writes health from its sync loop).
         .task {
             while !Task.isCancelled {
                 await directory.refresh()
+                syncHealthDismissed = false
                 do {
                     try await Task.sleep(for: DirectoryStore.refreshInterval)
                 } catch {
@@ -91,12 +122,28 @@ struct RootView: View {
             }
         }
         .onChange(of: directory.active?.syncHealth.status) { old, new in
-            guard let old, old != .ok, new == .ok else { return }
-            recoveredNotice = l10n.syncRecovered
-            Task {
-                try? await Task.sleep(for: .seconds(4))
-                recoveredNotice = nil
+            if let old, old != .ok, new == .ok {
+                // Spec §4.4: "Sync recovered" is a transient confirmation,
+                // not an error, so it goes through ErrorCenter with severity
+                // .info and an auto-dismiss.
+                errorCenter.report(.init(
+                    severity: .info,
+                    title: l10n.syncRecovered,
+                    autoDismissAfter: .seconds(4)
+                ))
             }
+            lastObservedHealth = new
+        }
+        .onChange(of: directory.loadError) { _, newError in
+            guard let newError else { return }
+            errorCenter.report(.init(
+                severity: .error,
+                title: newError,
+                actionLabel: l10n.retry,
+                action: { [weak directory = directory] in
+                    await directory?.refresh()
+                }
+            ))
         }
         .onChange(of: directory.active?.id) { _, activeId in
             do {
@@ -108,7 +155,10 @@ struct RootView: View {
                     try accounts.clear()
                 }
             } catch {
-                switchError = l10n.saveAccountFailed + error.lagoonUIMessage
+                errorCenter.report(.init(
+                    severity: .error,
+                    title: l10n.saveAccountFailed + error.lagoonUIMessage
+                ))
             }
         }
         .background {
@@ -116,92 +166,97 @@ struct RootView: View {
                 .keyboardShortcut("z", modifiers: .command)
                 .frame(width: 0, height: 0)
                 .opacity(0)
+                .focusable(false)
                 .accessibilityHidden(true)
         }
     }
 
-    // MARK: - Sync health banner
+    // MARK: - Priority banner chain
 
-    @ViewBuilder
-    private var banner: some View {
-        if let undoError = undo.errorMessage {
-            healthRow(
-                text: undoError,
-                color: .red,
-                action: (l10n.dismiss, { undo.clearError() })
-            )
-        } else if let recoveredNotice {
-            healthRow(
-                text: recoveredNotice,
-                color: .green,
-                systemImage: "checkmark.circle.fill",
-                action: nil
-            )
-        } else if let switchError {
-            healthRow(
-                text: switchError,
-                color: .red,
-                action: nil
-            )
-        } else if let composeNotice {
-            healthRow(
-                text: composeNotice,
-                color: .green,
-                systemImage: "paperplane.fill",
-                action: nil
-            )
-        } else if let loadError = directory.loadError {
-            healthRow(
-                text: loadError,
-                color: .red,
-                action: (l10n.retry, { Task { await directory.refresh() } })
-            )
-        } else if let active = directory.active, active.syncHealth.status != .ok {
-            switch active.syncHealth.status {
-            case .needsReconnect:
-                healthRow(
-                    text: l10n.healthNeedsReconnect,
-                    color: .red,
-                    action: (l10n.reconnect, { reconnect() })
-                )
-            case .degraded:
-                healthRow(
-                    text: l10n.healthDegraded + (active.syncHealth.lastError ?? l10n.unknownError),
-                    color: .orange,
-                    action: (l10n.retry, { Task { await retrySync() } })
-                )
-            case .error:
-                healthRow(
-                    text: l10n.healthError + (active.syncHealth.lastError ?? l10n.unknownError),
-                    color: .orange,
-                    action: (l10n.retry, { Task { await retrySync() } })
-                )
-            case .ok:
-                EmptyView()
-            }
+    /// First non-nil `ErrorBanner` wins. Six local sources (`undoError`,
+    /// sync health, load error) plus the global `errorCenter.banner` race
+    /// against each other; this keeps the highest-priority local banner
+    /// visible above the global one.
+    private var priorityBanner: ErrorBanner? {
+        if let banner = undoErrorBanner { return banner }
+        if let banner = syncHealthBanner { return banner }
+        if let banner = loadErrorBanner { return banner }
+        return errorCenter.banner
+    }
+
+    private func dismissPriorityBanner(_ banner: ErrorBanner) {
+        // The undo and sync-health sources own their own dismissal. The
+        // global one dismisses through ErrorCenter. The load-error banner
+        // is recomputed on the next directory poll, so dismissing is
+        // implicitly "until next poll".
+        if banner.id == undoErrorBanner?.id {
+            undo.clearError()
+        } else if banner.id == syncHealthBanner?.id {
+            syncHealthDismissed = true
+        } else if banner.id == loadErrorBanner?.id {
+            syncHealthDismissed = true
+        } else {
+            errorCenter.dismiss()
         }
     }
 
-    private func healthRow(
-        text: String,
-        color: Color,
-        systemImage: String = "exclamationmark.triangle.fill",
-        action: (String, () -> Void)?
-    ) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: systemImage)
-                .foregroundStyle(color)
-            Text(text)
-                .font(.caption)
-            Spacer()
-            if let action {
-                Button(action.0) { action.1() }
-                    .controlSize(.small)
+    private var undoErrorBanner: ErrorBanner? {
+        guard let text = undo.errorMessage else { return nil }
+        return ErrorBanner(
+            severity: .error,
+            title: text,
+            actionLabel: l10n.dismiss,
+            action: { await undo.clearError() }
+        )
+    }
+
+    private var loadErrorBanner: ErrorBanner? {
+        // Mirror what the old RootView did: only show if the directory
+        // poll actually failed. `directory.loadError` is set/cleared by
+        // `DirectoryStore.refresh()` so a successful poll also clears this
+        // banner for free.
+        guard let lastError = directory.loadError else { return nil }
+        return ErrorBanner(
+            severity: .error,
+            title: lastError,
+            actionLabel: l10n.retry,
+            action: { [weak directory = directory] in
+                await directory?.refresh()
             }
+        )
+    }
+
+    private var syncHealthBanner: ErrorBanner? {
+        guard !syncHealthDismissed,
+              let active = directory.active,
+              active.syncHealth.status != .ok else { return nil }
+        let lastError = active.syncHealth.lastError ?? l10n.unknownError
+        switch active.syncHealth.status {
+        case .needsReconnect:
+            return ErrorBanner(
+                severity: .error,
+                title: l10n.healthNeedsReconnect,
+                detail: l10n.healthReconnectDetail(lastError),
+                actionLabel: l10n.reconnect,
+                action: { [self] in await self.reconnect() }
+            )
+        case .degraded:
+            return ErrorBanner(
+                severity: .warning,
+                title: l10n.healthDegradedDetail(lastError),
+                actionLabel: l10n.retry,
+                action: { [self] in await self.retrySync() }
+            )
+        case .error:
+            return ErrorBanner(
+                severity: .error,
+                title: l10n.healthErrorDetail(lastError),
+                actionLabel: l10n.retry,
+                action: { [self] in await self.retrySync() }
+            )
+        case .ok:
+            return nil
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(color.opacity(0.12))
     }
 
     // MARK: - Account menu
@@ -213,7 +268,11 @@ struct RootView: View {
                 Button {
                     Task { await switchTo(account) }
                 } label: {
-                    Text(menuTitle(for: account))
+                    if account.isActive {
+                        Label(menuTitle(for: account), systemImage: "checkmark")
+                    } else {
+                        Text(menuTitle(for: account))
+                    }
                 }
                 .disabled(account.isActive)
             }
@@ -228,6 +287,9 @@ struct RootView: View {
                     .fill(statusColor(directory.active?.syncHealth.status))
                     .frame(width: 8, height: 8)
                 Text(directory.active?.email ?? l10n.accountsMenuHelp)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 180, alignment: .leading)
             }
         }
         .help(l10n.accountsMenuHelp)
@@ -250,19 +312,25 @@ struct RootView: View {
         }
     }
 
-    /// Switch account: make the server's active row authoritative first, then
-    /// persist the same id locally. If Keychain fails, roll the server back.
+    // MARK: - Actions
+
+    /// Switch account: make the server's active row authoritative first,
+    /// then persist the same id locally. If Keychain fails, roll the
+    /// server back and report the failure to the global banner.
     private func switchTo(_ account: ConnectedAccount) async {
         let previous = directory.accounts.first { $0.id == accounts.accountId }
         do {
-            switchError = nil
+            errorCenter.dismiss()
             try await directory.activate(account)
             try accounts.set(accountId: account.id)
         } catch {
             if let previous, accounts.accountId != account.id {
                 try? await directory.activate(previous)
             }
-            switchError = l10n.saveAccountFailed + error.lagoonUIMessage
+            errorCenter.report(.init(
+                severity: .error,
+                title: l10n.saveAccountFailed + error.lagoonUIMessage
+            ))
         }
     }
 
@@ -271,38 +339,32 @@ struct RootView: View {
             try await api.requestSync()
             await directory.refresh()
         } catch {
-            switchError = l10n.syncFailed + error.lagoonUIMessage
+            errorCenter.report(.init(
+                severity: .error,
+                title: l10n.syncFailed + error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.retrySync() }
+            ))
         }
     }
 
-    private func showComposeNotice() {
-        composeNoticeDismiss?.cancel()
-        composeNotice = l10n.sent
-        composeNoticeDismiss = Task {
-            do {
-                try await Task.sleep(for: .seconds(4))
-            } catch {
-                return
-            }
-            composeNotice = nil
-        }
-    }
-
-    /// "Add account" and "Reconnect" both open the connect sheet. The stored
-    /// account id is deliberately left in place: clearing it here would unmount
-    /// RootView before the user submits any credentials and strand them with no
-    /// way back. The sheet's Cancel (shown while an account id exists) is the
-    /// exit, and the success paths call `accounts.set(accountId:)` themselves.
+    /// "Add account" and "Reconnect" both open the connect sheet. The
+    /// stored account id is deliberately left in place: clearing it here
+    /// would unmount RootView before the user submits any credentials
+    /// and strand them with no way back. The sheet's Cancel (shown
+    /// while an account id exists) is the exit, and the success paths
+    /// call `accounts.set(accountId:)` themselves.
     private func addAccount() {
-        switchError = nil
+        errorCenter.dismiss()
         connectPrefillEmail = nil
         showConnect = true
     }
 
     private func reconnect() {
-        switchError = nil
-        // Only QQ re-auth is an in-app form; Gmail reconnect goes through the
-        // browser OAuth dance, so leaving the default Gmail tab is correct.
+        errorCenter.dismiss()
+        // Only QQ re-auth is an in-app form; Gmail reconnect goes through
+        // the browser OAuth dance, so leaving the default Gmail tab is
+        // correct.
         let active = directory.active
         connectPrefillEmail = active?.provider == .qq ? active?.email : nil
         showConnect = true
@@ -320,6 +382,8 @@ struct RootView: View {
                 }
             }
             .pickerStyle(.segmented)
+            .fixedSize()
+            .accessibilityLabel(l10n.surface)
             .help(l10n.surfaceHelp)
         }
         ToolbarItem(placement: .primaryAction) {
@@ -337,6 +401,8 @@ struct RootView: View {
                 }
             }
             .pickerStyle(.menu)
+            .fixedSize()
+            .accessibilityLabel(l10n.languageLabel)
         }
         ToolbarItemGroup(placement: .automatic) {
             Button { showSearch = true } label: {
@@ -345,9 +411,9 @@ struct RootView: View {
             .keyboardShortcut("f", modifiers: .command)
             .help(l10n.shortcutSearch)
             Menu {
-                Button(l10n.budgetThisMonth) { showUsage = true }
+                Button(l10n.budgetThisMonth) { Task { @MainActor in showUsage = true } }
                     .keyboardShortcut("b", modifiers: [.command])
-                Button(l10n.actionHistory) { showActionHistory = true }
+                Button(l10n.actionHistory) { Task { @MainActor in showActionHistory = true } }
             } label: {
                 Label(l10n.moreActions, systemImage: "ellipsis.circle")
             }

@@ -574,4 +574,164 @@ final class APIClientTests: XCTestCase {
             "requestId": requestId,
         ])
     }
+
+    // MARK: - APITimeout + auto-retry (spec §5.4, §5.7)
+
+    /// Drive the stub with a custom handler. Counted attempts let the test
+    /// assert both the final outcome and the number of underlying requests
+    /// (i.e., whether a retry happened).
+    private func stubSequence(_ handler: @escaping (Int) throws -> (HTTPURLResponse, Data)) {
+        var attempts = 0
+        StubURLProtocol.setHandler { request in
+            let n = attempts
+            attempts += 1
+            return try handler(n)
+        }
+    }
+
+    /// `.fast` (10s) re-tries once on transient `URLError.timedOut`. The
+    /// stub drives the first attempt to fail and the second to succeed.
+    func test_fastAutoRetriesOnce_onTimeout() async throws {
+        stubSequence { attempt in
+            if attempt == 0 {
+                throw URLError(.timedOut)
+            }
+            let url = URL(string: "http://127.0.0.1:8080/api/accounts")!
+            let response = HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            return (response, Data("[]".utf8))
+        }
+
+        let accounts = try await makeClient().fetchAccounts()
+
+        XCTAssertEqual(accounts.count, 0)
+        XCTAssertEqual(StubURLProtocol.capturedRequests.count, 2)
+    }
+
+    /// `.fast` surfaces the final failure when both attempts time out.
+    func test_fastGivesUpAfterSecondTimeout() async throws {
+        StubURLProtocol.setHandler { _ in throw URLError(.timedOut) }
+
+        do {
+            _ = try await makeClient().fetchAccounts()
+            XCTFail("expected URLError(.timedOut)")
+        } catch let error as URLError {
+            XCTAssertEqual(error.code, .timedOut)
+        }
+        XCTAssertEqual(StubURLProtocol.capturedRequests.count, 2)
+    }
+
+    /// `.interactive` (30s) does NOT retry — a slow AI call is still slow
+    /// on the second attempt and the user should see the failure.
+    func test_interactiveDoesNotRetry_onTimeout() async throws {
+        StubURLProtocol.setHandler { _ in throw URLError(.timedOut) }
+
+        do {
+            _ = try await makeClient().fetchUsage()
+            XCTFail("expected URLError(.timedOut)")
+        } catch let error as URLError {
+            XCTAssertEqual(error.code, .timedOut)
+        }
+        XCTAssertEqual(StubURLProtocol.capturedRequests.count, 1)
+    }
+
+    /// `.slow` (75s) is the QQ connect probe — it does real network work
+    /// and a retry would race against the already-in-flight server probe.
+    func test_slowDoesNotRetry_onTimeout() async throws {
+        StubURLProtocol.setHandler { _ in throw URLError(.timedOut) }
+
+        do {
+            _ = try await makeClient().connectQQ(email: "me@qq.com", authCode: "code")
+            XCTFail("expected URLError(.timedOut)")
+        } catch let error as URLError {
+            XCTAssertEqual(error.code, .timedOut)
+        }
+        XCTAssertEqual(StubURLProtocol.capturedRequests.count, 1)
+    }
+
+    /// 5xx is treated as transient on `.fast`: the auto-retry catches a
+    /// single 503 and re-sends.
+    func test_fastAutoRetriesOnce_on5xx() async throws {
+        stubSequence { attempt in
+            let url = URL(string: "http://127.0.0.1:8080/api/accounts")!
+            if attempt == 0 {
+                let response = HTTPURLResponse(
+                    url: url, statusCode: 503, httpVersion: "HTTP/1.1",
+                    headerFields: nil
+                )!
+                return (response, Data("upstream busy".utf8))
+            }
+            let response = HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            return (response, Data("[]".utf8))
+        }
+
+        let accounts = try await makeClient().fetchAccounts()
+
+        XCTAssertEqual(accounts.count, 0)
+        XCTAssertEqual(StubURLProtocol.capturedRequests.count, 2)
+    }
+
+    /// 4xx is not retried — a 401 is the user's problem, not the network's.
+    func test_4xxDoesNotRetry() async throws {
+        StubURLProtocol.setHandler { _ in
+            let url = URL(string: "http://127.0.0.1:8080/api/accounts")!
+            let response = HTTPURLResponse(
+                url: url, statusCode: 401, httpVersion: "HTTP/1.1", headerFields: nil
+            )!
+            return (response, Data("auth required".utf8))
+        }
+
+        do {
+            _ = try await makeClient().fetchAccounts()
+            XCTFail("expected APIError.badStatus(401)")
+        } catch APIError.badStatus(let code, _) {
+            XCTAssertEqual(code, 401)
+        }
+        XCTAssertEqual(StubURLProtocol.capturedRequests.count, 1)
+    }
+
+    /// `errorDescription` is the user-facing string. Spec §5.5 forbids
+    /// splicing the server body into it: the body may carry internal
+    /// diagnostics that should not appear in the UI.
+    func test_errorDescriptionExcludesBody() {
+        let error = APIError.badStatus(code: 500, bodySnippet: "internal-secret-token")
+        let desc = error.errorDescription ?? ""
+        XCTAssertFalse(desc.contains("internal-secret-token"), "body leaked: \(desc)")
+        XCTAssertTrue(desc.contains("500"), "expected status in description: \(desc)")
+    }
+
+    /// Per-tier timeout settings travel on the URLRequest. The actual
+    /// timing is exercised by URLSession itself; this just pins the
+    /// configuration so a future refactor that drops the value is caught.
+    func test_fastRequestsCarryTenSecondTimeout() async throws {
+        stub(status: 200, body: Data("[]".utf8))
+        _ = try await makeClient().fetchAccounts()
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.timeoutInterval, 10, "fast tier should be 10s")
+    }
+
+    func test_interactiveRequestsCarryThirtySecondTimeout() async throws {
+        stub(status: 200, body: Data("{\"monthUSD\":0,\"capUSD\":0,\"callCount\":0,\"costTrackingAvailable\":false}".utf8))
+        _ = try await makeClient().fetchUsage()
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.timeoutInterval, 30, "interactive tier should be 30s")
+    }
+
+    func test_slowRequestsCarrySeventyFiveSecondTimeout() async throws {
+        let id = UUID()
+        let body = Data("""
+        {"id":"\(id.uuidString)","provider":"qq","email":"me@qq.com","isActive":true,
+         "syncHealth":{"status":"ok"},
+         "capabilities":{"archiveFolder":true,"idle":true,"move":true,"serverSnippet":true}}
+        """.utf8)
+        stub(status: 201, body: body)
+        _ = try await makeClient().connectQQ(email: "me@qq.com", authCode: "code")
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.timeoutInterval, 75, "slow tier should be 75s")
+    }
 }

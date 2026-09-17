@@ -9,56 +9,50 @@ struct SearchSheet: View {
     @State private var query = ""
     @State private var results: [MessageHeader] = []
     @State private var isLoading = false
-    @State private var errorMessage: String?
+    @State private var errorBanner: ErrorBanner?
     @State private var path: [String] = []
     private let api = APIClient()
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField(l10n.searchPlaceholder, text: $query)
-                    .textFieldStyle(.plain)
-                    .onSubmit { Task { await run() } }
-                if !query.isEmpty {
-                    Button { query = ""; results = [] } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+        // `NavigationLink(value:)` only pushes when a NavigationStack is in
+        // scope; previously the stack lived *inside* the destination closure,
+        // so tapping a result did nothing. Bind `path` here too.
+        NavigationStack(path: $path) {
+            VStack(spacing: 0) {
+                HStack {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField(l10n.searchPlaceholder, text: $query)
+                        .textFieldStyle(.plain)
+                        .onSubmit { Task { await run() } }
+                    if !query.isEmpty {
+                        Button { query = ""; results = [] } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
+                    Button(l10n.search) { Task { await run() } }
+                        .disabled(query.isEmpty || isLoading)
                 }
-                Button(l10n.search) { Task { await run() } }
-                    .disabled(query.isEmpty || isLoading)
-            }
-            .padding(12)
-            Divider()
-            if let errorMessage {
-                VStack(spacing: 8) {
-                    Text(l10n.searchFailed + errorMessage)
-                        .foregroundStyle(.red)
-                        .multilineTextAlignment(.center)
-                    Button(l10n.retry) { Task { await run() } }
-                }
-                .padding(20)
-            } else if isLoading { ProgressView().padding(20) }
-            else if results.isEmpty { Text(l10n.noResults).foregroundStyle(.secondary).padding(20) }
-            else {
-                List(results) { m in
-                    NavigationLink(value: m.remoteId) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(m.subject ?? l10n.noSubject).bold(!m.isRead).lineLimit(1)
-                            HStack {
-                                Text(m.fromName ?? m.fromAddress).font(.caption).foregroundStyle(.secondary)
-                                Text(m.receivedAt.formatted(date: .abbreviated, time: .shortened)).font(.caption2).foregroundStyle(.tertiary)
+                .padding(12)
+                Divider()
+                if isLoading { ProgressView().padding(20) }
+                else if results.isEmpty { Text(l10n.noResults).foregroundStyle(.secondary).padding(20) }
+                else {
+                    List(results) { m in
+                        NavigationLink(value: m.remoteId) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(m.subject ?? l10n.noSubject).bold(!m.isRead).lineLimit(1)
+                                HStack {
+                                    Text(m.fromName ?? m.fromAddress).font(.caption).foregroundStyle(.secondary)
+                                    Text(m.receivedAt.formatted(date: .abbreviated, time: .shortened)).font(.caption2).foregroundStyle(.secondary)
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        .frame(width: 640, height: 480)
-        .navigationDestination(for: String.self) { remoteId in
-            if let accountId = accounts.accountId {
-                NavigationStack {
+            .navigationDestination(for: String.self) { remoteId in
+                if let accountId = accounts.accountId {
                     MessageDetailView(
                         remoteId: remoteId,
                         accountId: accountId,
@@ -75,17 +69,25 @@ struct SearchSheet: View {
                 }
             }
         }
+        .noticeBanner($errorBanner)
+        .frame(width: 640, height: 480)
     }
 
     func run() async {
         guard let accountId = accounts.accountId, !query.isEmpty else { return }
         isLoading = true
-        errorMessage = nil
+        errorBanner = nil
         do {
             results = try await api.search(query: query, accountId: accountId)
         } catch {
             results = []
-            errorMessage = error.lagoonUIMessage
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.searchFailedTitle,
+                detail: l10n.searchFailedDetail,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.run() }
+            )
         }
         isLoading = false
     }

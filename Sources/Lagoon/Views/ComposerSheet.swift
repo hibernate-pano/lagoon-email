@@ -51,9 +51,13 @@ struct ComposerSheet: View {
                 Label(l10n.replyTitle, systemImage: "arrowshape.turn.up.left").font(.headline)
                 Spacer()
                 Button { dismiss() } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .padding(4)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(l10n.dismiss)
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -107,10 +111,11 @@ struct ComposerSheet: View {
             }
 
             HStack {
-                Text(l10n.shortcutSend).font(.caption).foregroundStyle(.tertiary)
-                Text(l10n.draftSaved).font(.caption2).foregroundStyle(.tertiary)
+                Text(l10n.shortcutSend).font(.caption).foregroundStyle(.secondary)
+                Text(l10n.draftSaved).font(.caption2).foregroundStyle(.secondary)
                 Spacer()
                 Button(l10n.closeComposer) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
                 Button {
                     Task { await send() }
                 } label: {

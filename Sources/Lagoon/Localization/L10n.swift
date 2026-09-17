@@ -95,7 +95,17 @@ public struct L10n: Sendable, Equatable {
     public var syncingFirstTime: String {
         pick("正在首次同步邮箱…", "Syncing your mailbox for the first time…")
     }
+    public func syncingFirstTimeCount(_ count: Int) -> String {
+        pick("首次同步中…（已收到 \(count) 封）", "First sync in progress… (got \(count) so far)")
+    }
     public var briefingUnavailable: String { pick("简报不可用", "Briefing unavailable") }
+    public var emptyInboxZero: String { pick("邮箱是空的", "Inbox is empty") }
+    public var briefingTimeoutTitle: String { pick("简报生成较慢", "Briefing is taking longer than usual") }
+    public var briefingTimeoutDetail: String {
+        pick("已自动重试一次仍未完成，请检查网络。", "One auto-retry didn't complete — check your network.")
+    }
+    public var viewDetails: String { pick("查看详情", "View details") }
+    public var alreadyRefreshing: String { pick("已在刷新中…", "Already refreshing…") }
     public func expandGroup(_ title: String) -> String {
         pick("展开 \(title)", "Expand \(title)")
     }
@@ -115,6 +125,8 @@ public struct L10n: Sendable, Equatable {
     }
     public var syncFailed: String { pick("同步失败：", "Sync failed: ") }
     public var isServerRunning: String { pick("服务器在运行吗？", "Is the server running?") }
+    public var lastSyncAt: String { pick("上次同步", "Last sync") }
+    public var lastError: String { pick("最后错误", "Last error") }
 
     // MARK: - Message detail
 
@@ -144,14 +156,30 @@ public struct L10n: Sendable, Equatable {
     public var pinHelp: String { pick("置顶这封邮件", "Pin this message") }
     public var unpinHelp: String { pick("取消置顶这封邮件", "Unpin this message") }
     public var markReadFailed: String { pick("标记已读失败：", "Could not mark as read: ") }
+    public var markReadFailedTitle: String { pick("标记已读失败", "Couldn't mark as read") }
+    public var markReadFailedDetail: String { pick("标记已读失败，请重试。", "Mark-as-read didn't complete — retry.") }
     public var markRead: String { pick("标为已读", "Mark read") }
     public var pinFailed: String { pick("置顶失败：", "Could not pin: ") }
     public var unpinFailed: String { pick("取消置顶失败：", "Could not unpin: ") }
     public var summaryFailed: String { pick("摘要失败：", "Summary failed: ") }
+    public var archiveFailedTitle: String { pick("归档失败", "Archive failed") }
+    public var archiveFailedDetail: String {
+        pick("归档未完成，请重试或检查网络。", "Archive didn't complete — retry or check your network.")
+    }
+    public var unsubscribeFailedTitle: String { pick("退订请求未完成", "Unsubscribe didn't complete") }
+    public var unsubscribeFailedDetail: String {
+        pick("请到原邮件里手动退订，或稍后重试。", "Try again or unsubscribe from the original email.")
+    }
+    public var overrideGroupFailedTitle: String { pick("分组调整未记录", "Group preference wasn't saved") }
+    public var overrideGroupFailedDetail: String {
+        pick("请重试，或检查网络。", "Retry or check your network.")
+    }
+    public var openOriginal: String { pick("打开原邮件", "Open original email") }
 
     // MARK: - Connect
 
     public var connectPrompt: String { pick("连接你的邮箱开始使用。", "Connect your mailbox to begin.") }
+    public var connectMethod: String { pick("连接方式", "Connection method") }
     public var connectGmail: String { pick("连接 Gmail", "Connect Gmail") }
     public var waitingForApproval: String {
         pick("等待浏览器授权…", "waiting for browser approval…")
@@ -171,6 +199,14 @@ public struct L10n: Sendable, Equatable {
     public var connectQQTitle: String { pick("连接 QQ 邮箱", "Connect QQ Mail") }
     public var qqEmailPlaceholder: String { pick("QQ 邮箱地址", "QQ email address") }
     public var qqAuthCodePlaceholder: String { pick("授权码", "Authorization code") }
+    public var qqEmail: String { pick("邮箱地址", "Email address") }
+    public var qqAuthCode: String { pick("授权码", "Authorization code") }
+    public var qqAuthCodeHelp: String {
+        pick(
+            "在 QQ 邮箱 → 设置 → 账户 → POP3/IMAP 服务 → 开启 → 短信验证 → 生成授权码。",
+            "In QQ Mail: Settings → Account → POP3/IMAP service → Enable → SMS verify → Generate code."
+        )
+    }
     public var qqHelp: String {
         pick(
             "在 QQ 邮箱网页版：设置 → 账户 → POP3/IMAP/SMTP 服务，开启 IMAP/SMTP 后生成授权码（不是登录密码）。",
@@ -241,11 +277,24 @@ public struct L10n: Sendable, Equatable {
         }
     }
     public var healthDegraded: String { pick("同步不稳定：", "Sync degraded: ") }
+    public func healthDegradedDetail(_ reason: String) -> String {
+        pick("同步不稳定：\(reason)", "Sync is unstable: \(reason)")
+    }
     public var healthNeedsReconnect: String {
         pick("授权已失效 —— 重新连接后继续同步。", "Authorization expired — reconnect to keep syncing.")
     }
+    public func healthReconnectDetail(_ reason: String) -> String {
+        pick("授权码错误或已失效：\(reason)", "Authorization code is invalid or expired: \(reason)")
+    }
     public var healthError: String { pick("同步失败：", "Sync failed: ") }
+    public func healthErrorDetail(_ reason: String) -> String {
+        pick("同步失败：\(reason)", "Sync failed: \(reason)")
+    }
     public var syncRecovered: String { pick("同步已恢复", "Sync recovered") }
+    public var capabilities: String { pick("能力", "Capabilities") }
+    public var idleSupported: String { pick("IDLE 推送", "IDLE push") }
+    public var moveSupported: String { pick("MOVE 归档", "MOVE archive") }
+    public var archiveFolderName: String { pick("归档目录", "Archive folder") }
     public var archiveUnavailable: String {
         pick("这个邮箱没有可用的归档文件夹。", "This mailbox has no usable archive folder.")
     }
@@ -268,9 +317,15 @@ public struct L10n: Sendable, Equatable {
     public var undoLastAction: String { pick("撤销上一操作", "Undo last action") }
     public var nothingToUndo: String { pick("没有可撤销的操作", "Nothing to undo") }
     public var undoFailed: String { pick("撤销失败：", "Undo failed: ") }
+    public var undoFailedTitle: String { pick("撤销失败", "Undo failed") }
+    public var undoFailedDetail: String {
+        pick("操作可能已完成，请刷新确认。", "The action may have already completed — refresh to verify.")
+    }
     public var actionHistory: String { pick("最近操作", "Recent actions") }
     public var notUndoable: String { pick("不可撤销", "Not reversible") }
     public var dismiss: String { pick("关闭", "Dismiss") }
+    public var searchFailedTitle: String { pick("搜索失败", "Search failed") }
+    public var searchFailedDetail: String { pick("请检查网络后重试。", "Check your network and retry.") }
     public func actionTitle(_ kind: AIActionKind) -> String {
         switch kind {
         case .archive: pick("归档邮件", "Archived message")
@@ -290,6 +345,7 @@ public struct L10n: Sendable, Equatable {
     public var unsubscribe: String { pick("退订", "Unsubscribe") }
     public var pinning: String { pick("正在置顶…", "Pinning…") }
     public var draftVariants: String { pick("AI 草稿（3 个版本）", "AI drafts (3 variants)") }
+    public var pushToGmailDrafts: String { pick("保存到 Gmail 草稿", "Save to Gmail drafts") }
     public var chooseAndSendToGmail: String { pick("选这个 → 存到 Gmail Drafts",
                                               "Use this → save to Gmail Drafts") }
     public var chooseOnly: String { pick("只选中", "Select only") }
@@ -329,7 +385,7 @@ public struct L10n: Sendable, Equatable {
     public var mailArchivedLocally: String { pick("归档未完成", "Archive did not complete") }
     public var opening: String { pick("正在打开…", "Opening…") }
     public var nothingHereYet: String { pick("还没有内容", "Nothing here yet") }
-    public var inboxZero: String { pick("收件箱已清空 🎉", "Inbox zero 🎉") }
+    public var inboxZero: String { pick("收件箱已清空", "Inbox zero") }
     public var tapGmailToSync: String {
         pick("添加一个邮箱账号，让 Lagoon 开始同步。", "Add an email account to start syncing.")
     }
@@ -351,7 +407,8 @@ public struct L10n: Sendable, Equatable {
     public var newMessageHelp: String { pick("写一封新邮件（⌘N）", "Write a new message (⌘N)") }
     public var newMessageTitle: String { pick("新邮件", "New message") }
     public var newMessageToPlaceholder: String { pick("收件人邮箱", "Recipient email") }
-    public var newMessageSubjectPlaceholder: String { pick("主题", "Subject") }
+    public var newMessageToLabel: String { pick("收件人", "To") }
+    public var newMessageSubjectLabel: String { pick("主题", "Subject") }
     public var newMessageBodyPlaceholder: String { pick("写邮件…", "Write your message…") }
     public var emptyRecipient: String { pick("请填写收件人。", "Enter a recipient.") }
     public var emptyMessage: String { pick("邮件内容不能为空。", "The message cannot be empty.") }

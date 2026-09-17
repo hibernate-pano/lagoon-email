@@ -66,7 +66,7 @@ struct ConnectView: View {
             Text(l10n.connectPrompt)
                 .foregroundStyle(.secondary)
 
-            Picker(l10n.connectPrompt, selection: $mode) {
+            Picker(l10n.connectMethod, selection: $mode) {
                 Text("Gmail").tag(Mode.gmail)
                 Text(l10n.connectQQTab).tag(Mode.qq)
             }
@@ -114,7 +114,7 @@ struct ConnectView: View {
             }
         }
         .padding(40)
-        .frame(minWidth: 460, minHeight: 320)
+        .frame(minWidth: 460, maxWidth: 460, minHeight: 420)
         // Polls while the view is visible; SwiftUI cancels the task on disappear.
         .task(id: connectAttempt) { await pollForConnection() }
         .onAppear {
@@ -130,22 +130,27 @@ struct ConnectView: View {
 
     @ViewBuilder
     private var gmailSection: some View {
-        Button(l10n.connectGmail) {
+        Button {
             errorMessage = nil
             NSWorkspace.shared.open(api.oauthStartURL)
             connectAttempt += 1
+        } label: {
+            HStack(spacing: 6) {
+                if isPolling && connectAttempt > 0 {
+                    ProgressView().controlSize(.small)
+                }
+                Text(l10n.connectGmail)
+            }
         }
         .controlSize(.large)
         .buttonStyle(.borderedProminent)
         .disabled(isPolling && connectAttempt > 0)
 
         if isPolling && connectAttempt > 0 {
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text(l10n.waitingForApproval)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            // The button carries the spinner; a second one here just competes.
+            Text(l10n.waitingForApproval)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         } else {
             Text(l10n.afterApproval)
                 .font(.caption)

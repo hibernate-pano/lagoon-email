@@ -44,14 +44,31 @@ struct NewMessageSheet: View {
                 Button { dismiss() } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
+                        .padding(4)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(l10n.dismiss)
             }
 
-            TextField(l10n.newMessageToPlaceholder, text: $draft.to)
-                .textFieldStyle(.roundedBorder)
-            TextField(l10n.newMessageSubjectPlaceholder, text: $draft.subject)
-                .textFieldStyle(.roundedBorder)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(l10n.newMessageToLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField(l10n.newMessageToPlaceholder, text: $draft.to)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel(l10n.newMessageToLabel)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(l10n.newMessageSubjectLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                // No placeholder: the caption above already names the field, and
+                // reusing the same string twice read as a glitch.
+                TextField("", text: $draft.subject)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel(l10n.newMessageSubjectLabel)
+            }
 
             TextEditor(text: $draft.body)
                 .font(.body)
@@ -80,10 +97,11 @@ struct NewMessageSheet: View {
             }
 
             HStack {
-                Text(l10n.shortcutSend).font(.caption).foregroundStyle(.tertiary)
-                Text(l10n.draftSaved).font(.caption2).foregroundStyle(.tertiary)
+                Text(l10n.shortcutSend).font(.caption).foregroundStyle(.secondary)
+                Text(l10n.draftSaved).font(.caption2).foregroundStyle(.secondary)
                 Spacer()
                 Button(l10n.cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
                 Button {
                     Task { await send() }
                 } label: {

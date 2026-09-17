@@ -1,8 +1,35 @@
 import Foundation
 import LagoonKit
+import os
 
-/// Typed client-side API failures. Carries enough detail (status + body
-/// snippet) that the UI can show something actionable.
+/// Three tiers of request timeout (spec §5.1).
+///
+/// `.fast` (10s) is the common read/write path and auto-retries once on
+/// transient transport / 5xx — covers the brief network blips that would
+/// otherwise surface as red banners for no reason. `.interactive` (30s)
+/// covers AI paths (summary, drafts, send) where the server legitimately
+/// can take longer and a second attempt wouldn't help. `.slow` (75s) is
+/// only used by the QQ connect probe, which does real IMAP work before
+/// persisting — short-circuiting that path recreates the false-timeout
+/// window M1.5 worked to close.
+public enum APITimeout: Sendable {
+    case fast
+    case interactive
+    case slow
+
+    public var seconds: TimeInterval {
+        switch self {
+        case .fast: return 10
+        case .interactive: return 30
+        case .slow: return 75
+        }
+    }
+}
+
+/// Typed client-side API failures. The HTTP status + a stable error code
+/// reach the UI; raw response bodies do not — server-side text is never
+/// trusted to render verbatim (spec §5.5). `bodySnippet` is kept for typed
+/// code extraction and `os.Logger` diagnostics only.
 extension Error {
     /// UI-facing text: the typed `APIError` message when we have one, otherwise
     /// Foundation's description. Views use this so failures name the cause.
@@ -22,8 +49,8 @@ public enum APIError: LocalizedError, Sendable {
             return L10n.current.invalidServerURL + description
         case .invalidResponse:
             return L10n.current.nonHTTPResponse
-        case .badStatus(let code, let bodySnippet):
-            return L10n.current.httpStatus(code) + bodySnippet
+        case .badStatus(let code, _):
+            return L10n.current.httpStatus(code)
         }
     }
 
@@ -68,12 +95,12 @@ public final class APIClient: Sendable {
             self.session = session
         } else {
             let config = URLSessionConfiguration.default
-            config.timeoutIntervalForRequest = 10
-            // Per-request inactivity still fails after 10s, but the resource cap
-            // bounds the whole task. It must exceed the connect route's per-request
-            // timeout (60s below) or a long IMAP probe would be killed early and
-            // recreate the false-timeout window this fix is meant to close.
-            config.timeoutIntervalForResource = 75
+            // Session-level ceilings are safety nets well above any
+            // per-request timeout (`.slow` = 75s). Per-request values
+            // (set by `send(_, timeout:)`) take precedence; this just
+            // bounds runaway tasks.
+            config.timeoutIntervalForRequest = 60
+            config.timeoutIntervalForResource = 90
             self.session = URLSession(configuration: config)
         }
     }
@@ -94,8 +121,9 @@ public final class APIClient: Sendable {
         guard let url = c.url else {
             throw APIError.invalidURL(baseURL.absoluteString + "/api/messages")
         }
-        let (data, resp) = try await session.data(from: url)
-        try Self.validate(resp, data: data)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
         let dec = JSONDecoder()
         dec.dateDecodingStrategy = .iso8601
         return try dec.decode(SyncResponse.self, from: data)
@@ -110,8 +138,9 @@ public final class APIClient: Sendable {
     /// app is a bare SwiftPM executable and cannot register a URL scheme.
     public func fetchAccounts() async throws -> [ConnectedAccount] {
         let url = baseURL.appendingPathComponent("api/accounts")
-        let (data, resp) = try await session.data(from: url)
-        try Self.validate(resp, data: data)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
         let dec = JSONDecoder()
         dec.dateDecodingStrategy = .iso8601
         return try dec.decode([ConnectedAccount].self, from: data)
@@ -130,21 +159,17 @@ public final class APIClient: Sendable {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // The server probes IMAP before persisting anything: TLS + LOGIN +
-        // resolveArchiveFolder + selectInbox can exceed the 10s inactivity
-        // default. This request-level timeout lifts the per-request ceiling to
-        // 60s, and the session's `timeoutIntervalForResource` (75s) keeps the
-        // whole task from being capped below it. Together they close the
-        // false-timeout window where the client reports failure but the server
-        // still writes the account.
-        request.timeoutInterval = 60
+        // resolveArchiveFolder + selectInbox can take well over 10s on a cold
+        // connection. `.slow` (75s) gives the probe room to finish; a retry
+        // here would just race against the already-in-flight server probe.
+        request.timeoutInterval = APITimeout.slow.seconds
         let body: [String: Any] = [
             "provider": MailProviderKind.qq.rawValue,
             "email": email,
             "authCode": authCode,
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        let (data, _) = try await send(request, timeout: .slow)
         return try Self.decode(ConnectedAccount.self, from: data)
     }
 
@@ -160,36 +185,38 @@ public final class APIClient: Sendable {
         let url = try makeURL(path: ["api", "accounts", id.uuidString], query: [])
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        request.timeoutInterval = APITimeout.fast.seconds
+        _ = try await send(request, timeout: .fast)
     }
 
     // MARK: - M1 Briefing Feed
 
     /// GET /api/briefing?accountId=&limit= — every message the server could
-    /// classify, tagged with its `BriefingGroup`.
+    /// classify, tagged with its `BriefingGroup`. `.interactive` because
+    /// the briefing endpoint waits for AI classification on the first call
+    /// after each sync, which can stretch past 10s.
     public func fetchBriefing(accountId: UUID, limit: Int = 100) async throws -> BriefingResponse {
         let url = try makeURL(path: ["api", "briefing"], query: [
             .init(name: "accountId", value: accountId.uuidString),
             .init(name: "limit", value: String(limit))
         ])
-        let (data, resp) = try await session.data(from: url)
-        try Self.validate(resp, data: data)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.interactive.seconds
+        let (data, _) = try await send(request, timeout: .interactive)
         return try Self.decode(BriefingResponse.self, from: data)
     }
 
     /// GET /api/messages/{remoteId}/body?accountId= — plain-text body (spec §3).
+    /// `.fast` is fine because the route pool reuses an authenticated QQ
+    /// connection; the first cold call may exceed 10s and trigger the
+    /// auto-retry, which then hits the warm path.
     public func fetchBody(remoteId: String, accountId: UUID) async throws -> MessageBody {
         let url = try makeURL(path: ["api", "messages", remoteId, "body"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
         var request = URLRequest(url: url)
-        // The first body fetch may need a fresh QQ TLS + login round trip while
-        // background IDLE is already connected. Ten seconds is too close to
-        // that tail latency; once warm, the route pool reuses the session.
-        request.timeoutInterval = 30
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
         return try Self.decode(MessageBody.self, from: data)
     }
 
@@ -202,8 +229,8 @@ public final class APIClient: Sendable {
         ])
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
         return try Self.decode(ArchiveResponse.self, from: data)
     }
 
@@ -214,8 +241,8 @@ public final class APIClient: Sendable {
         ])
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
         return try Self.decode(UnsubscribeResponse.self, from: data)
     }
 
@@ -237,8 +264,8 @@ public final class APIClient: Sendable {
             body["fromGroup"] = from.rawValue
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        request.timeoutInterval = APITimeout.fast.seconds
+        _ = try await send(request, timeout: .fast)
     }
 
     /// GET /api/actions?accountId=&since=
@@ -250,8 +277,9 @@ public final class APIClient: Sendable {
             items.append(.init(name: "since", value: f.string(from: since)))
         }
         let url = try makeURL(path: ["api", "actions"], query: items)
-        let (data, resp) = try await session.data(from: url)
-        try Self.validate(resp, data: data)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
         return try Self.decode(AIActionListResponse.self, from: data).actions
     }
 
@@ -262,14 +290,15 @@ public final class APIClient: Sendable {
         ])
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        request.timeoutInterval = APITimeout.fast.seconds
+        _ = try await send(request, timeout: .fast)
     }
 
     /// POST /api/messages/{remoteId}/send {body} → SendResponse.
     ///
     /// Recipient, subject and threading headers are taken from the stored
-    /// message on the server; only the body travels from here.
+    /// message on the server; only the body travels from here. `.interactive`
+    /// because the server waits for SMTP + (QQ) Sent APPEND before returning.
     public func sendReply(
         remoteId: String,
         accountId: UUID,
@@ -286,8 +315,8 @@ public final class APIClient: Sendable {
             "body": body,
             "requestId": requestId,
         ])
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        request.timeoutInterval = APITimeout.interactive.seconds
+        let (data, _) = try await send(request, timeout: .interactive)
         return try Self.decode(SendResponse.self, from: data)
     }
 
@@ -311,12 +340,13 @@ public final class APIClient: Sendable {
             "body": body,
             "requestId": requestId,
         ])
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        request.timeoutInterval = APITimeout.interactive.seconds
+        let (data, _) = try await send(request, timeout: .interactive)
         return try Self.decode(SendResponse.self, from: data)
     }
 
-    /// POST /api/messages/{remoteId}/draft → DraftReply.
+    /// POST /api/messages/{remoteId}/draft → DraftReply. `.interactive`
+    /// because the server runs LLM inference before responding.
     public func generateDrafts(remoteId: String, accountId: UUID, language: String? = nil) async throws -> DraftReply {
         let url = try makeURL(path: ["api", "messages", remoteId, "draft"], query: [
             .init(name: "accountId", value: accountId.uuidString)
@@ -326,8 +356,8 @@ public final class APIClient: Sendable {
         if let language, !language.isEmpty {
             request.setValue(language, forHTTPHeaderField: "Accept-Language")
         }
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        request.timeoutInterval = APITimeout.interactive.seconds
+        let (data, _) = try await send(request, timeout: .interactive)
         return try Self.decode(DraftReply.self, from: data)
     }
 
@@ -339,8 +369,8 @@ public final class APIClient: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body: [String: Any] = ["variant": variant, "pushToGmail": pushToGmail]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
         return try Self.decode(ChooseDraftResponse.self, from: data)
     }
 
@@ -350,16 +380,19 @@ public final class APIClient: Sendable {
             .init(name: "accountId", value: accountId.uuidString),
             .init(name: "q", value: query)
         ])
-        let (data, resp) = try await session.data(from: url)
-        try Self.validate(resp, data: data)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
         return try Self.decode(SearchResponse.self, from: data).results
     }
 
-    /// GET /api/usage → UsageReport.
+    /// GET /api/usage → UsageReport. `.interactive` because the server
+    /// fans out to LLM providers to aggregate token counts.
     public func fetchUsage() async throws -> UsageReport {
         let url = baseURL.appendingPathComponent("api/usage")
-        let (data, resp) = try await session.data(from: url)
-        try Self.validate(resp, data: data)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.interactive.seconds
+        let (data, _) = try await send(request, timeout: .interactive)
         return try Self.decode(UsageReport.self, from: data)
     }
 
@@ -382,7 +415,8 @@ public final class APIClient: Sendable {
     ///
     /// When no LLM provider is configured the server answers 503; that surfaces
     /// as `APIError.badStatus(code: 503, …)` and the view renders the muted
-    /// "AI 未配置" hint rather than a red error.
+    /// "AI 未配置" hint rather than a red error. `.interactive` because the
+    /// server blocks on LLM inference.
     /// - Parameter language: sent as `Accept-Language`, which is how the AI
     ///   summary follows the UI language. nil omits the header and lets the
     ///   server use its configured default.
@@ -398,17 +432,17 @@ public final class APIClient: Sendable {
         if let language, !language.isEmpty {
             request.setValue(language, forHTTPHeaderField: "Accept-Language")
         }
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        request.timeoutInterval = APITimeout.interactive.seconds
+        let (data, _) = try await send(request, timeout: .interactive)
         return try Self.decode(MessageSummary.self, from: data)
     }
 
-    private func post(path: [String], query: [URLQueryItem]) async throws {
+    private func post(path: [String], query: [URLQueryItem], timeout: APITimeout = .fast) async throws {
         let url = try makeURL(path: path, query: query)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        let (data, resp) = try await session.data(for: request)
-        try Self.validate(resp, data: data)
+        request.timeoutInterval = timeout.seconds
+        _ = try await send(request, timeout: timeout)
     }
 
     /// Builds a URL where every supplied path component is percent-encoded.
@@ -456,5 +490,41 @@ public final class APIClient: Sendable {
         let raw = String(decoding: data.prefix(200), as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return raw.isEmpty ? "(empty body)" : raw
+    }
+
+    // MARK: - Per-request timeout + auto-retry
+
+    /// `send` is the *only* place that both issues the request and
+    /// validates the HTTP status, so the 5xx path can be observed by
+    /// `shouldAutoRetry`. Validating in callers would leave 5xx invisible
+    /// to the retry layer. Callers therefore receive the validated
+    /// (Data, URLResponse) and skip their own `validate(...)` call.
+    private func send(_ request: URLRequest, timeout: APITimeout) async throws -> (Data, URLResponse) {
+        let attempt: () async throws -> (Data, URLResponse) = {
+            let (data, resp) = try await self.session.data(for: request)
+            try Self.validate(resp, data: data)
+            return (data, resp)
+        }
+        do {
+            return try await attempt()
+        } catch {
+            guard timeout == .fast, Self.shouldAutoRetry(error) else { throw error }
+            return try await attempt()
+        }
+    }
+
+    private static func shouldAutoRetry(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            return [
+                .timedOut, .networkConnectionLost,
+                .notConnectedToInternet, .dnsLookupFailed,
+            ].contains(urlError.code)
+        }
+        if let apiError = error as? APIError,
+           case .badStatus(let code, _) = apiError,
+           (500...599).contains(code) {
+            return true
+        }
+        return false
     }
 }

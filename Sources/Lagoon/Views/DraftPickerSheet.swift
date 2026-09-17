@@ -30,24 +30,33 @@ struct DraftPickerSheet: View {
                 Label(l10n.draftVariants, systemImage: "text.bubble").font(.headline)
                 Spacer()
                 Button { dismiss() } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .padding(4)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(l10n.dismiss)
             }
-            Picker(l10n.pickOne, selection: $selected) {
-                ForEach(Array(draft.variants.enumerated()), id: \.offset) { index, _ in
-                    Text("\(l10n.variant) \(index + 1)").tag(index)
+            if !draft.variants.isEmpty {
+                Picker(l10n.pickOne, selection: $selected) {
+                    ForEach(Array(draft.variants.enumerated()), id: \.offset) { index, _ in
+                        Text("\(l10n.variant) \(index + 1)").tag(index)
+                    }
                 }
+                .pickerStyle(.segmented)
             }
-            .pickerStyle(.segmented)
-            Text(draft.variants.indices.contains(selected) ? draft.variants[selected] : "")
-                .font(.body)
-                .textSelection(.enabled)
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+            ScrollView {
+                Text(draft.variants.indices.contains(selected) ? draft.variants[selected] : "")
+                    .font(.body)
+                    .textSelection(.enabled)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+            }
+            .frame(minHeight: 120, maxHeight: 240)
             if provider == .gmail {
-                Toggle(l10n.chooseAndSendToGmail, isOn: $pushToGmail)
+                Toggle(l10n.pushToGmailDrafts, isOn: $pushToGmail)
                     .toggleStyle(.switch)
             }
             HStack {
@@ -57,17 +66,23 @@ struct DraftPickerSheet: View {
                         onPick(selected, false)
                         dismiss()
                     }
+                    .lineLimit(1)
+                    .disabled(draft.variants.isEmpty)
                     Button(l10n.chooseAndSendToGmail) {
                         onPick(selected, true)
                         dismiss()
                     }
+                    .lineLimit(1)
                     .keyboardShortcut(.defaultAction)
+                    .disabled(draft.variants.isEmpty)
                 } else {
                     Button(l10n.chooseOnly) {
                         onPick(selected, false)
                         dismiss()
                     }
+                    .lineLimit(1)
                     .keyboardShortcut(.defaultAction)
+                    .disabled(draft.variants.isEmpty)
                 }
             }
         }

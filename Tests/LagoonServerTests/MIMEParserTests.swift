@@ -94,14 +94,14 @@ final class MIMEParserTests: XCTestCase {
         XCTAssertEqual(MIMEParser.plainText(from: Data("Subject: hi\r\nFrom: a@b".utf8)), "")
 
         // Unterminated boundary: the first part is still recoverable.
-        let unterminated = Data(
-            ("Content-Type: multipart/mixed; boundary=\"b\"\r\n"
-                + "\r\n"
-                + "--b\r\n"
-                + "Content-Type: text/plain; charset=UTF-8\r\n"
-                + "\r\n"
-                + "部分正文").utf8
-        )
+        // Split from the literal: the concatenation alone blows the type checker.
+        let unterminatedRaw = "Content-Type: multipart/mixed; boundary=\"b\"\r\n"
+            + "\r\n"
+            + "--b\r\n"
+            + "Content-Type: text/plain; charset=UTF-8\r\n"
+            + "\r\n"
+            + "部分正文"
+        let unterminated = Data(unterminatedRaw.utf8)
         XCTAssertTrue(MIMEParser.plainText(from: unterminated).contains("部分正文"))
 
         XCTAssertEqual(MIMEParser.plainText(from: Data([0xFF, 0xFE, 0x00, 0x01])), "")

@@ -12,7 +12,7 @@ struct BriefingFeedView: View {
     @EnvironmentObject private var directory: DirectoryStore
     @State private var items: [BriefingItem] = []
     @State private var isLoading = false
-    @State private var errorMessage: String?
+    @State private var errorBanner: ErrorBanner?
     @State private var collapsedGroups: Set<BriefingGroup> = Set(BriefingGroup.allCases.filter(\.collapsedByDefault))
     @State private var path: [String] = []
     @State private var scrollProxy: ScrollViewProxy?
@@ -36,7 +36,15 @@ struct BriefingFeedView: View {
             ScrollViewReader { proxy in
                 VStack(alignment: .leading, spacing: 0) {
                     headerBar
-                    if let errorMessage { noticeBanner(errorMessage) }
+                    // Only render the inline banner when the feed itself is
+                    // already on screen: if `items` is empty the `errorState`
+                    // (ContentUnavailableView) is already showing, and RootView
+                    // covers sync-health concerns. Without this guard the
+                    // briefing page would stack a banner on top of the
+                    // empty-state copy.
+                    if let errorBanner, !items.isEmpty {
+                        NoticeBannerView(banner: errorBanner) { self.errorBanner = nil }
+                    }
                     content
                 }
                 .onAppear { scrollProxy = proxy }
@@ -48,7 +56,6 @@ struct BriefingFeedView: View {
                 groupJumpShortcuts
                 keyboardNavigationShortcuts
             }
-            .safeAreaInset(edge: .bottom) { UndoToast(controller: undo) }
         }
         .frame(minWidth: 720, minHeight: 480)
         .task {
@@ -84,17 +91,27 @@ struct BriefingFeedView: View {
     private var headerBar: some View {
         HStack(spacing: 8) {
             Text(l10n.briefing).font(.headline)
-            if isLoading { ProgressView().controlSize(.small) }
             Spacer()
             Button { onShowAllMessages() } label: {
                 Label(l10n.allMessages, systemImage: "list.bullet")
             }
             .keyboardShortcut("0", modifiers: .command)
             .help(l10n.showRawListHelp)
-            Button(l10n.refresh) { Task { await refresh() } }
-                .disabled(isLoading)
-                .keyboardShortcut("r", modifiers: .command)
-                .help(l10n.shortcutRefresh)
+            Button {
+                Task { await refresh() }
+            } label: {
+                if isLoading {
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.small)
+                        Text(l10n.refresh)
+                    }
+                } else {
+                    Label(l10n.refresh, systemImage: "arrow.clockwise")
+                }
+            }
+            .disabled(isLoading)
+            .keyboardShortcut("r", modifiers: .command)
+            .help(l10n.shortcutRefresh)
         }
         .padding()
     }
@@ -105,7 +122,7 @@ struct BriefingFeedView: View {
     private var content: some View {
         if items.isEmpty {
             if isLoading { ProgressView(l10n.loadingBriefing).frame(maxWidth: .infinity, maxHeight: .infinity) }
-            else if errorMessage != nil { errorState }
+            else if errorBanner != nil { errorState }
             else { emptyState }
         } else {
             feedList
@@ -136,6 +153,20 @@ struct BriefingFeedView: View {
                                     }
                                     .tint(.yellow)
                                 }
+                                // The row's ForEach id is a UUID but the list
+                                // selection is `String?`; tag with the remoteId
+                                // so highlight / j-k / Delete line up.
+                                .tag(item.message.remoteId)
+                                .id(item.message.remoteId)
+                                // Mouse users have no swipe gesture; expose
+                                // the same two verbs via right-click.
+                                .contextMenu {
+                                    Button(l10n.archived) { Task { await archiveAndUndo(item) } }
+                                        .disabled(!canArchive)
+                                    Button(item.group == .pinned ? l10n.unpin : l10n.pin) {
+                                        togglePin(item: item)
+                                    }
+                                }
                             }
                         }
                     } header: {
@@ -159,13 +190,14 @@ struct BriefingFeedView: View {
                 Text("\(group.emoji) \(l10n.groupTitle(group))").font(.headline)
                 Spacer()
                 Text("\(count)").font(.caption).monospacedDigit().foregroundStyle(.secondary)
-            }.contentShape(Rectangle())
-        }.buttonStyle(.plain)
-
-        .help(collapsedGroups.contains(group) ? l10n.expand : l10n.collapse)
-
+            }
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .help(collapsedGroups.contains(group)
+            ? l10n.expandGroup(l10n.groupTitle(group))
+            : l10n.collapseGroup(l10n.groupTitle(group)))
         .id(group)
-
     }
 
 
@@ -192,41 +224,13 @@ struct BriefingFeedView: View {
 
 
     private var errorState: some View {
-
         ContentUnavailableView {
-
             Label(l10n.briefingUnavailable, systemImage: "exclamationmark.triangle")
-
         } description: {
-
-            Text(errorMessage ?? l10n.unknownError)
-
+            Text(errorBanner?.title ?? l10n.unknownError)
         } actions: {
-
             Button(l10n.retry) { Task { await refresh() } }
-
         }
-
-    }
-
-
-
-    private func noticeBanner(_ message: String) -> some View {
-
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-
-            Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
-
-            Text(message).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
-
-            Spacer()
-
-        }.padding(.horizontal, 10).padding(.vertical, 8)
-
-        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
-
-        .padding(.horizontal).padding(.bottom, 8)
-
     }
 
 
@@ -281,7 +285,7 @@ struct BriefingFeedView: View {
 
             }
 
-        }.frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
+        }.frame(width: 0, height: 0).opacity(0).focusable(false).accessibilityHidden(true)
 
     }
 
@@ -298,6 +302,7 @@ struct BriefingFeedView: View {
         }
         .frame(width: 0, height: 0)
         .opacity(0)
+        .focusable(false)
         .accessibilityHidden(true)
     }
 
@@ -455,10 +460,12 @@ struct BriefingFeedView: View {
                 await refresh()
 
             } catch {
-
-                errorMessage = (toPinned ? l10n.pinFailed : l10n.unpinFailed)
-                    + error.lagoonUIMessage
-
+                errorBanner = ErrorBanner(
+                    severity: .error,
+                    title: toPinned ? l10n.pinFailed : l10n.unpinFailed,
+                    actionLabel: l10n.retry,
+                    action: { [self] in await self.togglePin(item: item) }
+                )
             }
 
         }
@@ -478,11 +485,11 @@ struct BriefingFeedView: View {
     private func archiveAndUndo(byId remoteId: String) async {
 
         guard canArchive else {
-
-            errorMessage = l10n.archiveUnavailable
-
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.archiveUnavailable
+            )
             return
-
         }
 
         guard let accountId = accounts.accountId else { return }
@@ -500,15 +507,19 @@ struct BriefingFeedView: View {
             ))
 
         } catch APIError.badStatus(let code, _) where code == 409 {
-
-            errorMessage = l10n.archiveUnavailable
-
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.archiveUnavailable
+            )
         } catch {
-
-            errorMessage = l10n.archiveFailed + error.lagoonUIMessage
-
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.archiveFailed,
+                detail: error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.archiveAndUndo(byId: remoteId) }
+            )
         }
-
     }
 
 
@@ -526,13 +537,28 @@ struct BriefingFeedView: View {
             let response = try await api.fetchBriefing(accountId: accountId)
 
             items = response.items
-
-            errorMessage = nil
-
+            errorBanner = nil
         } catch {
-
-            errorMessage = l10n.briefingFailed + error.lagoonUIMessage
-
+            // Spec §6.2: a `.timedOut` from the briefing endpoint (LLM
+            // classification can be slow) gets its own copy; everything
+            // else falls into the generic retry banner.
+            if let urlError = error as? URLError, urlError.code == .timedOut {
+                errorBanner = ErrorBanner(
+                    severity: .warning,
+                    title: l10n.briefingTimeoutTitle,
+                    detail: l10n.briefingTimeoutDetail,
+                    actionLabel: l10n.retry,
+                    action: { [self] in await self.refresh() }
+                )
+            } else {
+                errorBanner = ErrorBanner(
+                    severity: .error,
+                    title: l10n.briefingFailed,
+                    detail: error.lagoonUIMessage,
+                    actionLabel: l10n.retry,
+                    action: { [self] in await self.refresh() }
+                )
+            }
         }
 
         isLoading = false
@@ -565,7 +591,7 @@ private struct BriefingRow: View {
 
                 Text(item.message.receivedAt.formatted(date: .abbreviated, time: .shortened))
 
-                    .font(.caption2).foregroundStyle(.tertiary)
+                    .font(.caption2).foregroundStyle(.secondary)
 
             }
 
@@ -575,11 +601,11 @@ private struct BriefingRow: View {
 
             if let reason = l10n.reasonText(item.reasonCode) {
 
-                Text(reason).font(.caption2).foregroundStyle(.tertiary).lineLimit(2)
+                Text(reason).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
 
             } else if let snippet = item.message.snippet {
 
-                Text(snippet).font(.caption2).foregroundStyle(.tertiary).lineLimit(2)
+                Text(snippet).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
 
             }
 

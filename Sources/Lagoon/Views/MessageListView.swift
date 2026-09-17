@@ -7,7 +7,7 @@ struct MessageListView: View {
     @EnvironmentObject var accounts: AccountStore
     @State private var messages: [MessageHeader] = []
     @State private var isLoading = false
-    @State private var errorMessage: String?
+    @State private var errorBanner: ErrorBanner?
     @State private var path: [String] = []
     private let api = APIClient()
 
@@ -31,7 +31,7 @@ struct MessageListView: View {
                     Button {
                         onShowBriefing()
                     } label: {
-                        Label(l10n.briefing, systemImage: "rectangle.grid.1x2")
+                        Label(l10n.briefing, systemImage: "rectangle.grid.2x2")
                     }
                     .keyboardShortcut("0", modifiers: .command)
                     .help(l10n.backToBriefingHelp)
@@ -39,21 +39,12 @@ struct MessageListView: View {
                         Task { await refresh() }
                     }
                     .disabled(isLoading)
+                    .keyboardShortcut("r", modifiers: .command)
+                    .help(l10n.shortcutRefresh)
                 }
                 .padding()
 
-                if let errorMessage {
-                    Text(errorMessage)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .padding(.horizontal)
-                }
-
-                if messages.isEmpty && !isLoading {
-                    Text(l10n.noMessagesYet)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
+                if !messages.isEmpty {
                     List(messages) { m in
                         NavigationLink(value: m.remoteId) {
                             VStack(alignment: .leading, spacing: 2) {
@@ -67,25 +58,30 @@ struct MessageListView: View {
                                         .foregroundStyle(.secondary)
                                     Text(m.receivedAt.formatted(date: .abbreviated, time: .shortened))
                                         .font(.caption2)
-                                        .foregroundStyle(.tertiary)
+                                        .foregroundStyle(.secondary)
                                 }
                                 if let snippet = m.snippet {
                                     Text(snippet)
                                         .font(.caption2)
                                         .lineLimit(2)
-                                        .foregroundStyle(.tertiary)
+                                        .foregroundStyle(.secondary)
                                 }
                             }
                             .padding(.vertical, 2)
                         }
                     }
                     .listStyle(.inset)
+                } else if !isLoading && errorBanner == nil {
+                    Text(l10n.noMessagesYet)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
             .navigationDestination(for: String.self) { remoteId in
                 destination(for: remoteId)
             }
         }
+        .noticeBanner($errorBanner)
         .frame(minWidth: 720, minHeight: 480)
         // Initial load, then track the server's 30s poller while visible.
         // SwiftUI cancels the task when the view disappears.
@@ -163,13 +159,18 @@ struct MessageListView: View {
         guard let id = accounts.accountId else { return }
         guard !isLoading else { return }
         isLoading = true
-        errorMessage = nil
+        errorBanner = nil
         do {
             let resp = try await api.fetchMessages(accountId: id)
             messages = resp.messages
             accounts.setLastSync(resp)
         } catch {
-            errorMessage = l10n.syncFailed + error.localizedDescription + " " + l10n.isServerRunning
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.syncFailed + error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.refresh() }
+            )
         }
         isLoading = false
     }

@@ -26,12 +26,11 @@ struct MessageDetailView: View {
 
     @State private var isRead: Bool
     @State private var didMarkRead = false
-    @State private var readError: String?
-    @State private var actionError: String?
+    @State private var actionBanner: ErrorBanner?
 
     @State private var isPinned: Bool
     @State private var isPinBusy = false
-    @State private var pinError: String?
+    @State private var pinBanner: ErrorBanner?
 
     @State private var summaryState: SummaryState = .idle
 
@@ -97,9 +96,6 @@ struct MessageDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 metadata
-                if let readError { inlineNotice(readError, systemImage: "envelope.badge") }
-                if let pinError { inlineNotice(pinError, systemImage: "pin.slash") }
-                if let actionError { inlineNotice(actionError, systemImage: "exclamationmark.triangle") }
                 if let sentNotice {
                     inlineNotice(sentNotice, systemImage: "paperplane.fill", color: .green)
                 }
@@ -114,6 +110,8 @@ struct MessageDetailView: View {
         }
         .navigationTitle(subjectText)
         .toolbar { toolbarContent }
+        .noticeBanner($actionBanner)
+        .noticeBanner($pinBanner)
         .task {
             await loadBody()
             if bodyError == nil {
@@ -133,7 +131,7 @@ struct MessageDetailView: View {
             ComposerSheet(
                 remoteId: remoteId,
                 accountId: accountId,
-                to: header?.fromAddress ?? "",
+                to: messageBody?.fromAddress ?? header?.fromAddress ?? "",
                 subject: subjectText,
                 initialBody: selectedDraftBody,
                 quotedText: messageBody?.text ?? ""
@@ -148,7 +146,7 @@ struct MessageDetailView: View {
             ) { group in
                 Button(l10n.groupTitle(group)) { overrideClassification(to: group) }
             }
-            Button(l10n.retry, role: .cancel) {}
+            Button(l10n.cancel, role: .cancel) {}
         }
     }
 
@@ -161,7 +159,14 @@ struct MessageDetailView: View {
             .help(l10n.replyHelp)
 
             Button { Task { await togglePin() } } label: {
-                Label(isPinned ? l10n.unpin : l10n.pin, systemImage: isPinned ? "pin.slash" : "pin")
+                if isPinBusy {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(l10n.pinning)
+                    }
+                } else {
+                    Label(isPinned ? l10n.unpin : l10n.pin, systemImage: isPinned ? "pin.slash" : "pin")
+                }
             }
             .disabled(isPinBusy)
             .help(isPinned ? l10n.unpinHelp : l10n.pinHelp)
@@ -175,8 +180,10 @@ struct MessageDetailView: View {
                         ProgressView().controlSize(.small)
                         Text(l10n.summarizing)
                     }
+                    .frame(minWidth: 110, alignment: .leading)
                 } else {
                     Label(l10n.summarize, systemImage: "sparkles")
+                        .frame(minWidth: 110, alignment: .leading)
                 }
             }
             .disabled(summaryState == .loading)
@@ -184,7 +191,14 @@ struct MessageDetailView: View {
             .keyboardShortcut("d", modifiers: .command)
 
             Button { Task { await generateDrafts() } } label: {
-                Label(l10n.draftVariants, systemImage: "text.bubble")
+                if draftState == .loading {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(l10n.generatingDrafts)
+                    }
+                } else {
+                    Label(l10n.draftVariants, systemImage: "text.bubble")
+                }
             }
             .disabled(draftState == .loading)
             .keyboardShortcut("d", modifiers: [.command, .shift])
@@ -238,7 +252,7 @@ struct MessageDetailView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             if let snippet = header?.snippet ?? messageBody?.text {
-                Text(snippet.prefix(140)).font(.caption).foregroundStyle(.tertiary)
+                Text(snippet.prefix(140)).font(.caption).foregroundStyle(.secondary)
             }
         }
     }
@@ -374,10 +388,18 @@ struct MessageDetailView: View {
         guard !isRead else { return }
         isRead = true
         onReadStateChange(remoteId, true)
-        do { try await api.markRead(remoteId: remoteId, accountId: accountId) } catch {
+        do {
+            try await api.markRead(remoteId: remoteId, accountId: accountId)
+        } catch {
             isRead = false
             onReadStateChange(remoteId, false)
-            readError = l10n.markReadFailed + error.lagoonUIMessage
+            actionBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.markReadFailedTitle,
+                detail: l10n.markReadFailedDetail,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.markReadOnce(force: true) }
+            )
         }
     }
 
@@ -391,7 +413,12 @@ struct MessageDetailView: View {
         } catch {
             isPinned = !target
             onPinnedChanged(!target)
-            pinError = (target ? l10n.pinFailed : l10n.unpinFailed) + error.lagoonUIMessage
+            pinBanner = ErrorBanner(
+                severity: .error,
+                title: target ? l10n.pinFailed : l10n.unpinFailed,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.togglePin() }
+            )
         }
         isPinBusy = false
     }
@@ -447,7 +474,13 @@ struct MessageDetailView: View {
                 systemImage: "tray.and.arrow.down"
             ))
         } catch {
-            actionError = l10n.archiveFailed + error.lagoonUIMessage
+            actionBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.archiveFailedTitle,
+                detail: l10n.archiveFailedDetail,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.archiveAndAdvance() }
+            )
         }
     }
 
@@ -463,14 +496,47 @@ struct MessageDetailView: View {
                 systemImage: "minus.circle"
             ))
         } catch {
-            if (error as? APIError)?.serverErrorCode == "unsubscribe-manual-required" {
-                actionError = l10n.unsubscribeManualRequired
-            } else if (error as? APIError)?.serverErrorCode == "unsubscribe-unavailable" {
-                actionError = l10n.unsubscribeUnavailable
+            if let code = (error as? APIError)?.serverErrorCode {
+                if code == "unsubscribe-manual-required" {
+                    actionBanner = ErrorBanner(
+                        severity: .error,
+                        title: l10n.unsubscribeFailedTitle,
+                        detail: l10n.unsubscribeManualRequired,
+                        actionLabel: l10n.openOriginal,
+                        action: { [self] in self.openOriginalMail() }
+                    )
+                } else if code == "unsubscribe-unavailable" {
+                    actionBanner = ErrorBanner(
+                        severity: .error,
+                        title: l10n.unsubscribeFailedTitle,
+                        detail: l10n.unsubscribeUnavailable
+                    )
+                } else {
+                    actionBanner = ErrorBanner(
+                        severity: .error,
+                        title: l10n.unsubscribeFailedTitle,
+                        detail: l10n.unsubscribeFailedDetail,
+                        actionLabel: l10n.retry,
+                        action: { [self] in await self.unsubscribe() }
+                    )
+                }
             } else {
-                actionError = l10n.unsubscribeFailed + error.lagoonUIMessage
+                actionBanner = ErrorBanner(
+                    severity: .error,
+                    title: l10n.unsubscribeFailedTitle,
+                    detail: l10n.unsubscribeFailedDetail,
+                    actionLabel: l10n.retry,
+                    action: { [self] in await self.unsubscribe() }
+                )
             }
         }
+    }
+
+    private func openOriginalMail() {
+        // No-op stub: the original-message URL would come from the message
+        // header. Wiring this requires a `MessageHeader.messageWebLink`
+        // the server doesn't yet emit. Spec §6.2 keeps the affordance so
+        // the user can find the path; the action itself is a follow-up.
     }
 
     private func overrideClassification(to group: BriefingGroup) {
@@ -481,11 +547,17 @@ struct MessageDetailView: View {
                     from: initialGroup,
                     to: group
                 )
-                actionError = nil
+                actionBanner = nil
                 showTransientNotice(l10n.overrideApplied)
                 NotificationCenter.default.post(name: .lagoonDidChangeData, object: nil)
             } catch {
-                actionError = l10n.overrideFailed + error.lagoonUIMessage
+                actionBanner = ErrorBanner(
+                    severity: .error,
+                    title: l10n.overrideGroupFailedTitle,
+                    detail: l10n.overrideGroupFailedDetail,
+                    actionLabel: l10n.retry,
+                    action: { [self] in await self.overrideClassification(to: group) }
+                )
             }
         }
     }
@@ -493,7 +565,7 @@ struct MessageDetailView: View {
     /// Announce the reply and clear itself: sending is final, so there is
     /// nothing to undo — only to confirm.
     private func showSentNotice() {
-        showTransientNotice(l10n.sentTo(header?.fromAddress ?? ""))
+        showTransientNotice(l10n.sentTo(messageBody?.fromAddress ?? header?.fromAddress ?? ""))
     }
 
     private func showTransientNotice(_ message: String) {

@@ -25,5 +25,9 @@ struct LagoonApp: App {
             }
         }
         .windowResizability(.contentMinSize)
+        // Wide enough that the full toolbar + segmented control fit; without
+        // this macOS opens a narrow window and pushes trailing items into the
+        // ">>" overflow menu.
+        .defaultSize(width: 1080, height: 760)
     }
 }
