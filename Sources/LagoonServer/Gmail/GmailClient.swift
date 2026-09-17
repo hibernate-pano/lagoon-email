@@ -15,6 +15,7 @@ public struct RawGmailMessage: Codable, Sendable {
         public let headers: [Header]?
         /// MIME type of this part ("text/plain", "text/html", "multipart/…").
         public let mimeType: String?
+        public let filename: String?
         public let body: Body?
         /// Nested parts of a `multipart/*` payload.
         public let parts: [Payload]?
@@ -25,6 +26,9 @@ public struct RawGmailMessage: Codable, Sendable {
         /// carry an `attachmentId`.
         public let data: String?
         public let size: Int?
+        /// Present when this part is an attachment; bytes are fetched via
+        /// `users.messages.attachments.get`.
+        public let attachmentId: String?
     }
 
     public struct Header: Codable, Sendable {
@@ -41,6 +45,22 @@ public struct RawGmailList: Codable, Sendable {
         public let id: String
         public let threadId: String
     }
+}
+
+/// Response of `users.messages.attachments.get`. `data` is base64url-encoded
+/// (Gmail's URL-safe variant); decode with `GmailBodyExtractor.base64URLDecode`.
+public struct RawGmailAttachment: Codable, Sendable {
+    public let attachmentId: String?
+    public let size: Int?
+    public let data: String
+}
+
+/// Response of `users.messages.get?format=raw`. `raw` is base64url-encoded
+/// RFC 5322 source.
+public struct RawGmailRawMessage: Codable, Sendable {
+    public let id: String?
+    public let threadId: String?
+    public let raw: String
 }
 
 public enum GmailClientError: Error { case unauthorized, http(Int, String) }
@@ -123,6 +143,41 @@ public final class GmailClient: Sendable {
         let (data, resp) = try await session.outboundData(for: req)
         try Self.assertOK(resp, data)
         return try JSONDecoder().decode(RawGmailMessage.self, from: data)
+    }
+
+    /// `users.messages.attachments.get` — base64url-encoded bytes for one
+    /// attachment (Gmail splits attachments into a separate API call when
+    /// they are too large to fit in the message payload).
+    public func getAttachment(
+        accessToken: String,
+        messageId: String,
+        attachmentId: String
+    ) async throws -> RawGmailAttachment {
+        var c = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")!
+        c.path += "/\(Self.percentEncodePath(messageId))/attachments/\(Self.percentEncodePath(attachmentId))"
+        var req = URLRequest(url: c.url!)
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        try OutboundGuard.validate(req.url!)
+        let (data, resp) = try await session.outboundData(for: req)
+        try Self.assertOK(resp, data)
+        return try JSONDecoder().decode(RawGmailAttachment.self, from: data)
+    }
+
+    /// `users.messages.get?format=raw` — base64url-encoded RFC 5322 source
+    /// for the whole message. Used by the `.eml` export route.
+    public func getMessageRaw(
+        accessToken: String,
+        remoteId: String
+    ) async throws -> RawGmailRawMessage {
+        var c = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")!
+        c.path += "/\(Self.percentEncodePath(remoteId))"
+        c.queryItems = [.init(name: "format", value: "raw")]
+        var req = URLRequest(url: c.url!)
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        try OutboundGuard.validate(req.url!)
+        let (data, resp) = try await session.outboundData(for: req)
+        try Self.assertOK(resp, data)
+        return try JSONDecoder().decode(RawGmailRawMessage.self, from: data)
     }
 
     /// `users.messages.modify` — add/remove labels. Requires `gmail.modify`

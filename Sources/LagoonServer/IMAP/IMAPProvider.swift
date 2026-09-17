@@ -294,12 +294,56 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
 
     // MARK: - Body & headers
 
-    public func fetchBody(remoteId: String) async throws -> String {
+    public func fetchBody(remoteId: String) async throws -> FetchedBody {
+        let raw = try await withClient { client in
+            try await selectInbox(client: client, force: false)
+            let uid = try await resolveUID(remoteId, client: client)
+            return try await client.fetchFullBody(uid: uid)
+        }
+        let parsed = MIMEParser.parse(message: raw)
+        return FetchedBody(
+            text: parsed.text,
+            html: parsed.html,
+            attachments: parsed.attachments.map {
+                FetchedAttachment(
+                    id: $0.id,
+                    filename: $0.filename,
+                    mimeType: $0.mimeType,
+                    size: $0.size,
+                    contentId: $0.contentId,
+                    disposition: $0.disposition,
+                    data: $0.data
+                )
+            },
+            hasMore: parsed.hasMore
+        )
+    }
+
+    public func fetchAttachment(remoteId: String, attachmentId: String) async throws -> FetchedAttachmentBytes {
+        let raw = try await withClient { client in
+            try await selectInbox(client: client, force: false)
+            let uid = try await resolveUID(remoteId, client: client)
+            return try await client.fetchFullBody(uid: uid)
+        }
+        let parsed = MIMEParser.parse(message: raw)
+        guard let att = parsed.attachments.first(where: { $0.id == attachmentId }) else {
+            throw AttachmentError.notFound
+        }
+        guard att.data.count <= AttachmentLimit.maxBytes else {
+            throw AttachmentError.tooLarge
+        }
+        return FetchedAttachmentBytes(
+            mimeType: att.mimeType,
+            filename: att.filename,
+            data: att.data
+        )
+    }
+
+    public func fetchRawMessage(remoteId: String) async throws -> Data {
         return try await withClient { client in
             try await selectInbox(client: client, force: false)
             let uid = try await resolveUID(remoteId, client: client)
-            let raw = try await client.fetchFullBody(uid: uid)
-            return MIMEParser.plainText(from: raw)
+            return try await client.fetchFullBody(uid: uid)
         }
     }
 

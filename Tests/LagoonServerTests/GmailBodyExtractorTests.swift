@@ -13,12 +13,14 @@ final class GmailBodyExtractorTests: XCTestCase {
         _ data: String?,
         parts: [RawGmailMessage.Payload]? = nil,
         bodyPresent: Bool = true,
-        headers: [RawGmailMessage.Header]? = nil
+        headers: [RawGmailMessage.Header]? = nil,
+        filename: String? = nil
     ) -> RawGmailMessage.Payload {
         RawGmailMessage.Payload(
             headers: headers,
             mimeType: mimeType,
-            body: bodyPresent ? RawGmailMessage.Body(data: data, size: nil) : nil,
+            filename: filename,
+            body: bodyPresent ? RawGmailMessage.Body(data: data, size: nil, attachmentId: nil) : nil,
             parts: parts
         )
     }

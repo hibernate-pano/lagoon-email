@@ -78,9 +78,12 @@ public struct BriefingResponse: Codable, Equatable, Sendable {
 
 /// Response payload of GET /api/messages/{remoteId}/body.
 ///
-/// `text` is plain text: the server prefers Gmail's `text/plain` part and falls
-/// back to stripping the `text/html` part. HTML rendering is deliberately not
-/// part of this slice.
+/// `text` is plain text: the server prefers `text/plain` and falls back to
+/// stripping `text/html`. `html` is the original HTML part when present, capped
+/// at 5 MB on the server; the client renders it via WKWebView and resolves
+/// `cid:` references against `attachments` whose `disposition == .inline`.
+/// `hasMore` is true when either `text` or `html` was truncated server-side
+/// (defaults to false on the wire for compat with v0.2.0 clients).
 public struct MessageBody: Codable, Equatable, Sendable {
     public let remoteId: String
     public let subject: String?
@@ -89,6 +92,9 @@ public struct MessageBody: Codable, Equatable, Sendable {
     public let toAddress: String?
     public let receivedAt: Date
     public let text: String
+    public let html: String?
+    public let attachments: [Attachment]
+    public let hasMore: Bool
 
     public init(
         remoteId: String,
@@ -97,7 +103,10 @@ public struct MessageBody: Codable, Equatable, Sendable {
         fromName: String?,
         toAddress: String?,
         receivedAt: Date,
-        text: String
+        text: String,
+        html: String? = nil,
+        attachments: [Attachment] = [],
+        hasMore: Bool = false
     ) {
         self.remoteId = remoteId
         self.subject = subject
@@ -106,6 +115,70 @@ public struct MessageBody: Codable, Equatable, Sendable {
         self.toAddress = toAddress
         self.receivedAt = receivedAt
         self.text = text
+        self.html = html
+        self.attachments = attachments
+        self.hasMore = hasMore
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        remoteId = try c.decode(String.self, forKey: .remoteId)
+        subject = try c.decodeIfPresent(String.self, forKey: .subject)
+        fromAddress = try c.decode(String.self, forKey: .fromAddress)
+        fromName = try c.decodeIfPresent(String.self, forKey: .fromName)
+        toAddress = try c.decodeIfPresent(String.self, forKey: .toAddress)
+        receivedAt = try c.decode(Date.self, forKey: .receivedAt)
+        text = try c.decode(String.self, forKey: .text)
+        // v0.2.0 clients do not know about these fields. Decode as missing
+        // → no attachments, no HTML, no truncation flag. The forward path
+        // (v0.2.0 server, M1.6 client) sees the same defaults and renders
+        // the plain-text path, which is correct.
+        html = try c.decodeIfPresent(String.self, forKey: .html)
+        attachments = try c.decodeIfPresent([Attachment].self, forKey: .attachments) ?? []
+        hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? false
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case remoteId, subject, fromAddress, fromName, toAddress
+        case receivedAt, text, html, attachments, hasMore
+    }
+}
+
+/// One file attached to a message (M1.6 spec §1.1). `id` is the server's
+/// stable per-message identifier for the part — opaque to the client, used
+/// in `GET /api/messages/{remoteId}/attachments/{id}`. For IMAP this is the
+/// dotted part path; for Gmail it is `body.attachmentId`.
+public struct Attachment: Codable, Equatable, Sendable, Identifiable {
+    public let id: String
+    public let filename: String?
+    public let mimeType: String
+    public let size: Int
+    public let contentId: String?
+    public let disposition: Disposition
+
+    public enum Disposition: String, Codable, Sendable, Equatable {
+        /// User-visible download in the attachment list.
+        case attachment
+        /// Referenced by the HTML body via `cid:<contentId>`. Usually an
+        /// image; the client resolves these against the attachment list
+        /// when rendering.
+        case inline
+    }
+
+    public init(
+        id: String,
+        filename: String?,
+        mimeType: String,
+        size: Int,
+        contentId: String? = nil,
+        disposition: Disposition = .attachment
+    ) {
+        self.id = id
+        self.filename = filename
+        self.mimeType = mimeType
+        self.size = size
+        self.contentId = contentId
+        self.disposition = disposition
     }
 }
 

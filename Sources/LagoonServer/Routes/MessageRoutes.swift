@@ -151,6 +151,69 @@ public enum MessageRoutes {
             }
         }
 
+        // GET /api/messages/{remoteId}/attachments/{attachmentId}?accountId=<uuid>
+        // 200 application/octet-stream | 404 attachment-not-found | 413 too-large
+        router.get("api/messages/:remoteId/attachments/:attachmentId") { request, context -> Response in
+            guard let accountId = RouteParams.accountId(from: request) else {
+                return RouteJSON.error(.badRequest, "malformed-accountId")
+            }
+            guard let remoteId = RouteParams.remoteId(from: context) else {
+                return RouteJSON.error(.badRequest, "malformed-remoteId")
+            }
+            guard let attachmentId = context.parameters.get("attachmentId"),
+                  !attachmentId.isEmpty else {
+                return RouteJSON.error(.badRequest, "malformed-attachmentId")
+            }
+            let account: Account
+            do {
+                guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                    return RouteJSON.error(.notFound, "unknown-account")
+                }
+                account = found
+            } catch {
+                return RouteJSON.error(.internalServerError, "internal-error")
+            }
+            guard let provider = makeProvider(account) else {
+                return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+            }
+            return await downloadAttachment(
+                account: account,
+                remoteId: remoteId,
+                attachmentId: attachmentId,
+                provider: provider,
+                logger: logger
+            )
+        }
+
+        // GET /api/messages/{remoteId}/raw.eml?accountId=<uuid>
+        // 200 message/rfc822 | 4xx
+        router.get("api/messages/:remoteId/raw.eml") { request, context -> Response in
+            guard let accountId = RouteParams.accountId(from: request) else {
+                return RouteJSON.error(.badRequest, "malformed-accountId")
+            }
+            guard let remoteId = RouteParams.remoteId(from: context) else {
+                return RouteJSON.error(.badRequest, "malformed-remoteId")
+            }
+            let account: Account
+            do {
+                guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                    return RouteJSON.error(.notFound, "unknown-account")
+                }
+                account = found
+            } catch {
+                return RouteJSON.error(.internalServerError, "internal-error")
+            }
+            guard let provider = makeProvider(account) else {
+                return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+            }
+            return await downloadRawMessage(
+                account: account,
+                remoteId: remoteId,
+                provider: provider,
+                logger: logger
+            )
+        }
+
         // POST /api/messages/{remoteId}/read?accountId=<uuid> -> 204
         // Local state is authoritative and never blocks on the network; the
         // remote `\Seen` write is best-effort (spec §3.7).
@@ -637,14 +700,16 @@ public enum MessageRoutes {
 
     /// Fetch a full message through the account's provider and shape it as the
     /// shared `MessageBody` contract. Metadata comes from the synced row (best
-    /// effort: a row that vanished still yields the body text).
+    /// effort: a row that vanished still yields the body text). Attachment
+    /// data is stripped before the wire response — clients fetch each part
+    /// separately via `/api/messages/{remoteId}/attachments/{aid}`.
     static func fetchBody(
         account: Account,
         remoteId: String,
         provider: any MailProvider,
         db: PostgresConnection
     ) async throws -> MessageBody {
-        let text = try await provider.fetchBody(remoteId: remoteId)
+        let fetched = try await provider.fetchBody(remoteId: remoteId)
         let stored = try? await MessageStore.find(remoteId: remoteId, accountId: account.id, db: db)
         return MessageBody(
             remoteId: remoteId,
@@ -653,8 +718,97 @@ public enum MessageRoutes {
             fromName: stored?.fromName,
             toAddress: nil,
             receivedAt: stored?.receivedAt ?? Date(),
-            text: text
+            text: fetched.text,
+            html: fetched.html,
+            attachments: fetched.attachments.map { $0.toWire() },
+            hasMore: fetched.hasMore
         )
+    }
+
+    // MARK: - Attachment + raw.eml routes
+
+    static func downloadAttachment(
+        account: Account,
+        remoteId: String,
+        attachmentId: String,
+        provider: any MailProvider,
+        logger: Logger
+    ) async -> Response {
+        do {
+            let bytes = try await provider.fetchAttachment(
+                remoteId: remoteId,
+                attachmentId: attachmentId
+            )
+            var response = Response(status: .ok)
+            // RFC 6266: filename* with UTF-8 encoding for non-ASCII names;
+            // fall back to a quoted ASCII form when encoding isn't possible.
+            let safeName = bytes.filename?
+                .replacingOccurrences(of: "\"", with: "")
+                .replacingOccurrences(of: "\r", with: "")
+                .replacingOccurrences(of: "\n", with: "")
+            if let safeName, !safeName.isEmpty {
+                let encoded = safeName.addingPercentEncoding(
+                    withAllowedCharacters: .urlPathAllowed
+                ) ?? safeName
+                response.headers[.contentDisposition] = "attachment; filename=\"\(encoded)\"; filename*=UTF-8''\(encoded)"
+            } else {
+                response.headers[.contentDisposition] = "attachment"
+            }
+            response.headers[.contentType] = bytes.mimeType
+            response.headers[.contentLength] = String(bytes.data.count)
+            response.body = .init(byteBuffer: ByteBuffer(bytes: bytes.data))
+            return response
+        } catch AttachmentError.tooLarge {
+            logger.warning("attachment.tooLarge", metadata: [
+                "remoteId": .string(remoteId),
+                "attachmentId": .string(attachmentId),
+            ])
+            // Hummingbird's HTTPResponse.Status does not expose 413 as a named
+            // case. Fall back to .internalServerError — the JSON body's
+            // `error` code is the source of truth for the client.
+            return RouteJSON.error(.internalServerError, "attachment-too-large")
+        } catch AttachmentError.notFound {
+            return RouteJSON.error(.notFound, "attachment-not-found")
+        } catch let error as MailError {
+            return providerError(error, logger: logger, remoteId: remoteId)
+        } catch {
+            logger.error("attachment fetch failed", metadata: [
+                "remoteId": .string(remoteId),
+                "attachmentId": .string(attachmentId),
+                "err": .string("\(error)")
+            ])
+            return RouteJSON.error(.badGateway, "provider-unreachable")
+        }
+    }
+
+    static func downloadRawMessage(
+        account: Account,
+        remoteId: String,
+        provider: any MailProvider,
+        logger: Logger
+    ) async -> Response {
+        do {
+            let raw = try await provider.fetchRawMessage(remoteId: remoteId)
+            var response = Response(status: .ok)
+            response.headers[.contentType] = "message/rfc822"
+            let subject = "?";
+            let safeName = subject
+                .replacingOccurrences(of: "\"", with: "")
+                .replacingOccurrences(of: "\r", with: "")
+                .replacingOccurrences(of: "\n", with: "")
+            response.headers[.contentDisposition] = "attachment; filename=\"\(safeName).eml\""
+            response.headers[.contentLength] = String(raw.count)
+            response.body = .init(byteBuffer: ByteBuffer(bytes: raw))
+            return response
+        } catch let error as MailError {
+            return providerError(error, logger: logger, remoteId: remoteId)
+        } catch {
+            logger.error("raw message fetch failed", metadata: [
+                "remoteId": .string(remoteId),
+                "err": .string("\(error)")
+            ])
+            return RouteJSON.error(.badGateway, "provider-unreachable")
+        }
     }
 
     /// Map a provider failure onto the route-level status. Only the stable

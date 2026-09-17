@@ -553,7 +553,7 @@ final class IMAPProviderTests: XCTestCase {
             await transport.enqueue(")")
             await transport.enqueue("A0005 OK FETCH completed")
 
-            let text = try await provider.fetchBody(remoteId: "7")
+            let text = try await provider.fetchBody(remoteId: "7").text
 
             XCTAssertEqual(text, "纯文本版本")
         }

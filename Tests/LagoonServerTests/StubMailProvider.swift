@@ -43,7 +43,17 @@ actor StubMailProvider: MailProvider {
         return try pulls.removeFirst().get()
     }
 
-    func fetchBody(remoteId: String) async throws -> String { body }
+    func fetchBody(remoteId: String) async throws -> FetchedBody {
+        FetchedBody(text: body, html: nil, attachments: [], hasMore: false)
+    }
+
+    func fetchAttachment(remoteId: String, attachmentId: String) async throws -> FetchedAttachmentBytes {
+        throw AttachmentError.notFound
+    }
+
+    func fetchRawMessage(remoteId: String) async throws -> Data {
+        Data(body.utf8)
+    }
 
     func fetchRawHeaderValues(remoteId: String) async throws -> [String: String] {
         ["list-unsubscribe": "<mailto:unsubscribe@example.com>"]

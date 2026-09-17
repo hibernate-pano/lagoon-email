@@ -186,11 +186,54 @@ public actor GmailProvider: MailProvider {
 
     // MARK: - Body & headers
 
-    public func fetchBody(remoteId: String) async throws -> String {
+    /// M1.6: returns plain text + html + attachment metadata. Attachment
+    /// `data` is empty for Gmail because attachments come from a separate
+    /// `attachments.get` call — `fetchAttachment(remoteId:attachmentId:)`
+    /// does that work and returns the bytes.
+    public func fetchBody(remoteId: String) async throws -> FetchedBody {
         let raw = try await perform { token in
             try await self.client.getMessageFull(accessToken: token, remoteId: remoteId)
         }
-        return GmailBodyExtractor.plainText(from: raw.payload)
+        return GmailBodyExtractor.fetchedBody(from: raw.payload)
+    }
+
+    /// Fetch one attachment's bytes by Gmail `body.attachmentId`. The
+    /// `metadata` arg is the matching `FetchedAttachment` from the body
+    /// response — we use it for mimeType and filename without re-walking
+    /// the message tree.
+    public func fetchAttachment(remoteId: String, attachmentId: String) async throws -> FetchedAttachmentBytes {
+        let raw = try await perform { token in
+            try await self.client.getAttachment(
+                accessToken: token, messageId: remoteId, attachmentId: attachmentId
+            )
+        }
+        guard let data = GmailBodyExtractor.base64URLDecode(raw.data) else {
+            throw MailError.protocolError("gmail attachment decode failed")
+        }
+        guard data.count <= AttachmentLimit.maxBytes else {
+            throw AttachmentError.tooLarge
+        }
+        // We need filename + mimeType for Content-Type / Content-Disposition.
+        // Re-fetch the message metadata to fish out the part; on a hot path
+        // this is wasteful, but the user's Gmail account is not high-volume
+        // and the next M1.6.x pass can cache.
+        let body = try await fetchBody(remoteId: remoteId)
+        guard let att = body.attachments.first(where: { $0.id == attachmentId }) else {
+            throw AttachmentError.notFound
+        }
+        return FetchedAttachmentBytes(mimeType: att.mimeType, filename: att.filename, data: data)
+    }
+
+    /// Raw RFC 5322 bytes. `format=raw` returns a base64url-encoded string
+    /// in the Gmail API; we decode and hand the raw bytes back.
+    public func fetchRawMessage(remoteId: String) async throws -> Data {
+        let raw = try await perform { token in
+            try await self.client.getMessageRaw(accessToken: token, remoteId: remoteId)
+        }
+        guard let data = GmailBodyExtractor.base64URLDecode(raw.raw) else {
+            throw MailError.protocolError("gmail raw message decode failed")
+        }
+        return data
     }
 
     public func fetchRawHeaderValues(remoteId: String) async throws -> [String: String] {

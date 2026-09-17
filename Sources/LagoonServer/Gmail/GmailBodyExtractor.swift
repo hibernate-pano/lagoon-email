@@ -1,4 +1,5 @@
 import Foundation
+import LagoonKit
 
 /// Best-effort plain-text extraction from a Gmail `format=full` MIME payload.
 ///
@@ -7,8 +8,8 @@ import Foundation
 /// never throws: a missing, undecodable or oversized body degrades to a shorter
 /// string (possibly "") rather than failing the request.
 ///
-/// ponytail: plain text is enough for M1 (read + summarize). Rich HTML
-/// rendering, inline images and attachment parsing are out of scope.
+/// M1.6: also extracts HTML and attachment metadata. Attachment bytes
+/// remain empty here (Gmail splits them into a separate endpoint).
 public enum GmailBodyExtractor {
     /// Upper bound on the bytes we decode per message. A 4 MiB text body is
     /// far larger than anything the UI or an LLM prompt needs; beyond this we
@@ -18,21 +19,85 @@ public enum GmailBodyExtractor {
     /// Plain-text body: prefer `text/plain` anywhere in the MIME tree, fall
     /// back to stripping `text/html`, then to any body bytes on the root part.
     public static func plainText(from payload: RawGmailMessage.Payload?) -> String {
-        guard let payload else { return "" }
+        fetchedBody(from: payload).text
+    }
 
-        if let part = findPart(payload, mimeType: "text/plain"),
-           let text = decodeBody(part) {
-            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// M1.6: extract the full body content (text, HTML, attachment metadata).
+    /// Attachment `data` is left empty because Gmail stores attachments out
+    /// of band; the route layer pulls bytes via `users.messages.attachments.get`.
+    public static func fetchedBody(from payload: RawGmailMessage.Payload?) -> FetchedBody {
+        guard let payload else {
+            return FetchedBody(text: "", html: nil, attachments: [], hasMore: false)
         }
-        if let part = findPart(payload, mimeType: "text/html"),
-           let html = decodeBody(part) {
-            return stripHTML(html)
+
+        let plain = findPart(payload, mimeType: "text/plain")
+            .flatMap { decodeBody($0) }
+            ?? findPart(payload, mimeType: "text/html")
+                .flatMap { stripHTML(decodeBody($0) ?? "") }
+            ?? (decodeBody(payload).map(stripHTML) ?? "")
+
+        let html = findPart(payload, mimeType: "text/html")
+            .flatMap { decodeBody($0) }
+
+        var attachments: [FetchedAttachment] = []
+        collectAttachments(from: payload, into: &attachments)
+
+        return FetchedBody(
+            text: plain.trimmingCharacters(in: .whitespacesAndNewlines),
+            html: html,
+            attachments: attachments,
+            hasMore: false
+        )
+    }
+
+    /// Walk the payload tree, collecting every non-text part as an
+    /// attachment. Skip the body parts that became `plain`/`html` above.
+    private static func collectAttachments(
+        from part: RawGmailMessage.Payload,
+        into attachments: inout [FetchedAttachment]
+    ) {
+        for child in part.parts ?? [] {
+            let mime = (child.mimeType ?? "").lowercased()
+            if mime.hasPrefix("text/") {
+                // The body parts have already been captured as plain/html
+                // by `fetchedBody`. Walking into them again would duplicate.
+                continue
+            }
+            // Gmail signals "this is an attachment" either via the
+            // `attachmentId` field (must be fetched separately) or via
+            // `body.data` being absent/empty. We treat either as an
+            // attachment and leave `data` empty — the route calls
+            // `users.messages.attachments.get` to fetch bytes.
+            let isAttachment = (child.body?.attachmentId ?? nil) != nil
+                || (child.body?.data ?? "").isEmpty && mime != ""
+            guard isAttachment else { continue }
+
+            let filename = child.filename
+            let contentId = child.headers?.first {
+                $0.name.caseInsensitiveCompare("content-id") == .orderedSame
+            }.map { Self.stripAngleBrackets($0.value) }
+            let disposition: Attachment.Disposition = {
+                if let d = child.headers?.first(where: {
+                    $0.name.caseInsensitiveCompare("content-disposition") == .orderedSame
+                })?.value.lowercased() {
+                    if d.hasPrefix("inline") { return Attachment.Disposition.inline }
+                    if d.hasPrefix("attachment") { return Attachment.Disposition.attachment }
+                }
+                // Default: images without an explicit disposition are
+                // inline (can be referenced by cid:); everything else is
+                // a download.
+                return mime.hasPrefix("image/") ? Attachment.Disposition.inline : Attachment.Disposition.attachment
+            }()
+            attachments.append(FetchedAttachment(
+                id: child.body?.attachmentId ?? filename ?? mime,
+                filename: filename,
+                mimeType: mime.isEmpty ? "application/octet-stream" : mime,
+                size: child.body?.size ?? 0,
+                contentId: contentId,
+                disposition: disposition,
+                data: Data()
+            ))
         }
-        // Single-part payloads sometimes omit mimeType but still carry bytes.
-        if let html = decodeBody(payload) {
-            return stripHTML(html)
-        }
-        return ""
     }
 
     // MARK: - MIME tree
@@ -134,5 +199,15 @@ public enum GmailBodyExtractor {
 
     static func collapseWhitespace(_ value: String) -> String {
         HTMLText.collapseWhitespace(value)
+    }
+
+    /// `<image001@example.com>` → `image001@example.com`. Angle brackets
+    /// are required by RFC 2392 but Gmail senders sometimes omit them.
+    static func stripAngleBrackets(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("<") && trimmed.hasSuffix(">") && trimmed.count >= 2 {
+            return String(trimmed.dropFirst().dropLast())
+        }
+        return trimmed
     }
 }

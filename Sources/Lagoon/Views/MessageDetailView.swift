@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import LagoonKit
 
 /// Full message reader (spec §3). Loads body, fires markRead on appear,
@@ -23,6 +24,12 @@ struct MessageDetailView: View {
     @State private var messageBody: MessageBody?
     @State private var isLoadingBody = true
     @State private var bodyError: String?
+    /// M1.6: inline image attachments already fetched as `Data`, keyed by
+    /// their `Content-ID` (angle brackets stripped, lowercased). The HTML
+    /// renderer swaps `cid:` references for inline data URLs.
+    @State private var inlineImageData: [String: Data] = [:]
+    @State private var isLoadingInlineImages = false
+    @State private var attachmentInFlight: String?
 
     @State private var isRead: Bool
     @State private var didMarkRead = false
@@ -220,6 +227,11 @@ struct MessageDetailView: View {
             .keyboardShortcut("e", modifiers: .command)
             .disabled(!canArchive)
             .help(canArchive ? l10n.shortcutArchiveNext : l10n.archiveUnavailable)
+
+            Button { Task { await downloadRawEml() } } label: {
+                Label(l10n.downloadEml, systemImage: "square.and.arrow.down")
+            }
+            .help(l10n.downloadEmlHelp)
         }
     }
 
@@ -284,11 +296,154 @@ struct MessageDetailView: View {
                     Text(l10n.couldNotLoadMessage).font(.callout).foregroundStyle(.secondary)
                     Button(l10n.retry) { Task { await loadBody() } }
                 }
-            } else if let messageBody, !messageBody.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text(messageBody.text).font(.body).lineSpacing(3).textSelection(.enabled)
+            } else if let messageBody {
+                bodyContent(for: messageBody)
+                if !messageBody.attachments.isEmpty {
+                    attachmentsSection(messageBody.attachments)
+                }
             } else {
                 Text(l10n.noPlainTextBody).foregroundStyle(.secondary)
             }
+        }
+    }
+
+    /// HTML when present, otherwise the plain-text fallback. HTML renders in
+    /// a sandboxed WKWebView (no JS, no baseURL); the inline-image cid
+    /// references are resolved client-side via `inlineImageData`.
+    @ViewBuilder
+    private func bodyContent(for body: MessageBody) -> some View {
+        if let html = body.html, !html.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                HTMLMessageView(html: html, attachmentsByCid: inlineImageData)
+                    .frame(minHeight: 200, maxHeight: 1200)
+                if isLoadingInlineImages {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(l10n.loadingInlineImages)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        } else if !body.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Text(body.text)
+                .font(.body)
+                .lineSpacing(3)
+                .textSelection(.enabled)
+        } else {
+            Text(l10n.noPlainTextBody).foregroundStyle(.secondary)
+        }
+    }
+
+    private func attachmentsSection(_ attachments: [Attachment]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider().padding(.vertical, 4)
+            Text(l10n.attachments)
+                .font(.headline)
+            ForEach(attachments) { attachment in
+                attachmentRow(attachment)
+            }
+        }
+        .padding(.top, 8)
+    }
+
+    @ViewBuilder
+    private func attachmentRow(_ attachment: Attachment) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: iconName(for: attachment.mimeType))
+                .foregroundStyle(.secondary)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(attachment.filename ?? attachment.mimeType)
+                    .font(.callout)
+                    .lineLimit(1)
+                Text(humanReadableSize(attachment.size))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if attachmentInFlight == attachment.id {
+                ProgressView().controlSize(.small)
+            } else {
+                Button {
+                    Task { await downloadAttachment(attachment) }
+                } label: {
+                    Image(systemName: "arrow.down.circle")
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(l10n.download)
+                .help(l10n.download)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func iconName(for mimeType: String) -> String {
+        if mimeType.hasPrefix("image/") { return "photo" }
+        if mimeType.hasPrefix("video/") { return "film" }
+        if mimeType.hasPrefix("audio/") { return "waveform" }
+        if mimeType.hasPrefix("text/") { return "doc.text" }
+        if mimeType == "application/pdf" { return "doc.richtext" }
+        if mimeType.contains("zip") || mimeType.contains("compressed") { return "doc.zipper" }
+        return "paperclip"
+    }
+
+    private func humanReadableSize(_ bytes: Int) -> String {
+        if bytes < 1024 { return "\(bytes) B" }
+        if bytes < 1024 * 1024 { return String(format: "%.1f KB", Double(bytes) / 1024) }
+        return String(format: "%.1f MB", Double(bytes) / (1024 * 1024))
+    }
+
+    /// User chose an attachment: fetch its bytes, prompt for save path,
+    /// write the file. Uses `NSSavePanel` so the user gets the native
+    /// macOS file dialog and can route the file into Downloads, iCloud,
+    /// an SMB share, or a project folder.
+    private func downloadAttachment(_ attachment: Attachment) async {
+        guard attachmentInFlight == nil else { return }
+        attachmentInFlight = attachment.id
+        defer { attachmentInFlight = nil }
+        do {
+            let result = try await api.downloadAttachment(
+                accountId: accountId,
+                remoteId: remoteId,
+                attachmentId: attachment.id
+            )
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = []
+            panel.nameFieldStringValue = result.filename ?? "attachment"
+            panel.canCreateDirectories = true
+            let response = await panel.beginSheetModal(for: NSApp.keyWindow ?? NSApp.mainWindow!)
+            guard response == .OK, let url = panel.url else { return }
+            try result.data.write(to: url)
+        } catch {
+            actionBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.downloadFailed,
+                detail: error.lagoonUIMessage
+            )
+        }
+    }
+
+    /// Export the original `.eml` source for the message. Same download
+    /// path as attachments but the bytes come from `/raw.eml`.
+    private func downloadRawEml() async {
+        do {
+            let data = try await api.downloadRawMessage(
+                accountId: accountId,
+                remoteId: remoteId
+            )
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = (messageBody?.subject ?? "message") + ".eml"
+            panel.canCreateDirectories = true
+            let response = await panel.beginSheetModal(for: NSApp.keyWindow ?? NSApp.mainWindow!)
+            guard response == .OK, let url = panel.url else { return }
+            try data.write(to: url)
+        } catch {
+            actionBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.downloadFailed,
+                detail: error.lagoonUIMessage
+            )
         }
     }
 
@@ -380,6 +535,40 @@ struct MessageDetailView: View {
             bodyError = error.lagoonUIMessage
         }
         isLoadingBody = false
+        // M1.6: pull inline image bytes so the WKWebView can resolve
+        // `cid:` references. Fire-and-forget — body text is already
+        // visible; this just upgrades HTML rendering once bytes arrive.
+        if let body = messageBody, !body.inlineImageAttachments.isEmpty {
+            await loadInlineImages(body.inlineImageAttachments)
+        }
+    }
+
+    private func loadInlineImages(_ attachments: [Attachment]) async {
+        isLoadingInlineImages = true
+        defer { isLoadingInlineImages = false }
+        await withTaskGroup(of: (String, Data?).self) { group in
+            for attachment in attachments {
+                let cidKey = attachment.contentId?.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let key = cidKey, !key.isEmpty else { continue }
+                group.addTask { [accountId, remoteId, attachment] in
+                    do {
+                        let result = try await api.downloadAttachment(
+                            accountId: accountId,
+                            remoteId: remoteId,
+                            attachmentId: attachment.id
+                        )
+                        return (key, result.data)
+                    } catch {
+                        return (key, nil)
+                    }
+                }
+            }
+            for await (key, data) in group {
+                if let data {
+                    inlineImageData[key.lowercased()] = data
+                }
+            }
+        }
     }
 
     private func markReadOnce(force: Bool = false) async {

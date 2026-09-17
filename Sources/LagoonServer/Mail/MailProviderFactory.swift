@@ -124,11 +124,25 @@ actor PooledMailProvider: MailProvider, ArchiveFolderResolving {
         return try await provider.pullChanges(after: cursor, waitUpTo: waitUpTo)
     }
 
-    func fetchBody(remoteId: String) async throws -> String {
+    func fetchBody(remoteId: String) async throws -> FetchedBody {
         guard let provider = await resolved() else {
             throw MailError.notConfigured("provider unavailable")
         }
         return try await provider.fetchBody(remoteId: remoteId)
+    }
+
+    func fetchAttachment(remoteId: String, attachmentId: String) async throws -> FetchedAttachmentBytes {
+        guard let provider = await resolved() else {
+            throw MailError.notConfigured("provider unavailable")
+        }
+        return try await provider.fetchAttachment(remoteId: remoteId, attachmentId: attachmentId)
+    }
+
+    func fetchRawMessage(remoteId: String) async throws -> Data {
+        guard let provider = await resolved() else {
+            throw MailError.notConfigured("provider unavailable")
+        }
+        return try await provider.fetchRawMessage(remoteId: remoteId)
     }
 
     func fetchRawHeaderValues(remoteId: String) async throws -> [String: String] {

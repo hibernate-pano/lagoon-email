@@ -139,8 +139,20 @@ public protocol MailProvider: Sendable {
     /// something to happen (long-poll for Gmail, IDLE for IMAP).
     func pullChanges(after cursor: MailSyncState, waitUpTo: Duration) async throws -> MailChangeSet
 
-    /// Full plain-text body on demand (bodies are never stored).
-    func fetchBody(remoteId: String) async throws -> String
+    /// Body on demand: plain text, optional HTML, attachment metadata +
+    /// decoded bytes, and a truncation flag (M1.6).
+    func fetchBody(remoteId: String) async throws -> FetchedBody
+
+    /// One attachment's raw bytes by its provider-native id. Throws
+    /// `MailError.messageGone` if the message or attachment no longer exists.
+    /// Throws `LagoonServer.AttachmentTooLarge` if the bytes exceed the
+    /// server's per-attachment cap (currently 25 MB).
+    func fetchAttachment(remoteId: String, attachmentId: String) async throws -> FetchedAttachmentBytes
+
+    /// Original RFC 5322 message bytes (for `.eml` export). Implementations
+    /// may re-fetch the body; the user picked "every fetch on demand" so
+    /// there's no server-side cache.
+    func fetchRawMessage(remoteId: String) async throws -> Data
 
     /// Raw header values for one message (e.g. List-Unsubscribe at click time).
     func fetchRawHeaderValues(remoteId: String) async throws -> [String: String]
@@ -154,4 +166,87 @@ public protocol MailProvider: Sendable {
 
     /// Connectivity + credential check used by the connect flow.
     func probe() async throws
+}
+
+/// Provider-internal body shape (M1.6). `attachments[i].data` is the
+/// decoded bytes — stripped before the wire response goes out, since the
+/// client fetches each attachment through the dedicated route.
+public struct FetchedBody: Sendable, Equatable {
+    public var text: String
+    public var html: String?
+    public var attachments: [FetchedAttachment]
+    public var hasMore: Bool
+
+    public init(text: String, html: String?, attachments: [FetchedAttachment], hasMore: Bool) {
+        self.text = text
+        self.html = html
+        self.attachments = attachments
+        self.hasMore = hasMore
+    }
+}
+
+public struct FetchedAttachment: Sendable, Equatable {
+    public var id: String
+    public var filename: String?
+    public var mimeType: String
+    public var size: Int
+    public var contentId: String?
+    public var disposition: Attachment.Disposition
+    public var data: Data
+
+    public init(
+        id: String,
+        filename: String?,
+        mimeType: String,
+        size: Int,
+        contentId: String?,
+        disposition: Attachment.Disposition,
+        data: Data
+    ) {
+        self.id = id
+        self.filename = filename
+        self.mimeType = mimeType
+        self.size = size
+        self.contentId = contentId
+        self.disposition = disposition
+        self.data = data
+    }
+
+    /// Strip the byte payload before sending over the wire. The client
+    /// re-fetches the bytes via `GET /api/messages/{id}/attachments/{aid}`.
+    public func toWire() -> Attachment {
+        Attachment(
+            id: id,
+            filename: filename,
+            mimeType: mimeType,
+            size: size,
+            contentId: contentId,
+            disposition: disposition
+        )
+    }
+}
+
+/// The bytes for a single attachment, plus the metadata needed to set
+/// Content-Type / Content-Disposition correctly on the way out.
+public struct FetchedAttachmentBytes: Sendable, Equatable {
+    public var mimeType: String
+    public var filename: String?
+    public var data: Data
+
+    public init(mimeType: String, filename: String?, data: Data) {
+        self.mimeType = mimeType
+        self.filename = filename
+        self.data = data
+    }
+}
+
+/// Single-attachment response cap. Gmail caps at 25 MB, so we use the
+/// same number for IMAP to give the client a uniform UX.
+public enum AttachmentLimit {
+    public static let maxBytes = 25 * 1024 * 1024
+}
+
+public enum AttachmentError: Error, Equatable {
+    case tooLarge
+    case notFound
 }

@@ -175,6 +175,12 @@ public struct L10n: Sendable, Equatable {
         pick("请重试，或检查网络。", "Retry or check your network.")
     }
     public var openOriginal: String { pick("打开原邮件", "Open original email") }
+    public var attachments: String { pick("附件", "Attachments") }
+    public var download: String { pick("下载", "Download") }
+    public var downloadFailed: String { pick("下载失败", "Download failed") }
+    public var downloadEml: String { pick("下载 .eml", "Download .eml") }
+    public var downloadEmlHelp: String { pick("导出原始邮件文件（.eml 格式）", "Export the original message file (.eml format)") }
+    public var loadingInlineImages: String { pick("正在加载内嵌图片…", "Loading inline images…") }
 
     // MARK: - Connect
 

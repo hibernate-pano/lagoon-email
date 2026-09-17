@@ -146,6 +146,75 @@ public final class APIClient: Sendable {
         return try dec.decode([ConnectedAccount].self, from: data)
     }
 
+    // MARK: - M1.6 attachments + raw message
+
+    /// Download a single attachment's bytes. `accountId` is required even
+    /// though the route only uses it for the server-side provider lookup,
+    /// because the same `remoteId` is not unique across accounts. The bytes
+    /// are written to the user-selected path by the caller; this method
+    /// just returns the raw response body.
+    public func downloadAttachment(
+        accountId: UUID,
+        remoteId: String,
+        attachmentId: String
+    ) async throws -> (data: Data, mimeType: String, filename: String?) {
+        let url = try makeURL(
+            path: ["api", "messages", remoteId, "attachments", attachmentId],
+            query: [.init(name: "accountId", value: accountId.uuidString)]
+        )
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.interactive.seconds
+        // The attachment endpoint streams bytes — the `send` helper validates
+        // 2xx and throws on non-2xx, but we want the raw Data and headers
+        // back here, so bypass validation and handle non-2xx directly.
+        let (data, resp) = try await session.data(for: request)
+        guard let http = resp as? HTTPURLResponse else {
+            throw APIError.invalidResponse
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus(code: http.statusCode, bodySnippet: "")
+        }
+        let mimeType = http.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
+        let filename = Self.filenameFromContentDisposition(
+            http.value(forHTTPHeaderField: "Content-Disposition")
+        )
+        return (data, mimeType, filename)
+    }
+
+    /// Download the raw RFC 5322 bytes of a message (`.eml` export).
+    public func downloadRawMessage(
+        accountId: UUID,
+        remoteId: String
+    ) async throws -> Data {
+        let url = try makeURL(
+            path: ["api", "messages", remoteId, "raw.eml"],
+            query: [.init(name: "accountId", value: accountId.uuidString)]
+        )
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.interactive.seconds
+        let (data, resp) = try await send(request, timeout: .interactive)
+        _ = resp
+        return data
+    }
+
+    /// Parse the `filename=` parameter out of a `Content-Disposition`
+    /// header. We use this on the way out (after saving) to confirm the
+    /// server's suggested filename when the user did not provide one.
+    private static func filenameFromContentDisposition(_ header: String?) -> String? {
+        guard let header else { return nil }
+        for segment in header.split(separator: ";") {
+            let trimmed = segment.trimmingCharacters(in: .whitespaces)
+            let prefix = "filename="
+            guard trimmed.lowercased().hasPrefix(prefix) else { continue }
+            var value = String(trimmed.dropFirst(prefix.count))
+            if value.hasPrefix("\"") && value.hasSuffix("\"") && value.count >= 2 {
+                value = String(value.dropFirst().dropLast())
+            }
+            return value.isEmpty ? nil : value
+        }
+        return nil
+    }
+
     // MARK: - M1.5 accounts (QQ/IMAP connect + activation)
 
     /// POST /api/accounts/imap {provider, email, authCode} → 201 ConnectedAccount.

@@ -914,9 +914,17 @@ final class RouteTests: XCTestCase {
             MailChangeSet(upserts: [], resetRequired: false, cursor: cursor)
         }
 
-        func fetchBody(remoteId: String) async throws -> String {
+        func fetchBody(remoteId: String) async throws -> FetchedBody {
             if let bodyError { throw bodyError }
-            return bodyText
+            return FetchedBody(text: bodyText, html: nil, attachments: [], hasMore: false)
+        }
+
+        func fetchAttachment(remoteId: String, attachmentId: String) async throws -> FetchedAttachmentBytes {
+            throw AttachmentError.notFound
+        }
+
+        func fetchRawMessage(remoteId: String) async throws -> Data {
+            Data(bodyText.utf8)
         }
 
         func fetchRawHeaderValues(remoteId: String) async throws -> [String: String] { [:] }

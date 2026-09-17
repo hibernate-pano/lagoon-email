@@ -182,4 +182,165 @@ final class MIMEParserTests: XCTestCase {
             "line oneline two\n=end=ZZ"
         )
     }
+
+    // MARK: - M1.6 parse() surface (attachments + html)
+
+    /// `multipart/mixed` with a text body and a PDF attachment. The PDF lands
+    /// in `attachments` (not silently dropped like in v0.2.0), with a stable
+    /// IMAP part-path id and the original filename from Content-Disposition.
+    func test_parse_multipartMixed_textAndPdfAttachment_listsAttachment() {
+        let pdfBytes = Data("%PDF-1.4 fake body".utf8)
+        let pdfBase64 = pdfBytes.base64EncodedString()
+        let raw = """
+        Content-Type: multipart/mixed; boundary="b"
+
+        --b
+        Content-Type: text/plain; charset=UTF-8
+
+        See attached PDF for details.
+        --b
+        Content-Type: application/pdf
+        Content-Disposition: attachment; filename="report.pdf"
+        Content-Transfer-Encoding: base64
+
+        \(pdfBase64)
+        --b--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let message = Data(raw.utf8)
+
+        let parsed = MIMEParser.parse(message: message)
+        XCTAssertEqual(parsed.text, "See attached PDF for details.")
+        XCTAssertNil(parsed.html)
+        XCTAssertEqual(parsed.attachments.count, 1)
+        let att = parsed.attachments[0]
+        XCTAssertEqual(att.id, "1.2")
+        XCTAssertEqual(att.filename, "report.pdf")
+        XCTAssertEqual(att.mimeType, "application/pdf")
+        XCTAssertEqual(att.disposition, .attachment)
+        XCTAssertEqual(att.size, pdfBytes.count)
+        XCTAssertEqual(att.data, pdfBytes)
+        XCTAssertNil(att.contentId)
+        XCTAssertFalse(parsed.hasMore)
+    }
+
+    /// `multipart/related` HTML with a Content-ID-tagged inline image. The
+    /// image surfaces in `attachments` with `disposition = .inline` and a
+    /// `contentId` the client will later match against `cid:...` HTML refs.
+    func test_parse_multipartRelated_htmlWithInlineImage_cidMatchesContentId() {
+        // 1x1 transparent PNG.
+        let pngBytes = Data([
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+            0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
+            0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x62, 0x00, 0x01, 0x00, 0x00,
+            0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+            0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ])
+        let pngBase64 = pngBytes.base64EncodedString()
+        let raw = """
+        Content-Type: multipart/related; boundary="r"
+
+        --r
+        Content-Type: text/html; charset=UTF-8
+
+        <html><body><img src="cid:logo@example.com">hi</body></html>
+        --r
+        Content-Type: image/png
+        Content-ID: <logo@example.com>
+        Content-Disposition: inline
+        Content-Transfer-Encoding: base64
+
+        \(pngBase64)
+        --r--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let message = Data(raw.utf8)
+
+        let parsed = MIMEParser.parse(message: message)
+        XCTAssertNotNil(parsed.html)
+        XCTAssertTrue(parsed.html!.contains("cid:logo@example.com"))
+        XCTAssertEqual(parsed.attachments.count, 1)
+        let att = parsed.attachments[0]
+        XCTAssertEqual(att.mimeType, "image/png")
+        XCTAssertEqual(att.disposition, .inline)
+        XCTAssertEqual(att.contentId, "logo@example.com")
+        XCTAssertEqual(att.data, pngBytes)
+    }
+
+    /// An image with no explicit disposition still lands as inline so HTML
+    /// `cid:` references can find it. The MIME spec is fuzzy here; the safe
+    /// default for `image/*` is inline.
+    func test_parse_imageWithoutDisposition_defaultsToInline() {
+        let raw = """
+        Content-Type: multipart/mixed; boundary="b"
+
+        --b
+        Content-Type: text/plain
+
+        body
+        --b
+        Content-Type: image/png
+
+        00
+        --b--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let parsed = MIMEParser.parse(message: Data(raw.utf8))
+        XCTAssertEqual(parsed.attachments.count, 1)
+        XCTAssertEqual(parsed.attachments[0].disposition, .inline)
+    }
+
+    /// `Content-Disposition: attachment` wins over an `image/*` mime type —
+    /// the explicit disposition always takes precedence.
+    func test_parse_attachmentDisposition_evenWithImageMimeType_landsInAttachments() {
+        let raw = """
+        Content-Type: multipart/mixed; boundary="b"
+
+        --b
+        Content-Type: text/plain
+
+        see attached
+        --b
+        Content-Type: image/png
+        Content-Disposition: attachment; filename="screenshot.png"
+
+        00
+        --b--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let parsed = MIMEParser.parse(message: Data(raw.utf8))
+        XCTAssertEqual(parsed.attachments.count, 1)
+        XCTAssertEqual(parsed.attachments[0].disposition, .attachment)
+        XCTAssertEqual(parsed.attachments[0].filename, "screenshot.png")
+    }
+
+    /// Truncation: a body that exceeds `MIMEParser.textCap` is cut and the
+    /// `hasMore` flag is set so the client can warn the user.
+    func test_parse_textTruncatesAtCap_andFlagsHasMore() {
+        let big = String(repeating: "a", count: MIMEParser.textCap + 100)
+        let raw = "Content-Type: text/plain; charset=UTF-8\r\n\r\n\(big)"
+        let parsed = MIMEParser.parse(message: Data(raw.utf8))
+        XCTAssertTrue(parsed.hasMore)
+        XCTAssertLessThanOrEqual(parsed.text.count, MIMEParser.textCap + 64) // +truncation marker
+    }
+
+    /// Both `text/plain` and `text/html` are returned when present, so the
+    /// client can pick the rendered variant. The plain-text body is also
+    /// populated for search / accessibility.
+    func test_parse_multipartAlternative_returnsBothPlainAndHtml() {
+        let raw = """
+        Content-Type: multipart/alternative; boundary="a"
+
+        --a
+        Content-Type: text/plain; charset=UTF-8
+
+        hello world
+        --a
+        Content-Type: text/html; charset=UTF-8
+
+        <p>hello <b>world</b></p>
+        --a--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let parsed = MIMEParser.parse(message: Data(raw.utf8))
+        XCTAssertEqual(parsed.text, "hello world")
+        XCTAssertEqual(parsed.html, "<p>hello <b>world</b></p>")
+        XCTAssertTrue(parsed.attachments.isEmpty)
+    }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import LagoonKit
 
 /// Self-contained RFC 5322 / MIME reader: enough of the format to turn an IMAP
 /// `BODY[]` fetch into readable plain text, and nothing more (spec §3.6).
@@ -114,63 +115,144 @@ public enum MIMEParser {
 
     // MARK: - Body
 
-    /// Plain text of the preferred body part (spec §3.6). `text/plain` wins
-    /// over `text/html`; anything unreadable degrades to "".
+    /// Hard caps on extracted content. Generous enough for almost any
+    /// legitimate message, low enough to bound a hostile one. Truncation
+    /// surfaces as `hasMore = true` on the returned `ParsedMessage`.
+    public static let textCap = 200_000      // 200 KB
+    public static let htmlCap = 5_000_000    // 5 MB
+
+    /// Plain text of the preferred body part. Kept for the v0.2.0 surface
+    /// (and the existing test suite); internally it just reads `.text` from
+    /// `parse(message:)`.
     public static func plainText(from message: Data) -> String {
+        parse(message: message).text
+    }
+
+    /// Full parse: plain text, HTML (when present), and every attachment
+    /// with its disposition and decoded bytes. The IMAP part path is
+    /// preserved as `id` so the route layer can re-fetch a single part via
+    /// `BODY[1.2]`.
+    public static func parse(message: Data) -> ParsedMessage {
         let (header, body) = splitHeadAndBody(message)
         let headers = parseHeaderBlock(header)
-        guard let candidate = preferredContent(headers: headers, body: body, depth: 0) else {
-            return ""
+        let result = parsePart(headers: headers, body: body, depth: 0, partPath: "1")
+        let text = result.text ?? (result.html.map { HTMLText.strip($0) } ?? "")
+        return ParsedMessage(
+            text: text.trimmingCharacters(in: .whitespacesAndNewlines),
+            html: result.html,
+            attachments: result.attachments,
+            hasMore: result.hasMore
+        )
+    }
+
+    public struct ParsedMessage {
+        public var text: String
+        public var html: String?
+        public var attachments: [ParsedAttachment]
+        public var hasMore: Bool
+
+        public init(text: String, html: String?, attachments: [ParsedAttachment], hasMore: Bool) {
+            self.text = text
+            self.html = html
+            self.attachments = attachments
+            self.hasMore = hasMore
         }
-        let text = candidate.isHTML ? HTMLText.strip(candidate.text) : candidate.text
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private struct Candidate {
-        var text: String
-        var isHTML: Bool
+    /// Internal representation of a part. The route layer converts this to
+    /// the wire `Attachment` by stripping `data` (the client fetches bytes
+    /// via the dedicated attachment endpoint).
+    public struct ParsedAttachment {
+        public var id: String
+        public var filename: String?
+        public var mimeType: String
+        public var size: Int
+        public var contentId: String?
+        public var disposition: Attachment.Disposition
+        public var data: Data
+
+        public init(
+            id: String,
+            filename: String?,
+            mimeType: String,
+            size: Int,
+            contentId: String?,
+            disposition: Attachment.Disposition,
+            data: Data
+        ) {
+            self.id = id
+            self.filename = filename
+            self.mimeType = mimeType
+            self.size = size
+            self.contentId = contentId
+            self.disposition = disposition
+            self.data = data
+        }
     }
 
-    private static func preferredContent(
+    private struct ParseResult {
+        var text: String?
+        var html: String?
+        var attachments: [ParsedAttachment] = []
+        var hasMore: Bool = false
+    }
+
+    /// Recursive descent over a single MIME part. `partPath` is the IMAP
+    /// dotted notation ("1", "1.2", "1.2.3") that re-fetches the same bytes
+    /// via `BODY[path]`.
+    private static func parsePart(
         headers: [String: String],
         body: Data,
-        depth: Int
-    ) -> Candidate? {
-        guard depth < maxDepth else { return nil }
-        // Attachments are out of scope: skip them rather than summarize a PDF.
-        if (headers["content-disposition"] ?? "").lowercased().hasPrefix("attachment") {
-            return nil
-        }
-
+        depth: Int,
+        partPath: String
+    ) -> ParseResult {
+        guard depth < maxDepth else { return ParseResult() }
         let (mimeType, parameters) = parseContentType(headers["content-type"])
         let encoding = (headers["content-transfer-encoding"] ?? "")
             .trimmingCharacters(in: .whitespaces)
             .lowercased()
+        let dispositionRaw = (headers["content-disposition"] ?? "").lowercased()
+        let filename = parseFilename(headers: headers)
+        let contentId = stripAngleBrackets(headers["content-id"] ?? headers["Content-ID"] ?? "")
 
         if mimeType == "message/rfc822" {
             let (innerHeader, innerBody) = splitHeadAndBody(body)
-            return preferredContent(
+            return parsePart(
                 headers: parseHeaderBlock(innerHeader),
                 body: innerBody,
-                depth: depth + 1
+                depth: depth + 1,
+                partPath: partPath
             )
         }
 
         if mimeType.hasPrefix("multipart/") {
-            guard let boundary = parameters["boundary"], !boundary.isEmpty else { return nil }
+            guard let boundary = parameters["boundary"], !boundary.isEmpty else {
+                return ParseResult()
+            }
             let parts = splitParts(body, boundary: boundary)
-            var htmlFallback: Candidate?
-            for part in parts {
-                guard let candidate = preferredContent(
+            var result = ParseResult()
+            for (index, part) in parts.enumerated() {
+                let childPath = "\(partPath).\(index + 1)"
+                let child = parsePart(
                     headers: part.headers,
                     body: part.body,
-                    depth: depth + 1
-                ) else { continue }
-                guard mimeType == "multipart/alternative" else { return candidate }
-                if !candidate.isHTML { return candidate }
-                if htmlFallback == nil { htmlFallback = candidate }
+                    depth: depth + 1,
+                    partPath: childPath
+                )
+                if result.text == nil { result.text = child.text }
+                if result.html == nil { result.html = child.html }
+                result.attachments.append(contentsOf: child.attachments)
+                if child.hasMore { result.hasMore = true }
             }
-            return htmlFallback
+            // For `multipart/alternative` we keep whichever text candidate we
+            // saw first. The recurse order is the source-order of the parts,
+            // which most clients put plain-first — but the spec lets them put
+            // HTML first, so also pick text over html explicitly below.
+            if mimeType == "multipart/alternative",
+               result.text == nil, let html = result.html {
+                result.text = HTMLText.strip(html)
+            }
+            return result
         }
 
         let decoded: Data
@@ -183,14 +265,142 @@ public enum MIMEParser {
             decoded = body
         }
 
-        switch mimeType {
-        case "text/plain":
-            return Candidate(text: decodeCharset(decoded, charset: parameters["charset"]), isHTML: false)
-        case "text/html":
-            return Candidate(text: decodeCharset(decoded, charset: parameters["charset"]), isHTML: true)
-        default:
-            return nil
+        if mimeType.hasPrefix("text/") {
+            // Decide: body candidate or attachment? An explicit
+            // `Content-Disposition: attachment` on a text part is still
+            // treated as an attachment (rare but legal).
+            if dispositionRaw.hasPrefix("attachment") {
+                return attachmentResult(
+                    partPath: partPath,
+                    filename: filename,
+                    mimeType: mimeType,
+                    data: decoded,
+                    contentId: contentId,
+                    disposition: .attachment
+                )
+            }
+            return textResult(
+                mimeType: mimeType,
+                charset: parameters["charset"],
+                data: decoded,
+                contentId: contentId
+            )
         }
+
+        // Non-text leaf: everything else is an attachment. Images without an
+        // explicit disposition default to `.inline` so the HTML renderer
+        // can resolve `cid:` references even when the sender forgot the
+        // disposition.
+        let disposition: Attachment.Disposition
+        if dispositionRaw.hasPrefix("inline") {
+            disposition = .inline
+        } else if dispositionRaw.hasPrefix("attachment") {
+            disposition = .attachment
+        } else if mimeType.hasPrefix("image/") {
+            disposition = .inline
+        } else {
+            disposition = .attachment
+        }
+        return attachmentResult(
+            partPath: partPath,
+            filename: filename,
+            mimeType: mimeType,
+            data: decoded,
+            contentId: contentId,
+            disposition: disposition
+        )
+    }
+
+    private static func textResult(
+        mimeType: String,
+        charset: String?,
+        data: Data,
+        contentId: String?
+    ) -> ParseResult {
+        var result = ParseResult()
+        let charset = (charset ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let decoded = decodeCharset(data, charset: charset.isEmpty ? nil : charset)
+        if mimeType == "text/html" {
+            if decoded.count > htmlCap {
+                result.html = String(decoded.prefix(htmlCap))
+                result.hasMore = true
+            } else {
+                result.html = decoded
+            }
+        } else {
+            // text/plain and any other text/* lands here.
+            if decoded.count > textCap {
+                result.text = String(decoded.prefix(textCap)) + "\n[…truncated, original \(decoded.count) bytes]"
+                result.hasMore = true
+            } else {
+                result.text = decoded
+            }
+        }
+        return result
+    }
+
+    private static func attachmentResult(
+        partPath: String,
+        filename: String?,
+        mimeType: String,
+        data: Data,
+        contentId: String?,
+        disposition: Attachment.Disposition
+    ) -> ParseResult {
+        var result = ParseResult()
+        result.attachments.append(ParsedAttachment(
+            id: partPath,
+            filename: filename,
+            mimeType: mimeType,
+            size: data.count,
+            contentId: contentId,
+            disposition: disposition,
+            data: data
+        ))
+        return result
+    }
+
+    /// Filename from `Content-Disposition: attachment; filename=...` or
+    /// `Content-Type: ...; name=...`. The two are interchangeable per RFC 2183
+    /// and the spec sample we actually see uses either one.
+    private static func parseFilename(headers: [String: String]) -> String? {
+        let disposition = headers["content-disposition"] ?? ""
+        if let name = headerParameter(in: disposition, name: "filename") ?? headerParameter(in: disposition, name: "filename*") {
+            return decodeRFC2047(name)
+        }
+        let type = headers["content-type"] ?? ""
+        if let name = headerParameter(in: type, name: "name") {
+            return decodeRFC2047(name)
+        }
+        return nil
+    }
+
+    /// `name="value"` / `name=value` / `name*=RFC 2047 encoded` — the value
+    /// may be quoted (with backslash-escaped chars) or bare. We accept the
+    /// common forms and tolerate the rest by returning nil.
+    private static func headerParameter(in header: String, name: String) -> String? {
+        for segment in header.split(separator: ";") {
+            let trimmed = segment.trimmingCharacters(in: .whitespaces)
+            let prefix = "\(name)="
+            guard trimmed.lowercased().hasPrefix(prefix.lowercased()) else { continue }
+            var value = String(trimmed.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+            if value.hasPrefix("\"") && value.hasSuffix("\"") && value.count >= 2 {
+                value = String(value.dropFirst().dropLast())
+            }
+            return value.isEmpty ? nil : value
+        }
+        return nil
+    }
+
+    /// `Content-ID: <image001@example.com>` → `image001@example.com`.
+    /// Angle brackets are required by RFC 2392 but some clients omit them.
+    private static func stripAngleBrackets(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.hasPrefix("<") && trimmed.hasSuffix(">") {
+            return String(trimmed.dropFirst().dropLast())
+        }
+        return trimmed
     }
 
     /// First blank line splits headers from body; LF-only messages are accepted
