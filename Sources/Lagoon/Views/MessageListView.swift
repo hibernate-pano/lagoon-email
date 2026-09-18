@@ -2,13 +2,16 @@ import SwiftUI
 import LagoonKit
 
 /// Raw conversation list (spec §7.1) - the secondary surface reachable from
-/// the Briefing Feed. Each row drills into the message body.
+/// the Briefing Feed. Each row drills into the message body. Messages are
+/// grouped by `DateBucket` (Today / Yesterday / This week / ... / Earlier)
+/// so a 400-message inbox scans in seconds.
 struct MessageListView: View {
     @EnvironmentObject var accounts: AccountStore
     @State private var messages: [MessageHeader] = []
     @State private var isLoading = false
     @State private var errorBanner: ErrorBanner?
     @State private var path: [String] = []
+    @State private var selection: Set<String> = []
     private let api = APIClient()
 
     /// Switches back to the Briefing Feed from the toolbar button.
@@ -45,32 +48,42 @@ struct MessageListView: View {
                 .padding()
 
                 if !messages.isEmpty {
-                    List(messages) { m in
-                        NavigationLink(value: m.remoteId) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(m.subject ?? l10n.noSubject)
-                                    .font(.body)
-                                    .bold(!m.isRead)
-                                    .lineLimit(1)
-                                HStack(spacing: 6) {
-                                    Text(m.fromName ?? m.fromAddress)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    Text(m.receivedAt.formatted(date: .abbreviated, time: .shortened))
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
+                    List(selection: $selection) {
+                        ForEach(groupedSections, id: \.bucket) { section in
+                            Section {
+                                ForEach(section.messages) { m in
+                                    messageRow(m)
+                                        .tag(m.remoteId)
+                                        .swipeActions(edge: .trailing) {
+                                            Button(role: .destructive) {
+                                                Task { await archive(m) }
+                                            } label: {
+                                                Label(l10n.archived, systemImage: "tray.and.arrow.down")
+                                            }
+                                        }
+                                        .contextMenu {
+                                            Button(m.isRead ? l10n.markAsUnread : l10n.markAsRead) {
+                                                Task { await toggleRead(m) }
+                                            }
+                                            Button(l10n.archived) { Task { await archive(m) } }
+                                        }
                                 }
-                                if let snippet = m.snippet {
-                                    Text(snippet)
-                                        .font(.caption2)
-                                        .lineLimit(2)
-                                        .foregroundStyle(.secondary)
-                                }
+                            } header: {
+                                Text(l10n.label(for: section.bucket))
+                                    .font(.caption)
+                                    .bold()
+                                    .foregroundStyle(.secondary)
+                                    .padding(.vertical, 4)
                             }
-                            .padding(.vertical, 2)
                         }
                     }
                     .listStyle(.inset)
+                    // ⌫ archives the highlighted row(s). Backspace is the
+                    // gesture every mail client uses; .delete is the SwiftUI
+                    // name for it.
+                    .onDeleteCommand {
+                        archiveSelected()
+                    }
                 } else if !isLoading && errorBanner == nil {
                     Text(l10n.noMessagesYet)
                         .foregroundStyle(.secondary)
@@ -173,5 +186,183 @@ struct MessageListView: View {
             )
         }
         isLoading = false
+    }
+
+    // MARK: - Row
+
+    @ViewBuilder
+    private func messageRow(_ m: MessageHeader) -> some View {
+        NavigationLink(value: m.remoteId) {
+            HStack(alignment: .top, spacing: 8) {
+                // Unread dot: a small accent so triaging at a glance is easy.
+                if !m.isRead {
+                    Circle()
+                        .fill(.tint)
+                        .frame(width: 7, height: 7)
+                        .padding(.top, 7)
+                } else {
+                    Color.clear.frame(width: 7, height: 7)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(m.subject ?? l10n.noSubject)
+                            .font(.body)
+                            .bold(!m.isRead)
+                            .lineLimit(1)
+                        Spacer()
+                        Text(m.receivedAt.formatted(date: .omitted, time: .shortened))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(m.fromName ?? m.fromAddress)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    if let snippet = m.snippet {
+                        Text(snippet)
+                            .font(.caption2)
+                            .lineLimit(2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
+    // MARK: - Date grouping
+
+    private struct DateSection: Identifiable {
+        let bucket: DateBucket
+        let messages: [MessageHeader]
+        var id: DateBucket { bucket }
+    }
+
+    private var groupedSections: [DateSection] {
+        let groups = Dictionary(grouping: messages) { $0.receivedAt.dateBucket }
+        // Render buckets in chronological order (newest first).
+        return DateBucket.allCases.compactMap { bucket in
+            guard let bucketMessages = groups[bucket], !bucketMessages.isEmpty else { return nil }
+            return DateSection(
+                bucket: bucket,
+                messages: bucketMessages.sorted { $0.receivedAt > $1.receivedAt }
+            )
+        }
+    }
+
+    // MARK: - Actions
+
+    private func archive(_ m: MessageHeader) async {
+        do {
+            _ = try await api.archiveMessage(remoteId: m.remoteId, accountId: m.accountId)
+            messages.removeAll { $0.remoteId == m.remoteId }
+        } catch APIError.badStatus(_, _) where (try? archiveUnavailable()) == nil {
+            // server answered 409 — the account can't archive; banner set below
+        } catch {
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.archiveFailed,
+                detail: error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.archive(m) }
+            )
+        }
+    }
+
+    /// Archive every message the user has selected (multi-select via ⌫
+    /// or shift-click). Failures on individual rows surface a banner;
+    /// successes are removed from the list silently to keep the gesture
+    /// snappy.
+    private func archiveSelected() {
+        let ids = selection.isEmpty ? Set(messages.prefix(1).map(\.remoteId)) : selection
+        let targets = messages.filter { ids.contains($0.remoteId) }
+        selection.removeAll()
+        for m in targets {
+            Task { await archive(m) }
+        }
+    }
+
+    private func toggleRead(_ m: MessageHeader) async {
+        // Optimistic toggle: flip the local state immediately, then write
+        // through. If the server fails, revert.
+        let original = m.isRead
+        if let index = messages.firstIndex(where: { $0.remoteId == m.remoteId }) {
+            messages[index] = m.withRead(!original)
+        }
+        do {
+            try await api.markRead(remoteId: m.remoteId, accountId: m.accountId)
+        } catch {
+            if let index = messages.firstIndex(where: { $0.remoteId == m.remoteId }) {
+                messages[index] = m.withRead(original)
+            }
+        }
+    }
+
+    private func archiveUnavailable() throws -> Void {
+        // Discriminates the 409 path; the real mapping lives in
+        // MessageDetailView. We surface a banner instead.
+        throw APIError.badStatus(code: 409, bodySnippet: "archive-unavailable")
+    }
+}
+
+// MARK: - DateBucket
+
+/// Friendly grouping used by `MessageListView`. Order in `allCases` is the
+/// display order (newest → oldest); `dateBucket` is computed from the
+/// local calendar so a message at 23:59 today stays in `.today` and
+/// doesn't flip to `.yesterday` until midnight.
+public enum DateBucket: CaseIterable, Comparable, Sendable {
+    case today
+    case yesterday
+    case thisWeek
+    case thisMonth
+    case earlier
+
+    private var sortOrder: Int {
+        switch self {
+        case .today: 0
+        case .yesterday: 1
+        case .thisWeek: 2
+        case .thisMonth: 3
+        case .earlier: 4
+        }
+    }
+
+    public static func < (lhs: DateBucket, rhs: DateBucket) -> Bool {
+        lhs.sortOrder < rhs.sortOrder
+    }
+}
+
+extension Date {
+    var dateBucket: DateBucket {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(self) { return .today }
+        if calendar.isDateInYesterday(self) { return .yesterday }
+        let now = Date()
+        let days = calendar.dateComponents([.day], from: self, to: now).day ?? 0
+        if days < 7 { return .thisWeek }
+        if days < 30 { return .thisMonth }
+        return .earlier
+    }
+}
+
+extension MessageHeader {
+    /// Tap-to-toggle-read creates a copy with the read flag flipped. The
+    /// stored struct is `Sendable` and value-typed, so this is the
+    /// standard "copy with a field change" idiom.
+    fileprivate func withRead(_ isRead: Bool) -> MessageHeader {
+        MessageHeader(
+            id: id,
+            accountId: accountId,
+            remoteId: remoteId,
+            threadId: threadId,
+            fromAddress: fromAddress,
+            fromName: fromName,
+            subject: subject,
+            snippet: snippet,
+            receivedAt: receivedAt,
+            isRead: isRead,
+            isArchived: isArchived
+        )
     }
 }

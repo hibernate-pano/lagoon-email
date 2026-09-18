@@ -181,6 +181,22 @@ public struct L10n: Sendable, Equatable {
     public var downloadEml: String { pick("下载 .eml", "Download .eml") }
     public var downloadEmlHelp: String { pick("导出原始邮件文件（.eml 格式）", "Export the original message file (.eml format)") }
     public var loadingInlineImages: String { pick("正在加载内嵌图片…", "Loading inline images…") }
+    public var dateBucketToday: String { pick("今天", "Today") }
+    public var dateBucketYesterday: String { pick("昨天", "Yesterday") }
+    public var dateBucketThisWeek: String { pick("本周", "This week") }
+    public var dateBucketThisMonth: String { pick("本月", "This month") }
+    public var dateBucketEarlier: String { pick("更早", "Earlier") }
+    public var markAsUnread: String { pick("标为未读", "Mark as unread") }
+    public var markAsRead: String { pick("标为已读", "Mark as read") }
+    public func label(for bucket: DateBucket) -> String {
+        switch bucket {
+        case .today: pick("今天", "Today")
+        case .yesterday: pick("昨天", "Yesterday")
+        case .thisWeek: pick("本周", "This week")
+        case .thisMonth: pick("本月", "This month")
+        case .earlier: pick("更早", "Earlier")
+        }
+    }
 
     // MARK: - Connect
 
