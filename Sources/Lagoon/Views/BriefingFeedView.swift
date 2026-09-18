@@ -12,6 +12,7 @@ struct BriefingFeedView: View {
     @EnvironmentObject private var directory: DirectoryStore
     @State private var items: [BriefingItem] = []
     @State private var isLoading = false
+    @State private var isMarkingAllRead = false
     @State private var errorBanner: ErrorBanner?
     @State private var collapsedGroups: Set<BriefingGroup> = Set(BriefingGroup.allCases.filter(\.collapsedByDefault))
     @State private var path: [String] = []
@@ -92,6 +93,18 @@ struct BriefingFeedView: View {
         HStack(spacing: 8) {
             Text(l10n.briefing).font(.headline)
             Spacer()
+            Button {
+                Task { await markAllRead() }
+            } label: {
+                if isMarkingAllRead {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Label(l10n.markAllRead, systemImage: "envelope.open")
+                }
+            }
+            .keyboardShortcut("k", modifiers: [.command, .shift])
+            .disabled(isMarkingAllRead || items.isEmpty)
+            .help(l10n.markAllReadHelp)
             Button { onShowAllMessages() } label: {
                 Label(l10n.allMessages, systemImage: "list.bullet")
             }
@@ -569,6 +582,49 @@ struct BriefingFeedView: View {
 
     }
 
+    /// Mark every message in the current briefing as read. Runs the per-row
+    /// markRead calls in parallel via a TaskGroup so a 50-message briefing
+    /// takes ~3-5 round trips' worth of wall time rather than 50 in series.
+    /// Optimistic local flip first so the UI updates before the server
+    /// confirms; the first error surfaces in `errorBanner` and the next
+    /// refresh pulls the server's view of truth back.
+    private func markAllRead() async {
+        guard let accountId = accounts.accountId else { return }
+        guard !isMarkingAllRead, !items.isEmpty else { return }
+        let unread = items.filter { !$0.message.isRead }
+        guard !unread.isEmpty else { return }
+        isMarkingAllRead = true
+        defer { isMarkingAllRead = false }
+
+        // Optimistic local update so the unread dots disappear immediately.
+        for i in items.indices where !items[i].message.isRead {
+            items[i] = items[i].withRead(true)
+        }
+
+        await withTaskGroup(of: Error?.self) { group in
+            for item in unread {
+                group.addTask { [api] in
+                    do {
+                        try await api.markRead(
+                            remoteId: item.message.remoteId,
+                            accountId: accountId
+                        )
+                        return nil
+                    } catch {
+                        return error
+                    }
+                }
+            }
+            if let firstError = await group.first(where: { $0 != nil }) ?? nil {
+                errorBanner = ErrorBanner(
+                    severity: .warning,
+                    title: l10n.markAllReadPartial,
+                    detail: firstError.lagoonUIMessage
+                )
+            }
+        }
+    }
+
 }
 
 
@@ -617,4 +673,36 @@ private struct BriefingRow: View {
 
     }
 
+}
+
+// MARK: - Optimistic read-flip helpers
+
+extension BriefingItem {
+    /// Copy with a different read state. BriefingItem itself is a thin
+    /// wrapper; the read bit lives on the underlying `MessageHeader`.
+    func withRead(_ isRead: Bool) -> BriefingItem {
+        BriefingItem(
+            message: message.withRead(isRead),
+            group: group,
+            reasonCode: reasonCode
+        )
+    }
+}
+
+extension MessageHeader {
+    fileprivate func withRead(_ isRead: Bool) -> MessageHeader {
+        MessageHeader(
+            id: id,
+            accountId: accountId,
+            remoteId: remoteId,
+            threadId: threadId,
+            fromAddress: fromAddress,
+            fromName: fromName,
+            subject: subject,
+            snippet: snippet,
+            receivedAt: receivedAt,
+            isRead: isRead,
+            isArchived: isArchived
+        )
+    }
 }

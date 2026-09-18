@@ -181,6 +181,9 @@ public struct L10n: Sendable, Equatable {
     public var downloadEml: String { pick("下载 .eml", "Download .eml") }
     public var downloadEmlHelp: String { pick("导出原始邮件文件（.eml 格式）", "Export the original message file (.eml format)") }
     public var loadingInlineImages: String { pick("正在加载内嵌图片…", "Loading inline images…") }
+    public var print: String { pick("打印…", "Print…") }
+    public var printHelp: String { pick("打印当前邮件（⌘P）", "Print the current message (⌘P)") }
+    public var printFailed: String { pick("打印失败", "Print failed") }
     public var dateBucketToday: String { pick("今天", "Today") }
     public var dateBucketYesterday: String { pick("昨天", "Yesterday") }
     public var dateBucketThisWeek: String { pick("本周", "This week") }
@@ -188,6 +191,9 @@ public struct L10n: Sendable, Equatable {
     public var dateBucketEarlier: String { pick("更早", "Earlier") }
     public var markAsUnread: String { pick("标为未读", "Mark as unread") }
     public var markAsRead: String { pick("标为已读", "Mark as read") }
+    public var markAllRead: String { pick("全部标为已读", "Mark all as read") }
+    public var markAllReadHelp: String { pick("把当前简报里的未读邮件全部标为已读（⇧⌘K）", "Mark every unread message in the briefing as read (⇧⌘K)") }
+    public var markAllReadPartial: String { pick("部分邮件标为已读失败", "Some messages could not be marked as read") }
     public func label(for bucket: DateBucket) -> String {
         switch bucket {
         case .today: pick("今天", "Today")
