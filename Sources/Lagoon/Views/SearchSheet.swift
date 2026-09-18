@@ -40,7 +40,7 @@ struct SearchSheet: View {
                 else {
                     List(results) { m in
                         NavigationLink(value: m.remoteId) {
-                            VStack(alignment: .leading, spacing: 2) {
+                            VStack(alignment: .leading, spacing: 3) {
                                 highlightedText(
                                     m.subject ?? l10n.noSubject,
                                     term: query,
@@ -58,6 +58,15 @@ struct SearchSheet: View {
                                     Text(m.receivedAt.formatted(date: .abbreviated, time: .shortened))
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
+                                }
+                                if let snippet = m.snippet, !snippet.isEmpty {
+                                    highlightedText(
+                                        snippet,
+                                        term: query,
+                                        font: .caption2,
+                                        color: .secondary
+                                    )
+                                    .lineLimit(2)
                                 }
                             }
                         }
