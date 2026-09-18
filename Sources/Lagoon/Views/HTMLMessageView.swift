@@ -37,8 +37,56 @@ struct HTMLMessageView: NSViewRepresentable {
         return view
     }
 
+    /// Reload the WebView when the underlying HTML or inline-image map
+    /// changes. SwiftUI's `updateNSView` is the only place where the new
+    /// values land — if we just `loadHTMLString` on every redraw, the
+    /// selection state and scroll position reset. `Coordinator.html` is
+    /// our cache of the last value; only reload when the bytes actually
+    /// differ. The image map is harder (Data is non-Equatable enough that
+    /// we'd need a per-attachment signature) so we accept a reload whenever
+    /// the *count* of resolved cid: references grows.
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        var html: String = ""
+        var resolvedCidCount: Int = 0
+
+        /// Open links in the user's default browser instead of navigating
+        /// the WebView. We still allow the *initial* `loadHTMLString` (no
+        /// real `request`, no decision to make) but anything after that
+        /// — clicks, redirects, programmatic navigation — gets handed off
+        /// to `NSWorkspace`.
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            // The `loadHTMLString(_:baseURL:)` we use in `updateNSView` does
+            // not produce a navigation action — it sets content directly —
+            // so any action reaching here is a real user gesture.
+            if let url = navigationAction.request.url,
+               let scheme = url.scheme?.lowercased(),
+               scheme == "http" || scheme == "https" {
+                NSWorkspace.shared.open(url)
+                decisionHandler(.cancel)
+                return
+            }
+            // About: / data: / blob: etc.: let the WebView handle them
+            // (mostly no-ops).
+            decisionHandler(.allow)
+        }
+    }
+
     func updateNSView(_ webView: WKWebView, context: Context) {
         let resolved = Self.resolveCidReferences(in: html, with: attachmentsByCid)
+        // Avoid reloading on every SwiftUI body invalidation: the WebView
+        // already holds the rendered page, and reloading blows away
+        // selection, scroll position, and any in-flight image loads.
+        let nextCidCount = resolved.components(separatedBy: "data:").count - 1
+        if resolved == context.coordinator.html,
+           nextCidCount == context.coordinator.resolvedCidCount {
+            return
+        }
+        context.coordinator.html = resolved
+        context.coordinator.resolvedCidCount = nextCidCount
         webView.loadHTMLString(resolved, baseURL: nil)
     }
 
@@ -91,14 +139,6 @@ struct HTMLMessageView: NSViewRepresentable {
         // rendering should pass an explicit mime mapping; the WKWebView
         // is permissive enough to sniff from the data URL bytes when needed.
         nil
-    }
-
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        // M1.6 deliberately registers no policy handlers: a user clicking
-        // an `<a href="...">` in the WebView opens it in the system
-        // browser by default, and that is the spec's M1.7 design choice.
-        // We do not block navigation; we just do not implement it as
-        // in-app.
     }
 }
 

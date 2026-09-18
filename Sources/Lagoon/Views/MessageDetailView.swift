@@ -111,7 +111,6 @@ struct MessageDetailView: View {
                 Divider()
                 bodySection
             }
-            .frame(maxWidth: 680, alignment: .leading)
             .padding(24)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
@@ -267,6 +266,10 @@ struct MessageDetailView: View {
                 Text(snippet.prefix(140)).font(.caption).foregroundStyle(.secondary)
             }
         }
+        // Metadata is a header strip — wide subject lines look broken when
+        // they wrap, so cap the column at 900pt. The body below gets the
+        // full window width; HTML email clients expect that.
+        .frame(maxWidth: 900, alignment: .leading)
     }
 
     private var subjectText: String {
@@ -309,13 +312,16 @@ struct MessageDetailView: View {
 
     /// HTML when present, otherwise the plain-text fallback. HTML renders in
     /// a sandboxed WKWebView (no JS, no baseURL); the inline-image cid
-    /// references are resolved client-side via `inlineImageData`.
+    /// references are resolved client-side via `inlineImageData`. The
+    /// WebView grows with its content — a long HTML email fills the
+    /// window, a short one is short; the surrounding `ScrollView` handles
+    /// scrolling either way.
     @ViewBuilder
     private func bodyContent(for body: MessageBody) -> some View {
         if let html = body.html, !html.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 HTMLMessageView(html: html, attachmentsByCid: inlineImageData)
-                    .frame(minHeight: 200, maxHeight: 1200)
+                    .frame(minHeight: 200)
                 if isLoadingInlineImages {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
