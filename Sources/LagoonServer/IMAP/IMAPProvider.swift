@@ -41,6 +41,23 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     private var negotiated: Set<String> = []
     /// Mailbox state of the last SELECT; nil means "not selected yet".
     private var selected: IMAPSelected?
+    /// Message-ID → UID for the currently-selected mailbox.
+    ///
+    /// IMAP addresses messages by UID, but the store's stable identity is
+    /// the RFC 5322 Message-ID (migration 010 — a UID changes after MOVE).
+    /// Resolving one to the other used to cost a `UID SEARCH HEADER` that
+    /// QQ routinely answers empty, followed by a 501-message header scan
+    /// — ~2 s on every body fetch, attachment download, markRead, archive
+    /// and undo.
+    ///
+    /// A UID is stable for the lifetime of a UIDVALIDITY, so the mapping
+    /// is safe to keep. `uidCacheValidity` records which UIDVALIDITY the
+    /// cache was built against; a mismatch (server-side mailbox rebuild)
+    /// drops the whole map. The one expensive scan populates *every*
+    /// mapping it sees, so opening a second message from the same window
+    /// is free.
+    private var uidByMessageID: [String: Int64] = [:]
+    private var uidCacheValidity: Int64?
     /// The archive role is account data, not connection state: it survives a
     /// reconnect (spec §4.3).
     private var archiveResolved = false
@@ -638,19 +655,36 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         if remoteId.hasPrefix("uid:"), let uid = Int64(remoteId.dropFirst(4)) {
             return uid
         }
+        // Cache: the same Message-ID resolves to the same UID for the whole
+        // UIDVALIDITY. Drop the map when the mailbox was rebuilt under us.
+        if let selected {
+            if uidCacheValidity != selected.uidValidity {
+                uidByMessageID.removeAll(keepingCapacity: true)
+                uidCacheValidity = selected.uidValidity
+            }
+            if let cached = uidByMessageID[remoteId] {
+                return cached
+            }
+        }
         if let uid = try await client.searchUID(messageID: remoteId) {
+            uidByMessageID[remoteId] = uid
             return uid
         }
         // QQ accepts HEADER SEARCH but can return an empty set even when the
-        // header is present. Scan the selected mailbox's recent window as a
-        // deterministic fallback.
+        // header is present (and for older messages it always does). Scan
+        // the recent window once and remember *every* mapping it yields —
+        // the next open from the same window is then a dictionary hit.
         if let selected {
             let fromUid = max(1, selected.uidNext - 501)
             let headers = try await client.fetchHeaders(fromUid: fromUid)
-            if let match = headers.first(where: {
-                $0.rawHeaders["message-id"] == remoteId
-            }) {
-                return match.uid
+            for header in headers {
+                guard let messageID = header.rawHeaders["message-id"],
+                      !messageID.isEmpty
+                else { continue }
+                uidByMessageID[messageID] = header.uid
+            }
+            if let match = uidByMessageID[remoteId] {
+                return match
             }
         }
         throw MailError.messageGone
