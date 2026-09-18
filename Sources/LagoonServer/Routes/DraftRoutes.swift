@@ -89,6 +89,15 @@ public enum DraftRoutes {
                 accountEmail: account.email,
                 draftGenerator: draftGenerator
             )
+        } catch let llmError as LLMError where llmError.code == "insufficient-credit" {
+            // The provider's account is out of money / revoked. Surface a
+            // distinct code so the client tells the user to top up their
+            // MiniMax account instead of showing "AI error, retry".
+            return errorResponse(.serviceUnavailable, "ai-credit-exhausted", logger: logger, error: llmError)
+        } catch let llmError as LLMError where llmError.code == "budget-exceeded" {
+            return errorResponse(.serviceUnavailable, "ai-budget-exceeded", logger: logger, error: llmError)
+        } catch let llmError as LLMError where llmError.code == "circuit-open" {
+            return errorResponse(.serviceUnavailable, "ai-circuit-open", logger: logger, error: llmError)
         } catch {
             return errorResponse(.badGateway, "ai-error", logger: logger, error: error)
         }

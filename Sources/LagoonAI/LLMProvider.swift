@@ -52,6 +52,12 @@ public enum LLMError: Error, CustomStringConvertible {
     case circuitOpen(provider: String)
     /// The configured monthly budget is exhausted.
     case budgetExceeded(currentUSD: Double, capUSD: Double)
+    /// The *vendor's* account is out of credit or the key was revoked
+    /// (HTTP 401/402). Distinguished from `budgetExceeded` because the
+    /// remedy is different: the user tops up their provider account
+    /// rather than raising the local cap. Also trips the circuit breaker
+    /// so a background classifier does not hammer a dead account.
+    case insufficientCredit(status: Int)
 
     public var description: String {
         switch self {
@@ -67,6 +73,24 @@ public enum LLMError: Error, CustomStringConvertible {
                 format: "LLM budget exceeded: $%.4f of $%.2f",
                 cur, cap
             )
+        case .insufficientCredit(let status):
+            "provider account out of credit (HTTP \(status))"
+        }
+    }
+
+    /// Stable machine code for the route layer to map onto a client-facing
+    /// error code. Distinct from `description`, which is for logs.
+    public var code: String {
+        switch self {
+        case .notConfigured: "not-configured"
+        case .invalidBaseURL: "invalid-base-url"
+        case .blockedHost: "blocked-host"
+        case .redirectBlocked: "redirect-blocked"
+        case .http: "http"
+        case .badResponse: "bad-response"
+        case .circuitOpen: "circuit-open"
+        case .budgetExceeded: "budget-exceeded"
+        case .insufficientCredit: "insufficient-credit"
         }
     }
 }

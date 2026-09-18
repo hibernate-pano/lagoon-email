@@ -128,14 +128,28 @@ public enum MIMEParser {
         parse(message: message).text
     }
 
-    /// Full parse: plain text, HTML (when present), and every attachment
-    /// with its disposition and decoded bytes. The IMAP part path is
-    /// preserved as `id` so the route layer can re-fetch a single part via
-    /// `BODY[1.2]`.
-    public static func parse(message: Data) -> ParsedMessage {
+    /// Full parse: plain text, HTML (when present), and every attachment's
+    /// *metadata*. The IMAP part path is preserved as `id` so the route
+    /// layer can re-fetch a single part via `BODY[1.2]`.
+    ///
+    /// `decodeAttachmentBytes` defaults to `false` because the body route
+    /// strips attachment bytes before the wire response — decoding them
+    /// was pure waste (a 5 MB attachment decoded on every message open).
+    /// The attachment download route passes `true` because it needs the
+    /// bytes.
+    public static func parse(
+        message: Data,
+        decodeAttachmentBytes: Bool = false
+    ) -> ParsedMessage {
         let (header, body) = splitHeadAndBody(message)
         let headers = parseHeaderBlock(header)
-        let result = parsePart(headers: headers, body: body, depth: 0, partPath: "1")
+        let result = parsePart(
+            headers: headers,
+            body: body,
+            depth: 0,
+            partPath: "1",
+            decodeAttachmentBytes: decodeAttachmentBytes
+        )
         let text = result.text ?? (result.html.map { HTMLText.strip($0) } ?? "")
         return ParsedMessage(
             text: text.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -204,7 +218,8 @@ public enum MIMEParser {
         headers: [String: String],
         body: Data,
         depth: Int,
-        partPath: String
+        partPath: String,
+        decodeAttachmentBytes: Bool
     ) -> ParseResult {
         guard depth < maxDepth else { return ParseResult() }
         let (mimeType, parameters) = parseContentType(headers["content-type"])
@@ -221,7 +236,8 @@ public enum MIMEParser {
                 headers: parseHeaderBlock(innerHeader),
                 body: innerBody,
                 depth: depth + 1,
-                partPath: partPath
+                partPath: partPath,
+                decodeAttachmentBytes: decodeAttachmentBytes
             )
         }
 
@@ -237,7 +253,8 @@ public enum MIMEParser {
                     headers: part.headers,
                     body: part.body,
                     depth: depth + 1,
-                    partPath: childPath
+                    partPath: childPath,
+                    decodeAttachmentBytes: decodeAttachmentBytes
                 )
                 if result.text == nil { result.text = child.text }
                 if result.html == nil { result.html = child.html }
@@ -274,7 +291,10 @@ public enum MIMEParser {
                     partPath: partPath,
                     filename: filename,
                     mimeType: mimeType,
-                    data: decoded,
+                    decoded: decoded,
+                    encoded: body,
+                    encoding: encoding,
+                    decodeBytes: decodeAttachmentBytes,
                     contentId: contentId,
                     disposition: .attachment
                 )
@@ -305,7 +325,10 @@ public enum MIMEParser {
             partPath: partPath,
             filename: filename,
             mimeType: mimeType,
-            data: decoded,
+            decoded: decoded,
+            encoded: body,
+            encoding: encoding,
+            decodeBytes: decodeAttachmentBytes,
             contentId: contentId,
             disposition: disposition
         )
@@ -343,21 +366,61 @@ public enum MIMEParser {
         partPath: String,
         filename: String?,
         mimeType: String,
-        data: Data,
+        decoded: Data,
+        encoded: Data,
+        encoding: String,
+        decodeBytes: Bool,
         contentId: String?,
         disposition: Attachment.Disposition
     ) -> ParseResult {
         var result = ParseResult()
+        // Decoding the bytes is the expensive step (a 5 MB PDF costs a
+        // few hundred ms of BASE64 work + allocation). When the caller
+        // only needs metadata we skip it and estimate the size from the
+        // encoded length instead.
+        let data: Data
+        let size: Int
+        if decodeBytes {
+            data = decoded
+            size = decoded.count
+        } else {
+            data = Data()
+            size = estimatedSize(encoding: encoding, encoded: encoded)
+        }
         result.attachments.append(ParsedAttachment(
             id: partPath,
             filename: filename,
             mimeType: mimeType,
-            size: data.count,
+            size: size,
             contentId: contentId,
             disposition: disposition,
             data: data
         ))
         return result
+    }
+
+    /// Decoded byte count without paying for the decode. BASE64 is a
+    /// 4→3 expansion (minus padding); QP shrinks by roughly the number
+    /// of `=XX` escapes, which we cannot know without scanning — the
+    /// estimate is close enough for a UI size label. 7bit/binary are
+    /// stored as-is.
+    static func estimatedSize(encoding: String, encoded: Data) -> Int {
+        switch encoding {
+        case "base64":
+            let padding = encoded.suffix(2).reduce(0) { $0 + ($1 == UInt8(ascii: "=") ? 1 : 0) }
+            return max(0, encoded.count * 3 / 4 - padding)
+        case "quoted-printable":
+            // Scan for `=` without decoding: each escape removes 2 bytes.
+            var escapes = 0
+            var index = encoded.startIndex
+            while index < encoded.endIndex, encoded[index] == UInt8(ascii: "=") {
+                escapes += 1
+                index = encoded.index(index, offsetBy: 3, limitedBy: encoded.endIndex) ?? encoded.endIndex
+            }
+            return max(0, encoded.count - escapes * 2)
+        default:
+            return encoded.count
+        }
     }
 
     /// Filename from `Content-Disposition: attachment; filename=...` or

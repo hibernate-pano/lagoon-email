@@ -626,8 +626,15 @@ struct MessageDetailView: View {
                 language: l10n.language.rawValue
             )
             summaryState = .loaded(summary)
-        } catch APIError.badStatus(let code, _) where code == 503 {
-            summaryState = .unavailable
+        } catch let apiError as APIError {
+            switch Self.aiFailureKind(for: apiError) {
+            case .notConfigured:
+                summaryState = .unavailable
+            case .specific(let message):
+                summaryState = .failed(message)
+            case .none:
+                summaryState = .failed(l10n.summaryFailed + apiError.lagoonUIMessage)
+            }
         } catch {
             summaryState = .failed(l10n.summaryFailed + error.lagoonUIMessage)
         }
@@ -642,10 +649,40 @@ struct MessageDetailView: View {
             )
             draftState = .loaded(draft)
             showDraftPicker = true
-        } catch APIError.badStatus(let code, _) where code == 503 {
-            draftState = .unavailable
+        } catch let apiError as APIError {
+            switch Self.aiFailureKind(for: apiError) {
+            case .notConfigured:
+                // AI is off by config; render the muted "AI not configured"
+                // hint rather than a red error.
+                draftState = .unavailable
+            case .specific(let message):
+                draftState = .failed(message)
+            case .none:
+                draftState = .failed(l10n.draftFailed + apiError.lagoonUIMessage)
+            }
         } catch {
             draftState = .failed(l10n.draftFailed + error.lagoonUIMessage)
+        }
+    }
+
+    /// The AI endpoints answer 503 with three distinct, actionable codes
+    /// (`ai-credit-exhausted` / `ai-budget-exceeded` / `ai-circuit-open`)
+    /// plus the benign `ai-not-configured`. Before this, every 503 was
+    /// folded into "AI not configured" — so a billing failure looked
+    /// like a configuration switch and the user never saw the reason.
+    private enum AIFailureKind {
+        case notConfigured
+        case specific(String)
+        case none
+    }
+
+    private static func aiFailureKind(for error: APIError) -> AIFailureKind {
+        switch error.serverErrorCode {
+        case "ai-not-configured": return .notConfigured
+        case "ai-credit-exhausted": return .specific(L10n.current.aiCreditExhausted)
+        case "ai-budget-exceeded": return .specific(L10n.current.aiBudgetExceeded)
+        case "ai-circuit-open": return .specific(L10n.current.aiCircuitOpen)
+        default: return .none
         }
     }
 

@@ -150,6 +150,24 @@ public struct L10n: Sendable, Equatable {
             "AI not configured (missing LLM_PROVIDER_PRIMARY_API_KEY)"
         )
     }
+    public var aiCreditExhausted: String {
+        pick(
+            "AI 服务余额不足 —— 请到 MiniMax 控制台充值后重试。",
+            "AI provider account is out of credit — top up MiniMax and try again."
+        )
+    }
+    public var aiBudgetExceeded: String {
+        pick(
+            "本月 AI 用量已达上限，请到「本月 LLM 用量」里调整。",
+            "Monthly AI budget reached — adjust it under “This month's LLM usage”."
+        )
+    }
+    public var aiCircuitOpen: String {
+        pick(
+            "AI 服务连续失败，已暂时熔断；几分钟后会自动重试。",
+            "AI provider kept failing; the circuit is open and will retry in a few minutes."
+        )
+    }
     public var unknownSender: String { pick("未知发件人", "Unknown sender") }
     public var pin: String { pick("置顶", "Pin") }
     public var unpin: String { pick("取消置顶", "Unpin") }

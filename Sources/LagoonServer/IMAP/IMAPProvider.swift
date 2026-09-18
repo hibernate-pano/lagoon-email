@@ -335,7 +335,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             let uid = try await resolveUID(remoteId, client: client)
             return try await client.fetchFullBody(uid: uid)
         }
-        let parsed = MIMEParser.parse(message: raw)
+        // The download route DOES need the bytes, so decode them here
+        // (the body route skips this via the default false).
+        let parsed = MIMEParser.parse(message: raw, decodeAttachmentBytes: true)
         guard let att = parsed.attachments.first(where: { $0.id == attachmentId }) else {
             throw AttachmentError.notFound
         }

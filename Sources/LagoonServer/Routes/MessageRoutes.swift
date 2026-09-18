@@ -4,6 +4,7 @@ import Hummingbird
 import NIOCore
 import PostgresNIO
 import LagoonKit
+import LagoonAI
 
 /// Shared JSON response helpers for the M1 routes. Dates are ISO-8601 to match
 /// the macOS client's `JSONDecoder.dateDecodingStrategy = .iso8601`.
@@ -361,6 +362,16 @@ public enum MessageRoutes {
                     provider: result.provider
                 )
                 return RouteJSON.response(summary)
+            } catch let llmError as LLMError where llmError.code == "insufficient-credit" {
+                logger.warning("summarizer.outOfCredit", metadata: [
+                    "accountId": .string(accountId.uuidString),
+                    "remoteId": .string(remoteId),
+                ])
+                return RouteJSON.error(.serviceUnavailable, "ai-credit-exhausted")
+            } catch let llmError as LLMError where llmError.code == "budget-exceeded" {
+                return RouteJSON.error(.serviceUnavailable, "ai-budget-exceeded")
+            } catch let llmError as LLMError where llmError.code == "circuit-open" {
+                return RouteJSON.error(.serviceUnavailable, "ai-circuit-open")
             } catch {
                 logger.error("summarizer failed", metadata: [
                     "accountId": .string(accountId.uuidString),

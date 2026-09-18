@@ -388,12 +388,38 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
             log(capability: capability, provider: provider, completion: completion, outcome: "ok")
             return completion
         } catch {
-            if case LLMError.http(let status) = error, (500..<600).contains(status) {
+            let normalized = Self.normalize(error)
+            // 5xx (transient) AND out-of-credit (401/402) both trip the
+            // breaker. The latter is permanent until the user tops up,
+            // so retrying it on every briefing refresh just burns
+            // requests and fills the log — the log showed 104 identical
+            // 402s before this change.
+            switch normalized {
+            case LLMError.http(let status) where (500..<600).contains(status):
                 breaker.recordFailure(provider.name)
+            case LLMError.insufficientCredit:
+                breaker.recordFailure(provider.name)
+            default:
+                break
             }
-            log(capability: capability, provider: provider, completion: nil, outcome: "\(error)")
-            throw error
+            log(capability: capability, provider: provider, completion: nil, outcome: "\(normalized)")
+            throw normalized
         }
+    }
+
+    /// Map a raw provider error onto the public `LLMError` surface so the
+    /// route layer never has to know about vendor status codes. 401/402
+    /// mean the vendor's account is unusable — surfacing them as
+    /// `insufficientCredit` lets the client render "top up your provider"
+    /// instead of a generic "AI error".
+    static func normalize(_ error: Error) -> Error {
+        if let llmError = error as? LLMError {
+            if case .http(let status) = llmError, status == 401 || status == 402 {
+                return LLMError.insufficientCredit(status: status)
+            }
+            return llmError
+        }
+        return error
     }
 
     private func provider(for capability: LLMCapability) -> LLMProvider? {

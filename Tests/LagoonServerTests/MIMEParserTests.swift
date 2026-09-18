@@ -208,7 +208,7 @@ final class MIMEParserTests: XCTestCase {
         """.replacingOccurrences(of: "\n", with: "\r\n")
         let message = Data(raw.utf8)
 
-        let parsed = MIMEParser.parse(message: message)
+        let parsed = MIMEParser.parse(message: message, decodeAttachmentBytes: true)
         XCTAssertEqual(parsed.text, "See attached PDF for details.")
         XCTAssertNil(parsed.html)
         XCTAssertEqual(parsed.attachments.count, 1)
@@ -255,7 +255,7 @@ final class MIMEParserTests: XCTestCase {
         """.replacingOccurrences(of: "\n", with: "\r\n")
         let message = Data(raw.utf8)
 
-        let parsed = MIMEParser.parse(message: message)
+        let parsed = MIMEParser.parse(message: message, decodeAttachmentBytes: true)
         XCTAssertNotNil(parsed.html)
         XCTAssertTrue(parsed.html!.contains("cid:logo@example.com"))
         XCTAssertEqual(parsed.attachments.count, 1)
