@@ -106,6 +106,15 @@ public actor SyncEngine {
                 waitUpTo: waitBudget
             )
             try await apply(changes, to: account)
+            // Recovery is as important to observe as failure: without this
+            // line the log shows an error and then silence, and "did it come
+            // back?" is answerable only by querying the health row.
+            if consecutiveFailures > 0 {
+                logger.info("sync.recovered", metadata: [
+                    "account": .string(account.email),
+                    "afterFailures": .string("\(consecutiveFailures)"),
+                ])
+            }
             consecutiveFailures = 0
         } catch is CancellationError {
             return
@@ -216,10 +225,28 @@ public actor SyncEngine {
     /// Transient/structural failure: exponential backoff 1→2→…→300s with ±20%
     /// jitter, and `last_sync_error` escalates from `error` to `degraded` after
     /// three consecutive rounds (spec §3.4).
+    ///
+    /// Two things beyond the spec matter here:
+    ///
+    /// 1. **It logs.** It used to write the health row and nothing else, so a
+    ///    mailbox stuck in `error` for hours was invisible in the server log —
+    ///    the only signal was `GET /api/accounts`, and the client renders that
+    ///    as a banner with no root cause. This is the same lesson as
+    ///    `.memory/imap-pull-path-must-log-a-round.md`: state that only exists
+    ///    inside your own table cannot be observed.
+    ///
+    /// 2. **It drops the cached provider.** `withClient` already discards a
+    ///    connection that threw, but the provider object itself is cached per
+    ///    account and the failure can happen outside any command (a cancelled
+    ///    IDLE, a capability probe). Dropping it mirrors `markAuthFailure`
+    ///    and guarantees the next tick starts from a fresh connect + LOGIN
+    ///    rather than trusting a half-dead session.
     private func markFailure(_ error: Error) async {
         consecutiveFailures += 1
         let label = (error as? MailError)?.logLabel ?? "\(type(of: error))"
         if let id = currentAccountId {
+            providersByAccount[id] = nil
+            capabilitiesChecked.remove(id)
             try? await AccountStore.updateHealth(
                 accountId: id,
                 health: SyncHealth(
@@ -232,6 +259,14 @@ public actor SyncEngine {
         }
         let base = min(300.0, pow(2.0, Double(consecutiveFailures - 1)))
         let jitter = base * 0.2 * Double.random(in: -1...1)
-        await sleep(.seconds(max(1, base + jitter)))
+        let pause = max(1, base + jitter)
+        logger.warning("sync.failed", metadata: [
+            "accountId": .string(currentAccountId?.uuidString ?? "none"),
+            "label": .string(label),
+            "consecutive": .string("\(consecutiveFailures)"),
+            "retryInSeconds": .string(String(format: "%.1f", pause)),
+            "detail": .string("\(error)"),
+        ])
+        await sleep(.seconds(pause))
     }
 }
