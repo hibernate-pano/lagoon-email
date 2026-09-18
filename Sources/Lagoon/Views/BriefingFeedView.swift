@@ -137,22 +137,26 @@ struct BriefingFeedView: View {
                     Section {
                         if !collapsedGroups.contains(group) {
                             ForEach(groupItems) { item in
-                                NavigationLink(value: item.message.remoteId) {
-                                    BriefingRow(item: item)
+                            NavigationLink(value: item.message.remoteId) {
+                                BriefingRow(item: item)
+                            }
+                            .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                                // Leading swipe = archive (the destructive
+                                // gesture Mail.app puts on the left).
+                                Button { Task { await archiveAndUndo(item) } } label: {
+                                    Label(l10n.archived, systemImage: "tray.and.arrow.down")
                                 }
-                                .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                                    Button { Task { await archiveAndUndo(item) } } label: {
-                                        Label(l10n.archived, systemImage: "tray.and.arrow.down")
-                                    }
-                                    .tint(.orange)
-                                    .disabled(!canArchive)
+                                .tint(.orange)
+                                .disabled(!canArchive)
+                            }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                // Trailing swipe = pin/unpin (the quick
+                                // triage gesture on the right).
+                                Button { togglePin(item: item) } label: {
+                                    Label(item.group == .pinned ? l10n.unpin : l10n.pin, systemImage: "pin")
                                 }
-                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                    Button { togglePin(item: item) } label: {
-                                        Label(item.group == .pinned ? l10n.unpin : l10n.pin, systemImage: "pin")
-                                    }
-                                    .tint(.yellow)
-                                }
+                                .tint(.yellow)
+                            }
                                 // The row's ForEach id is a UUID but the list
                                 // selection is `String?`; tag with the remoteId
                                 // so highlight / j-k / Delete line up.

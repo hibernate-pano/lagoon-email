@@ -55,11 +55,26 @@ struct MessageListView: View {
                                     messageRow(m)
                                         .tag(m.remoteId)
                                         .swipeActions(edge: .trailing) {
+                                            // Trailing swipe = archive (Mail.app convention).
                                             Button(role: .destructive) {
                                                 Task { await archive(m) }
                                             } label: {
                                                 Label(l10n.archived, systemImage: "tray.and.arrow.down")
                                             }
+                                        }
+                                        .swipeActions(edge: .leading) {
+                                            // Leading swipe = toggle read. Single
+                                            // gesture, no destructive styling so
+                                            // the row snaps back without warning.
+                                            Button {
+                                                Task { await toggleRead(m) }
+                                            } label: {
+                                                Label(
+                                                    m.isRead ? l10n.markAsUnread : l10n.markAsRead,
+                                                    systemImage: m.isRead ? "envelope.badge" : "envelope.open"
+                                                )
+                                            }
+                                            .tint(.blue)
                                         }
                                         .contextMenu {
                                             Button(m.isRead ? l10n.markAsUnread : l10n.markAsRead) {
