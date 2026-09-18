@@ -42,7 +42,51 @@ struct ComposerSheet: View {
         let key = "lagoon.composer.\(accountId.uuidString).\(remoteId)"
         self.draftKey = key
         let saved = UserDefaults.standard.string(forKey: key) ?? ""
-        _bodyText = State(initialValue: initialBody.isEmpty ? saved : initialBody)
+        // When the user is replying, prepend the original message as a
+        // quoted block so they have the context right where they type.
+        // The standard "top-post" convention is `\n\n` separator + `> `
+        // prefix; line wrapping keeps the quote from exploding sideways
+        // on long lines.
+        let prefill: String
+        if !initialBody.isEmpty {
+            prefill = initialBody
+        } else if !quotedText.isEmpty {
+            prefill = Self.formatQuotedReply(quotedText)
+        } else {
+            prefill = saved
+        }
+        _bodyText = State(initialValue: prefill)
+    }
+
+    /// Format the original message body as a quoted block. Top-post
+    /// convention: blank line, then each line prefixed with `> ` and
+    /// soft-wrapped at ~72 columns. Empty lines inside the quote are
+    /// preserved as bare `>` so the block stays visually contiguous.
+    static func formatQuotedReply(_ original: String) -> String {
+        let wrap = 72
+        let quoted = original
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> String in
+                let trimmed = String(line)
+                if trimmed.isEmpty { return ">" }
+                // Soft-wrap: chunk on whitespace, prefix every chunk.
+                var pieces: [String] = []
+                var current = ""
+                for word in trimmed.split(separator: " ") {
+                    if current.isEmpty {
+                        current = String(word)
+                    } else if current.count + 1 + word.count > wrap {
+                        pieces.append(current)
+                        current = String(word)
+                    } else {
+                        current += " " + word
+                    }
+                }
+                if !current.isEmpty { pieces.append(current) }
+                return pieces.map { "> \($0)" }.joined(separator: "\n")
+            }
+            .joined(separator: "\n")
+        return "\n\n" + quoted
     }
 
     var body: some View {
