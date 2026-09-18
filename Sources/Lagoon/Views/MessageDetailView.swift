@@ -29,6 +29,10 @@ struct MessageDetailView: View {
     /// renderer swaps `cid:` references for inline data URLs.
     @State private var inlineImageData: [String: Data] = [:]
     @State private var isLoadingInlineImages = false
+    /// The rendered HTML document height, reported by `HTMLMessageView`.
+    /// Reset when the message changes so a tall email does not leave a
+    /// gap under the next short one.
+    @State private var htmlContentHeight: CGFloat = 0
     @State private var attachmentInFlight: String?
 
     @State private var isRead: Bool
@@ -446,8 +450,17 @@ struct MessageDetailView: View {
     private func bodyContent(for body: MessageBody) -> some View {
         if let html = body.html, !html.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
-                HTMLMessageView(html: html, attachmentsByCid: inlineImageData)
-                    .frame(minHeight: 200)
+                // The WebView reports its rendered document height back so
+                // this frame matches it exactly. Without the measured
+                // height the WebView collapses to `minHeight` and scrolls
+                // inside itself while the page below stays empty — the
+                // "body doesn't fill the window" bug.
+                HTMLMessageView(
+                    html: html,
+                    attachmentsByCid: inlineImageData,
+                    contentHeight: $htmlContentHeight
+                )
+                .frame(height: max(200, htmlContentHeight))
                 if isLoadingInlineImages {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
