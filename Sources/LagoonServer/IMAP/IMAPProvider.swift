@@ -295,13 +295,21 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     // MARK: - Body & headers
 
     public func fetchBody(remoteId: String) async throws -> FetchedBody {
+        // M1.6: a 60s in-memory cache makes "open email → swipe away →
+        // come back" effectively free. `accountId` is plumbed through the
+        // MailProvider protocol's caller (the route) — IMAPProvider's
+        // account is set at construction, so we read it from there.
+        let key = account.id
+        if let cached = await MessageBodyCache.shared.get(accountId: key, remoteId: remoteId) {
+            return cached
+        }
         let raw = try await withClient { client in
             try await selectInbox(client: client, force: false)
             let uid = try await resolveUID(remoteId, client: client)
             return try await client.fetchFullBody(uid: uid)
         }
         let parsed = MIMEParser.parse(message: raw)
-        return FetchedBody(
+        let body = FetchedBody(
             text: parsed.text,
             html: parsed.html,
             attachments: parsed.attachments.map {
@@ -317,6 +325,8 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             },
             hasMore: parsed.hasMore
         )
+        await MessageBodyCache.shared.put(body, accountId: key, remoteId: remoteId)
+        return body
     }
 
     public func fetchAttachment(remoteId: String, attachmentId: String) async throws -> FetchedAttachmentBytes {
@@ -332,6 +342,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         guard att.data.count <= AttachmentLimit.maxBytes else {
             throw AttachmentError.tooLarge
         }
+        // Body bytes are now served — the cached metadata in
+        // MessageBodyCache is still accurate (filename, mimeType, size)
+        // so we don't need to invalidate it.
         return FetchedAttachmentBytes(
             mimeType: att.mimeType,
             filename: att.filename,

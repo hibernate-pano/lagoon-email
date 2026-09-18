@@ -191,10 +191,19 @@ public actor GmailProvider: MailProvider {
     /// `attachments.get` call — `fetchAttachment(remoteId:attachmentId:)`
     /// does that work and returns the bytes.
     public func fetchBody(remoteId: String) async throws -> FetchedBody {
+        // M1.6 cache hit avoids the full Gmail message fetch when the
+        // user re-opens an email inside the 60s window.
+        if let cached = await MessageBodyCache.shared.get(
+            accountId: account.id, remoteId: remoteId
+        ) {
+            return cached
+        }
         let raw = try await perform { token in
             try await self.client.getMessageFull(accessToken: token, remoteId: remoteId)
         }
-        return GmailBodyExtractor.fetchedBody(from: raw.payload)
+        let body = GmailBodyExtractor.fetchedBody(from: raw.payload)
+        await MessageBodyCache.shared.put(body, accountId: account.id, remoteId: remoteId)
+        return body
     }
 
     /// Fetch one attachment's bytes by Gmail `body.attachmentId`. The
