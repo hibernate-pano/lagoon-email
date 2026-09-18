@@ -321,6 +321,58 @@ final class MIMEParserTests: XCTestCase {
         XCTAssertLessThanOrEqual(parsed.text.count, MIMEParser.textCap + 64) // +truncation marker
     }
 
+    // MARK: - RFC 5322 address list (reply-all)
+
+    /// The plain case: `Name <addr>` and bare addresses mixed.
+    func test_addressList_mixedBareAndBracketed() {
+        let parsed = MIMEParser.parseAddressList(
+            "Alice <alice@example.com>, bob@example.com, \"Carol\" <carol@x.org>"
+        )
+        XCTAssertEqual(parsed, ["alice@example.com", "bob@example.com", "carol@x.org"])
+    }
+
+    /// A comma inside a quoted display name must not split the list.
+    /// This is the case that breaks a naive `split(",")`.
+    func test_addressList_quotedCommaStaysOneRecipient() {
+        let parsed = MIMEParser.parseAddressList(
+            "\"Smith, John\" <john@example.com>, other@example.com"
+        )
+        XCTAssertEqual(parsed, ["john@example.com", "other@example.com"])
+    }
+
+    /// A comma inside angle brackets must not split either.
+    func test_addressList_commaInsideAngleBrackets() {
+        let parsed = MIMEParser.parseAddressList("\"weird, name\" <a@b.com>")
+        XCTAssertEqual(parsed, ["a@b.com"])
+    }
+
+    /// A display name with no address is junk and gets dropped rather
+    /// than becoming a recipient.
+    func test_addressList_displayNameWithoutAddress_isSkipped() {
+        let parsed = MIMEParser.parseAddressList("Just A Name, real@example.com")
+        XCTAssertEqual(parsed, ["real@example.com"])
+    }
+
+    func test_addressList_emptyInputYieldsEmpty() {
+        XCTAssertEqual(MIMEParser.parseAddressList(""), [])
+        XCTAssertEqual(MIMEParser.parseAddressList("   "), [])
+    }
+
+    /// `To:` / `Cc:` come off the top-level headers, addresses only.
+    func test_parse_extractsToAndCc() {
+        let raw = """
+        From: sender@example.com
+        To: Alice <alice@example.com>, bob@example.com
+        Cc: "Smith, Carol" <carol@example.com>
+        Subject: hi
+
+        body
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let parsed = MIMEParser.parse(message: Data(raw.utf8))
+        XCTAssertEqual(parsed.to, ["alice@example.com", "bob@example.com"])
+        XCTAssertEqual(parsed.cc, ["carol@example.com"])
+    }
+
     /// Both `text/plain` and `text/html` are returned when present, so the
     /// client can pick the rendered variant. The plain-text body is also
     /// populated for search / accessibility.

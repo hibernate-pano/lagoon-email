@@ -66,7 +66,13 @@ public struct MailChangeSet: Sendable {
 public struct OutboundMessage: Sendable {
     public var fromEmail: String
     public var fromName: String?
+    /// Primary recipients, comma-joined into a single `To:` header. A
+    /// reply-to-one passes one address; reply-all passes the sender plus
+    /// every other `To` (minus self, minus the Cc set to avoid duplicates).
     public var to: String
+    /// Carbon-copy recipients. Empty means the `Cc:` header is omitted
+    /// entirely rather than emitted blank.
+    public var cc: [String]
     public var subject: String
     public var body: String
     public var inReplyTo: String?
@@ -79,6 +85,7 @@ public struct OutboundMessage: Sendable {
         fromEmail: String,
         fromName: String?,
         to: String,
+        cc: [String] = [],
         subject: String,
         body: String,
         inReplyTo: String?,
@@ -88,11 +95,20 @@ public struct OutboundMessage: Sendable {
         self.fromEmail = fromEmail
         self.fromName = fromName
         self.to = to
+        self.cc = cc
         self.subject = subject
         self.body = body
         self.inReplyTo = inReplyTo
         self.references = references
         self.isReply = isReply
+    }
+
+    /// Split a comma-separated `To:` string back into addresses. Used by
+    /// the route when it needs the recipient count for validation.
+    public var recipientAddresses: [String] {
+        to.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 }
 
@@ -176,12 +192,26 @@ public struct FetchedBody: Sendable, Equatable {
     public var html: String?
     public var attachments: [FetchedAttachment]
     public var hasMore: Bool
+    /// Recipient addresses from the message's `To:` header. Reply-all
+    /// needs these; before M1.7 the wire `toAddress` was hardcoded nil.
+    public var to: [String]
+    /// Recipient addresses from the message's `Cc:` header.
+    public var cc: [String]
 
-    public init(text: String, html: String?, attachments: [FetchedAttachment], hasMore: Bool) {
+    public init(
+        text: String,
+        html: String?,
+        attachments: [FetchedAttachment],
+        hasMore: Bool,
+        to: [String] = [],
+        cc: [String] = []
+    ) {
         self.text = text
         self.html = html
         self.attachments = attachments
         self.hasMore = hasMore
+        self.to = to
+        self.cc = cc
     }
 }
 

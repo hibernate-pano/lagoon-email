@@ -34,7 +34,12 @@ public enum MIMEBuilder {
     ) -> Data {
         var lines: [String] = []
         lines.append("From: \(address(outbound.fromEmail, name: outbound.fromName))")
-        lines.append("To: \(address(outbound.to, name: nil))")
+        lines.append("To: \(addressList(outbound.to))")
+        // `Cc:` is omitted entirely when empty — a bare `Cc:` header is
+        // technically legal but many spam filters score it.
+        if !outbound.cc.isEmpty {
+            lines.append("Cc: \(addressList(outbound.cc.joined(separator: ", ")))")
+        }
         lines.append("Subject: \(subject)")
         lines.append("Date: \(Self.dateHeader())")
         lines.append("Message-ID: \(messageId)")
@@ -83,6 +88,19 @@ public enum MIMEBuilder {
             return "=?UTF-8?B?\(Data(name.utf8).base64EncodedString())?= <\(email)>"
         }
         return "\"\(name)\" <\(email)>"
+    }
+
+    /// Comma-separated address list → the bracketed form the headers use.
+    /// Already-bracketed input passes through unchanged (a caller that
+    /// received `Name <a@b>` from a header keeps it verbatim).
+    private static func addressList(_ raw: String) -> String {
+        raw.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .map { value in
+                value.contains("<") ? value : "<\(value)>"
+            }
+            .joined(separator: ", ")
     }
 
     private static func base64Lines(_ data: Data) -> String {

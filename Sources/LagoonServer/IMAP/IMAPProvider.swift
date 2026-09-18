@@ -323,7 +323,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                     data: $0.data
                 )
             },
-            hasMore: parsed.hasMore
+            hasMore: parsed.hasMore,
+            to: parsed.to,
+            cc: parsed.cc
         )
         await MessageBodyCache.shared.put(body, accountId: key, remoteId: remoteId)
         return body

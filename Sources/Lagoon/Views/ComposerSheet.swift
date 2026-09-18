@@ -8,6 +8,10 @@ struct ComposerSheet: View {
     let remoteId: String
     let accountId: UUID
     let to: String
+    /// Reply-all Cc recipients. Empty for a plain reply; shown as a
+    /// read-only line so the user can see who else is on the thread
+    /// without being able to silently drop them.
+    let cc: [String]
     let subject: String
     let quotedText: String
     /// Called with the provider-assigned message id (nil when it reports none)
@@ -24,10 +28,20 @@ struct ComposerSheet: View {
     private let draftKey: String
     private let api = APIClient()
 
+    /// The `To:` line split into an array for the reply-all override.
+    /// A plain reply passes a single-element array (the same address the
+    /// server would have derived), so the send path is uniform.
+    private var toRecipients: [String] {
+        to.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
     init(
         remoteId: String,
         accountId: UUID,
         to: String,
+        cc: [String] = [],
         subject: String,
         initialBody: String = "",
         quotedText: String = "",
@@ -36,6 +50,7 @@ struct ComposerSheet: View {
         self.remoteId = remoteId
         self.accountId = accountId
         self.to = to
+        self.cc = cc
         self.subject = subject
         self.quotedText = quotedText
         self.onSent = onSent
@@ -107,6 +122,13 @@ struct ComposerSheet: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(l10n.replyTo).font(.caption).foregroundStyle(.secondary)
                 Text(to).font(.callout).textSelection(.enabled)
+                if !cc.isEmpty {
+                    Text(l10n.replyCc).font(.caption).foregroundStyle(.secondary)
+                    Text(cc.joined(separator: ", "))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
                 Text(subject).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
 
@@ -194,7 +216,9 @@ struct ComposerSheet: View {
                 remoteId: remoteId,
                 accountId: accountId,
                 body: trimmed,
-                requestId: requestId
+                requestId: requestId,
+                to: toRecipients,
+                cc: cc.isEmpty ? nil : cc
             )
             UserDefaults.standard.removeObject(forKey: draftKey)
             onSent(response.providerMessageId)

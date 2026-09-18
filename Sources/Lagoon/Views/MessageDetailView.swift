@@ -48,6 +48,11 @@ struct MessageDetailView: View {
     @State private var showOverrideMenu = false
 
     @State private var showComposer = false
+    /// Which composer variant the toolbar button opened. `.reply` keeps
+    /// the pre-M1.7 single-recipient path; `.replyAll` adds the other
+    /// To/Cc addresses minus self; `.forward` opens the new-message
+    /// composer pre-filled with the quoted original.
+    @State private var composerMode: ComposerMode = .reply
     @State private var sentNotice: String?
     @State private var sentNoticeDismiss: Task<Void, Never>?
 
@@ -71,6 +76,15 @@ struct MessageDetailView: View {
         case loaded(DraftReply)
         case unavailable
         case failed(String)
+    }
+
+    /// Which composer the toolbar opened. Drives the recipient set the
+    /// sheet sends: Reply keeps the default envelope; ReplyAll overrides
+    /// it with `to` + `cc` minus self; Forward opens the compose sheet.
+    private enum ComposerMode: Equatable {
+        case reply
+        case replyAll
+        case forward
     }
 
     init(
@@ -134,15 +148,37 @@ struct MessageDetailView: View {
             }
         }
         .sheet(isPresented: $showComposer) {
-            ComposerSheet(
-                remoteId: remoteId,
-                accountId: accountId,
-                to: messageBody?.fromAddress ?? header?.fromAddress ?? "",
-                subject: subjectText,
-                initialBody: selectedDraftBody,
-                quotedText: messageBody?.text ?? ""
-            ) { _ in
-                showSentNotice()
+            switch composerMode {
+            case .reply, .replyAll:
+                ComposerSheet(
+                    remoteId: remoteId,
+                    accountId: accountId,
+                    to: replyRecipients.joined(separator: ", "),
+                    cc: composerMode == .replyAll ? replyCcRecipients : [],
+                    subject: subjectText,
+                    initialBody: selectedDraftBody,
+                    quotedText: messageBody?.text ?? ""
+                ) { _ in
+                    showSentNotice()
+                }
+            case .forward:
+                // Forward reuses the compose sheet (arbitrary recipient,
+                // editable To). The original is quoted so the recipient
+                // has the context; the Fwd: prefix follows the same
+                // de-dup rule as Re:.
+                NewMessageSheet(
+                    accountId: accountId,
+                    prefillTo: "",
+                    prefillSubject: forwardSubject,
+                    prefillBody: Self.formatForwardBody(
+                        from: messageBody?.fromAddress ?? header?.fromAddress ?? "",
+                        date: receivedAt,
+                        subject: subjectText,
+                        body: messageBody?.text ?? ""
+                    )
+                ) { _ in
+                    showSentNotice()
+                }
             }
         }
         .confirmationDialog(l10n.overrideGroup, isPresented: $showOverrideMenu, titleVisibility: .visible) {
@@ -159,10 +195,24 @@ struct MessageDetailView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItemGroup {
-            Button { showComposer = true } label: {
+            Button { composerMode = .reply; showComposer = true } label: {
                 Label(l10n.reply, systemImage: "arrowshape.turn.up.left")
             }
             .help(l10n.replyHelp)
+
+            Button { composerMode = .replyAll; showComposer = true } label: {
+                Label(l10n.replyAll, systemImage: "arrowshape.turn.up.left.2")
+            }
+            .keyboardShortcut("r", modifiers: [.command, .shift])
+            .disabled(messageBody == nil)
+            .help(l10n.replyAllHelp)
+
+            Button { composerMode = .forward; showComposer = true } label: {
+                Label(l10n.forward, systemImage: "arrowshape.turn.up.right")
+            }
+            .keyboardShortcut("f", modifiers: [.command, .shift])
+            .disabled(messageBody == nil)
+            .help(l10n.forwardHelp)
 
             Button { Task { await togglePin() } } label: {
                 if isPinBusy {
@@ -244,9 +294,22 @@ struct MessageDetailView: View {
         directory.active?.capabilities.archiveFolder ?? true
     }
 
+    /// The recipient line in the metadata block. Prefers the parsed `to`
+    /// array (M1.7); falls back to the legacy single `toAddress` so a
+    /// response from an older server still renders something.
     private var toDisplay: String? {
+        if let body = messageBody, !body.to.isEmpty {
+            return body.to.joined(separator: ", ")
+        }
         guard let to = messageBody?.toAddress, !to.isEmpty else { return nil }
         return to
+    }
+
+    /// The Cc line, when the message has one. Rendered as its own row so a
+    /// long Cc list wraps without pushing the To line off screen.
+    private var ccDisplay: String? {
+        guard let body = messageBody, !body.cc.isEmpty else { return nil }
+        return body.cc.joined(separator: ", ")
     }
 
     private var receivedAt: Date? {
@@ -258,6 +321,7 @@ struct MessageDetailView: View {
             Text(subjectText).font(.title2).bold().textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
             Text(fromDisplay).font(.callout).textSelection(.enabled)
             if let toDisplay { Text(l10n.recipient(toDisplay)).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+            if let ccDisplay { Text("\(l10n.replyCc): \(ccDisplay)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
             if let receivedAt {
                 Text(receivedAt.formatted(date: .complete, time: .shortened))
                     .font(.caption).foregroundStyle(.secondary)
@@ -274,6 +338,68 @@ struct MessageDetailView: View {
 
     private var subjectText: String {
         messageBody?.subject ?? header?.subject ?? l10n.noSubject
+    }
+
+    /// Reply-all `To:` — the original sender first (that is who a reply
+    /// goes to), then every other `To` address minus ourselves. The
+    /// server does the self-filtering again on its side; doing it here
+    /// too keeps the composer's read-only display honest.
+    private var replyRecipients: [String] {
+        let sender = messageBody?.fromAddress ?? header?.fromAddress ?? ""
+        guard composerMode == .replyAll, let body = messageBody else {
+            return sender.isEmpty ? [] : [sender]
+        }
+        let selfAddress = directory.active?.email.lowercased() ?? ""
+        var seen = Set<String>()
+        var result: [String] = []
+        for address in [sender] + body.to {
+            let lower = address.lowercased()
+            guard !lower.isEmpty, lower != selfAddress, !seen.contains(lower) else { continue }
+            seen.insert(lower)
+            result.append(address)
+        }
+        return result
+    }
+
+    /// Reply-all `Cc:` — the original Cc list minus self and minus anyone
+    /// already on the To line.
+    private var replyCcRecipients: [String] {
+        guard composerMode == .replyAll, let body = messageBody else { return [] }
+        let selfAddress = directory.active?.email.lowercased() ?? ""
+        let toSet = Set(replyRecipients.map { $0.lowercased() })
+        return body.cc.filter {
+            let lower = $0.lowercased()
+            return lower != selfAddress && !toSet.contains(lower)
+        }
+    }
+
+    private var forwardSubject: String {
+        let base = messageBody?.subject ?? header?.subject ?? ""
+        if base.lowercased().hasPrefix("fwd:") { return base }
+        return base.isEmpty ? "Fwd:" : "Fwd: \(base)"
+    }
+
+    /// The quoted block a forward carries. Mirrors the reply quote
+    /// convention (`> ` prefix) but with a header block naming the
+    /// original sender and date — a forwarded message usually lands in
+    /// front of someone who has no context.
+    static func formatForwardBody(
+        from: String,
+        date: Date?,
+        subject: String,
+        body: String
+    ) -> String {
+        var header = "\n\n---------- Forwarded message ----------\n"
+        header += "From: \(from)\n"
+        if let date {
+            header += "Date: \(date.formatted(date: .complete, time: .standard))\n"
+        }
+        header += "Subject: \(subject)\n\n"
+        let quoted = body
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.isEmpty ? ">" : "> \($0)" }
+            .joined(separator: "\n")
+        return header + quoted
     }
 
     private var fromDisplay: String {

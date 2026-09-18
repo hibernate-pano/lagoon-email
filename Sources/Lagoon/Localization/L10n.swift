@@ -461,6 +461,11 @@ public struct L10n: Sendable, Equatable {
 
     public var reply: String { pick("回复", "Reply") }
     public var replyHelp: String { pick("回复这封邮件", "Reply to this message") }
+    public var replyAll: String { pick("回复全部", "Reply all") }
+    public var replyAllHelp: String { pick("回复发件人和所有收件人（⇧⌘R）", "Reply to the sender and everyone on the thread (⇧⌘R)") }
+    public var replyCc: String { pick("抄送", "Cc") }
+    public var forward: String { pick("转发", "Forward") }
+    public var forwardHelp: String { pick("把这封邮件转发给别人（⇧⌘F）", "Forward this message to someone else (⇧⌘F)") }
     public var replyTitle: String { pick("回复邮件", "Reply") }
     public var replyTo: String { pick("收件人", "To") }
     public var replyBodyPlaceholder: String { pick("写回复…", "Write your reply…") }

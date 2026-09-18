@@ -566,11 +566,31 @@ public enum MessageRoutes {
         struct SendRequest: Decodable {
             let body: String
             let requestId: String?
+            /// Reply-all override: the full recipient list the client
+            /// computed (sender + other To's minus self). Omitted for a
+            /// plain reply, in which case the server falls back to the
+            /// stored message's From — that is the single-recipient path
+            /// and is left untouched.
+            let to: [String]?
+            /// Reply-all Cc list. Omitted means "no Cc header".
+            let cc: [String]?
         }
         guard let decoded = try? JSONDecoder().decode(SendRequest.self, from: rawBody),
               !decoded.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
             return RouteJSON.error(.badRequest, "malformed-body")
+        }
+        // Every reply-all recipient must be a routable address. A malformed
+        // entry would otherwise end up in the `To:` header verbatim.
+        if let recipients = decoded.to, !recipients.isEmpty {
+            for address in recipients where !Self.isValidRecipient(address) {
+                return RouteJSON.error(.badRequest, "malformed-recipient")
+            }
+        }
+        if let copies = decoded.cc {
+            for address in copies where !Self.isValidRecipient(address) {
+                return RouteJSON.error(.badRequest, "malformed-recipient")
+            }
         }
         let requestId = decoded.requestId.flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
         if decoded.requestId != nil, requestId == nil {
@@ -637,10 +657,25 @@ public enum MessageRoutes {
             .compactMap { $0 }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
+        // Reply-all: the client sends the full recipient set (it has the
+        // parsed `to`/`cc` arrays from the body response). A plain reply
+        // omits the overrides and keeps the pre-M1.7 behaviour of replying
+        // to the stored `From` only.
+        let recipients = decoded.to.flatMap { $0.isEmpty ? nil : $0 }
+            ?? [stored.fromAddress]
+        // Drop self and any address already in `To` so a reply-all to a
+        // message you sent to yourself does not put you in your own Cc.
+        let selfAddress = account.email.lowercased()
+        let toSet = Set(recipients.map { $0.lowercased() })
+        let cc = (decoded.cc ?? []).filter {
+            let lower = $0.lowercased()
+            return lower != selfAddress && !toSet.contains(lower)
+        }
         let outbound = OutboundMessage(
             fromEmail: account.email,
             fromName: nil,
-            to: stored.fromAddress,
+            to: recipients.joined(separator: ", "),
+            cc: cc,
             subject: stored.subject ?? "",
             body: decoded.body,
             inReplyTo: stored.messageIdHeader,
@@ -732,7 +767,9 @@ public enum MessageRoutes {
             text: fetched.text,
             html: fetched.html,
             attachments: fetched.attachments.map { $0.toWire() },
-            hasMore: fetched.hasMore
+            hasMore: fetched.hasMore,
+            to: fetched.to,
+            cc: fetched.cc
         )
     }
 

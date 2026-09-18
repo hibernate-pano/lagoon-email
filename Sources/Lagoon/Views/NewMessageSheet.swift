@@ -22,17 +22,42 @@ struct NewMessageSheet: View {
     private let draftKey: String
     private let api = APIClient()
 
-    init(accountId: UUID, onSent: @escaping (String?) -> Void) {
+    /// - Parameters:
+    ///   - prefillTo: Recipient to seed the To field with. Empty for a
+    ///     blank compose; the forward flow leaves it empty on purpose so
+    ///     the user must consciously pick who receives the forwarded mail.
+    ///   - prefillSubject: Subject to seed. `nil` restores the persisted
+    ///     draft's subject (the normal compose case).
+    ///   - prefillBody: Body to seed (the quoted forward block). `nil`
+    ///     restores the persisted draft's body.
+    ///
+    /// Prefills win over the persisted draft so opening Forward never
+    /// shows a half-typed message from a previous compose session. The
+    /// draft itself is left on disk — cancel and reopen "New message"
+    /// and it comes back.
+    init(
+        accountId: UUID,
+        prefillTo: String? = nil,
+        prefillSubject: String? = nil,
+        prefillBody: String? = nil,
+        onSent: @escaping (String?) -> Void
+    ) {
         self.accountId = accountId
         self.onSent = onSent
         let key = "lagoon.compose.\(accountId.uuidString)"
         self.draftKey = key
+        let seeded: Draft
         if let data = UserDefaults.standard.data(forKey: key),
            let saved = try? JSONDecoder().decode(Draft.self, from: data) {
-            _draft = State(initialValue: saved)
+            seeded = saved
         } else {
-            _draft = State(initialValue: Draft())
+            seeded = Draft()
         }
+        var initial = seeded
+        if let prefillTo { initial.to = prefillTo }
+        if let prefillSubject { initial.subject = prefillSubject }
+        if let prefillBody { initial.body = prefillBody }
+        _draft = State(initialValue: initial)
     }
 
     var body: some View {

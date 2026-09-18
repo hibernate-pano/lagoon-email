@@ -368,11 +368,20 @@ public final class APIClient: Sendable {
     /// Recipient, subject and threading headers are taken from the stored
     /// message on the server; only the body travels from here. `.interactive`
     /// because the server waits for SMTP + (QQ) Sent APPEND before returning.
+    /// - Parameters:
+    ///   - to: Reply-all recipient override. nil means "reply to the stored
+    ///     From only" and lets the server derive the envelope; a non-nil
+    ///     array replaces the envelope entirely (the client computed it
+    ///     from the body response's `to` + `cc` minus self).
+    ///   - cc: Reply-all carbon-copy list. nil and `[]` are equivalent
+    ///     (no `Cc:` header).
     public func sendReply(
         remoteId: String,
         accountId: UUID,
         body: String,
-        requestId: String
+        requestId: String,
+        to: [String]? = nil,
+        cc: [String]? = nil
     ) async throws -> SendResponse {
         let url = try makeURL(path: ["api", "messages", remoteId, "send"], query: [
             .init(name: "accountId", value: accountId.uuidString)
@@ -380,10 +389,13 @@ public final class APIClient: Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
+        var payload: [String: Any] = [
             "body": body,
             "requestId": requestId,
-        ])
+        ]
+        if let to, !to.isEmpty { payload["to"] = to }
+        if let cc, !cc.isEmpty { payload["cc"] = cc }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         request.timeoutInterval = APITimeout.interactive.seconds
         let (data, _) = try await send(request, timeout: .interactive)
         return try Self.decode(SendResponse.self, from: data)

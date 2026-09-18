@@ -95,6 +95,11 @@ public struct MessageBody: Codable, Equatable, Sendable {
     public let html: String?
     public let attachments: [Attachment]
     public let hasMore: Bool
+    /// Recipient addresses from `To:` (addresses only, no display names).
+    /// Reply-all builds its recipient list from `to` + `cc` minus self.
+    public let to: [String]
+    /// Recipient addresses from `Cc:`.
+    public let cc: [String]
 
     public init(
         remoteId: String,
@@ -106,7 +111,9 @@ public struct MessageBody: Codable, Equatable, Sendable {
         text: String,
         html: String? = nil,
         attachments: [Attachment] = [],
-        hasMore: Bool = false
+        hasMore: Bool = false,
+        to: [String] = [],
+        cc: [String] = []
     ) {
         self.remoteId = remoteId
         self.subject = subject
@@ -118,6 +125,8 @@ public struct MessageBody: Codable, Equatable, Sendable {
         self.html = html
         self.attachments = attachments
         self.hasMore = hasMore
+        self.to = to
+        self.cc = cc
     }
 
     public init(from decoder: Decoder) throws {
@@ -129,18 +138,20 @@ public struct MessageBody: Codable, Equatable, Sendable {
         toAddress = try c.decodeIfPresent(String.self, forKey: .toAddress)
         receivedAt = try c.decode(Date.self, forKey: .receivedAt)
         text = try c.decode(String.self, forKey: .text)
-        // v0.2.0 clients do not know about these fields. Decode as missing
-        // → no attachments, no HTML, no truncation flag. The forward path
-        // (v0.2.0 server, M1.6 client) sees the same defaults and renders
-        // the plain-text path, which is correct.
+        // Fields the older server did not emit decode as "missing" rather
+        // than failing the whole body: a v0.3.x server + v0.4.x client is
+        // a supported combination during rollout, and every added field
+        // has a safe default here.
         html = try c.decodeIfPresent(String.self, forKey: .html)
         attachments = try c.decodeIfPresent([Attachment].self, forKey: .attachments) ?? []
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? false
+        to = try c.decodeIfPresent([String].self, forKey: .to) ?? []
+        cc = try c.decodeIfPresent([String].self, forKey: .cc) ?? []
     }
 
     private enum CodingKeys: String, CodingKey {
         case remoteId, subject, fromAddress, fromName, toAddress
-        case receivedAt, text, html, attachments, hasMore
+        case receivedAt, text, html, attachments, hasMore, to, cc
     }
 }
 

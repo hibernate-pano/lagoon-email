@@ -46,8 +46,26 @@ public enum GmailBodyExtractor {
             text: plain.trimmingCharacters(in: .whitespacesAndNewlines),
             html: html,
             attachments: attachments,
-            hasMore: false
+            hasMore: false,
+            to: recipientAddresses(from: payload, headerName: "To"),
+            cc: recipientAddresses(from: payload, headerName: "Cc")
         )
+    }
+
+    /// Pull `To:` / `Cc:` off the payload headers and normalize each into a
+    /// bare address. Gmail's `format=full` returns the message headers on
+    /// the root payload only; nested parts carry content headers.
+    static func recipientAddresses(
+        from payload: RawGmailMessage.Payload,
+        headerName: String
+    ) -> [String] {
+        let raw = payload.headers?.first {
+            $0.name.caseInsensitiveCompare(headerName) == .orderedSame
+        }?.value ?? ""
+        guard !raw.isEmpty else { return [] }
+        // Reuse the IMAP parser — the header syntax is identical, and a
+        // second implementation would drift.
+        return MIMEParser.parseAddressList(raw)
     }
 
     /// Walk the payload tree, collecting every non-text part as an

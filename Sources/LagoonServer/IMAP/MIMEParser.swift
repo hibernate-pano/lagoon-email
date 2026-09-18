@@ -128,6 +128,73 @@ public enum MIMEParser {
         parse(message: message).text
     }
 
+    /// Extract the recipient list from a `To:` / `Cc:` header value.
+    ///
+    /// RFC 5322 address lists are comma-separated, but commas can legally
+    /// appear inside a quoted display name (`"Smith, John" <j@x.com>`) and
+    /// inside angle brackets. We split only on top-level commas (outside
+    /// quotes and angle brackets) and pull the bare `addr@host` out of each
+    /// piece — a bare address with no angle brackets is returned as-is.
+    ///
+    /// Only addresses travel: the display name is dropped because
+    /// reply-all needs routable recipients, not labels. Pieces whose shape
+    /// is unparseable (a stray display name with no address) are skipped
+    /// rather than emitted as junk recipients.
+    public static func parseAddressList(_ raw: String) -> [String] {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        var pieces: [String] = []
+        var current = ""
+        var inQuotes = false
+        var angleDepth = 0
+        var escaped = false
+
+        for char in trimmed {
+            if escaped {
+                current.append(char)
+                escaped = false
+                continue
+            }
+            switch char {
+            case "\\" where inQuotes:
+                escaped = true
+                current.append(char)
+            case "\"":
+                inQuotes.toggle()
+                current.append(char)
+            case "<":
+                angleDepth += 1
+                current.append(char)
+            case ">":
+                angleDepth = max(0, angleDepth - 1)
+                current.append(char)
+            case "," where !inQuotes && angleDepth == 0:
+                pieces.append(current)
+                current = ""
+            default:
+                current.append(char)
+            }
+        }
+        if !current.isEmpty { pieces.append(current) }
+
+        return pieces.compactMap { piece -> String? in
+            let value = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { return nil }
+            if let open = value.lastIndex(of: "<"),
+               let close = value.lastIndex(of: ">"),
+               open < close {
+                let address = value[value.index(after: open)..<close]
+                    .trimmingCharacters(in: .whitespaces)
+                return address.isEmpty ? nil : address
+            }
+            // No angle brackets: the whole piece should be a bare address.
+            // Reject anything with internal whitespace.
+            guard !value.contains(" ") else { return nil }
+            return value
+        }
+    }
+
     /// Full parse: plain text, HTML (when present), and every attachment's
     /// *metadata*. The IMAP part path is preserved as `id` so the route
     /// layer can re-fetch a single part via `BODY[1.2]`.
@@ -155,7 +222,9 @@ public enum MIMEParser {
             text: text.trimmingCharacters(in: .whitespacesAndNewlines),
             html: result.html,
             attachments: result.attachments,
-            hasMore: result.hasMore
+            hasMore: result.hasMore,
+            to: parseAddressList(headers["to"] ?? ""),
+            cc: parseAddressList(headers["cc"] ?? "")
         )
     }
 
@@ -164,12 +233,25 @@ public enum MIMEParser {
         public var html: String?
         public var attachments: [ParsedAttachment]
         public var hasMore: Bool
+        /// Recipient addresses from `To:`, addresses only.
+        public var to: [String]
+        /// Recipient addresses from `Cc:`, addresses only.
+        public var cc: [String]
 
-        public init(text: String, html: String?, attachments: [ParsedAttachment], hasMore: Bool) {
+        public init(
+            text: String,
+            html: String?,
+            attachments: [ParsedAttachment],
+            hasMore: Bool,
+            to: [String] = [],
+            cc: [String] = []
+        ) {
             self.text = text
             self.html = html
             self.attachments = attachments
             self.hasMore = hasMore
+            self.to = to
+            self.cc = cc
         }
     }
 
