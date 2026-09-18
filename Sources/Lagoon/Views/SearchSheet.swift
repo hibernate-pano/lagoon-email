@@ -41,10 +41,23 @@ struct SearchSheet: View {
                     List(results) { m in
                         NavigationLink(value: m.remoteId) {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(m.subject ?? l10n.noSubject).bold(!m.isRead).lineLimit(1)
+                                highlightedText(
+                                    m.subject ?? l10n.noSubject,
+                                    term: query,
+                                    bold: !m.isRead
+                                )
+                                .lineLimit(1)
                                 HStack {
-                                    Text(m.fromName ?? m.fromAddress).font(.caption).foregroundStyle(.secondary)
-                                    Text(m.receivedAt.formatted(date: .abbreviated, time: .shortened)).font(.caption2).foregroundStyle(.secondary)
+                                    highlightedText(
+                                        m.fromName ?? m.fromAddress,
+                                        term: query,
+                                        font: .caption,
+                                        color: .secondary
+                                    )
+                                    .lineLimit(1)
+                                    Text(m.receivedAt.formatted(date: .abbreviated, time: .shortened))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
                                 }
                             }
                         }
@@ -90,5 +103,40 @@ struct SearchSheet: View {
             )
         }
         isLoading = false
+    }
+
+    /// Render `text` with every case-insensitive occurrence of `term`
+    /// highlighted in a yellow rounded background. Used to mark the
+    /// user's search hits inside a result row so they can see *why* a
+    /// given message matched before they open it.
+    ///
+    /// Built as a single `AttributedString` so styling stays consistent
+    /// across matched and unmatched segments; the `Text` returned here
+    /// lets the caller chain `.lineLimit` / `.foregroundStyle` modifiers
+    /// if needed.
+    private func highlightedText(
+        _ text: String,
+        term: String,
+        font: Font? = nil,
+        bold: Bool = false,
+        color: Color? = nil,
+        lineLimit: Int? = nil
+    ) -> Text {
+        var attr = AttributedString(text)
+        if let font { attr.font = font }
+        if bold {
+            // `attr.font` is an optional, and `Font.bold()` returns a Font.
+            // The compact assignment form below avoids the
+            // if-let-with-side-effect-in-ViewBuilder pitfall.
+            attr.font = (attr.font ?? .body).bold()
+        }
+        if let color { attr.foregroundColor = color }
+
+        let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty,
+           let range = attr.range(of: trimmed, options: .caseInsensitive) {
+            attr[range].backgroundColor = .yellow.opacity(0.35)
+        }
+        return Text(attr)
     }
 }
