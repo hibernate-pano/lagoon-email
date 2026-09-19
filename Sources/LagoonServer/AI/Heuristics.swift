@@ -4,23 +4,28 @@ import LagoonKit
 /// Deterministic, offline classifier used when no LLM provider is configured
 /// (and as the fallback when the AI classifier errors).
 ///
-/// ponytail: ceiling — this is header/address heuristics only. There is no
-/// thread analysis and no reply detection, so a read message you already
-/// replied to can still land in `needsReply`.
+/// Reply detection is wired but partial (spec 2026-09-19 §2): it sees replies
+/// sent through Lagoon (audited as send actions). Mail replied to from other
+/// clients is invisible — the Sent folder is not synced — so those messages
+/// can still land in `needsReply`.
 public struct HeuristicBriefingClassifier: BriefingClassifying {
     /// Extra context the protocol method cannot carry on `MessageHeader`:
-    /// local pins and (when a data source exists) which messages carry a
-    /// `List-Unsubscribe` header.
+    /// local pins, (when a data source exists) which messages carry a
+    /// `List-Unsubscribe` header, and which messages Lagoon has already
+    /// sent a reply for.
     public struct Signals: Sendable {
         public let pinnedGmailIds: Set<String>
         public let listUnsubscribeGmailIds: Set<String>
+        public let repliedRemoteIds: Set<String>
 
         public init(
             pinnedGmailIds: Set<String> = [],
-            listUnsubscribeGmailIds: Set<String> = []
+            listUnsubscribeGmailIds: Set<String> = [],
+            repliedRemoteIds: Set<String> = []
         ) {
             self.pinnedGmailIds = pinnedGmailIds
             self.listUnsubscribeGmailIds = listUnsubscribeGmailIds
+            self.repliedRemoteIds = repliedRemoteIds
         }
     }
 
@@ -65,7 +70,8 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
             for: message,
             accountEmail: accountEmail,
             pinnedGmailIds: signals.pinnedGmailIds,
-            listUnsubscribeGmailIds: signals.listUnsubscribeGmailIds
+            listUnsubscribeGmailIds: signals.listUnsubscribeGmailIds,
+            repliedRemoteIds: signals.repliedRemoteIds
         )
     }
 
@@ -75,13 +81,15 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
     ///   1. pinned                       → .pinned
     ///   2. List-Unsubscribe or no-reply → .subscriptionNoise
     ///   3. sender is the account owner  → .awaitingReply
-    ///   4. read and older than 7 days   → .safeToArchive
-    ///   5. otherwise                    → .needsReply
+    ///   4. Lagoon recorded a reply      → .safeToArchive (reason .replied)
+    ///   5. read and older than 7 days   → .safeToArchive
+    ///   6. otherwise                    → .needsReply
     public static func group(
         for message: MessageHeader,
         accountEmail: String,
         pinnedGmailIds: Set<String>,
         listUnsubscribeGmailIds: Set<String>,
+        repliedRemoteIds: Set<String> = [],
         now: Date = Date()
     ) -> (group: BriefingGroup, reason: BriefingReason) {
         if pinnedGmailIds.contains(message.remoteId) {
@@ -95,6 +103,12 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
         }
         if message.fromAddress.caseInsensitiveCompare(accountEmail) == .orderedSame {
             return (.awaitingReply, .fromSelf)
+        }
+        // Already replied = already handled: leave "needs reply" even when the
+        // message is unread (replies usually follow a read, but the send
+        // audit is the stronger signal either way).
+        if repliedRemoteIds.contains(message.remoteId) {
+            return (.safeToArchive, .replied)
         }
         let sevenDays: TimeInterval = 7 * 24 * 60 * 60
         if message.isRead, now.timeIntervalSince(message.receivedAt) > sevenDays {

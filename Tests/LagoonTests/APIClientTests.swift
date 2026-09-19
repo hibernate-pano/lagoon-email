@@ -734,4 +734,27 @@ final class APIClientTests: XCTestCase {
         let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
         XCTAssertEqual(request.timeoutInterval, 75, "slow tier should be 75s")
     }
+
+    func test_fetchTimeSaved_buildsQueryAndDecodesISO8601Report() async throws {
+        let accountId = UUID()
+        let day = Date(timeIntervalSince1970: 1_760_000_000)
+        let iso8601 = ISO8601DateFormatter().string(from: day)
+        let body = Data("""
+        {"today":{"minutesSaved":4.5,"messagesHandled":3,"draftsSent":1,"unsubscribed":1,"byDay":[]},
+         "week":{"minutesSaved":11.5,"messagesHandled":8,"draftsSent":2,"unsubscribed":2,
+                 "byDay":[{"date":"\(iso8601)","minutesSaved":4.5,"messagesHandled":3}]}}
+        """.utf8)
+        stub(status: 200, body: body)
+
+        let report = try await makeClient().fetchTimeSaved(accountId: accountId)
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.url?.path, "/api/time-saved")
+        XCTAssertEqual(queryValue("accountId", in: request), accountId.uuidString)
+        XCTAssertEqual(report.today.minutesSaved, 4.5)
+        XCTAssertEqual(report.week.messagesHandled, 8)
+        XCTAssertEqual(report.week.byDay.first?.messagesHandled, 3)
+        XCTAssertFalse(report.today.isEmpty)
+        XCTAssertTrue(report.today.byDay.isEmpty)
+    }
 }

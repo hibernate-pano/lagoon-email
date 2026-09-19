@@ -15,6 +15,7 @@ struct RootView: View {
     @State private var showSearch = false
     @State private var showUsage = false
     @State private var showActionHistory = false
+    @State private var showAutoArchiveRules = false
     @State private var showCompose = false
     @State private var showConnect = false
     @State private var showHealthDetail = false
@@ -65,8 +66,15 @@ struct RootView: View {
         .environmentObject(directory)
         .toolbar { toolbar }
         // The undo toast lives at the RootView level so it is also visible on
-        // the "All messages" surface, not just the Briefing Feed.
-        .safeAreaInset(edge: .bottom) { UndoToast(controller: undo) }
+        // the "All messages" surface, not just the Briefing Feed. The
+        // time-saved status bar (spec principle #3) shares the bottom inset,
+        // under the toast.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                UndoToast(controller: undo)
+                TimeSavedBar()
+            }
+        }
         .sheet(isPresented: $showSearch) {
             SearchSheet()
         }
@@ -75,6 +83,9 @@ struct RootView: View {
         }
         .sheet(isPresented: $showActionHistory) {
             ActionHistorySheet()
+        }
+        .sheet(isPresented: $showAutoArchiveRules) {
+            AutoArchiveRulesSheet()
         }
         .sheet(isPresented: $showCompose) {
             if let accountId = accounts.accountId {
@@ -414,6 +425,7 @@ struct RootView: View {
                 Button(l10n.budgetThisMonth) { Task { @MainActor in showUsage = true } }
                     .keyboardShortcut("b", modifiers: [.command])
                 Button(l10n.actionHistory) { Task { @MainActor in showActionHistory = true } }
+                Button(l10n.autoArchiveRulesTitle) { Task { @MainActor in showAutoArchiveRules = true } }
             } label: {
                 Label(l10n.moreActions, systemImage: "ellipsis.circle")
             }

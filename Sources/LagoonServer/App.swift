@@ -184,6 +184,8 @@ struct LagoonServerMain {
             logger: logger, makeProvider: makeProvider
         )
         SearchRoutes.register(on: router, db: db)
+        TimeSavedRoutes.register(on: router, db: db, logger: logger)
+        AutoArchiveRoutes.register(on: router, db: db, logger: logger)
         BudgetRoutes.register(
             on: router,
             budget: usageBudget,

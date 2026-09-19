@@ -54,6 +54,7 @@ public struct L10n: Sendable, Equatable {
         case .listUnsubscribe: pick("带有退订链接", "Has a List-Unsubscribe header")
         case .subscriptionSender: pick("订阅或免回复发件人", "Newsletter or no-reply sender")
         case .fromSelf: pick("你发出的 —— 等待对方回复", "Sent by you — awaiting their reply")
+        case .replied: pick("你已回复 —— 可归档", "You replied — safe to archive")
         case .readAndOld: pick("已读且超过 7 天", "Read and older than 7 days")
         case .needsReply: pick("需要你回复", "Needs your reply")
         case .ai: pick("AI 分类", "AI classification")
@@ -61,6 +62,47 @@ public struct L10n: Sendable, Equatable {
         case .unclassified: pick("未分类", "Unclassified")
         }
     }
+
+    // MARK: - Time saved (spec principle #3)
+
+    /// The numbers are declared estimates — the bar and the detail popover
+    /// both disclose it (same honesty rule as the usage panel).
+    public var timeSavedEstimatedNote: String {
+        pick("分钟数为按动作类型的估算值", "Minutes are per-action estimates")
+    }
+    public var timeSavedWeekTitle: String { pick("近 7 天", "Last 7 days") }
+    public func timeSavedToday(minutes: String, handled: Int) -> String {
+        pick("今天 ≈ 节省 \(minutes) 分钟 · 处理 \(handled) 封",
+             "Today ≈ \(minutes) min saved · \(handled) handled")
+    }
+    public func timeSavedWeek(minutes: String, handled: Int) -> String {
+        pick("本周 ≈ 节省 \(minutes) 分钟 · 处理 \(handled) 封",
+             "This week ≈ \(minutes) min saved · \(handled) handled")
+    }
+    public func timeSavedWeekRow(_ day: String, minutes: String, handled: Int) -> String {
+        pick("\(day)：≈ \(minutes) 分钟 · \(handled) 封",
+             "\(day): ≈ \(minutes) min · \(handled) handled")
+    }
+
+    // MARK: - Auto-archive rules (whitelist autopilot, spec 2026-09-19 §3)
+
+    public var autoArchiveSenderMenuItem: String {
+        pick("自动归档此发件人", "Auto-archive this sender")
+    }
+    public var autoArchiveRuleFailed: String {
+        pick("自动归档规则创建失败", "Could not create the auto-archive rule")
+    }
+    public var autoArchiveRulesTitle: String { pick("自动归档规则", "Auto-archive rules") }
+    public var autoArchiveRulesEmpty: String {
+        pick("还没有规则。在简报里右键一封订阅邮件，选「自动归档此发件人」即可创建。",
+             "No rules yet. Right-click a subscription message in the Briefing and choose “Auto-archive this sender”.")
+    }
+    public var autoArchiveRulesHelp: String {
+        pick("命中规则的邮件到达后自动归档，30 天内可撤销。", "Matching mail is archived on arrival and undoable for 30 days.")
+    }
+    public var deleteRule: String { pick("删除规则", "Delete rule") }
+    public var deleteRuleFailed: String { pick("删除规则失败", "Could not delete the rule") }
+    public var done: String { pick("完成", "Done") }
 
     // MARK: - Shared
 

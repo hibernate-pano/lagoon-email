@@ -186,6 +186,25 @@ public enum MessageStore {
         }
     }
 
+    /// Local half of an archive/unarchive. The remote move happens through the
+    /// provider first; this only flips the row. The sync loop's whitelist
+    /// autopilot (spec 2026-09-19 §3) uses the same helper as the routes.
+    public static func setArchived(
+        _ archived: Bool,
+        remoteId: String,
+        accountId: UUID,
+        db: PostgresConnection
+    ) async throws {
+        try await db.query(
+            "UPDATE message_headers SET is_archived = $3 WHERE remote_id = $1 AND account_id = $2",
+            [
+                PostgresData(string: remoteId),
+                PostgresData(uuid: accountId),
+                PostgresData(bool: archived),
+            ]
+        ).get()
+    }
+
     public static func unreadCount(
         forAccount accountId: UUID,
         db: PostgresConnection

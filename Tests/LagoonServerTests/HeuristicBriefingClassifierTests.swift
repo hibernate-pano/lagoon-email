@@ -41,15 +41,60 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
     private func group(
         _ message: MessageHeader,
         pinned: Set<String> = [],
-        listUnsubscribe: Set<String> = []
+        listUnsubscribe: Set<String> = [],
+        replied: Set<String> = []
     ) -> (group: BriefingGroup, reason: BriefingReason) {
         HeuristicBriefingClassifier.group(
             for: message,
             accountEmail: accountEmail,
             pinnedGmailIds: pinned,
             listUnsubscribeGmailIds: listUnsubscribe,
+            repliedRemoteIds: replied,
             now: now
         )
+    }
+
+    // MARK: - Reply detection (spec 2026-09-19 §2)
+
+    /// A message Lagoon has recorded a reply for leaves "needs reply" even
+    /// when it is still unread — the send audit outranks the read state.
+    func test_replied_landsInSafeToArchive_withRepliedReason() {
+        let message = header("m-reply", from: "alice@example.com", isRead: false)
+        let result = group(message, replied: ["m-reply"])
+        XCTAssertEqual(result.group, .safeToArchive)
+        XCTAssertEqual(result.reason, .replied)
+    }
+
+    /// A pin is an explicit user action and still wins over the reply audit.
+    func test_pinned_beatsReplied() {
+        let message = header("m-pin", from: "alice@example.com")
+        let result = group(message, pinned: ["m-pin"], replied: ["m-pin"])
+        XCTAssertEqual(result.group, .pinned)
+        XCTAssertEqual(result.reason, .pinned)
+    }
+
+    /// Subscription signals sit above the reply audit in the precedence chain.
+    func test_subscriptionNoise_beatsReplied() {
+        let message = header("m-sub", from: "no-reply@news.example.com")
+        let result = group(message, listUnsubscribe: ["m-sub"], replied: ["m-sub"])
+        XCTAssertEqual(result.group, .subscriptionNoise)
+    }
+
+    /// The reply reason must not be shadowed by the older read-and-old rule:
+    /// both land in safeToArchive, but the explanation differs.
+    func test_replied_beatsReadAndOld() {
+        let message = header("m-old", from: "bob@example.com", isRead: true, daysAgo: 30)
+        let result = group(message, replied: ["m-old"])
+        XCTAssertEqual(result.group, .safeToArchive)
+        XCTAssertEqual(result.reason, .replied)
+    }
+
+    /// Without the reply signal nothing changes: unread and fresh stays in
+    /// "needs reply".
+    func test_noReplySignal_keepsNeedsReply() {
+        let message = header("m-fresh", from: "alice@example.com")
+        let result = group(message)
+        XCTAssertEqual(result.group, .needsReply)
     }
 
     // MARK: - Precedence chain

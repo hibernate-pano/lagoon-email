@@ -100,12 +100,15 @@ public actor SyncEngine {
                 await sleep(.seconds(60))
                 return
             }
-            await ensureCapabilities(for: account, provider: provider)
+            // The negotiated capabilities must reach `apply` explicitly: the
+            // `account` struct was read before negotiation, so first-round
+            // auto-archive would otherwise see `.unknown` and skip.
+            let capabilities = await ensureCapabilities(for: account, provider: provider)
             let changes = try await provider.pullChanges(
                 after: account.syncState,
                 waitUpTo: waitBudget
             )
-            try await apply(changes, to: account)
+            try await apply(changes, to: account, capabilities: capabilities)
             // Recovery is as important to observe as failure: without this
             // line the log shows an error and then silence, and "did it come
             // back?" is answerable only by querying the health row.
@@ -128,10 +131,13 @@ public actor SyncEngine {
     /// Negotiated capabilities are account data (spec §2.5): version-skewed
     /// rows carry all-false `.unknown`, and the client gates verbs (archive)
     /// on them. Refreshed once per account per process, before the first pull
-    /// so the gate is honest as early as possible.
-    private func ensureCapabilities(for account: Account, provider: any MailProvider) async {
+    /// so the gate is honest as early as possible. Returns the capabilities
+    /// the caller should act on this round — the negotiated set when a
+    /// refresh happened, the stored set otherwise.
+    @discardableResult
+    private func ensureCapabilities(for account: Account, provider: any MailProvider) async -> MailCapabilities {
         guard !capabilitiesChecked.contains(account.id), account.capabilities == .unknown else {
-            return
+            return account.capabilities
         }
         capabilitiesChecked.insert(account.id)
         let capabilities = await provider.capabilities()
@@ -140,6 +146,7 @@ public actor SyncEngine {
             capabilities: capabilities,
             db: db
         )
+        return capabilities
     }
 
     private func provider(for account: Account) -> (any MailProvider)? {
@@ -153,7 +160,11 @@ public actor SyncEngine {
     /// identity space changed, land the rows, and only then advance the cursor
     /// — a partial write leaves the cursor untouched and the next pull is
     /// idempotent (spec §2.4).
-    private func apply(_ changes: MailChangeSet, to account: Account) async throws {
+    private func apply(
+        _ changes: MailChangeSet,
+        to account: Account,
+        capabilities: MailCapabilities
+    ) async throws {
         if changes.resetRequired {
             try await MessageStore.deleteAll(accountId: account.id, db: db)
             logger.warning("sync.reset", metadata: ["account": .string(account.email)])
@@ -165,6 +176,11 @@ public actor SyncEngine {
                 db: db
             )
         }
+        try await autoArchiveMatched(
+            upserts: changes.upserts,
+            account: account,
+            capabilities: capabilities
+        )
         try await AccountStore.updateSyncState(
             accountId: account.id,
             syncState: changes.cursor,
@@ -179,6 +195,57 @@ public actor SyncEngine {
             logger.info("sync.applied", metadata: [
                 "account": .string(account.email),
                 "count": .string("\(changes.upserts.count)"),
+            ])
+        }
+    }
+
+    /// Whitelist autopilot (spec 2026-09-19 §3): mail from a sender the user
+    /// put on the auto-archive list is archived remotely the moment it lands,
+    /// with the same audited, undoable archive verb the Briefing row uses.
+    ///
+    /// Ordering is load-bearing: this runs after the rows are persisted but
+    /// *before* the cursor advances. If the process dies mid-step the next
+    /// pull re-delivers the same upserts; a message already moved remotely
+    /// resolves to `messageGone` and is skipped, so the step is idempotent.
+    ///
+    /// Remote-first, like every destructive verb: a provider failure throws
+    /// out of `apply`, which backs the loop off and retries the round — the
+    /// local row is never flipped for mail that is still in the inbox.
+    private func autoArchiveMatched(
+        upserts: [RemoteHeader],
+        account: Account,
+        capabilities: MailCapabilities
+    ) async throws {
+        guard capabilities.archiveFolder else { return }
+        guard !upserts.isEmpty else { return }
+        let rules = try await AutoArchiveStore.senderAddresses(accountId: account.id, db: db)
+        guard !rules.isEmpty else { return }
+        guard let provider = providersByAccount[account.id] else { return }
+
+        for header in upserts where rules.contains(header.fromAddress.lowercased()) {
+            do {
+                try await provider.archive(remoteId: header.remoteId)
+            } catch MailError.messageGone {
+                // Left the inbox between rounds (already archived, or deleted
+                // server-side): treat as handled, keep going.
+                continue
+            }
+            try await MessageStore.setArchived(
+                true,
+                remoteId: header.remoteId,
+                accountId: account.id,
+                db: db
+            )
+            _ = try await AIActionStore.record(
+                accountId: account.id,
+                kind: .archive,
+                payload: ["remoteId": header.remoteId, "autoRule": "true"],
+                db: db
+            )
+            logger.info("autoarchive.applied", metadata: [
+                "account": .string(account.email),
+                "from": .string(header.fromAddress),
+                "remoteId": .string(header.remoteId),
             ])
         }
     }

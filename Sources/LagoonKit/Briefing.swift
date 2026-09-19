@@ -39,6 +39,9 @@ public enum BriefingReason: String, Codable, Sendable, CaseIterable {
     case listUnsubscribe = "list-unsubscribe"
     case subscriptionSender = "subscription-sender"
     case fromSelf = "from-self"
+    /// A Lagoon-recorded reply (ai_actions kind='send' naming this message) —
+    /// the thread is handled, so the message belongs in "safe to archive".
+    case replied = "replied"
     case readAndOld = "read-and-old"
     case needsReply = "needs-reply"
     case ai

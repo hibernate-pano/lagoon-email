@@ -477,6 +477,55 @@ public final class APIClient: Sendable {
         return try Self.decode(UsageReport.self, from: data)
     }
 
+    /// GET /api/time-saved?accountId= → TimeSavedReport (spec principle #3).
+    /// Pure Postgres aggregation over the audit log, so `.fast` is enough.
+    public func fetchTimeSaved(accountId: UUID) async throws -> TimeSavedReport {
+        let url = try makeURL(path: ["api", "time-saved"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(TimeSavedReport.self, from: data)
+    }
+
+    /// GET /api/auto-archive?accountId= → current whitelist autopilot rules.
+    public func fetchAutoArchiveRules(accountId: UUID) async throws -> [AutoArchiveRule] {
+        let url = try makeURL(path: ["api", "auto-archive"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(AutoArchiveRuleListResponse.self, from: data).rules
+    }
+
+    /// POST /api/auto-archive?accountId= `{senderAddress}` → 201 rule.
+    /// Idempotent server-side: recreating an existing rule returns that rule.
+    public func addAutoArchiveRule(senderAddress: String, accountId: UUID) async throws -> AutoArchiveRule {
+        let url = try makeURL(path: ["api", "auto-archive"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["senderAddress": senderAddress])
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(AutoArchiveRule.self, from: data)
+    }
+
+    /// DELETE /api/auto-archive/{id}?accountId= → 204.
+    public func deleteAutoArchiveRule(id: Int64, accountId: UUID) async throws {
+        let url = try makeURL(path: ["api", "auto-archive", "\(id)"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.timeoutInterval = APITimeout.fast.seconds
+        _ = try await send(request, timeout: .fast)
+    }
+
     /// POST /api/messages/{remoteId}/read?accountId= → 204.
     public func markRead(remoteId: String, accountId: UUID) async throws {
         try await post(path: ["api", "messages", remoteId, "read"], query: [

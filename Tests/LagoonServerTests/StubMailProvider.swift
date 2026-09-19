@@ -18,6 +18,10 @@ actor StubMailProvider: MailProvider {
     private(set) var pullCount = 0
     private(set) var lastCursor: MailSyncState?
     private(set) var sendCalls: [OutboundMessage] = []
+    private(set) var archiveCalls: [String] = []
+    /// When set, every archive throws this — drives the whitelist autopilot's
+    /// remote-first failure paths (spec 2026-09-19 §3).
+    private var archiveFailure: MailError?
 
     init(
         kind: MailProviderKind = .qq,
@@ -60,8 +64,15 @@ actor StubMailProvider: MailProvider {
     }
 
     func setRead(remoteId: String, isRead: Bool) async throws {}
-    func archive(remoteId: String) async throws {}
+    func archive(remoteId: String) async throws {
+        archiveCalls.append(remoteId)
+        if let archiveFailure { throw archiveFailure }
+    }
     func unarchive(remoteId: String) async throws {}
+    /// Actor-isolated knob for scripted archive failures.
+    func setArchiveFailure(_ error: MailError?) {
+        archiveFailure = error
+    }
 
     func send(_ outbound: OutboundMessage) async throws -> String? {
         sendCalls.append(outbound)

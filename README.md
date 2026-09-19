@@ -1,9 +1,10 @@
 # Lagoon
 
-An AI Inbox Operating System for the Apple ecosystem. Current state: **M1.5** — the
+An AI Inbox Operating System for the Apple ecosystem. Current state: **M1.7** — the
 mailbox layer is provider-agnostic and **QQ Mail is the primary account** (authorization
 code → IMAP sync → read → Briefing Feed → AI summary → SMTP reply → archive/⌘Z undo).
-The original Gmail path (OAuth + REST) is preserved and switchable.
+The original Gmail path (OAuth + REST) is preserved and switchable. M1.7 completes the
+M1 P0 list: quantified time saved, reply detection, and whitelist auto-archive.
 
 Docs: [M1.5 spec](docs/superpowers/specs/2026-09-11-imap-qq-provider-design.md) ·
 [M1.5 plan](docs/superpowers/plans/2026-09-11-imap-qq-provider.md) ·
@@ -290,9 +291,29 @@ Provider routing and defaults live in `config/providers.json`; see
   recorded manually in
   `docs/superpowers/m1-5-smoke.md`.
 
+### M1.7 — time saved, reply detection, whitelist autopilot
+
+- **Time-saved status bar** (`GET /api/time-saved`): today/week aggregation over the
+  `ai_actions` audit log, with undone actions excluded. Minutes are **declared
+  estimates** per action kind (`TimeSavedEstimates` in `Sources/LagoonServer/Routes/TimeSavedRoutes.swift`)
+  and the UI says so. The bar hides until something has been handled.
+- **Reply detection**: a send action recorded by the reply route names the original
+  message, and the briefing classifier treats it as handled (`.safeToArchive`, reason
+  `replied`) instead of nagging in "needs reply". Replies sent from *other* mail
+  clients are invisible — the Sent folder is not synced (below).
+- **Whitelist auto-archive** (spec principle #2): right-click a subscription-noise row
+  → "Auto-archive this sender" creates an `auto_archive_rules` row and archives the
+  message on the spot (both reversible — archive via ⌘Z, rule via ⋮ → Auto-archive
+  rules). The sync loop archives matching arrivals the moment they land: remote-first,
+  audited with `autoRule`, skipped on `messageGone`, and the round fails (backoff +
+  retry) when the provider errors. Rules are offered only on subscription-noise rows,
+  so a sender that owes you replies can never be silently blackholed.
+
 ## Known limitations (by design)
 
 - No API authentication — the server is loopback-only for that reason
+- Reply detection sees only replies sent through Lagoon — mail replied to from
+  other clients still shows in "needs reply" until the Sent folder is synced
 - **Pre-M0.1 OAuth rows are unreadable, and pre-008 Gmail rows lost their token
   columns** — after migration 008 an existing Gmail account surfaces as
   `sync-failed: not-configured` and stops updating (it still appears in

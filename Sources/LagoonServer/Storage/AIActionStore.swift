@@ -72,6 +72,57 @@ public enum AIActionStore {
         return try rows.rows.first.map { try Self.decode($0) }
     }
 
+    /// remoteIds Lagoon actually sent a reply to. The reply route records the
+    /// *original* message's remoteId in the send action's payload, so this is
+    /// the authoritative "already replied" signal for the briefing classifier.
+    /// Replies sent from other mail clients are invisible here — the Sent
+    /// folder is never synced (known limitation, spec 2026-09-19 §2).
+    public static func repliedRemoteIds(
+        accountId: UUID,
+        db: PostgresConnection
+    ) async throws -> Set<String> {
+        let sql = """
+            SELECT DISTINCT payload->>'remoteId' AS rid
+            FROM ai_actions
+            WHERE account_id = $1 AND kind = 'send' AND payload ? 'remoteId'
+        """
+        let rows = try await db.query(sql, [PostgresData(uuid: accountId)]).get()
+        let ids = try rows.map { row -> String in
+            try row.makeRandomAccess()["rid"].decode(String.self)
+        }
+        return Set(ids)
+    }
+
+    /// Audited (kind, createdAt) events for the time-saved report, with
+    /// actions that were later undone excluded — an undone archive is not a
+    /// handled message. `since` bounds the query; the caller aggregates.
+    public static func timeSavedEvents(
+        accountId: UUID,
+        since: Date,
+        db: PostgresConnection
+    ) async throws -> [(kind: AIActionKind, createdAt: Date)] {
+        let sql = """
+            SELECT a.kind, a.created_at
+            FROM ai_actions a
+            WHERE a.account_id = $1 AND a.created_at >= $2
+              AND NOT EXISTS (
+                  SELECT 1 FROM ai_actions u
+                  WHERE u.account_id = a.account_id AND u.kind = 'undo'
+                    AND u.payload->>'undoOf' = a.id::text
+              )
+        """
+        let rows = try await db.query(sql, [
+            PostgresData(uuid: accountId),
+            PostgresData(date: since),
+        ]).get()
+        return try rows.map { row in
+            let r = row.makeRandomAccess()
+            let kindStr: String = try r["kind"].decode(String.self)
+            let createdAt: Date = try r["created_at"].decode(Date.self)
+            return (kind: AIActionKind(rawValue: kindStr) ?? .archive, createdAt: createdAt)
+        }
+    }
+
     /// Per-(account, sender) override lookup used by the heuristic classifier.
     public static func overridesBySender(
         accountId: UUID,

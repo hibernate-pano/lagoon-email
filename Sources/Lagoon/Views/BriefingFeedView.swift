@@ -183,6 +183,17 @@ struct BriefingFeedView: View {
                                     Button(item.group == .pinned ? l10n.unpin : l10n.pin) {
                                         togglePin(item: item)
                                     }
+                                    // Whitelist autopilot is offered only on
+                                    // subscription noise: auto-archiving a
+                                    // sender that owes you replies would be
+                                    // an accidental blacklist (spec 2026-09-19 §3).
+                                    if item.group == .subscriptionNoise {
+                                        Divider()
+                                        Button(l10n.autoArchiveSenderMenuItem) {
+                                            Task { await autoArchiveSender(item) }
+                                        }
+                                        .disabled(!canArchive)
+                                    }
                                 }
                             }
                         }
@@ -495,6 +506,31 @@ struct BriefingFeedView: View {
 
         await archiveAndUndo(byId: item.message.remoteId)
 
+    }
+
+    /// Whitelist autopilot entry point (spec 2026-09-19 §3): create the rule
+    /// AND archive the message in front of the user — one tap, both effects,
+    /// both reversible (archive via ⌘Z, the rule via the rules sheet).
+    private func autoArchiveSender(_ item: BriefingItem) async {
+        guard canArchive else {
+            errorBanner = ErrorBanner(severity: .error, title: l10n.archiveUnavailable)
+            return
+        }
+        guard let accountId = accounts.accountId else { return }
+        do {
+            _ = try await api.addAutoArchiveRule(
+                senderAddress: item.message.fromAddress,
+                accountId: accountId
+            )
+        } catch {
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.autoArchiveRuleFailed,
+                detail: error.lagoonUIMessage
+            )
+            return
+        }
+        await archiveAndUndo(byId: item.message.remoteId)
     }
 
 

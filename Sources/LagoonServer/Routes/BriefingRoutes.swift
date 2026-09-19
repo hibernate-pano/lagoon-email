@@ -48,11 +48,13 @@ public enum BriefingRoutes {
             let messages: [MessageHeader]
             let pinned: Set<String>
             let listUnsubscribe: Set<String>
+            let replied: Set<String>
             let userOverrides: [String: BriefingGroup]
             do {
                 messages = try await MessageStore.recent(forAccount: accountId, limit: limit, db: db)
                 pinned = try await MessageStore.pinnedIds(forAccount: accountId, db: db)
                 listUnsubscribe = try await MessageStore.listUnsubscribeIds(forAccount: accountId, db: db)
+                replied = try await AIActionStore.repliedRemoteIds(accountId: accountId, db: db)
                 userOverrides = try await AIActionStore.overridesBySender(
                     accountId: accountId,
                     db: db
@@ -68,7 +70,8 @@ public enum BriefingRoutes {
             let heuristics = HeuristicBriefingClassifier(
                 signals: .init(
                     pinnedGmailIds: pinned,
-                    listUnsubscribeGmailIds: listUnsubscribe
+                    listUnsubscribeGmailIds: listUnsubscribe,
+                    repliedRemoteIds: replied
                 )
             )
             var classified = heuristics.classifyWithReasons(
