@@ -93,6 +93,17 @@ struct SearchSheet: View {
         }
         .noticeBanner($errorBanner)
         .frame(width: 640, height: 480)
+        .background {
+            Button(l10n.back) {
+                if !path.isEmpty { path.removeLast() }
+            }
+            .keyboardShortcut("[", modifiers: .command)
+            .help(l10n.backHelp)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+            .focusable(false)
+            .accessibilityHidden(true)
+        }
     }
 
     func run() async {

@@ -26,5 +26,9 @@
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
+    <key>CFBundleIconFile</key>
+    <string>Lagoon</string>
+    <key>CFBundleIconName</key>
+    <string>Lagoon</string>
 </dict>
 </plist>

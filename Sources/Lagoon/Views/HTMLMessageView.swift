@@ -174,19 +174,68 @@ struct HTMLMessageView: NSViewRepresentable {
         }
     }
 
+    /// CSS injected into every HTML email so it lays out fluidly inside the
+    /// reading column instead of sticking to whatever intrinsic width the
+    /// sender picked. Without this, an email designed for a 600pt Outlook
+    /// window renders as a narrow strip in a 900pt column — the page looks
+    /// "disjointed" with empty space on both sides. With this, the body
+    /// fills the WebView's width; tables and images shrink when the column
+    /// narrows and grow up to the column width on wide windows.
+    ///
+    /// `!important` is the only way to win against senders that hardcode
+    /// widths on their root `<table>` (most transactional / newsletter HTML
+    /// does this).
+    static let fluidCSS = """
+    <style>
+      html, body { margin: 0; padding: 0; max-width: 100%; }
+      body { word-wrap: break-word; overflow-wrap: break-word; -webkit-text-size-adjust: 100%; }
+      table { max-width: 100% !important; }
+      img, video { max-width: 100% !important; height: auto !important; }
+      pre { white-space: pre-wrap; word-wrap: break-word; }
+    </style>
+    """
+
     func updateNSView(_ webView: WKWebView, context: Context) {
         let resolved = Self.resolveCidReferences(in: html, with: attachmentsByCid)
+        // Inject the fluid CSS into the head — or wrap a minimal head around
+        // documents that have no `<head>` at all (rare but legal HTML).
+        let withCSS = Self.injectFluidCSS(into: resolved)
         // Avoid reloading on every SwiftUI body invalidation: the WebView
         // already holds the rendered page, and reloading blows away
         // selection, scroll position, and any in-flight image loads.
-        let nextCidCount = resolved.components(separatedBy: "data:").count - 1
-        if resolved == context.coordinator.html,
+        let nextCidCount = withCSS.components(separatedBy: "data:").count - 1
+        if withCSS == context.coordinator.html,
            nextCidCount == context.coordinator.resolvedCidCount {
             return
         }
-        context.coordinator.html = resolved
+        context.coordinator.html = withCSS
         context.coordinator.resolvedCidCount = nextCidCount
-        webView.loadHTMLString(resolved, baseURL: nil)
+        webView.loadHTMLString(withCSS, baseURL: nil)
+    }
+
+    /// Prepends `fluidCSS` to whatever `<head>` (or implicit head) the email
+    /// ships with. We don't try to *replace* sender styles — Mail.app and
+    /// the bug ticket both lose information when we do; we just add our
+    /// fluid overrides on top.
+    static func injectFluidCSS(into html: String) -> String {
+        let css = fluidCSS
+        if html.range(of: "<head>", options: .caseInsensitive) != nil {
+            return html.replacingOccurrences(
+                of: "<head>",
+                with: "<head>\n\(css)",
+                options: .caseInsensitive
+            )
+        }
+        if html.range(of: "<html", options: .caseInsensitive) != nil {
+            return html.replacingOccurrences(
+                of: "<html",
+                with: "<html><head>\n\(css)</head>",
+                options: .caseInsensitive
+            )
+        }
+        // No <html> / <head> at all: wrap so our CSS still applies. The
+        // sender's body text lands inside our wrapper.
+        return "<html><head>\n\(css)</head><body>\(html)</body></html>"
     }
 
     /// Replaces `src="cid:xxx"` with `src="data:<mime>;base64,<bytes>"`.

@@ -179,6 +179,7 @@ struct NewMessageSheet: View {
                 requestId: requestId
             )
             UserDefaults.standard.removeObject(forKey: draftKey)
+            SoundEffects.send()
             onSent(response.providerMessageId)
             dismiss()
         } catch {

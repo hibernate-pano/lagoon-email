@@ -19,6 +19,9 @@ struct RootView: View {
     @State private var showCompose = false
     @State private var showConnect = false
     @State private var showHealthDetail = false
+    @State private var showCommandPalette = false
+    @State private var showShortcuts = false
+    @State private var showAbout = false
     /// Seeded by the "Reconnect" banner so the QQ form comes up pre-filled;
     /// "Add account" deliberately leaves it nil.
     @State private var connectPrefillEmail: String?
@@ -113,6 +116,29 @@ struct RootView: View {
                 )
             }
         }
+        // ⌘K is the power-user fast path; mirrors Things / Linear / Superhuman.
+        .sheet(isPresented: $showCommandPalette) {
+            CommandPaletteView(
+                onNewMessage: { showCompose = true },
+                onSearch: { showSearch = true },
+                onShowBriefing: { surface = .briefing },
+                onShowAllMessages: { surface = .allMessages },
+                onShowUsage: { showUsage = true },
+                onShowActionHistory: { showActionHistory = true },
+                onShowAutoArchiveRules: { showAutoArchiveRules = true },
+                onShowShortcuts: { showShortcuts = true },
+                onRefresh: {
+                    Task { try? await api.requestSync(); await directory.refresh() }
+                },
+                onToggleSound: { SoundEffects.isEnabled.toggle() }
+            )
+        }
+        .sheet(isPresented: $showShortcuts) {
+            ShortcutsSheet()
+        }
+        .sheet(isPresented: $showAbout) {
+            AboutSheet()
+        }
         // Binding the environment store (not a throwaway one): UndoController
         // holds it weakly, so the real owner must be the one bound.
         .onAppear {
@@ -136,7 +162,10 @@ struct RootView: View {
             if let old, old != .ok, new == .ok {
                 // Spec §4.4: "Sync recovered" is a transient confirmation,
                 // not an error, so it goes through ErrorCenter with severity
-                // .info and an auto-dismiss.
+                // .info and an auto-dismiss. The "Glass" chime is the
+                // audio counterpart — distinct from "Tink"/"Pop" so the user
+                // learns what each sound means after a few days.
+                SoundEffects.syncRecovered()
                 errorCenter.report(.init(
                     severity: .info,
                     title: l10n.syncRecovered,
@@ -175,6 +204,20 @@ struct RootView: View {
         .background {
             Button(l10n.undoLastAction) { Task { await undo.undoLatest() } }
                 .keyboardShortcut("z", modifiers: .command)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .focusable(false)
+                .accessibilityHidden(true)
+            // ⌘K — command palette, the power-user fast path
+            Button(l10n.commandPalette) { showCommandPalette = true }
+                .keyboardShortcut("k", modifiers: .command)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+                .focusable(false)
+                .accessibilityHidden(true)
+            // ⌘/ — keyboard shortcuts cheatsheet
+            Button(l10n.commandPalette) { showShortcuts = true }
+                .keyboardShortcut("/", modifiers: .command)
                 .frame(width: 0, height: 0)
                 .opacity(0)
                 .focusable(false)
@@ -426,6 +469,17 @@ struct RootView: View {
                     .keyboardShortcut("b", modifiers: [.command])
                 Button(l10n.actionHistory) { Task { @MainActor in showActionHistory = true } }
                 Button(l10n.autoArchiveRulesTitle) { Task { @MainActor in showAutoArchiveRules = true } }
+                Divider()
+                // The toggle reads the current value via `SoundEffects.isEnabled`.
+                // Using `Toggle` (not a Button) makes the checkmark reflect the
+                // live state and gives the user a clear off affordance.
+                Toggle(l10n.soundEnabled, isOn: Binding(
+                    get: { SoundEffects.isEnabled },
+                    set: { SoundEffects.isEnabled = $0 }
+                ))
+                .help(l10n.soundEnabledHelp)
+                Divider()
+                Button(l10n.aboutTitle) { showAbout = true }
             } label: {
                 Label(l10n.moreActions, systemImage: "ellipsis.circle")
             }

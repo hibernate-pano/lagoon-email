@@ -117,6 +117,11 @@ struct MessageDetailView: View {
         _isPinned = State(initialValue: initiallyPinned)
     }
 
+    /// Reading-column width. Matches Mail.app / Superhuman defaults; anything
+    /// wider makes the subject / from / body sit visually disconnected and
+    /// the body fill the full window like a stretched banner.
+    private static let readingColumnWidth: CGFloat = 900
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -131,6 +136,12 @@ struct MessageDetailView: View {
             }
             .padding(24)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            // Reading column: metadata + summary + body all share one width so
+            // they look like a single coherent strip rather than a narrow header
+            // over a stretched-out page. On narrow windows this is a no-op
+            // (the VStack already fills); on wide windows the column stops at
+            // `readingColumnWidth` and centers via the inner alignment.
+            .frame(maxWidth: Self.readingColumnWidth, alignment: .leading)
         }
         .navigationTitle(subjectText)
         .toolbar { toolbarContent }
@@ -198,11 +209,39 @@ struct MessageDetailView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
-        ToolbarItemGroup {
+        // Three sections, left-to-right, each visually separated so a power
+        // user can park their mouse on the right cluster (Archive & Next) and
+        // not lose the thread when the toolbar overflows on narrow windows.
+        //
+        //   [Pin]  |  [Reply · ReplyAll · Forward]  |  [Archive & Next]  [⋯]
+        //
+        // Summarize, Generate Drafts, Download .eml, Mark Read, Override and
+        // Unsubscribe all move into the ⋯ menu — they remain keyboard-
+        // accessible via ⌘D / ⇧⌘D but no longer compete for toolbar space.
+        // Less common actions stop costing pixels in the always-visible strip.
+
+        ToolbarItem(placement: .navigation) {
+            Button { Task { await togglePin() } } label: {
+                if isPinBusy {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(l10n.pinning)
+                    }
+                } else {
+                    Label(isPinned ? l10n.unpin : l10n.pin, systemImage: isPinned ? "pin.slash" : "pin")
+                }
+            }
+            .disabled(isPinBusy)
+            .help(isPinned ? l10n.unpinHelp : l10n.pinHelp)
+            .keyboardShortcut("p", modifiers: .command)
+        }
+
+        ToolbarItemGroup(placement: .primaryAction) {
             Button { composerMode = .reply; showComposer = true } label: {
                 Label(l10n.reply, systemImage: "arrowshape.turn.up.left")
             }
             .help(l10n.replyHelp)
+            .keyboardShortcut("r", modifiers: .command)
 
             Button { composerMode = .replyAll; showComposer = true } label: {
                 Label(l10n.replyAll, systemImage: "arrowshape.turn.up.left.2")
@@ -217,74 +256,59 @@ struct MessageDetailView: View {
             .keyboardShortcut("f", modifiers: [.command, .shift])
             .disabled(messageBody == nil)
             .help(l10n.forwardHelp)
+        }
 
-            Button { Task { await togglePin() } } label: {
-                if isPinBusy {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text(l10n.pinning)
-                    }
-                } else {
-                    Label(isPinned ? l10n.unpin : l10n.pin, systemImage: isPinned ? "pin.slash" : "pin")
-                }
-            }
-            .disabled(isPinBusy)
-            .help(isPinned ? l10n.unpinHelp : l10n.pinHelp)
-            .keyboardShortcut("p", modifiers: .command)
-
-            Button {
-                Task { await loadSummary() }
-            } label: {
-                if summaryState == .loading {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text(l10n.summarizing)
-                    }
-                    .frame(minWidth: 110, alignment: .leading)
-                } else {
-                    Label(l10n.summarize, systemImage: "sparkles")
-                        .frame(minWidth: 110, alignment: .leading)
-                }
-            }
-            .disabled(summaryState == .loading)
-            .help(l10n.summarizeHelp)
-            .keyboardShortcut("d", modifiers: .command)
-
-            Button { Task { await generateDrafts() } } label: {
-                if draftState == .loading {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text(l10n.generatingDrafts)
-                    }
-                } else {
-                    Label(l10n.draftVariants, systemImage: "text.bubble")
-                }
-            }
-            .disabled(draftState == .loading)
-            .keyboardShortcut("d", modifiers: [.command, .shift])
-            .help(l10n.shortcutDraft)
-
-            Menu {
-                Button(l10n.markRead) { Task { await markReadOnce(force: true) } }
-                    .disabled(isRead)
-                Button(l10n.overrideGroup) { showOverrideMenu = true }
-                Button(l10n.unsubscribe, role: .destructive) { Task { await unsubscribe() } }
-                    .disabled(header == nil)
-            } label: {
-                Label(l10n.moreActions, systemImage: "ellipsis.circle")
-            }
-
+        ToolbarItem(placement: .primaryAction) {
+            // Archive & Next is the rightmost (primary) action: when the
+            // toolbar overflows, this is the last button to disappear.
             Button { Task { await archiveAndAdvance() } } label: {
                 Label(l10n.archiveAndNext, systemImage: "tray.and.arrow.down")
             }
             .keyboardShortcut("e", modifiers: .command)
             .disabled(!canArchive)
             .help(canArchive ? l10n.shortcutArchiveNext : l10n.archiveUnavailable)
+        }
 
-            Button { Task { await downloadRawEml() } } label: {
-                Label(l10n.downloadEml, systemImage: "square.and.arrow.down")
+        ToolbarItem(placement: .primaryAction) {
+            // The overflow menu gathers Summarize / Drafts / Download /
+            // Mark Read / Override / Unsubscribe. Each keeps its keyboard
+            // shortcut so a power user never has to open it.
+            Menu {
+                Button { Task { await loadSummary() } } label: {
+                    if summaryState == .loading {
+                        Label(l10n.summarizing, systemImage: "sparkles")
+                    } else {
+                        Label(l10n.summarize, systemImage: "sparkles")
+                    }
+                }
+                .disabled(summaryState == .loading)
+                .keyboardShortcut("d", modifiers: .command)
+
+                Button { Task { await generateDrafts() } } label: {
+                    if draftState == .loading {
+                        Label(l10n.generatingDrafts, systemImage: "text.bubble")
+                    } else {
+                        Label(l10n.draftVariants, systemImage: "text.bubble")
+                    }
+                }
+                .disabled(draftState == .loading)
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+
+                Divider()
+
+                Button(l10n.markRead) { Task { await markReadOnce(force: true) } }
+                    .disabled(isRead)
+                Button(l10n.overrideGroup) { showOverrideMenu = true }
+                Button(l10n.unsubscribe, role: .destructive) { Task { await unsubscribe() } }
+                    .disabled(header == nil)
+
+                Divider()
+
+                Button(l10n.downloadEml) { Task { await downloadRawEml() } }
+                    .help(l10n.downloadEmlHelp)
+            } label: {
+                Label(l10n.moreActions, systemImage: "ellipsis.circle")
             }
-            .help(l10n.downloadEmlHelp)
         }
     }
 
@@ -334,10 +358,8 @@ struct MessageDetailView: View {
                 Text(snippet.prefix(140)).font(.caption).foregroundStyle(.secondary)
             }
         }
-        // Metadata is a header strip — wide subject lines look broken when
-        // they wrap, so cap the column at 900pt. The body below gets the
-        // full window width; HTML email clients expect that.
-        .frame(maxWidth: 900, alignment: .leading)
+        // Width comes from the parent `body`'s reading-column frame — no
+        // need to repeat it here.
     }
 
     private var subjectText: String {

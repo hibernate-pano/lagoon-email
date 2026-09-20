@@ -23,6 +23,11 @@ struct ComposerSheet: View {
     @State private var bodyText: String
     @State private var isSending = false
     @State private var error: String?
+    /// True briefly after each save fires — drives the "Draft saved ✓"
+    /// checkmark animation. Reset when the user types again so the
+    /// indicator doesn't lie about freshness.
+    @State private var draftJustSaved = false
+    @State private var draftSavedResetTask: Task<Void, Never>?
     /// Stable across retries; changes only when the composer is created anew.
     @State private var requestId = UUID().uuidString.lowercased()
     private let draftKey: String
@@ -134,11 +139,19 @@ struct ComposerSheet: View {
 
             if !quotedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 DisclosureGroup {
-                    Text(String(quotedText.prefix(3_000)))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .padding(.top, 6)
+                    // ScrollView so a long original (typical of forwarded
+                    // threads) doesn't push the composer off the sheet.
+                    // The previous version truncated at 3000 chars which
+                    // silently dropped the tail of any long reply chain.
+                    ScrollView {
+                        Text(quotedText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 6)
+                    }
+                    .frame(maxHeight: 200)
                 } label: {
                     Text(l10n.originalMessage)
                         .font(.caption)
@@ -170,15 +183,38 @@ struct ComposerSheet: View {
                     } else {
                         UserDefaults.standard.set(newValue, forKey: draftKey)
                     }
+                    // Flash the "saved" checkmark for 1.6 s after every
+                    // keystroke. The reset task is cancelled and replaced
+                    // so rapid typing doesn't leave the indicator stuck on.
+                    draftSavedResetTask?.cancel()
+                    draftJustSaved = !trimmed.isEmpty
+                    draftSavedResetTask = Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(1_600))
+                        guard !Task.isCancelled else { return }
+                        draftJustSaved = false
+                    }
                 }
 
             if let error {
                 Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
             }
 
-            HStack {
+            HStack(spacing: 10) {
                 Text(l10n.shortcutSend).font(.caption).foregroundStyle(.secondary)
-                Text(l10n.draftSaved).font(.caption2).foregroundStyle(.secondary)
+                // Live save indicator: a checkmark that fades in briefly
+                // after each keystroke. Replaces the old static "Drafts
+                // are auto-saved" caption, which read like a footnote
+                // rather than a confirmation.
+                HStack(spacing: 4) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .opacity(draftJustSaved ? 1 : 0)
+                    Text(l10n.draftSaved)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .animation(.easeOut(duration: 0.25), value: draftJustSaved)
                 Spacer()
                 Button(l10n.closeComposer) { dismiss() }
                     .keyboardShortcut(.cancelAction)
@@ -221,6 +257,9 @@ struct ComposerSheet: View {
                 cc: cc.isEmpty ? nil : cc
             )
             UserDefaults.standard.removeObject(forKey: draftKey)
+            // Subtle "Pop" confirms the send landed — the dismiss animation
+            // is silent, this fills the gap between "send" and "sheet gone".
+            SoundEffects.send()
             onSent(response.providerMessageId)
             dismiss()
         } catch {

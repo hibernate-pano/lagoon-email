@@ -16,6 +16,10 @@ struct LagoonApp: App {
                 }
             }
             .environmentObject(accounts)
+            // Brand tint: matches the icon palette so every accent
+            // (toggles, links, picker segments, selection highlight)
+            // reads as "Lagoon teal", not "system blue".
+            .tint(LagoonTheme.brand)
             // When launched as a bare executable (`swift run Lagoon`), macOS
             // treats the process as background and the window never activates.
             // A real .app bundle (M1) makes this unnecessary.

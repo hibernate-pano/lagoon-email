@@ -126,6 +126,10 @@ public struct L10n: Sendable, Equatable {
     public var backToBriefingHelp: String {
         pick("返回简报（⌘0）", "Back to the Briefing Feed (⌘0)")
     }
+    public var back: String { pick("返回", "Back") }
+    public var backHelp: String {
+        pick("返回上一级（⌘[）", "Back one level (⌘[)")
+    }
     public var loadingBriefing: String { pick("正在加载简报…", "Loading briefing…") }
     public var noBriefingYet: String { pick("还没有简报", "No briefing yet") }
     public var noBriefingYetDescription: String {
@@ -445,6 +449,10 @@ public struct L10n: Sendable, Equatable {
     public var searchPlaceholder: String { pick("搜索邮件（发件人、主题、正文）", "Search mail (sender, subject, body)") }
     public var noResults: String { pick("没找到匹配邮件", "No matching messages") }
     public var budgetThisMonth: String { pick("本月 LLM 用量", "This month's LLM usage") }
+    public var soundEnabled: String { pick("操作音效", "Action sound") }
+    public var soundEnabledHelp: String {
+        pick("发送 / 归档 / 同步恢复时播放轻微音效", "Play a subtle sound on send, archive, and sync recovery")
+    }
     public var budgetCap: String { pick("上限", "Cap") }
     public var budgetDisabled: String { pick("未启用（上限设为 0）", "Disabled (cap is 0)") }
     public func usageCallCount(_ count: Int) -> String {
@@ -479,6 +487,18 @@ public struct L10n: Sendable, Equatable {
     }
     public var copiedToClipboard: String { pick("已复制", "Copied") }
     public var commandPalette: String { pick("命令面板", "Command palette") }
+    public var commandPalettePlaceholder: String {
+        pick("输入命令名称…", "Type a command…")
+    }
+    public var aboutTagline: String {
+        pick("macOS 上的 AI 收件箱操作系统", "The AI Inbox Operating System for macOS")
+    }
+    public var aboutTitle: String { pick("关于 Lagoon", "About Lagoon") }
+    public func aboutVersion(_ version: String) -> String {
+        pick("版本 \(version)", "Version \(version)")
+    }
+    public var aboutFeedback: String { pick("发送反馈", "Send feedback") }
+    public var aboutWebsite: String { pick("访问官网", "Visit website") }
     public var shortcutArchiveNext: String { pick("E = 归档并下一封", "E = archive & next") }
     public var shortcutJ: String { pick("J = 下一封", "J = next") }
     public var shortcutK: String { pick("K = 上一封", "K = previous") }

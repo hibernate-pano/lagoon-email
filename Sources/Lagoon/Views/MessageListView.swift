@@ -111,6 +111,19 @@ struct MessageListView: View {
         }
         .noticeBanner($errorBanner)
         .frame(minWidth: 720, minHeight: 480)
+        // ⌘[ pops the NavigationStack one level. Hidden so the
+        // keyboard shortcut is the only UI affordance — mirrors Mail.app.
+        .background {
+            Button(l10n.back) {
+                if !path.isEmpty { path.removeLast() }
+            }
+            .keyboardShortcut("[", modifiers: .command)
+            .help(l10n.backHelp)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+            .focusable(false)
+            .accessibilityHidden(true)
+        }
         // Initial load, then track the server's 30s poller while visible.
         // SwiftUI cancels the task when the view disappears.
         .task {

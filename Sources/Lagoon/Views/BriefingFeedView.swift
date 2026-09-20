@@ -175,6 +175,15 @@ struct BriefingFeedView: View {
                                 // so highlight / j-k / Delete line up.
                                 .tag(item.message.remoteId)
                                 .id(item.message.remoteId)
+                                // Slide the archived row off to the leading
+                                // edge as it fades. Without `withAnimation`
+                                // around the `items.removeAll` the transition
+                                // never fires; the call sites below make sure
+                                // every removal goes through this path.
+                                .transition(.asymmetric(
+                                    insertion: .opacity.combined(with: .move(edge: .trailing)),
+                                    removal: .opacity.combined(with: .move(edge: .leading))
+                                ))
                                 // Mouse users have no swipe gesture; expose
                                 // the same two verbs via right-click.
                                 .contextMenu {
@@ -204,6 +213,11 @@ struct BriefingFeedView: View {
             }
         }
         .listStyle(.inset)
+        // Drive every list-row transition with the same easing curve so a
+        // swipe-to-archive feels identical to a ⌫-to-archive. Spring with a
+        // light damping reads as "the row slid into the tray" — closer to
+        // Mail.app than the default easeInOut.
+        .animation(.spring(response: 0.32, dampingFraction: 0.85), value: items.map(\.message.remoteId))
         .onDeleteCommand { if let id = selectedGmailId { Task { await archiveAndUndo(byId: id) } } }
         .onMoveCommand { direction in
             moveSelection(direction: direction)
@@ -217,7 +231,13 @@ struct BriefingFeedView: View {
                     .font(.caption2).foregroundStyle(.secondary)
                 Text("\(group.emoji) \(l10n.groupTitle(group))").font(.headline)
                 Spacer()
-                Text("\(count)").font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                // Content transition on the count Text so a digit change
+                // (3 → 2 after an archive) cross-fades instead of jumping.
+                Text("\(count)")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .contentTransition(.numericText(value: Double(count)))
             }
         }
         .buttonStyle(.plain)
@@ -235,8 +255,19 @@ struct BriefingFeedView: View {
             if directory.active?.syncHealth.lastSyncAt == nil {
                 VStack(spacing: 10) {
                     ProgressView()
-                    Text(l10n.syncingFirstTime)
-                        .foregroundStyle(.secondary)
+                    // Show a running count once the server has classified
+                    // *anything* — a generic "syncing first time" leaves
+                    // a 400-message mailbox waiting in silence. The count
+                    // animates each refresh so the user sees the inbox
+                    // filling up.
+                    if items.isEmpty {
+                        Text(l10n.syncingFirstTime)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(l10n.syncingFirstTimeCount(items.count))
+                            .foregroundStyle(.secondary)
+                            .contentTransition(.numericText(value: Double(items.count)))
+                    }
                 }
             } else {
                 ContentUnavailableView {
@@ -327,6 +358,12 @@ struct BriefingFeedView: View {
                 if let selectedGmailId { path = [selectedGmailId] }
             }
             .keyboardShortcut(.return, modifiers: [])
+            // Mail.app's back gesture: ⌘[ pops one level off the
+            // NavigationStack. No-op when the user is already at the root.
+            Button(l10n.back) {
+                if !path.isEmpty { path.removeLast() }
+            }
+            .keyboardShortcut("[", modifiers: .command)
         }
         .frame(width: 0, height: 0)
         .opacity(0)
@@ -418,9 +455,12 @@ struct BriefingFeedView: View {
 
 
     private func toggle(_ group: BriefingGroup) {
-
-        if collapsedGroups.contains(group) { collapsedGroups.remove(group) } else { collapsedGroups.insert(group) }
-
+        // Animate the section's height collapse so the rows below slide up
+        // smoothly. Without `withAnimation` the section just snaps closed
+        // and the rows beneath jump.
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) {
+            if collapsedGroups.contains(group) { collapsedGroups.remove(group) } else { collapsedGroups.insert(group) }
+        }
     }
 
 
@@ -551,7 +591,16 @@ struct BriefingFeedView: View {
 
             let response = try await api.archiveMessage(remoteId: remoteId, accountId: accountId)
 
-            items.removeAll { $0.message.remoteId == remoteId }
+            // Wrap the removal in `withAnimation` so the row's
+            // `.transition(.move(edge: .leading))` actually fires. Without
+            // it the row snaps out of existence — the visual is "poof",
+            // not "filed".
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) {
+                items.removeAll { $0.message.remoteId == remoteId }
+            }
+            // Soft metallic "Tink" complements the slide-out — a confirmatory
+            // tick at low volume (see `SoundEffects`).
+            SoundEffects.archive()
 
             undo.show(UndoItem(
                 id: response.actionId,
@@ -675,7 +724,16 @@ private struct BriefingRow: View {
 
     var body: some View {
 
-        VStack(alignment: .leading, spacing: 4) {
+        HStack(alignment: .top, spacing: 10) {
+            // Avatar — initials in a colour derived from the email hash.
+            // Anchors the row visually so a long list of subscription
+            // noise scans faster (eye lands on the circle, then the subject).
+            SenderAvatar(
+                email: item.message.fromAddress,
+                displayName: item.message.fromName
+            )
+
+            VStack(alignment: .leading, spacing: 4) {
 
             HStack(alignment: .firstTextBaseline, spacing: 8) {
 
@@ -705,6 +763,7 @@ private struct BriefingRow: View {
 
             }
 
+            }
         }.padding(.vertical, 2)
 
     }
