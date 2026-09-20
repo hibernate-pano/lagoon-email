@@ -32,6 +32,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     private let db: PostgresConnection?
     private let logger: Logger
     private let transportFactory: @Sendable () -> any StreamTransport
+    /// Full INBOX membership reconciliation. Enabled in production; provider
+    /// tests that script one narrow wire round can disable it.
+    private let reconcilesInbox: Bool
     /// IMAP is single-command by design. Actor reentrancy alone does not keep
     /// two route calls from interleaving tagged commands while one awaits I/O.
     private let commandLock = AsyncMutex()
@@ -58,6 +61,12 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     /// is free.
     private var uidByMessageID: [String: Int64] = [:]
     private var uidCacheValidity: Int64?
+    /// Current INBOX membership, keyed by UID. The first round builds this map
+    /// once; later rounds use `UID SEARCH ALL` to detect messages another
+    /// client moved or deleted.
+    private var inboxRemoteIdByUID: [Int64: String] = [:]
+    private var inboxUIDs: Set<Int64> = []
+    private var inboxIndexValid = false
     /// The archive role is account data, not connection state: it survives a
     /// reconnect (spec §4.3).
     private var archiveResolved = false
@@ -78,6 +87,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         account: Account,
         db: PostgresConnection?,
         logger: Logger,
+        reconcilesInbox: Bool = true,
         transportFactory: @escaping @Sendable () -> any StreamTransport = {
             NIOSSLStreamTransport()
         }
@@ -86,6 +96,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         self.account = account
         self.db = db
         self.logger = logger
+        self.reconcilesInbox = reconcilesInbox
         self.transportFactory = transportFactory
     }
 
@@ -222,6 +233,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             if let expected = cursor.uidValidity, expected != inbox.uidValidity {
                 logger.warning("sync.uidValidityReset", metadata: ["account": .string(account.email)])
                 reportedRead.removeAll()
+                inboxRemoteIdByUID.removeAll(keepingCapacity: true)
+                inboxUIDs.removeAll(keepingCapacity: true)
+                inboxIndexValid = false
                 return MailChangeSet(
                     upserts: [],
                     resetRequired: true,
@@ -231,6 +245,14 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                         lastUid: nil,
                         archiveFolder: archiveFolder
                     )
+                )
+            }
+
+            var inboxRemoteIds: Set<String>?
+            if reconcilesInbox {
+                inboxRemoteIds = try await reconcileInboxMembership(
+                    client: client,
+                    exists: inbox.exists
                 )
             }
 
@@ -252,6 +274,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             var upserts: [RemoteHeader] = []
             upserts.reserveCapacity(fetched.count)
             for header in fetched {
+                rememberInboxHeader(header)
                 let remote = remoteHeader(from: header, snippet: await snippetText(client: client, uid: header.uid))
                 upserts.append(remote)
                 reportedRead[header.uid] = remote.isRead
@@ -264,6 +287,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             // nothing newer to resume from.
             let nextLastUid = fetched.map(\.uid).max().map { max(cursor.lastUid ?? 0, $0) }
                 ?? cursor.lastUid
+            if let ids = inboxRemoteIds {
+                inboxRemoteIds = ids.union(upserts.map(\.remoteId))
+            }
             return MailChangeSet(
                 upserts: upserts,
                 resetRequired: false,
@@ -272,7 +298,8 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                     uidValidity: inbox.uidValidity,
                     lastUid: nextLastUid,
                     archiveFolder: archiveFolder
-                )
+                ),
+                inboxRemoteIds: inboxRemoteIds
             )
         }
     }
@@ -614,6 +641,59 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     }
 
     // MARK: - Mapping
+
+    /// Record one INBOX header in both the UID→remote-ID reconciliation index
+    /// and the Message-ID→UID lookup cache.
+    private func rememberInboxHeader(_ fetched: IMAPFetchedHeader) {
+        let messageID = fetched.rawHeaders["message-id"].flatMap {
+            $0.isEmpty ? nil : MIMEParser.decodeRFC2047($0)
+        }
+        let remoteId = messageID ?? "uid:\(fetched.uid)"
+        inboxRemoteIdByUID[fetched.uid] = remoteId
+        uidByMessageID[remoteId] = fetched.uid
+    }
+
+    /// Build the complete INBOX identity view once, then reconcile it on every
+    /// round with `UID SEARCH ALL`. Returning nil means the server did not
+    /// provide a trustworthy complete view, so the store must not delete rows.
+    private func reconcileInboxMembership(
+        client: IMAPClient,
+        exists: Int
+    ) async throws -> Set<String>? {
+        if !inboxIndexValid {
+            let headers = try await client.fetchHeaders(fromUid: 1)
+            inboxRemoteIdByUID.removeAll(keepingCapacity: true)
+            uidByMessageID.removeAll(keepingCapacity: true)
+            for header in headers {
+                rememberInboxHeader(header)
+            }
+            inboxUIDs = Set(inboxRemoteIdByUID.keys)
+            inboxIndexValid = true
+        }
+
+        let currentUIDs = try await client.allUIDs()
+        // A successful search over a non-empty mailbox cannot legitimately be
+        // empty. Treat that as an incomplete server answer and skip deletion.
+        guard !currentUIDs.isEmpty || exists == 0 else { return nil }
+
+        let vanished = inboxUIDs.subtracting(currentUIDs)
+        for uid in vanished {
+            if let remoteId = inboxRemoteIdByUID.removeValue(forKey: uid) {
+                uidByMessageID[remoteId] = nil
+            }
+            reportedRead[uid] = nil
+        }
+        inboxUIDs = currentUIDs
+
+        let unmapped = currentUIDs.filter { inboxRemoteIdByUID[$0] == nil }
+        if let firstUnmapped = unmapped.min() {
+            let headers = try await client.fetchHeaders(fromUid: firstUnmapped)
+            for header in headers where currentUIDs.contains(header.uid) {
+                rememberInboxHeader(header)
+            }
+        }
+        return Set(currentUIDs.compactMap { inboxRemoteIdByUID[$0] })
+    }
 
     /// One wire header block → the provider-neutral row. RFC 2047 runs first:
     /// QQ encodes Chinese subjects and display names as encoded-words.

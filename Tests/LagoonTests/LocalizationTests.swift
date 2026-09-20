@@ -110,6 +110,8 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(en.activateAccount, "Switch to this account")
         XCTAssertEqual(zh.activateAccountFailed, "切换账号失败：")
         XCTAssertEqual(en.activateAccountFailed, "Could not switch account: ")
+        XCTAssertEqual(zh.sleepingAccount, "休眠")
+        XCTAssertEqual(en.sleepingAccount, "Sleeping")
         XCTAssertEqual(zh.deleteAccountFailed, "删除这个账号失败：")
         XCTAssertEqual(en.deleteAccountFailed, "Could not remove this account: ")
         XCTAssertFalse(zh.accountsMenuHelp.isEmpty)

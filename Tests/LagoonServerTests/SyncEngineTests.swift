@@ -5,9 +5,13 @@ import PostgresNIO
 @testable import LagoonServer
 @testable import LagoonKit
 
-/// Drives `SyncEngine` with a scripted provider against the guarded test DB:
-/// the whole round — pull → persist → cursor → health → backoff — with no
+/// Drives the sync machinery with scripted providers against the guarded test
+/// DB: the whole round — pull → persist → cursor → health → backoff — with no
 /// network and no wall-clock sleeping.
+///
+/// Round-level tests drive one `AccountSyncLoop` directly. The supervisor
+/// (`SyncEngine`) gets its own tests, because "one mailbox's trouble must not
+/// stop another's mail" is a property of the supervision, not of a round.
 final class SyncEngineTests: XCTestCase {
     // MARK: - Fixtures
 
@@ -29,8 +33,6 @@ final class SyncEngineTests: XCTestCase {
             ),
             db: db
         )
-        // The engine only ever syncs the single active account.
-        try await AccountStore.setActive(accountId: account.id, db: db)
     }
 
     private func cleanup(_ oauthUser: String) -> @Sendable (PostgresConnection) async -> Void {
@@ -39,16 +41,18 @@ final class SyncEngineTests: XCTestCase {
         }
     }
 
-    private func makeEngine(
+    private func makeLoop(
         db: PostgresConnection,
+        account: Account,
         provider: (any MailProvider)?,
         sleeper: SleepRecorder = SleepRecorder(),
         counter: CallCounter? = nil
-    ) -> SyncEngine {
-        SyncEngine(
+    ) -> AccountSyncLoop {
+        AccountSyncLoop(
+            account: account,
             db: db,
-            logger: Logger(label: "sync-engine-tests"),
-            providers: { (_: Account) -> (any MailProvider)? in
+            logger: Logger(label: "sync-loop-tests"),
+            makeProvider: { (_: Account) -> (any MailProvider)? in
                 counter?.bump()
                 return provider
             },
@@ -77,7 +81,7 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertLessThanOrEqual(actual, seconds * 1.2, file: file, line: line)
     }
 
-    // MARK: - Tests
+    // MARK: - One round
 
     /// (a) upserts land in the store, the cursor advances, health turns ok.
     func test_success_appliesUpserts_advancesCursor_andReportsOk() async throws {
@@ -103,10 +107,11 @@ final class SyncEngineTests: XCTestCase {
                     cursor: cursor
                 ))
                 let sleeper = SleepRecorder()
-                let engine = makeEngine(db: conn, provider: provider, sleeper: sleeper)
+                let loop = makeLoop(db: conn, account: account, provider: provider, sleeper: sleeper)
 
-                await engine.tickOnce()
+                let parked = await loop.round()
 
+                XCTAssertFalse(parked, "a healthy round keeps looping")
                 let stored = try await MessageStore.recent(
                     forAccount: account.id,
                     limit: 50,
@@ -148,6 +153,56 @@ final class SyncEngineTests: XCTestCase {
         }
     }
 
+    /// (a2) A round must resume from the cursor the *previous* round persisted,
+    /// not from whatever the row held when the loop was built.
+    ///
+    /// The loop is a long-lived object holding a snapshot of its account; using
+    /// that snapshot for `pullChanges(after:)` makes the cursor stand still and
+    /// every round re-deliver the same mail (observed against a real mailbox:
+    /// the same 168 messages re-applied every 20 s).
+    func test_secondRound_resumesFromThePersistedCursor() async throws {
+        let oauthUser = "sync-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+                // What the row holds when the loop starts.
+                let account = Account(
+                    id: UUID(),
+                    provider: .qq,
+                    oauthUser: oauthUser,
+                    email: "\(oauthUser)@qq.com",
+                    credentials: nil,
+                    syncState: MailSyncState(uidValidity: 42, lastUid: 900)
+                )
+                try await seed(account, db: conn)
+
+                let advanced = MailSyncState(uidValidity: 42, lastUid: 901)
+                let provider = StubMailProvider(pulls: [
+                    .success(MailChangeSet(
+                        upserts: [.stub(remoteId: "901")],
+                        resetRequired: false,
+                        cursor: advanced
+                    )),
+                    .success(MailChangeSet(
+                        upserts: [],
+                        resetRequired: false,
+                        cursor: advanced
+                    )),
+                ])
+                let loop = makeLoop(db: conn, account: account, provider: provider)
+
+                await loop.round()
+                await loop.round()
+
+                let passed = await provider.lastCursor
+                XCTAssertEqual(
+                    passed, advanced,
+                    "round 2 must resume from the cursor round 1 committed, not the loop's initial snapshot"
+                )
+            }
+        }
+    }
+
     /// (b) `resetRequired` (UIDVALIDITY change) wipes stale rows first, then the
     /// cursor is reset to the new identity space.
     func test_resetRequired_wipesStaleRowsBeforeApplying() async throws {
@@ -184,9 +239,9 @@ final class SyncEngineTests: XCTestCase {
                     resetRequired: true,
                     cursor: cursor
                 ))
-                let engine = makeEngine(db: conn, provider: provider)
+                let loop = makeLoop(db: conn, account: account, provider: provider)
 
-                await engine.tickOnce()
+                await loop.round()
 
                 let stored = try await MessageStore.recent(
                     forAccount: account.id,
@@ -203,9 +258,57 @@ final class SyncEngineTests: XCTestCase {
         }
     }
 
-    /// (c) `authFailed` → `needsReconnect` plus a long pause: credentials must
-    /// not be retried in a tight loop (QQ rate-limits failed logins).
-    func test_authFailure_marksNeedsReconnect_andPauses() async throws {
+    /// (b2) A complete inbox snapshot removes rows another client moved or
+    /// deleted remotely. Without this, the UI keeps opening a stale message and
+    /// the body route correctly answers 410 `message-gone`.
+    func test_inboxSnapshot_removesMessagesNoLongerInInbox() async throws {
+        let oauthUser = "sync-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(account, db: conn)
+                try await MessageStore.upsert(
+                    MessageHeader(
+                        id: UUID(),
+                        accountId: account.id,
+                        remoteId: "<stale@example.com>",
+                        threadId: "stale",
+                        fromAddress: "old@example.com",
+                        fromName: nil,
+                        subject: "Moved in another client",
+                        snippet: nil,
+                        receivedAt: Date(),
+                        isRead: false,
+                        isArchived: false
+                    ),
+                    db: conn
+                )
+
+                let cursor = MailSyncState(uidValidity: 42, lastUid: 901)
+                let provider = StubMailProvider.once(MailChangeSet(
+                    upserts: [.stub(remoteId: "<fresh@example.com>")],
+                    resetRequired: false,
+                    cursor: cursor,
+                    inboxRemoteIds: ["<fresh@example.com>"]
+                ))
+                let loop = makeLoop(db: conn, account: account, provider: provider)
+
+                await loop.round()
+
+                let stored = try await MessageStore.recent(
+                    forAccount: account.id,
+                    limit: 50,
+                    db: conn
+                )
+                XCTAssertEqual(stored.map(\.remoteId), ["<fresh@example.com>"])
+            }
+        }
+    }
+
+    /// (c) `authFailed` → `needsReconnect` and the loop parks: a rejected
+    /// credential must not be retried at all (QQ rate-limits failed logins).
+    func test_authFailure_marksNeedsReconnect_andParks() async throws {
         let oauthUser = "sync-\(UUID().uuidString)"
 
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
@@ -215,10 +318,11 @@ final class SyncEngineTests: XCTestCase {
 
                 let provider = StubMailProvider.failing(.authFailed)
                 let sleeper = SleepRecorder()
-                let engine = makeEngine(db: conn, provider: provider, sleeper: sleeper)
+                let loop = makeLoop(db: conn, account: account, provider: provider, sleeper: sleeper)
 
-                await engine.tickOnce()
+                let parked = await loop.round()
 
+                XCTAssertTrue(parked, "an auth failure must stop the loop, not throttle it")
                 let updated = try await health(account.id, db: conn)
                 XCTAssertEqual(updated?.status, .needsReconnect)
                 XCTAssertEqual(
@@ -226,11 +330,36 @@ final class SyncEngineTests: XCTestCase {
                     "only the stable label is stored, never credential material"
                 )
                 XCTAssertEqual(
-                    sleeper.durations, [.seconds(60)],
-                    "an auth failure must pause, not hot-loop"
+                    sleeper.durations, [],
+                    "a parked loop must not schedule a retry"
                 )
                 let pullCount = await provider.pullCount
                 XCTAssertEqual(pullCount, 1)
+            }
+        }
+    }
+
+    /// (c2) missing credentials are not a transient failure: retrying cannot
+    /// fix them, so the loop parks with the same call to action as a rejected
+    /// token (the client already renders a Reconnect button for it).
+    func test_notConfigured_parksAsNeedsReconnect() async throws {
+        let oauthUser = "sync-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(account, db: conn)
+
+                let provider = StubMailProvider.failing(.notConfigured("gmail credentials missing"))
+                let sleeper = SleepRecorder()
+                let loop = makeLoop(db: conn, account: account, provider: provider, sleeper: sleeper)
+
+                let parked = await loop.round()
+
+                XCTAssertTrue(parked)
+                let updated = try await health(account.id, db: conn)
+                XCTAssertEqual(updated?.status, .needsReconnect)
+                XCTAssertEqual(sleeper.durations, [])
             }
         }
     }
@@ -247,18 +376,18 @@ final class SyncEngineTests: XCTestCase {
 
                 let provider = StubMailProvider.failing(.unreachable("stub"))
                 let sleeper = SleepRecorder()
-                let engine = makeEngine(db: conn, provider: provider, sleeper: sleeper)
+                let loop = makeLoop(db: conn, account: account, provider: provider, sleeper: sleeper)
 
-                await engine.tickOnce()
+                await loop.round()
                 let first = try await health(account.id, db: conn)
                 XCTAssertEqual(first?.status, .error)
                 XCTAssertEqual(first?.lastError, "unreachable")
 
-                await engine.tickOnce()
+                await loop.round()
                 let second = try await health(account.id, db: conn)
                 XCTAssertEqual(second?.status, .error)
 
-                await engine.tickOnce()
+                await loop.round()
                 let third = try await health(account.id, db: conn)
                 XCTAssertEqual(
                     third?.status, .degraded,
@@ -294,17 +423,17 @@ final class SyncEngineTests: XCTestCase {
                     .failure(.unreachable("stub")),
                 ])
                 let sleeper = SleepRecorder()
-                let engine = makeEngine(db: conn, provider: provider, sleeper: sleeper)
+                let loop = makeLoop(db: conn, account: account, provider: provider, sleeper: sleeper)
 
-                await engine.tickOnce()
+                await loop.round()
                 let failed = try await health(account.id, db: conn)
                 XCTAssertEqual(failed?.status, .error)
 
-                await engine.tickOnce()
+                await loop.round()
                 let recovered = try await health(account.id, db: conn)
                 XCTAssertEqual(recovered?.status, .ok)
 
-                await engine.tickOnce()
+                await loop.round()
                 let failedAgain = try await health(account.id, db: conn)
                 XCTAssertEqual(failedAgain?.status, .error)
                 // Two failures, two pauses: the successful round in between
@@ -317,9 +446,9 @@ final class SyncEngineTests: XCTestCase {
         }
     }
 
-    /// (f) the factory runs once per account: a provider carries connection
-    /// state (IDLE socket / Gmail poll baseline) that must survive ticks.
-    func test_providerFactory_runsOncePerAccount() async throws {
+    /// (f) the factory runs once per loop: a provider carries connection state
+    /// (an IDLE socket) that must survive rounds.
+    func test_providerFactory_runsOnce() async throws {
         let oauthUser = "sync-\(UUID().uuidString)"
 
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
@@ -328,14 +457,15 @@ final class SyncEngineTests: XCTestCase {
                 try await seed(account, db: conn)
 
                 let counter = CallCounter()
-                let engine = makeEngine(
+                let loop = makeLoop(
                     db: conn,
+                    account: account,
                     provider: StubMailProvider(),
                     counter: counter
                 )
 
-                await engine.tickOnce()
-                await engine.tickOnce()
+                await loop.round()
+                await loop.round()
 
                 XCTAssertEqual(counter.value, 1)
             }
@@ -343,7 +473,7 @@ final class SyncEngineTests: XCTestCase {
     }
 
     /// (g) an account whose provider is unavailable is visibly unhealthy
-    /// instead of silently unsynced (the `.qq` state before Task 8).
+    /// instead of silently unsynced.
     func test_missingProvider_recordsNoProviderHealth() async throws {
         let oauthUser = "sync-\(UUID().uuidString)"
 
@@ -353,9 +483,9 @@ final class SyncEngineTests: XCTestCase {
                 try await seed(account, db: conn)
 
                 let sleeper = SleepRecorder()
-                let engine = makeEngine(db: conn, provider: nil, sleeper: sleeper)
+                let loop = makeLoop(db: conn, account: account, provider: nil, sleeper: sleeper)
 
-                await engine.tickOnce()
+                await loop.round()
 
                 let updated = try await health(account.id, db: conn)
                 XCTAssertEqual(updated?.status, .error)
@@ -364,9 +494,100 @@ final class SyncEngineTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - Supervision
+
+    /// (h) Switching the server's active account stops the old provider and
+    /// starts the selected one. The dormant mailbox keeps its stored cursor and
+    /// makes no further network calls.
+    func test_switch_stopsOldAccount_andStartsSelectedAccount() async throws {
+        let oauthA = "sync-a-\(UUID().uuidString)"
+        let oauthB = "sync-b-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: { conn in
+                try? await TestDatabase.deleteAccount(oauthUser: oauthA, provider: .qq, db: conn)
+                try? await TestDatabase.deleteAccount(oauthUser: oauthB, provider: .qq, db: conn)
+            }) { conn in
+                let broken = makeAccount(oauthUser: oauthA)
+                let healthy = makeAccount(oauthUser: oauthB)
+                try await seed(broken, db: conn)
+                try await seed(healthy, db: conn)
+
+                let providerA = StubMailProvider.once(MailChangeSet(
+                    upserts: [.stub(remoteId: "a-1")],
+                    resetRequired: false,
+                    cursor: MailSyncState(uidValidity: 8, lastUid: 1)
+                ))
+                let providerB = StubMailProvider.once(MailChangeSet(
+                    upserts: [.stub(remoteId: "b-1")],
+                    resetRequired: false,
+                    cursor: MailSyncState(uidValidity: 9, lastUid: 1)
+                ))
+                let engine = SyncEngine(
+                    db: conn,
+                    logger: Logger(label: "sync-switch-tests"),
+                    makeProvider: { account in
+                        account.id == broken.id ? providerA : providerB
+                    },
+                    sleep: { _ in }
+                )
+
+                try await AccountStore.setActive(accountId: healthy.id, db: conn)
+                await engine.start()
+                defer { Task { await engine.stop() } }
+
+                // B owns the only loop.
+                var bSynced = false
+                for _ in 0..<100 {
+                    if let health = try await health(healthy.id, db: conn),
+                       health.lastSyncAt != nil {
+                        bSynced = true
+                        break
+                    }
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                XCTAssertTrue(bSynced, "the selected B account must sync")
+                let bMessages = try await MessageStore.recent(
+                    forAccount: healthy.id, limit: 50, db: conn
+                )
+                XCTAssertEqual(bMessages.map(\.remoteId), ["b-1"])
+                let aHealthBeforeSwitch = try await health(broken.id, db: conn)
+                XCTAssertNil(aHealthBeforeSwitch?.lastSyncAt, "dormant A must not sync")
+                // Select A. The old B task must be cancelled and awaited before
+                // A receives the provider.
+                try await AccountStore.setActive(accountId: broken.id, db: conn)
+                await engine.refresh()
+                var aSynced = false
+                for _ in 0..<100 {
+                    if let health = try await health(broken.id, db: conn),
+                       health.lastSyncAt != nil {
+                        aSynced = true
+                        break
+                    }
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                XCTAssertTrue(aSynced, "selecting A must start its sync loop")
+                let aMessages = try await MessageStore.recent(
+                    forAccount: broken.id, limit: 50, db: conn
+                )
+                XCTAssertEqual(aMessages.map(\.remoteId), ["a-1"])
+
+                let bPullsAfterSwitch = await providerB.pullCount
+                try await Task.sleep(for: .milliseconds(100))
+                let bPullsAfterSettling = await providerB.pullCount
+                XCTAssertEqual(
+                    bPullsAfterSettling,
+                    bPullsAfterSwitch,
+                    "dormant B must make no network calls after the switch"
+                )
+                await engine.stop()
+            }
+        }
+    }
 }
 
-/// Records the pauses the engine took, so the backoff state machine can be
+/// Records the pauses the loop took, so the backoff state machine can be
 /// asserted without waiting for it.
 final class SleepRecorder: @unchecked Sendable {
     private(set) var durations: [Duration] = []
@@ -376,7 +597,7 @@ final class SleepRecorder: @unchecked Sendable {
     }
 }
 
-/// Counts provider-factory invocations; only touched from the engine actor.
+/// Counts provider-factory invocations; only touched from the loop actor.
 final class CallCounter: @unchecked Sendable {
     private(set) var value = 0
 

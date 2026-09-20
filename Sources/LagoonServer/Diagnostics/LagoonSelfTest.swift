@@ -3,16 +3,37 @@ import Logging
 import PostgresNIO
 import LagoonKit
 
-/// Explicit real-account smoke test. It sends only to the active account's own
-/// address and never accepts an arbitrary recipient.
+/// Explicit real-account smoke test. It sends only to the selected account's
+/// own address and never accepts an arbitrary recipient.
 enum LagoonSelfTest {
+    /// The QQ account the diagnostics act on.
+    ///
+    /// Several mailboxes can be stored at once, so the choice is never
+    /// accidental: an explicit `--account <email>` wins, otherwise the active
+    /// QQ account wins, then any stored QQ account.
+    private static func qqAccount(
+        db: PostgresConnection, logger: Logger
+    ) async throws -> Account {
+        let accounts = try await AccountStore.all(db: db)
+            .filter { $0.provider == .qq }
+        if let flag = CommandLine.arguments.firstIndex(of: "--account") {
+            let valueIndex = CommandLine.arguments.index(after: flag)
+            if valueIndex < CommandLine.arguments.endIndex {
+                let wanted = CommandLine.arguments[valueIndex]
+                guard let match = accounts.first(where: { $0.email == wanted }) else {
+                    throw SelfTestError.unknownAccount(wanted)
+                }
+                return match
+            }
+        }
+        guard let first = accounts.first(where: \.isActive) ?? accounts.first else {
+            throw SelfTestError.noQQAccount
+        }
+        logger.info("self-test account", metadata: ["email": .string(first.email)])
+        return first
+    }
     static func listMailboxes(db: PostgresConnection, logger: Logger) async throws {
-        guard let account = try await AccountStore.active(db: db) else {
-            throw SelfTestError.noActiveAccount
-        }
-        guard account.provider == .qq else {
-            throw SelfTestError.qqOnly
-        }
+        let account = try await qqAccount(db: db, logger: logger)
         let provider = IMAPProvider(account: account, db: db, logger: logger)
         for mailbox in try await provider.diagnosticMailboxes() {
             print("\(mailbox.name)\t\(mailbox.attributes.joined(separator: ","))")
@@ -20,12 +41,7 @@ enum LagoonSelfTest {
     }
 
     static func find(subject: String, db: PostgresConnection, logger: Logger) async throws {
-        guard let account = try await AccountStore.active(db: db) else {
-            throw SelfTestError.noActiveAccount
-        }
-        guard account.provider == .qq else {
-            throw SelfTestError.qqOnly
-        }
+        let account = try await qqAccount(db: db, logger: logger)
         let provider = IMAPProvider(account: account, db: db, logger: logger)
         for (mailbox, uid) in try await provider.diagnosticFind(subject: subject) {
             print("\(mailbox)\t\(uid)")
@@ -33,24 +49,14 @@ enum LagoonSelfTest {
     }
 
     static func restore(remoteId: String, db: PostgresConnection, logger: Logger) async throws {
-        guard let account = try await AccountStore.active(db: db) else {
-            throw SelfTestError.noActiveAccount
-        }
-        guard account.provider == .qq else {
-            throw SelfTestError.qqOnly
-        }
+        let account = try await qqAccount(db: db, logger: logger)
         let provider = IMAPProvider(account: account, db: db, logger: logger)
         try await provider.unarchive(remoteId: remoteId)
         print("restore: ok remoteId=\(remoteId)")
     }
 
     static func run(db: PostgresConnection, logger: Logger) async throws {
-        guard let account = try await AccountStore.active(db: db) else {
-            throw SelfTestError.noActiveAccount
-        }
-        guard account.provider == .qq else {
-            throw SelfTestError.qqOnly
-        }
+        let account = try await qqAccount(db: db, logger: logger)
 
         let marker = "[Lagoon Self-Test \(UUID().uuidString.prefix(8))]"
         print("marker: \(marker)")
@@ -140,16 +146,16 @@ enum LagoonSelfTest {
 }
 
 private enum SelfTestError: Error, CustomStringConvertible {
-    case noActiveAccount
-    case qqOnly
+    case noQQAccount
+    case unknownAccount(String)
     case noArchiveCandidate
 
     var description: String {
         switch self {
-        case .noActiveAccount:
-            "self-test requires one active account"
-        case .qqOnly:
-            "self-test currently supports an active QQ account only"
+        case .noQQAccount:
+            "self-test requires a stored QQ account (none found)"
+        case .unknownAccount(let email):
+            "no stored QQ account matches --account \(email)"
         case .noArchiveCandidate:
             "no existing INBOX message is available for archive/unarchive verification"
         }

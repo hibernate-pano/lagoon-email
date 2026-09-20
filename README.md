@@ -1,10 +1,11 @@
 # Lagoon
 
-An AI Inbox Operating System for the Apple ecosystem. Current state: **M1.7** — the
+An AI Inbox Operating System for the Apple ecosystem. Current state: **M1.8** — the
 mailbox layer is provider-agnostic and **QQ Mail is the primary account** (authorization
 code → IMAP sync → read → Briefing Feed → AI summary → SMTP reply → archive/⌘Z undo).
-The original Gmail path (OAuth + REST) is preserved and switchable. M1.7 completes the
-M1 P0 list: quantified time saved, reply detection, and whitelist auto-archive.
+The original Gmail path (OAuth + REST) is preserved. Multiple mailboxes can stay
+connected, but exactly one is active; switching puts the previous mailbox to sleep and
+the selected mailbox resumes from its own cursor.
 
 Docs: [M1.5 spec](docs/superpowers/specs/2026-09-11-imap-qq-provider-design.md) ·
 [M1.5 plan](docs/superpowers/plans/2026-09-11-imap-qq-provider.md) ·
@@ -309,6 +310,24 @@ Provider routing and defaults live in `config/providers.json`; see
   retry) when the provider errors. Rules are offered only on subscription-noise rows,
   so a sender that owes you replies can never be silently blackholed.
 
+### M1.8 — multiple accounts, one active mailbox
+
+- **Single sync owner**: migration 013 restores `accounts.is_active` and adds a
+  partial unique index that permits at most one active row. Dormant accounts keep
+  credentials, cursors and cached messages but own no provider connection.
+- **One loop, no overlap**: `SyncEngine` supervises one active `AccountSyncLoop`.
+  Switching cancels and awaits the old task before starting the new provider, so
+  QQ and Gmail never sync in parallel by accident.
+- **Server-authoritative switching**: `POST /api/accounts/{id}/activate` moves the
+  active marker and restarts the loop. `GET /api/accounts` returns `isActive`, and
+  the client mirrors the confirmed choice into Keychain only after success.
+- **Dormant UX**: non-active accounts display as “Sleeping” and retain their cached
+  view. Only the active mailbox receives new mail and notifications.
+- **Inbox reconciliation**: the IMAP loop maintains the complete INBOX
+  UID/Message-ID view and removes local rows when another client moves or
+  deletes a message. This prevents stale list entries that later fail with
+  `410 message-gone`.
+
 ## Known limitations (by design)
 
 - No API authentication — the server is loopback-only for that reason
@@ -324,7 +343,8 @@ Provider routing and defaults live in `config/providers.json`; see
 - Gmail `historyId` incremental sync via the API only (no Pub/Sub push)
 - Body is fetched on demand and never stored server-side (headers/snippets only)
 - Postgres: single connection, no pool
-- macOS only; one active account at a time (the directory can hold several)
+- macOS only; one active account at a time by design (the directory can hold several,
+  and inactive accounts go dormant rather than syncing in parallel)
 
 ## Reliability hardening
 

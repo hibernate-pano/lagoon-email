@@ -71,7 +71,7 @@ final class RouteTests: XCTestCase {
                 oauthUser: oauthUser,
                 email: "route-\(UUID().uuidString)@example.com",
                 credentials: nil,
-                isActive: true
+                isActive: false
             )
             let preExistingCount = try await AccountStore.all(db: conn).count
             try await AccountStore.upsert(
@@ -105,7 +105,6 @@ final class RouteTests: XCTestCase {
                             id: account.id,
                             provider: .gmail,
                             email: account.email,
-                            isActive: true,
                             syncHealth: SyncHealth(status: .ok),
                             capabilities: .unknown
                         )),
@@ -246,7 +245,7 @@ final class RouteTests: XCTestCase {
             oauthUser: oauthUser,
             email: email,
             credentials: nil,
-            isActive: true
+            isActive: false
         )
     }
 
@@ -1148,7 +1147,6 @@ final class RouteTests: XCTestCase {
                         )
                         XCTAssertEqual(decoded.id, seededId, "re-auth must keep the existing row id")
                         XCTAssertEqual(decoded.email, email)
-                        XCTAssertTrue(decoded.isActive)
                         XCTAssertEqual(decoded.syncHealth.status, .ok)
                     }
                 }
@@ -1184,7 +1182,7 @@ final class RouteTests: XCTestCase {
                 try await seedAccount(
                     Account(
                         id: seededId, provider: .qq, oauthUser: email, email: email,
-                        credentials: nil, capabilities: seededCapabilities, isActive: true,
+                        credentials: nil, capabilities: seededCapabilities, isActive: false,
                         syncHealth: SyncHealth(status: .needsReconnect, lastError: "old failure")
                     ),
                     credentials: seededCredentials,
@@ -1214,7 +1212,7 @@ final class RouteTests: XCTestCase {
                 XCTAssertEqual(account.syncHealth.status, .needsReconnect)
                 XCTAssertEqual(account.syncHealth.lastError, "old failure")
                 XCTAssertEqual(account.capabilities, seededCapabilities)
-                XCTAssertTrue(account.isActive)
+                XCTAssertFalse(account.isActive, "a failed re-auth must not activate the row")
             }
         }
     }
@@ -1310,51 +1308,6 @@ final class RouteTests: XCTestCase {
         }
     }
 
-    func test_postActivate_flipsTheActiveAccount() async throws {
-        let first = makeAccount(oauthUser: "route-\(UUID().uuidString)", email: "a-\(UUID())@example.com")
-        let second = makeAccount(oauthUser: "route-\(UUID().uuidString)", email: "b-\(UUID())@example.com")
-        try await TestDatabase.withConnection(cleanup: { conn in
-            try? await TestDatabase.deleteAccount(id: first.id, db: conn)
-            try? await TestDatabase.deleteAccount(id: second.id, db: conn)
-        }) { conn in
-            try await seedAccount(first, db: conn)
-            try await seedAccount(second, db: conn)
-            try await AccountStore.setActive(accountId: first.id, db: conn)
-
-            let provider = StubMailProvider()
-            let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
-            try await app.test(.router) { client in
-                try await client.execute(
-                    uri: "/api/accounts/\(second.id.uuidString)/activate",
-                    method: .post
-                ) { response in
-                    XCTAssertEqual(response.status, .noContent)
-                }
-            }
-
-            let active = try await AccountStore.find(byId: second.id, db: conn)
-            XCTAssertEqual(active?.isActive, true)
-            let demoted = try await AccountStore.find(byId: first.id, db: conn)
-            XCTAssertEqual(demoted?.isActive, false)
-        }
-    }
-
-    func test_postActivate_unknownAccount_returns404() async throws {
-        try await TestDatabase.withConnection { conn in
-            let provider = StubMailProvider()
-            let app = Application(router: makeAccountsRouter(db: conn, provider: provider))
-            try await app.test(.router) { client in
-                try await client.execute(
-                    uri: "/api/accounts/\(UUID().uuidString)/activate",
-                    method: .post
-                ) { response in
-                    XCTAssertEqual(response.status, .notFound)
-                    XCTAssertEqual(try Self.errorCode(from: response.body), "unknown-account")
-                }
-            }
-        }
-    }
-
     func test_deleteAccount_returns204AndRemovesRow() async throws {
         let account = makeAccount(oauthUser: "route-\(UUID().uuidString)", email: "d-\(UUID())@example.com")
         try await TestDatabase.withConnection(cleanup: { conn in
@@ -1390,6 +1343,65 @@ final class RouteTests: XCTestCase {
                     method: .delete
                 ) { response in
                     XCTAssertEqual(response.status, .notFound)
+                }
+            }
+        }
+    }
+
+    func test_postActivate_movesTheSingleActiveAccount() async throws {
+        let first = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "activate-a-\(UUID().uuidString)@example.com"
+        )
+        let second = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "activate-b-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: { conn in
+            try? await TestDatabase.deleteAccount(id: first.id, db: conn)
+            try? await TestDatabase.deleteAccount(id: second.id, db: conn)
+        }) { conn in
+            try await seedAccount(first, db: conn)
+            try await seedAccount(second, db: conn)
+            try await AccountStore.setActive(accountId: first.id, db: conn)
+
+            let app = Application(
+                router: makeAccountsRouter(db: conn, provider: StubMailProvider())
+            )
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/accounts/\(second.id.uuidString)/activate",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .noContent)
+                }
+                try await client.execute(uri: "/api/accounts", method: .get) { response in
+                    let decoded = try Self.iso8601Decoder().decode(
+                        [ConnectedAccount].self, from: Data(buffer: response.body)
+                    )
+                    XCTAssertEqual(decoded.filter(\.isActive).map(\.id), [second.id])
+                }
+            }
+
+            let oldActive = try await AccountStore.find(byId: first.id, db: conn)
+            let newActive = try await AccountStore.find(byId: second.id, db: conn)
+            XCTAssertEqual(oldActive?.isActive, false)
+            XCTAssertEqual(newActive?.isActive, true)
+        }
+    }
+
+    func test_postActivate_unknownAccount_returns404() async throws {
+        try await TestDatabase.withConnection { conn in
+            let app = Application(
+                router: makeAccountsRouter(db: conn, provider: StubMailProvider())
+            )
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/accounts/\(UUID().uuidString)/activate",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "unknown-account")
                 }
             }
         }
@@ -1476,7 +1488,7 @@ final class RouteTests: XCTestCase {
                     capabilities: MailCapabilities(
                         archiveFolder: true, idle: true, move: true, serverSnippet: true
                     ),
-                    isActive: true
+                    isActive: false
                 ),
                 db: conn
             )
@@ -1514,7 +1526,7 @@ final class RouteTests: XCTestCase {
                     capabilities: MailCapabilities(
                         archiveFolder: false, idle: true, move: true, serverSnippet: true
                     ),
-                    isActive: true
+                    isActive: false
                 ),
                 db: conn
             )
@@ -1954,7 +1966,7 @@ final class RouteTests: XCTestCase {
                 capabilities: MailCapabilities(
                     archiveFolder: true, idle: true, move: true, serverSnippet: true
                 ),
-                isActive: true
+                isActive: false
             ),
             db: db
         )

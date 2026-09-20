@@ -104,6 +104,8 @@ final class AccountStoreTests: XCTestCase {
         try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
             let first = makeAccount(oauthUser: oauthUser, email: "first@example.com", historyId: "h1")
             try await AccountStore.upsert(first, credentials: Data([1]), db: conn)
+            // The active choice survives a credential refresh: `upsert`'s
+            // ON CONFLICT branch only touches email/credentials.
             try await AccountStore.setActive(accountId: first.id, db: conn)
 
             let second = makeAccount(oauthUser: oauthUser, email: "second@example.com", historyId: nil)
@@ -114,11 +116,13 @@ final class AccountStoreTests: XCTestCase {
             XCTAssertEqual(found?.email, "second@example.com")
             XCTAssertEqual(found?.credentials, Data([2]))
             XCTAssertEqual(found?.syncState.historyId, "h1", "re-connect must not reset the cursor")
-            XCTAssertEqual(found?.isActive, true, "re-connect must not deactivate the account")
+            XCTAssertEqual(found?.isActive, true, "re-connect must not clear the active flag")
         }
     }
 
-    func test_setActive_activatesExactlyOne() async throws {
+    /// Selecting one account moves the single active marker and leaves the
+    /// other stored mailbox dormant.
+    func test_setActive_isExclusive() async throws {
         let oauthA = "acct-\(UUID().uuidString)"
         let oauthB = "acct-\(UUID().uuidString)"
         try await TestDatabase.withConnection(cleanup: { conn in
@@ -133,13 +137,14 @@ final class AccountStoreTests: XCTestCase {
             try await AccountStore.setActive(accountId: a.id, db: conn)
             var active = try await AccountStore.active(db: conn)
             XCTAssertEqual(active?.id, a.id)
+            var dormant = try await AccountStore.find(byId: b.id, db: conn)
+            XCTAssertEqual(dormant?.isActive, false)
 
             try await AccountStore.setActive(accountId: b.id, db: conn)
             active = try await AccountStore.active(db: conn)
             XCTAssertEqual(active?.id, b.id)
-
-            let all = try await AccountStore.all(db: conn)
-            XCTAssertEqual(all.filter(\.isActive).count, 1, "setting B active must deactivate A")
+            dormant = try await AccountStore.find(byId: a.id, db: conn)
+            XCTAssertEqual(dormant?.isActive, false)
         }
     }
 

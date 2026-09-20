@@ -99,7 +99,7 @@ final class APIClientTests: XCTestCase {
     func test_fetchAccounts_decodes_one_element() async throws {
         let id = UUID()
         let body = Data(#"""
-        [{"id":"\#(id.uuidString)","provider":"qq","email":"a@b.com","isActive":true,
+        [{"id":"\#(id.uuidString)","provider":"qq","email":"a@b.com","isActive":true,"unreadCount":4,
           "syncHealth":{"status":"needsReconnect","lastError":"auth failed"},
           "capabilities":{"archiveFolder":false,"idle":true,"move":true,"serverSnippet":false}}]
         """#.utf8)
@@ -111,7 +111,8 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(accounts.first?.id, id)
         XCTAssertEqual(accounts.first?.provider, .qq)
         XCTAssertEqual(accounts.first?.email, "a@b.com")
-        XCTAssertEqual(accounts.first?.isActive, true)
+        XCTAssertTrue(accounts.first?.isActive ?? false)
+        XCTAssertEqual(accounts.first?.unreadCount, 4)
         XCTAssertEqual(accounts.first?.syncHealth.status, .needsReconnect)
         XCTAssertEqual(accounts.first?.capabilities.idle, true)
     }
@@ -389,7 +390,7 @@ final class APIClientTests: XCTestCase {
     func test_connectQQ_postsJSONBodyAndDecodesConnectedAccount() async throws {
         let id = UUID()
         let body = Data("""
-        {"id":"\(id.uuidString)","provider":"qq","email":"me@qq.com","isActive":true,
+        {"id":"\(id.uuidString)","provider":"qq","email":"me@qq.com","isActive":true,"unreadCount":0,
          "syncHealth":{"status":"ok"},
          "capabilities":{"archiveFolder":true,"idle":true,"move":true,"serverSnippet":true}}
         """.utf8)
@@ -444,17 +445,6 @@ final class APIClientTests: XCTestCase {
         XCTAssertNil(APIError.invalidResponse.serverErrorCode)
     }
 
-    func test_activateAccount_postsToActivateAndTreats204AsSuccess() async throws {
-        let id = UUID()
-        stub(status: 204, body: Data())
-
-        try await makeClient().activateAccount(id: id)
-
-        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
-        XCTAssertEqual(request.httpMethod, "POST")
-        XCTAssertEqual(request.url?.path, "/api/accounts/\(id.uuidString)/activate")
-    }
-
     func test_deleteAccount_sendsDeleteAndTreats204AsSuccess() async throws {
         let id = UUID()
         stub(status: 204, body: Data())
@@ -464,6 +454,17 @@ final class APIClientTests: XCTestCase {
         let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
         XCTAssertEqual(request.httpMethod, "DELETE")
         XCTAssertEqual(request.url?.path, "/api/accounts/\(id.uuidString)")
+    }
+
+    func test_activateAccount_postsToActivateAndTreats204AsSuccess() async throws {
+        let id = UUID()
+        stub(status: 204, body: Data())
+
+        try await makeClient().activateAccount(id: id)
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/api/accounts/\(id.uuidString)/activate")
     }
 
     func test_deleteAccount_404_throwsBadStatus() async throws {
@@ -725,7 +726,7 @@ final class APIClientTests: XCTestCase {
     func test_slowRequestsCarrySeventyFiveSecondTimeout() async throws {
         let id = UUID()
         let body = Data("""
-        {"id":"\(id.uuidString)","provider":"qq","email":"me@qq.com","isActive":true,
+        {"id":"\(id.uuidString)","provider":"qq","email":"me@qq.com","isActive":true,"unreadCount":0,
          "syncHealth":{"status":"ok"},
          "capabilities":{"archiveFolder":true,"idle":true,"move":true,"serverSnippet":true}}
         """.utf8)

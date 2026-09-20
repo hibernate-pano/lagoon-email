@@ -19,7 +19,8 @@ final class IMAPProviderTests: XCTestCase {
     // MARK: - Scaffolding
 
     private func makeProvider(
-        transport: ScriptedTransport
+        transport: ScriptedTransport,
+        reconcilesInbox: Bool = false
     ) throws -> (provider: IMAPProvider, account: Account) {
         let account = Account(
             id: UUID(),
@@ -34,6 +35,7 @@ final class IMAPProviderTests: XCTestCase {
             account: account,
             db: nil,
             logger: Logger(label: "imap-provider-tests"),
+            reconcilesInbox: reconcilesInbox,
             transportFactory: { transport }
         )
         return (provider, account)
@@ -305,6 +307,46 @@ final class IMAPProviderTests: XCTestCase {
                 "Hello world! stuff",
                 "the prefix now carries headers, so a base64 text part decodes to readable text"
             )
+        }
+    }
+
+    /// The production reconciliation pass builds the complete INBOX identity
+    /// map once, then `UID SEARCH ALL` removes a UID another client moved out
+    /// of INBOX from the authoritative set returned to the store.
+    func test_pullChanges_reconcilesMessagesMovedOutOfInbox() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let transport = ScriptedTransport()
+            let (provider, _) = try makeProvider(transport: transport, reconcilesInbox: true)
+            await scriptHandshake(transport)
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+                (name: "Archive", attribute: "\\Archive"),
+            ])
+            await scriptSelect(transport, number: 5, uidValidity: 42, uidNext: 3)
+
+            await scriptHeaderFetch(transport, sequence: 1, uid: 1, flags: "", headers: [
+                ("Message-ID", "<m1@qq.com>"),
+            ])
+            await scriptHeaderFetch(transport, sequence: 2, uid: 2, flags: "", headers: [
+                ("Message-ID", "<m2@qq.com>"),
+            ])
+            await transport.enqueue("A0006 OK FETCH completed")
+
+            await transport.enqueue("* SEARCH 1")
+            await transport.enqueue("A0007 OK SEARCH completed")
+
+            await transport.enqueue("A0008 OK FETCH completed")
+
+            let change = try await provider.pullChanges(
+                after: MailSyncState(uidValidity: 42, lastUid: nil),
+                waitUpTo: .zero
+            )
+
+            XCTAssertEqual(change.inboxRemoteIds, Set(["<m1@qq.com>"]))
+            let lines = await wire(transport)
+            XCTAssertTrue(lines.contains("A0006 UID FETCH 1:* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (\(headerFields))])"))
+            XCTAssertTrue(lines.contains("A0007 UID SEARCH ALL"))
+            XCTAssertTrue(lines.contains("A0008 UID FETCH 1:* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (\(headerFields))])"))
         }
     }
 

@@ -349,6 +349,11 @@ public struct L10n: Sendable, Equatable {
     public var addAccount: String { pick("添加账号", "Add account") }
     public var activateAccount: String { pick("切换到这个账号", "Switch to this account") }
     public var activateAccountFailed: String { pick("切换账号失败：", "Could not switch account: ") }
+    public var sleepingAccount: String { pick("休眠", "Sleeping") }
+    /// Unread count for one mailbox in the account menu.
+    public func unreadCount(_ count: Int) -> String {
+        pick("\(count) 封未读", "\(count) unread")
+    }
     public var deleteAccountFailed: String { pick("删除这个账号失败：", "Could not remove this account: ") }
     public func providerName(_ kind: MailProviderKind) -> String {
         switch kind {

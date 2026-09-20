@@ -53,11 +53,23 @@ public struct MailChangeSet: Sendable {
     public var upserts: [RemoteHeader]
     public var resetRequired: Bool
     public var cursor: MailSyncState
+    /// When non-nil, this is the complete set of provider IDs currently in the
+    /// source mailbox. The store removes any non-archived local row for this
+    /// account that is absent from the set. IMAP uses it to reconcile mail
+    /// moved or deleted by another client; providers without a cheap complete
+    /// view leave it nil.
+    public var inboxRemoteIds: Set<String>?
 
-    public init(upserts: [RemoteHeader], resetRequired: Bool, cursor: MailSyncState) {
+    public init(
+        upserts: [RemoteHeader],
+        resetRequired: Bool,
+        cursor: MailSyncState,
+        inboxRemoteIds: Set<String>? = nil
+    ) {
         self.upserts = upserts
         self.resetRequired = resetRequired
         self.cursor = cursor
+        self.inboxRemoteIds = inboxRemoteIds
     }
 }
 

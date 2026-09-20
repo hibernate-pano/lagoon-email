@@ -3,18 +3,16 @@ import LagoonKit
 
 /// Client-side account directory (the M1.5 multi-account surface).
 ///
-/// `GET /api/accounts` is the single source of truth for which mailboxes exist
-/// and which one is active; this store polls it, exposes the active row for the
-/// toolbar/health banner, and performs the activate/delete mutations. It is
-/// deliberately separate from `AccountStore`, which only remembers the locally
-/// chosen account id in the keychain.
+/// `GET /api/accounts` is the source of truth for which mailboxes exist and how
+/// each one's sync is doing; this store polls it and performs activate/delete
+/// mutations. Exactly one account is active; every other account is dormant.
 @MainActor
 public final class DirectoryStore: ObservableObject {
     @Published public private(set) var accounts: [ConnectedAccount] = []
     @Published public private(set) var loadError: String?
 
     /// RootView re-polls on this cadence while the window is open. The server
-    /// writes health from its sync loop, so a slow poll is enough to notice.
+    /// writes health from its active sync loop, so a slow poll is enough.
     public static let refreshInterval: Duration = .seconds(30)
 
     private let api: APIClient
@@ -23,12 +21,13 @@ public final class DirectoryStore: ObservableObject {
         self.api = api
     }
 
-    /// The one active account (server invariant: zero or one).
+    /// The server's active account. The fallback keeps the UI usable during the
+    /// brief interval before reconciliation or before a fresh account is shown.
     public var active: ConnectedAccount? {
-        accounts.first { $0.isActive }
+        accounts.first(where: \.isActive) ?? accounts.first
     }
 
-    /// True when a health problem is worth a banner.
+    /// True when a health problem is worth a banner for the viewed account.
     public var needsAttention: Bool {
         guard let active else { return false }
         return active.syncHealth.status != .ok
@@ -43,8 +42,9 @@ public final class DirectoryStore: ObservableObject {
         }
     }
 
-    /// Switch the active account. Throws so the caller can keep the local
-    /// account id and the server's `is_active` row in sync.
+    /// Select the one account that owns the provider connection. Refresh only
+    /// after the server confirms, so the client never shows a switch that did
+    /// not actually happen.
     public func activate(_ account: ConnectedAccount) async throws {
         guard !account.isActive else { return }
         do {

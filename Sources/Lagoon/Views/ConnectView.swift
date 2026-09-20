@@ -307,11 +307,8 @@ struct ConnectView: View {
         }
     }
 
-    /// The 409 action: adopt the already-connected server row for this mailbox
-    /// as the local account. Activation is flipped server-side too, otherwise
-    /// the feed (local accountId) and the toolbar/health banner (server
-    /// is_active) can show two different accounts. If the row is not listed,
-    /// the neutral prompt stays up and Cancel returns the user to the main screen.
+    /// The 409 action: select the already-connected server row as the single
+    /// active account. If the row is not listed, the neutral prompt stays up.
     private func useExistingAccount(email: String) async {
         do {
             let rows = try await api.fetchAccounts()
@@ -319,12 +316,7 @@ struct ConnectView: View {
             guard let row = rows.first(where: { $0.provider == .qq && $0.email == email }) else {
                 return
             }
-            // Activate server-side first: if this fails or the user cancels
-            // mid-flight, the local id is still the old one, so the feed and
-            // the toolbar's `directory.active` never disagree. (Keychain
-            // failure after this point is the rarer half of the race.)
             try await api.activateAccount(id: row.id)
-            if Task.isCancelled { return }
             try accounts.set(accountId: row.id)
             dismiss()
         } catch let urlError as URLError where urlError.code == .cancelled {
@@ -401,7 +393,7 @@ struct ConnectView: View {
             baseline.map { ($0.id, $0) },
             uniquingKeysWith: { first, _ in first }
         )
-        for account in current where account.provider == .gmail {
+        for account in current where account.provider == .gmail && account.isActive {
             guard let before = baselineById[account.id] else { return account }
             if before.syncHealth.status != .ok, account.syncHealth.status == .ok {
                 return account

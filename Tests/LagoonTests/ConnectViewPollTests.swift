@@ -11,13 +11,14 @@ final class ConnectViewPollTests: XCTestCase {
     private func account(
         id: UUID = UUID(),
         provider: MailProviderKind = .gmail,
+        isActive: Bool = true,
         _ status: SyncHealth.Status
     ) -> ConnectedAccount {
         ConnectedAccount(
             id: id,
             provider: provider,
             email: "a@example.com",
-            isActive: false,
+            isActive: isActive,
             syncHealth: SyncHealth(status: status),
             capabilities: MailCapabilities(
                 archiveFolder: true, idle: true, move: true, serverSnippet: true

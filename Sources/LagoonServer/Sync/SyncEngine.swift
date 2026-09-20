@@ -3,144 +3,144 @@ import Logging
 import PostgresNIO
 import LagoonKit
 
-/// The single sync loop for the active account.
+/// One active account's sync loop.
 ///
-/// One `tickOnce()` is: pick the active account → `pullChanges` (blocks up to
-/// `waitBudget` waiting for something to happen) → persist → write health.
-/// `start()` drives it; failures follow spec §3.4 — auth failures stop the
-/// retry loop and surface `needsReconnect`, everything else backs off
-/// 1→2→…→300s with ±20% jitter.
-public actor SyncEngine {
-    /// How long one `pullChanges` may block waiting for a change. The loop is
-    /// therefore never quieter than one tick per 5 minutes even when idle.
+/// The loop owns a long-lived provider (one IMAP IDLE connection or Gmail
+/// poller) but never treats the account snapshot as mutable state. Each round
+/// re-reads the row so credentials, capabilities and the cursor are always the
+/// latest values committed by the connect or action flows.
+public actor AccountSyncLoop {
+    /// How long one `pullChanges` may block waiting for a change, so the loop
+    /// is never quieter than one round per 5 minutes even when idle.
     public static let waitBudget: Duration = .seconds(300)
 
+    private let accountId: UUID
+    private let fallbackEmail: String
     private let db: PostgresConnection
     private let logger: Logger
-    private let providers: @Sendable (Account) -> (any MailProvider)?
+    private let makeProvider: @Sendable (Account) -> (any MailProvider)?
     /// Injected so tests can exercise the backoff state machine without
     /// wall-clock sleeps.
     private let sleep: @Sendable (Duration) async -> Void
 
-    private var loop: Task<Void, Never>?
     private var consecutiveFailures = 0
-    private var currentAccountId: UUID?
-    /// Accounts whose negotiated capabilities have been persisted this process.
-    private var capabilitiesChecked: Set<UUID> = []
-    /// Provider instances are long-lived: an IMAP provider holds an IDLE
-    /// connection and a Gmail provider remembers the last poll it diffed
-    /// against, so rebuilding one per tick would lose both.
-    private var providersByAccount: [UUID: any MailProvider] = [:]
+    /// The provider is long-lived: an IMAP provider holds an IDLE connection,
+    /// so rebuilding one per round would lose it.
+    private var provider: (any MailProvider)?
+    /// Negotiated once per provider; refreshed whenever the provider is rebuilt.
+    private var capabilitiesChecked = false
+    private var lastNegotiated: MailCapabilities?
 
     public init(
+        account: Account,
         db: PostgresConnection,
         logger: Logger,
-        providers: @escaping @Sendable (Account) -> (any MailProvider)?,
+        makeProvider: @escaping @Sendable (Account) -> (any MailProvider)?,
         sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
     ) {
+        self.accountId = account.id
+        self.fallbackEmail = account.email
         self.db = db
         self.logger = logger
-        self.providers = providers
+        self.makeProvider = makeProvider
         self.sleep = sleep
     }
 
-    public func start() {
-        guard loop == nil else { return }
-        loop = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let engine = self else { return }
-                await engine.tickOnce()
-            }
+    /// Runs rounds until the loop parks (the account needs the user) or the
+    /// Task is cancelled. `SyncEngine` is the only component that starts it.
+    public func run() async {
+        while !Task.isCancelled {
+            // `round` returns true when it parked the loop; the supervisor
+            // starts it again after a reconnect or account switch.
+            if await round() { return }
         }
     }
 
-    public func stop() {
-        loop?.cancel()
-        loop = nil
-    }
-
-    /// The active account changed (activate / connect / delete). A tick can be
-    /// blocked inside a long IDLE or poll for the old account, so it is
-    /// cancelled and the loop restarted against the new active row.
-    public func accountChanged() {
-        currentAccountId = nil
-        capabilitiesChecked.removeAll()
-        loop?.cancel()
-        loop = nil
-        start()
-    }
-
-    /// Wake the loop now without discarding the active provider connection.
-    public func requestImmediateSync() {
-        currentAccountId = nil
-        loop?.cancel()
-        loop = nil
-        start()
-    }
-
-    /// One round: pull, persist, record health. Never throws — failures become
-    /// state (`needsReconnect` / `error` / `degraded`) plus a backoff pause.
+    /// One round. Never throws — failures become state (`needsReconnect` /
+    /// `error` / `degraded`) plus a backoff pause. Returns true when the loop
+    /// parked and must not run again until explicitly woken.
     ///
     /// - Parameter waitBudget: how long the pull may block waiting for a change.
-    ///   Connect flows pass a tiny budget so a fresh account syncs immediately
-    ///   instead of inheriting the loop's idle wait.
-    public func tickOnce(waitBudget: Duration = SyncEngine.waitBudget) async {
+    @discardableResult
+    public func round(waitBudget: Duration = AccountSyncLoop.waitBudget) async -> Bool {
+        // Re-read the account row every round. The loop owns identity (id and
+        // fallback address) but not mutable state: the cursor persisted by the
+        // previous round is what the next round resumes from, and reconnect can
+        // replace credentials or capabilities while the loop is alive.
+        let current: Account
         do {
-            guard let account = try await AccountStore.active(db: db) else {
-                await sleep(.seconds(5))
-                return
+            guard let row = try await AccountStore.find(byId: accountId, db: db) else {
+                return true
             }
-            currentAccountId = account.id
-            guard let provider = provider(for: account) else {
+            current = row
+        } catch {
+            await markFailure(error, email: fallbackEmail)
+            return false
+        }
+
+        do {
+            guard let provider = resolveProvider(for: current) else {
                 try await AccountStore.updateHealth(
-                    accountId: account.id,
+                    accountId: accountId,
                     health: SyncHealth(status: .error, lastSyncAt: nil, lastError: "no-provider"),
                     db: db
                 )
                 await sleep(.seconds(60))
-                return
+                return false
             }
-            // The negotiated capabilities must reach `apply` explicitly: the
-            // `account` struct was read before negotiation, so first-round
-            // auto-archive would otherwise see `.unknown` and skip.
-            let capabilities = await ensureCapabilities(for: account, provider: provider)
+            // The negotiated capabilities must reach `apply` explicitly. The
+            // row above predates negotiation, so first-round auto-archive would
+            // otherwise see `.unknown` and skip.
+            let capabilities = await ensureCapabilities(for: provider, account: current)
             let changes = try await provider.pullChanges(
-                after: account.syncState,
+                after: current.syncState,
                 waitUpTo: waitBudget
             )
-            try await apply(changes, to: account, capabilities: capabilities)
-            // Recovery is as important to observe as failure: without this
-            // line the log shows an error and then silence, and "did it come
-            // back?" is answerable only by querying the health row.
+            // A switch cancels this task while the provider may already have a
+            // completed result. Do not let stale mail land after ownership moved.
+            try Task.checkCancellation()
+            try await apply(changes, to: current, capabilities: capabilities)
             if consecutiveFailures > 0 {
                 logger.info("sync.recovered", metadata: [
-                    "account": .string(account.email),
+                    "account": .string(current.email),
                     "afterFailures": .string("\(consecutiveFailures)"),
                 ])
             }
             consecutiveFailures = 0
+            return false
         } catch is CancellationError {
-            return
+            return false
         } catch let error as MailError where error == .authFailed {
-            await markAuthFailure()
+            await markNeedsReconnect(label: error.logLabel, email: current.email)
+            return true
+        } catch MailError.notConfigured {
+            // No usable credentials. Retrying cannot fix that, so park with the
+            // same reconnect action used for a rejected token.
+            await markNeedsReconnect(
+                label: MailError.notConfigured("").logLabel,
+                email: current.email
+            )
+            return true
         } catch {
-            await markFailure(error)
+            await markFailure(error, email: current.email)
+            return false
         }
     }
 
-    /// Negotiated capabilities are account data (spec §2.5): version-skewed
-    /// rows carry all-false `.unknown`, and the client gates verbs (archive)
-    /// on them. Refreshed once per account per process, before the first pull
-    /// so the gate is honest as early as possible. Returns the capabilities
-    /// the caller should act on this round — the negotiated set when a
-    /// refresh happened, the stored set otherwise.
-    @discardableResult
-    private func ensureCapabilities(for account: Account, provider: any MailProvider) async -> MailCapabilities {
-        guard !capabilitiesChecked.contains(account.id), account.capabilities == .unknown else {
-            return account.capabilities
+    // MARK: - Capabilities
+
+    /// Negotiated capabilities are account data. Refresh once per provider,
+    /// then keep the negotiated value until that provider is discarded.
+    private func ensureCapabilities(
+        for provider: any MailProvider,
+        account: Account
+    ) async -> MailCapabilities {
+        guard !capabilitiesChecked else {
+            return lastNegotiated ?? account.capabilities
         }
-        capabilitiesChecked.insert(account.id)
+        capabilitiesChecked = true
         let capabilities = await provider.capabilities()
+        lastNegotiated = capabilities
         try? await AccountStore.updateCapabilities(
             accountId: account.id,
             capabilities: capabilities,
@@ -149,17 +149,22 @@ public actor SyncEngine {
         return capabilities
     }
 
-    private func provider(for account: Account) -> (any MailProvider)? {
-        if let cached = providersByAccount[account.id] { return cached }
-        guard let made = providers(account) else { return nil }
-        providersByAccount[account.id] = made
+    /// Long-lived instance, or nil when this build has no implementation for
+    /// the account's provider (the round records `no-provider`).
+    private func resolveProvider(for account: Account) -> (any MailProvider)? {
+        if let provider { return provider }
+        guard let made = makeProvider(account) else { return nil }
+        provider = made
+        capabilitiesChecked = false
         return made
     }
+
+    // MARK: - Persistence
 
     /// Persist one change set. Order matters: wipe first when the remote
     /// identity space changed, land the rows, and only then advance the cursor
     /// — a partial write leaves the cursor untouched and the next pull is
-    /// idempotent (spec §2.4).
+    /// idempotent.
     private func apply(
         _ changes: MailChangeSet,
         to account: Account,
@@ -173,6 +178,13 @@ public actor SyncEngine {
             try await MessageStore.upsert(
                 Self.message(from: header, accountId: account.id),
                 listUnsubscribe: header.listUnsubscribe,
+                db: db
+            )
+        }
+        if let inboxRemoteIds = changes.inboxRemoteIds {
+            try await MessageStore.reconcileInbox(
+                accountId: account.id,
+                keeping: inboxRemoteIds,
                 db: db
             )
         }
@@ -199,18 +211,9 @@ public actor SyncEngine {
         }
     }
 
-    /// Whitelist autopilot (spec 2026-09-19 §3): mail from a sender the user
-    /// put on the auto-archive list is archived remotely the moment it lands,
-    /// with the same audited, undoable archive verb the Briefing row uses.
-    ///
-    /// Ordering is load-bearing: this runs after the rows are persisted but
-    /// *before* the cursor advances. If the process dies mid-step the next
-    /// pull re-delivers the same upserts; a message already moved remotely
-    /// resolves to `messageGone` and is skipped, so the step is idempotent.
-    ///
-    /// Remote-first, like every destructive verb: a provider failure throws
-    /// out of `apply`, which backs the loop off and retries the round — the
-    /// local row is never flipped for mail that is still in the inbox.
+    /// Whitelist autopilot. Mail from a configured sender is archived remotely
+    /// after local persistence but before the cursor advances, preserving the
+    /// existing idempotent remote-first ordering.
     private func autoArchiveMatched(
         upserts: [RemoteHeader],
         account: Account,
@@ -220,14 +223,12 @@ public actor SyncEngine {
         guard !upserts.isEmpty else { return }
         let rules = try await AutoArchiveStore.senderAddresses(accountId: account.id, db: db)
         guard !rules.isEmpty else { return }
-        guard let provider = providersByAccount[account.id] else { return }
+        guard let provider else { return }
 
         for header in upserts where rules.contains(header.fromAddress.lowercased()) {
             do {
                 try await provider.archive(remoteId: header.remoteId)
             } catch MailError.messageGone {
-                // Left the inbox between rounds (already archived, or deleted
-                // server-side): treat as handled, keep going.
                 continue
             }
             try await MessageStore.setArchived(
@@ -269,71 +270,147 @@ public actor SyncEngine {
         )
     }
 
-    /// Credentials are wrong or revoked: stop retrying, ask the user to
-    /// reconnect, and drop the cached provider so a reconnect starts clean.
-    /// The pause exists because QQ rate-limits repeated failed logins.
-    private func markAuthFailure() async {
-        if let id = currentAccountId {
-            providersByAccount[id] = nil
-            capabilitiesChecked.remove(id)
-            try? await AccountStore.updateHealth(
-                accountId: id,
-                health: SyncHealth(
-                    status: .needsReconnect,
-                    lastSyncAt: nil,
-                    lastError: MailError.authFailed.logLabel
-                ),
-                db: db
-            )
-        }
-        await sleep(.seconds(60))
+    // MARK: - Failure handling
+
+    /// Credentials are wrong, revoked, or absent: record `needsReconnect`, drop
+    /// the cached provider, and park until the user reconnects.
+    private func markNeedsReconnect(label: String, email: String) async {
+        provider = nil
+        capabilitiesChecked = false
+        lastNegotiated = nil
+        consecutiveFailures = 0
+        logger.warning("sync.needsReconnect", metadata: [
+            "account": .string(email),
+            "label": .string(label),
+        ])
+        try? await AccountStore.updateHealth(
+            accountId: accountId,
+            health: SyncHealth(status: .needsReconnect, lastSyncAt: nil, lastError: label),
+            db: db
+        )
     }
 
-    /// Transient/structural failure: exponential backoff 1→2→…→300s with ±20%
-    /// jitter, and `last_sync_error` escalates from `error` to `degraded` after
-    /// three consecutive rounds (spec §3.4).
-    ///
-    /// Two things beyond the spec matter here:
-    ///
-    /// 1. **It logs.** It used to write the health row and nothing else, so a
-    ///    mailbox stuck in `error` for hours was invisible in the server log —
-    ///    the only signal was `GET /api/accounts`, and the client renders that
-    ///    as a banner with no root cause. This is the same lesson as
-    ///    `.memory/imap-pull-path-must-log-a-round.md`: state that only exists
-    ///    inside your own table cannot be observed.
-    ///
-    /// 2. **It drops the cached provider.** `withClient` already discards a
-    ///    connection that threw, but the provider object itself is cached per
-    ///    account and the failure can happen outside any command (a cancelled
-    ///    IDLE, a capability probe). Dropping it mirrors `markAuthFailure`
-    ///    and guarantees the next tick starts from a fresh connect + LOGIN
-    ///    rather than trusting a half-dead session.
-    private func markFailure(_ error: Error) async {
+    /// Transient/structural failure: exponential backoff 1→2→…→300 s with
+    /// ±20% jitter, escalating to `degraded` after three consecutive rounds.
+    private func markFailure(_ error: Error, email: String) async {
         consecutiveFailures += 1
         let label = (error as? MailError)?.logLabel ?? "\(type(of: error))"
-        if let id = currentAccountId {
-            providersByAccount[id] = nil
-            capabilitiesChecked.remove(id)
-            try? await AccountStore.updateHealth(
-                accountId: id,
-                health: SyncHealth(
-                    status: consecutiveFailures >= 3 ? .degraded : .error,
-                    lastSyncAt: nil,
-                    lastError: label
-                ),
-                db: db
-            )
-        }
+        provider = nil
+        capabilitiesChecked = false
+        lastNegotiated = nil
+        try? await AccountStore.updateHealth(
+            accountId: accountId,
+            health: SyncHealth(
+                status: consecutiveFailures >= 3 ? .degraded : .error,
+                lastSyncAt: nil,
+                lastError: label
+            ),
+            db: db
+        )
         let base = min(300.0, pow(2.0, Double(consecutiveFailures - 1)))
         let jitter = base * 0.2 * Double.random(in: -1...1)
         let pause = max(1, base + jitter)
         logger.warning("sync.failed", metadata: [
-            "accountId": .string(currentAccountId?.uuidString ?? "none"),
+            "account": .string(email),
             "label": .string(label),
             "consecutive": .string("\(consecutiveFailures)"),
             "retryInSeconds": .string(String(format: "%.1f", pause)),
             "detail": .string("\(error)"),
         ])
         await sleep(.seconds(pause))
+    }
+}
+
+/// Supervises the one account that owns the provider connection.
+///
+/// Dormant accounts keep their rows, cursors, cached messages and credentials.
+/// Selecting a different account cancels and awaits the old loop before the new
+/// loop starts, so two mailboxes are never syncing at the same time.
+public actor SyncEngine {
+    private let db: PostgresConnection
+    private let logger: Logger
+    private let makeProvider: @Sendable (Account) -> (any MailProvider)?
+    private let sleep: @Sendable (Duration) async -> Void
+
+    private var loop: AccountSyncLoop?
+    private var task: Task<Void, Never>?
+    private var activeAccountId: UUID?
+
+    public init(
+        db: PostgresConnection,
+        logger: Logger,
+        makeProvider: @escaping @Sendable (Account) -> (any MailProvider)?,
+        sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
+    ) {
+        self.db = db
+        self.logger = logger
+        self.makeProvider = makeProvider
+        self.sleep = sleep
+    }
+
+    public func start() async {
+        await refresh()
+    }
+
+    public func stop() async {
+        task?.cancel()
+        if let task {
+            await task.value
+        }
+        task = nil
+        loop = nil
+        activeAccountId = nil
+    }
+
+    /// Re-read the server's active account and make the one running loop match.
+    /// Explicit refreshes always restart, which also recovers a loop that parked
+    /// after an auth failure and is therefore already finished.
+    public func refresh() async {
+        let account: Account?
+        do {
+            account = try await AccountStore.active(db: db)
+        } catch {
+            logger.error("sync.activeAccountFailed", metadata: ["err": .string("\(error)")])
+            await sleep(.seconds(5))
+            return
+        }
+        guard let account else {
+            await stop()
+            return
+        }
+        await restart(with: account)
+    }
+
+    /// Wake the current account immediately. The old provider is discarded so
+    /// a reconnect is guaranteed to use fresh credentials.
+    public func requestImmediateSync() async {
+        await refresh()
+    }
+
+    /// Test/diagnostic hook.
+    func loop(forAccount id: UUID) -> AccountSyncLoop? {
+        activeAccountId == id ? loop : nil
+    }
+
+    private func restart(with account: Account) async {
+        task?.cancel()
+        if let task {
+            await task.value
+        }
+        task = nil
+        loop = nil
+
+        activeAccountId = account.id
+        let nextLoop = AccountSyncLoop(
+            account: account,
+            db: db,
+            logger: logger,
+            makeProvider: makeProvider,
+            sleep: sleep
+        )
+        loop = nextLoop
+        task = Task {
+            await nextLoop.run()
+        }
     }
 }

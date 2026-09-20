@@ -455,8 +455,6 @@ final class GmailProviderTests: XCTestCase {
                     expiresAt: Date().addingTimeInterval(3600),
                     db: conn
                 )
-                // The engine always syncs the single active account.
-                try await AccountStore.setActive(accountId: account.id, db: conn)
 
                 var metadata: [String: Data] = [:]
                 for (index, id) in ids.enumerated() {
@@ -475,13 +473,14 @@ final class GmailProviderTests: XCTestCase {
                 )
 
                 let provider = makeProvider(account: account, db: conn)
-                let engine = SyncEngine(
+                let loop = AccountSyncLoop(
+                    account: account,
                     db: conn,
                     logger: Logger(label: "gmail-provider-tests"),
-                    providers: { _ in provider },
+                    makeProvider: { _ in provider },
                     sleep: { _ in }
                 )
-                await engine.tickOnce(waitBudget: .milliseconds(1))
+                await loop.round(waitBudget: .milliseconds(1))
 
                 let stored = try await MessageStore.recent(
                     forAccount: account.id,

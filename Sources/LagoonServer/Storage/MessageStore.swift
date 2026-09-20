@@ -113,6 +113,36 @@ public enum MessageStore {
         try await db.query(sql, [PostgresData(uuid: accountId)]).get()
     }
 
+    /// Remove non-archived rows that no longer exist in the provider's inbox.
+    /// Archived rows are retained because they represent messages Lagoon moved
+    /// out of the inbox intentionally and may still need local history/undo.
+    public static func reconcileInbox(
+        accountId: UUID,
+        keeping remoteIds: Set<String>,
+        db: PostgresConnection
+    ) async throws {
+        let rows = try await db.query(
+            """
+            SELECT remote_id
+            FROM message_headers
+            WHERE account_id = $1 AND is_archived = FALSE
+            """,
+            [PostgresData(uuid: accountId)]
+        ).get()
+        let localIds = try rows.map {
+            try $0.makeRandomAccess()["remote_id"].decode(String.self)
+        }
+        for remoteId in localIds where !remoteIds.contains(remoteId) {
+            try await db.query(
+                "DELETE FROM message_headers WHERE account_id = $1 AND remote_id = $2",
+                [
+                    PostgresData(uuid: accountId),
+                    PostgresData(string: remoteId),
+                ]
+            ).get()
+        }
+    }
+
     public static func markRead(
         remoteId: String,
         accountId: UUID,

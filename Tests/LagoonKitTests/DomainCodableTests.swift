@@ -181,6 +181,7 @@ final class DomainCodableTests: XCTestCase {
           "provider":"qq",
           "email":"a@b.com",
           "isActive":true,
+          "unreadCount":7,
           "syncHealth":{"status":"degraded","lastError":"imap timeout"},
           "capabilities":{"archiveFolder":false,"idle":true,"move":false,"serverSnippet":false}
         }]
@@ -191,6 +192,7 @@ final class DomainCodableTests: XCTestCase {
         XCTAssertEqual(accounts.first?.provider, .qq)
         XCTAssertEqual(accounts.first?.email, "a@b.com")
         XCTAssertEqual(accounts.first?.isActive, true)
+        XCTAssertEqual(accounts.first?.unreadCount, 7)
         XCTAssertEqual(accounts.first?.syncHealth.status, .degraded)
         XCTAssertEqual(accounts.first?.capabilities.idle, true)
         XCTAssertEqual(accounts.first?.capabilities.archiveFolder, false)

@@ -185,15 +185,12 @@ struct RootView: View {
                 }
             ))
         }
-        .onChange(of: directory.active?.id) { _, activeId in
+        // The server owns the active account. Keep the Keychain mirror aligned
+        // so the next launch opens the same mailbox.
+        .onChange(of: directory.active?.id) { _, resolved in
+            guard let resolved, accounts.accountId != resolved else { return }
             do {
-                if let activeId {
-                    if accounts.accountId != activeId {
-                        try accounts.set(accountId: activeId)
-                    }
-                } else if accounts.accountId != nil {
-                    try accounts.clear()
-                }
+                try accounts.set(accountId: resolved)
             } catch {
                 errorCenter.report(.init(
                     severity: .error,
@@ -338,7 +335,7 @@ struct RootView: View {
         } label: {
             HStack(spacing: 6) {
                 Circle()
-                    .fill(statusColor(directory.active?.syncHealth.status))
+                    .fill(statusColor(for: directory.active))
                     .frame(width: 8, height: 8)
                 Text(directory.active?.email ?? l10n.accountsMenuHelp)
                     .lineLimit(1)
@@ -350,7 +347,13 @@ struct RootView: View {
     }
 
     private func menuTitle(for account: ConnectedAccount) -> String {
-        let base = "\(account.email) · \(l10n.providerName(account.provider))"
+        var base = "\(account.email) · \(l10n.providerName(account.provider))"
+        if !account.isActive {
+            return "\(base) · \(l10n.sleepingAccount)"
+        }
+        if account.unreadCount > 0 {
+            base += " · \(l10n.unreadCount(account.unreadCount))"
+        }
         guard account.syncHealth.status != .ok else { return base }
         if let lastError = account.syncHealth.lastError {
             return "\(base) · \(lastError)"
@@ -358,9 +361,10 @@ struct RootView: View {
         return "\(base) · \(l10n.healthStatusText(account.syncHealth.status))"
     }
 
-    private func statusColor(_ status: SyncHealth.Status?) -> Color {
-        switch status {
-        case .ok, .none: return .green
+    private func statusColor(for account: ConnectedAccount?) -> Color {
+        guard let account, account.isActive else { return .gray }
+        switch account.syncHealth.status {
+        case .ok: return .green
         case .degraded, .error: return .yellow
         case .needsReconnect: return .red
         }
@@ -368,19 +372,14 @@ struct RootView: View {
 
     // MARK: - Actions
 
-    /// Switch account: make the server's active row authoritative first,
-    /// then persist the same id locally. If Keychain fails, roll the
-    /// server back and report the failure to the global banner.
+    /// Switch the server's active sync owner, then mirror the choice locally.
+    /// The UI does not move until the server confirms.
     private func switchTo(_ account: ConnectedAccount) async {
-        let previous = directory.accounts.first { $0.id == accounts.accountId }
+        errorCenter.dismiss()
         do {
-            errorCenter.dismiss()
             try await directory.activate(account)
             try accounts.set(accountId: account.id)
         } catch {
-            if let previous, accounts.accountId != account.id {
-                try? await directory.activate(previous)
-            }
             errorCenter.report(.init(
                 severity: .error,
                 title: l10n.saveAccountFailed + error.lagoonUIMessage

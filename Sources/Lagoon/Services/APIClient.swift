@@ -242,10 +242,14 @@ public final class APIClient: Sendable {
         return try Self.decode(ConnectedAccount.self, from: data)
     }
 
-    /// POST /api/accounts/{id}/activate → 204. The server flips every other row
-    /// inactive in the same statement.
+    /// POST /api/accounts/{id}/activate → 204. The server moves the single
+    /// sync owner and puts every other mailbox to sleep.
     public func activateAccount(id: UUID) async throws {
-        try await post(path: ["api", "accounts", id.uuidString, "activate"], query: [])
+        let url = try makeURL(path: ["api", "accounts", id.uuidString, "activate"], query: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = APITimeout.fast.seconds
+        _ = try await send(request, timeout: .fast)
     }
 
     /// DELETE /api/accounts/{id} → 204. Foreign keys cascade to that account's

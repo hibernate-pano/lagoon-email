@@ -77,11 +77,17 @@ public enum OAuthRoutes {
                     )),
                     db: db
                 )
-                // A freshly connected account becomes the one active account.
-                try await AccountStore.setActive(accountId: account.id, db: db)
-                // Restart the loop immediately without blocking the browser
-                // callback on the first full mailbox sync.
-                await sync.accountChanged()
+                guard let persisted = try await AccountStore.find(
+                    byOAuthUser: info.sub,
+                    provider: .gmail,
+                    db: db
+                ) else {
+                    throw AccountStoreError.notFound
+                }
+                // Gmail just connected or re-authenticated: select it and put
+                // every other mailbox to sleep.
+                try await AccountStore.setActive(accountId: persisted.id, db: db)
+                await sync.refresh()
                 return Response(
                     status: .ok,
                     body: .init(byteBuffer: ByteBuffer(

@@ -1,4 +1,5 @@
 import Foundation
+import Logging
 import PostgresNIO
 import LagoonKit
 
@@ -150,38 +151,62 @@ public enum AccountStore {
         return try rows.map { try Self.decode($0) }
     }
 
-    /// The single active account (UI target of every provider-neutral route).
+    /// The one account the server is currently syncing.
     public static func active(db: PostgresConnection) async throws -> Account? {
         let sql = """
             SELECT id, provider, oauth_user, email, credentials, sync_state,
                    capabilities, is_active, sync_status, last_sync_at, last_sync_error
             FROM accounts
             WHERE is_active = TRUE
-            ORDER BY updated_at DESC
             LIMIT 1
         """
         let rows = try await db.query(sql, []).get()
         return try rows.first.map { try Self.decode($0) }
     }
 
-    /// Atomically flip the active flag: exactly one account is active after
-    /// this statement (`is_active = (id = $1)`), or none when `$1` is unknown.
-    public static func setActive(accountId: UUID, db: PostgresConnection) async throws {
-        let sql = "UPDATE accounts SET is_active = (id = $1), updated_at = now()"
-        try await db.query(sql, [PostgresData(uuid: accountId)]).get()
+    /// Atomically move the single active marker. The transaction clears the
+    /// old owner before setting the new one, which keeps the partial unique
+    /// index valid during the update.
+    public static func setActive(
+        accountId: UUID,
+        db: PostgresConnection
+    ) async throws {
+        try await db.withTransaction(logger: Logger(label: "lagoon.account-store")) { transaction in
+            try await transaction.query(
+                "UPDATE accounts SET is_active = FALSE WHERE is_active = TRUE"
+            ).get()
+            try await transaction.query(
+                """
+                UPDATE accounts
+                SET is_active = TRUE, updated_at = now()
+                WHERE id = $1
+                """,
+                [PostgresData(uuid: accountId)]
+            ).get()
+        }
     }
 
-    /// Enforce the one-active-account invariant at startup. No-op when exactly
-    /// one account is active; repairs zero-or-many states deterministically.
+    /// Repair a zero-active state after a delete or an interrupted switch.
+    /// More than one active row cannot exist because of the partial unique
+    /// index; zero is valid only when there are no accounts.
     public static func reconcileActive(db: PostgresConnection) async throws {
-        let accounts = try await all(db: db)
-        let actives = accounts.filter(\.isActive)
-        if actives.count == 1 { return }
-        if actives.isEmpty, let newest = accounts.max(by: { $0.id.uuidString < $1.id.uuidString }) {
-            try await setActive(accountId: newest.id, db: db)
-        } else if let keep = actives.first {
-            try await setActive(accountId: keep.id, db: db)
-        }
+        if try await active(db: db) != nil { return }
+        guard let newest = try await mostRecentlyUpdated(db: db) else { return }
+        try await setActive(accountId: newest.id, db: db)
+    }
+
+    private static func mostRecentlyUpdated(
+        db: PostgresConnection
+    ) async throws -> Account? {
+        let sql = """
+            SELECT id, provider, oauth_user, email, credentials, sync_state,
+                   capabilities, is_active, sync_status, last_sync_at, last_sync_error
+            FROM accounts
+            ORDER BY updated_at DESC, id
+            LIMIT 1
+        """
+        let rows = try await db.query(sql, []).get()
+        return try rows.first.map { try Self.decode($0) }
     }
 
     /// Deletes the account row; foreign keys cascade to messages/pins/drafts.

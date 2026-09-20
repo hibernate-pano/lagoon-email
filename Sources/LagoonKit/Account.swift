@@ -10,6 +10,8 @@ public struct Account: Codable, Equatable, Sendable, Identifiable {
     public let credentials: Data?
     public let syncState: MailSyncState
     public let capabilities: MailCapabilities
+    /// Whether this is the one account the server is currently syncing.
+    /// Connected accounts remain stored and dormant until selected.
     public let isActive: Bool
     public let syncHealth: SyncHealth
 

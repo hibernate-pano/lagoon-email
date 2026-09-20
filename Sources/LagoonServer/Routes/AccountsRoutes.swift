@@ -14,8 +14,9 @@ public enum AccountsRoutes {
     }
 
     /// GET /api/accounts — every connected account with the fields the client
-    /// needs to pick one (M0 handshake + M1.5 `isActive`/`syncHealth`/
-    /// `capabilities`). Credentials are never part of this payload.
+    /// needs (M0 handshake + health/capabilities + cached unread count).
+    /// `isActive` identifies the one account currently syncing. Credentials are
+    /// never part of this payload.
     ///
     /// `makeProvider` is the route's provider seam: production passes
     /// `MailProviderFactory.factory(...)`, tests script a fake.
@@ -29,15 +30,23 @@ public enum AccountsRoutes {
         router.get("api/accounts") { _, _ -> Response in
             do {
                 let accounts = try await AccountStore.all(db: db)
-                let connected = accounts.map {
-                    ConnectedAccount(
-                        id: $0.id,
-                        provider: $0.provider,
-                        email: $0.email,
-                        isActive: $0.isActive,
-                        syncHealth: $0.syncHealth,
-                        capabilities: $0.capabilities
-                    )
+                var connected: [ConnectedAccount] = []
+                connected.reserveCapacity(accounts.count)
+                for account in accounts {
+                    // A count failure must not break the whole directory: the
+                    // client uses this payload for health and the toolbar too.
+                    let unread = (try? await MessageStore.unreadCount(
+                        forAccount: account.id, db: db
+                    )) ?? 0
+                    connected.append(ConnectedAccount(
+                        id: account.id,
+                        provider: account.provider,
+                        email: account.email,
+                        isActive: account.isActive,
+                        unreadCount: unread,
+                        syncHealth: account.syncHealth,
+                        capabilities: account.capabilities
+                    ))
                 }
                 return RouteJSON.response(connected)
             } catch {
@@ -65,7 +74,7 @@ public enum AccountsRoutes {
         //        • probe succeeds → persist against the existing row id (never
         //          a fresh UUID): replace credentials, capabilities and
         //          sync_state, reset health to `.ok` with `lastError = nil`
-        //          (so the client's red banner clears) and activate it.
+        //          (so the client's red banner clears).
         //   3. no row → the original create path.
         //
         // The auth code travels request body → TLS → provider, and is stored
@@ -167,7 +176,6 @@ public enum AccountsRoutes {
                     try await AccountStore.updateHealth(
                         accountId: existing.id, health: SyncHealth(status: .ok), db: db
                     )
-                    try await AccountStore.setActive(accountId: existing.id, db: db)
                 } else {
                     try await AccountStore.upsert(account, credentials: sealed, db: db)
                     try await AccountStore.updateCapabilities(
@@ -178,18 +186,11 @@ public enum AccountsRoutes {
                         syncState: MailSyncState(archiveFolder: archiveFolder),
                         db: db
                     )
-                    try await AccountStore.setActive(accountId: account.id, db: db)
                 }
             } catch {
                 logger.error("accounts.imapPersistFailed", metadata: ["err": .string("\(error)")])
                 return RouteJSON.error(.internalServerError, "internal-error")
             }
-            // Restart the sync loop immediately. Do not await the first full
-            // mailbox round here: a real 500-message backfill can take tens of
-            // seconds, and the connect request should return as soon as the
-            // credentials are safely persisted.
-            await sync?.accountChanged()
-
             // `upsert`'s `ON CONFLICT ... DO UPDATE` keeps the *existing* row's
             // id, so under concurrent double-POSTs the locally generated UUID
             // can be one the server never stored (every later request would
@@ -201,12 +202,27 @@ public enum AccountsRoutes {
                 logger.error("accounts.readbackFailed", metadata: ["err": .string("\(error)")])
                 persisted = nil
             }
+            let connectedId = persisted?.id ?? account.id
+            do {
+                // Connecting or re-authenticating a mailbox selects it. This
+                // moves the single sync owner; every other account goes dormant.
+                try await AccountStore.setActive(accountId: connectedId, db: db)
+            } catch {
+                logger.error("accounts.activateAfterConnectFailed", metadata: [
+                    "err": .string("\(error)"),
+                ])
+                return RouteJSON.error(.internalServerError, "internal-error")
+            }
+            // Start the selected account's loop immediately without waiting for
+            // its first potentially long mailbox backfill.
+            await sync?.refresh()
             return RouteJSON.response(
                 ConnectedAccount(
-                    id: persisted?.id ?? account.id,
+                    id: connectedId,
                     provider: .qq,
                     email: persisted?.email ?? account.email,
                     isActive: true,
+                    unreadCount: 0,
                     syncHealth: SyncHealth(status: .ok),
                     capabilities: capabilities
                 ),
@@ -215,8 +231,8 @@ public enum AccountsRoutes {
         }
 
         // POST /api/accounts/{id}/activate -> 204 | 404 unknown-account
-        // The invariant is one active account (spec §2.5): every other row is
-        // flipped off in the same statement.
+        // Selects the single account that owns the sync loop. Dormant accounts
+        // retain their credentials, cursors and cached messages.
         router.post("api/accounts/:id/activate") { _, context -> Response in
             guard let accountId = UUID(uuidString: context.parameters.get("id") ?? "") else {
                 return RouteJSON.error(.notFound, "unknown-account")
@@ -230,8 +246,7 @@ public enum AccountsRoutes {
                 logger.error("accounts.activateFailed", metadata: ["err": .string("\(error)")])
                 return RouteJSON.error(.internalServerError, "internal-error")
             }
-            // The loop may be blocked in a long IDLE/poll for the old account.
-            await sync?.accountChanged()
+            await sync?.refresh()
             return Response(status: .noContent)
         }
 
@@ -246,14 +261,13 @@ public enum AccountsRoutes {
                     return RouteJSON.error(.notFound, "unknown-account")
                 }
                 try await AccountStore.delete(accountId: accountId, db: db)
-                // Deleting the active account leaves zero active rows; promote
-                // the newest remaining one so the client has a target.
                 try await AccountStore.reconcileActive(db: db)
             } catch {
                 logger.error("accounts.deleteFailed", metadata: ["err": .string("\(error)")])
                 return RouteJSON.error(.internalServerError, "internal-error")
             }
-            await sync?.accountChanged()
+            // Restart against the promoted account, or stop when none remain.
+            await sync?.refresh()
             return Response(status: .noContent)
         }
     }

@@ -153,8 +153,8 @@ final class AutoArchiveTests: XCTestCase {
                     resetRequired: false,
                     cursor: MailSyncState(uidValidity: 42, lastUid: 902)
                 ))
-                let engine = Self.makeEngine(db: conn, provider: provider)
-                await engine.tickOnce()
+                let loop = Self.makeLoop(account: account, db: conn, provider: provider)
+                await loop.round()
 
                 let archiveCalls = await provider.archiveCalls
                 XCTAssertEqual(archiveCalls, ["901"], "only the ruled sender is archived, case-insensitively")
@@ -197,8 +197,8 @@ final class AutoArchiveTests: XCTestCase {
                     cursor: MailSyncState(uidValidity: 42, lastUid: 901)
                 ))
                 await provider.setArchiveFailure(MailError.protocolError("MOVE not supported"))
-                let engine = Self.makeEngine(db: conn, provider: provider)
-                await engine.tickOnce()
+                let loop = Self.makeLoop(account: account, db: conn, provider: provider)
+                await loop.round()
 
                 let stored = try await MessageStore.recent(forAccount: account.id, limit: 50, db: conn)
                 XCTAssertEqual(stored.first?.isArchived, false, "the row must not flip when the remote move failed")
@@ -233,8 +233,8 @@ final class AutoArchiveTests: XCTestCase {
                     cursor: MailSyncState(uidValidity: 42, lastUid: 901)
                 ))
                 await provider.setArchiveFailure(MailError.messageGone)
-                let engine = Self.makeEngine(db: conn, provider: provider)
-                await engine.tickOnce()
+                let loop = Self.makeLoop(account: account, db: conn, provider: provider)
+                await loop.round()
 
                 let health = try await AccountStore.find(byId: account.id, db: conn)?.syncHealth
                 XCTAssertEqual(health?.status, .ok)
@@ -253,7 +253,7 @@ final class AutoArchiveTests: XCTestCase {
             oauthUser: "auto-\(UUID().uuidString)",
             email: "auto-\(UUID().uuidString)@example.com",
             credentials: nil,
-            isActive: true
+            isActive: false
         )
     }
 
@@ -288,14 +288,16 @@ final class AutoArchiveTests: XCTestCase {
             ),
             db: db
         )
-        try await AccountStore.setActive(accountId: account.id, db: db)
     }
 
-    private static func makeEngine(db: PostgresConnection, provider: StubMailProvider) -> SyncEngine {
-        SyncEngine(
+    private static func makeLoop(
+        account: Account, db: PostgresConnection, provider: StubMailProvider
+    ) -> AccountSyncLoop {
+        AccountSyncLoop(
+            account: account,
             db: db,
             logger: Logger(label: "auto-archive-tests"),
-            providers: { (_: Account) -> (any MailProvider)? in provider },
+            makeProvider: { (_: Account) -> (any MailProvider)? in provider },
             sleep: { _ in }
         )
     }

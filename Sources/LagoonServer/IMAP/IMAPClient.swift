@@ -249,6 +249,21 @@ public actor IMAPClient {
         return nil
     }
 
+    /// Every UID currently present in the selected mailbox. Used to reconcile
+    /// messages another client moved or deleted out of INBOX.
+    public func allUIDs() async throws -> Set<Int64> {
+        let responses = try await connection.execute("UID SEARCH ALL")
+        for response in responses {
+            guard case .untagged = response.kind,
+                  response.atoms.count >= 2,
+                  response.atoms[0] == "*",
+                  response.atoms[1].uppercased() == "SEARCH"
+            else { continue }
+            return Set(response.atoms.dropFirst(2).compactMap(Int64.init))
+        }
+        return []
+    }
+
     /// How many bytes of a message the list-preview fetch asks for.
     ///
     /// This is a *byte* count, not a round-trip count: every message is still

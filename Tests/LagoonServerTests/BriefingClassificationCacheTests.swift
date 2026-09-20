@@ -111,7 +111,7 @@ final class BriefingClassificationCacheTests: XCTestCase {
             oauthUser: oauthUser,
             email: "\(oauthUser)@example.com",
             credentials: nil,
-            isActive: true
+            isActive: false
         )
     }
 

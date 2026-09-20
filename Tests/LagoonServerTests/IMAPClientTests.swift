@@ -379,6 +379,20 @@ final class IMAPClientTests: XCTestCase {
         )
     }
 
+    func test_allUIDs_returnsCompleteSelectedMailboxSet() async throws {
+        let transport = ScriptedTransport()
+        let client = try await makeClient(transport: transport)
+
+        await transport.enqueue(#"* SEARCH 5 6 12 91"#)
+        await transport.enqueue("A0001 OK SEARCH completed")
+
+        let uids = try await client.allUIDs()
+
+        XCTAssertEqual(uids, Set([5, 6, 12, 91]))
+        let lines = await wire(transport)
+        XCTAssertEqual(lines, ["A0001 UID SEARCH ALL"])
+    }
+
     func test_fetchTextSnippet_readsLiteralBytes() async throws {
         let transport = ScriptedTransport()
         let client = try await makeClient(transport: transport)
