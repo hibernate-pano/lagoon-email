@@ -352,6 +352,71 @@ final class IMAPProviderTests: XCTestCase {
 
     /// Second pull: the cursor's `lastUid` makes it `UID FETCH <lastUid + 1>:*`
     /// and no new mail leaves the cursor untouched.
+    /// Sent-folder reply detection (V2 A2): In-Reply-To/References harvested
+    /// as reply signals, Sent mail never stored as rows, and a steady-state
+    /// round with no new Sent mail skips the FETCH.
+    func test_pullChanges_harvestsSentRepliesWithoutStoringSentMail() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let transport = ScriptedTransport()
+            let (provider, _) = try makeProvider(transport: transport)
+            await scriptHandshake(transport)
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+                (name: "Archive", attribute: "\\Archive"),
+                (name: "Sent", attribute: "\\Sent"),
+            ])
+            await scriptSelect(transport, number: 5, uidValidity: 42, uidNext: 1000)
+            await scriptHeaderFetch(transport, sequence: 1, uid: 900, flags: "\\Seen", headers: [
+                ("From", "boss@qq.com"),
+                ("Subject", "Q3 plan"),
+                ("Message-ID", "<m900@qq.com>"),
+            ])
+            await transport.enqueue("A0006 OK FETCH completed")
+            await scriptSnippet(
+                transport, sequence: 1, uid: 900,
+                message: "Content-Type: text/plain; charset=UTF-8\r\n\r\nHi"
+            )
+            await transport.enqueue("A0007 OK FETCH completed")
+            // Sent folder scan: one reply answering <m900@qq.com>.
+            await scriptSelect(transport, number: 8, exists: 1, uidValidity: 7, uidNext: 52)
+            await scriptHeaderFetch(transport, sequence: 1, uid: 50, flags: "\\Seen", headers: [
+                ("From", "user@qq.com"),
+                ("Subject", "Re: Q3 plan"),
+                ("Message-ID", "<reply50@qq.com>"),
+                ("In-Reply-To", "<m900@qq.com>"),
+            ])
+            await transport.enqueue("A0009 OK FETCH completed")
+
+            let change = try await provider.pullChanges(after: MailSyncState(), waitUpTo: .zero)
+
+            XCTAssertEqual(change.upserts.count, 1, "Sent mail is never stored as rows")
+            XCTAssertEqual(change.repliedMessageIds, ["<m900@qq.com>"])
+            XCTAssertEqual(change.cursor.sentLastUid, 50)
+            XCTAssertEqual(change.cursor.sentUidValidity, 7)
+            XCTAssertEqual(change.cursor.sentFolder, "Sent")
+            var lines = await wire(transport)
+            XCTAssertTrue(lines.contains("A0008 SELECT \"Sent\""))
+
+            // Second round: nothing new anywhere. Inbox FETCH is empty, the
+            // Seen rescan finds no flip, and the Sent scan skips its FETCH.
+            await scriptSelect(transport, number: 10, uidValidity: 42, uidNext: 901)
+            await transport.enqueue("A0011 OK FETCH completed")
+            await transport.enqueue(#"* 1 FETCH (UID 900 FLAGS (\Seen))"#)
+            await transport.enqueue("A0012 OK FETCH completed")
+            await scriptSelect(transport, number: 13, exists: 1, uidValidity: 7, uidNext: 51)
+
+            let second = try await provider.pullChanges(after: change.cursor, waitUpTo: .zero)
+
+            XCTAssertTrue(second.repliedMessageIds.isEmpty)
+            XCTAssertEqual(second.cursor.sentLastUid, 50)
+            lines = await wire(transport)
+            XCTAssertEqual(
+                lines.filter { $0.contains("UID FETCH 1:*") }.count, 1,
+                "steady-state Sent scan must not FETCH again"
+            )
+        }
+    }
+
     func test_pullChanges_secondRound_fetchesAfterLastUid() async throws {
         try await TokenKeyFixture.withKeyAsync(Self.key) {
             let transport = ScriptedTransport()

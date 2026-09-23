@@ -18,6 +18,10 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     /// Read-state rescan window: one round costs at most this many UID flags
     /// (spec §3.2 step 3).
     static let flagRescanWindow: Int64 = 200
+    /// First Sent-folder scan is bounded: only threading references are
+    /// harvested (no bodies, no snippets), but an unbounded first scan on a
+    /// decade-old Sent mailbox is still a pointless FETCH.
+    static let sentBackfillWindow: Int64 = 200
     /// Poll cadence when the server has no IDLE — the Gmail poller's rhythm.
     static let pollInterval: Duration = .seconds(30)
     /// One IDLE stretch. The loop leaves IDLE, re-SELECTs and re-enters, so a
@@ -290,6 +294,10 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             if let ids = inboxRemoteIds {
                 inboxRemoteIds = ids.union(upserts.map(\.remoteId))
             }
+            // Cross-client reply detection (V2 A2): harvest threading
+            // references from Sent mail. Best-effort — a Sent failure must
+            // never fail the inbox round.
+            let sent = await collectSentReplies(client: client, cursor: cursor)
             return MailChangeSet(
                 upserts: upserts,
                 resetRequired: false,
@@ -297,11 +305,75 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                     historyId: cursor.historyId,
                     uidValidity: inbox.uidValidity,
                     lastUid: nextLastUid,
-                    archiveFolder: archiveFolder
+                    archiveFolder: archiveFolder,
+                    sentUidValidity: sent.validity ?? cursor.sentUidValidity,
+                    sentLastUid: sent.lastUid ?? cursor.sentLastUid,
+                    sentFolder: sent.folder ?? cursor.sentFolder
                 ),
-                inboxRemoteIds: inboxRemoteIds
+                inboxRemoteIds: inboxRemoteIds,
+                repliedMessageIds: sent.ids
             )
         }
+    }
+
+    /// Harvest In-Reply-To/References Message-IDs from Sent-folder mail newer
+    /// than the sent cursor. Sent mail is never stored as rows — only the
+    /// threading references are returned, and the engine records them as reply
+    /// signals. Runs inside the round's `withClient` session (no nested lock).
+    /// The SELECT moves the session away from INBOX, so `selected` is cleared
+    /// and the next INBOX access re-selects.
+    private func collectSentReplies(
+        client: IMAPClient,
+        cursor: MailSyncState
+    ) async -> (ids: Set<String>, validity: Int64?, lastUid: Int64?, folder: String?) {
+        do {
+            guard let folder = sentName else { return ([], nil, nil, nil) }
+            let state = try await client.select(folder)
+            selected = nil
+            let validity = state.uidValidity
+            let baseUid: Int64
+            if cursor.sentUidValidity == validity, let last = cursor.sentLastUid {
+                baseUid = last + 1
+            } else {
+                // First scan or Sent UIDVALIDITY change: bounded window, and
+                // a UIDVALIDITY change invalidates the old sent cursor.
+                baseUid = max(1, state.uidNext - Self.sentBackfillWindow)
+            }
+            guard state.uidNext > baseUid || state.exists > 0 else {
+                return ([], validity, cursor.sentLastUid, folder)
+            }
+            // Steady state with nothing new: skip the FETCH entirely.
+            if cursor.sentLastUid != nil, baseUid >= state.uidNext {
+                return ([], validity, cursor.sentLastUid, folder)
+            }
+            let headers = try await client.fetchHeaders(fromUid: baseUid)
+            var ids = Set<String>()
+            var maxUid = cursor.sentLastUid
+            for header in headers {
+                maxUid = max(maxUid ?? 0, header.uid)
+                ids.formUnion(Self.threadReferenceIDs(rawHeaders: header.rawHeaders))
+            }
+            return (ids, validity, maxUid, folder)
+        } catch {
+            // Best-effort by design: Sent sync must never break inbox sync.
+            logger.debug("imap.sentSkipped", metadata: ["label": .string(Self.label(error))])
+            selected = nil
+            return ([], nil, nil, nil)
+        }
+    }
+
+    /// Message-IDs a sent message answers: its In-Reply-To plus every token
+    /// in References. Pure function so the parsing is unit-testable without
+    /// a wire session.
+    static func threadReferenceIDs(rawHeaders: [String: String]) -> Set<String> {
+        var ids = Set<String>()
+        if let reply = rawHeaders["in-reply-to"], !reply.isEmpty {
+            ids.formUnion(RemoteHeader.messageIDTokens(reply))
+        }
+        if let refs = rawHeaders["references"], !refs.isEmpty {
+            ids.formUnion(RemoteHeader.messageIDTokens(refs))
+        }
+        return ids
     }
 
     /// Bounded `\Seen` rescan over already-known mail (spec §3.2 step 3).
@@ -339,14 +411,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     // MARK: - Body & headers
 
     public func fetchBody(remoteId: String) async throws -> FetchedBody {
-        // M1.6: a 60s in-memory cache makes "open email → swipe away →
-        // come back" effectively free. `accountId` is plumbed through the
-        // MailProvider protocol's caller (the route) — IMAPProvider's
-        // account is set at construction, so we read it from there.
-        let key = account.id
-        if let cached = await MessageBodyCache.shared.get(accountId: key, remoteId: remoteId) {
-            return cached
-        }
+        // No local cache here: the route serves parsed bodies from the
+        // durable BodyStore (V2 A3) and only calls this on a miss, so a
+        // provider-level memory cache would just be a second copy.
         let raw = try await withClient { client in
             try await selectInbox(client: client, force: false)
             let uid = try await resolveUID(remoteId, client: client)
@@ -371,7 +438,6 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             to: parsed.to,
             cc: parsed.cc
         )
-        await MessageBodyCache.shared.put(body, accountId: key, remoteId: remoteId)
         return body
     }
 
@@ -390,9 +456,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         guard att.data.count <= AttachmentLimit.maxBytes else {
             throw AttachmentError.tooLarge
         }
-        // Body bytes are now served — the cached metadata in
-        // MessageBodyCache is still accurate (filename, mimeType, size)
-        // so we don't need to invalidate it.
+        // Attachment bytes always come off the wire; metadata staleness is a
+        // non-issue because bodies are immutable and the store row is keyed
+        // on the same stable remoteId.
         return FetchedAttachmentBytes(
             mimeType: att.mimeType,
             filename: att.filename,
@@ -610,20 +676,29 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             }
         }
         archiveResolved = true
+        // Piggyback the Sent role on the same LIST: the sync round needs the
+        // Sent folder every round for reply detection, and a second LIST per
+        // round would double the command cost (V2 A2).
+        if !sentResolved {
+            sentName = mailboxes.first(where: { Self.isSentMailbox($0) })?.name
+            sentResolved = true
+        }
         return archiveName
+    }
+
+    private static func isSentMailbox(_ mailbox: IMAPMailbox) -> Bool {
+        mailbox.attributes.contains {
+            $0.caseInsensitiveCompare("\\Sent") == .orderedSame
+        } || ["sent", "sent messages", "已发送", "已发送邮件"].contains(
+            mailbox.name.lowercased()
+        )
     }
 
     private func resolveSentFolder() async throws -> String? {
         if sentResolved { return sentName }
         return try await withClient { client in
             let mailboxes = try await client.listMailboxes()
-            sentName = mailboxes.first(where: { mailbox in
-                mailbox.attributes.contains {
-                    $0.caseInsensitiveCompare("\\Sent") == .orderedSame
-                } || ["sent", "sent messages", "已发送", "已发送邮件"].contains(
-                    mailbox.name.lowercased()
-                )
-            })?.name
+            sentName = mailboxes.first(where: { Self.isSentMailbox($0) })?.name
             sentResolved = true
             return sentName
         }

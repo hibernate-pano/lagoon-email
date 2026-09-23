@@ -254,6 +254,15 @@ public struct L10n: Sendable, Equatable {
     public var dateBucketThisMonth: String { pick("本月", "This month") }
     public var dateBucketEarlier: String { pick("更早", "Earlier") }
     public var markAsUnread: String { pick("标为未读", "Mark as unread") }
+    public var aiCreditTitle: String { pick("AI 额度已用完", "AI credit exhausted") }
+    public var aiCreditDetail: String { pick("给 MiniMax 充值后点重试。期间分类与摘要降级为本地启发式，邮件不受影响。", "Top up MiniMax, then retry. Meanwhile grouping and summaries fall back to local heuristics; mail is unaffected.") }
+    public var aiCircuitTitle: String { pick("AI 服务暂时不可用", "AI temporarily unavailable") }
+    public var aiCircuitDetail: String { pick("上游连续出错，稍后自动恢复。期间分类与摘要降级为本地启发式。", "Upstream errors; recovers automatically. Grouping and summaries fall back to local heuristics meanwhile.") }
+    public var unreadDotLabel: String { pick("未读", "Unread") }
+    public var syncStatusOk: String { pick("同步正常", "Sync OK") }
+    public var syncStatusDegraded: String { pick("同步缓慢", "Sync degraded") }
+    public var syncStatusNeedsReconnect: String { pick("需要重新连接", "Needs reconnect") }
+    public var syncStatusInactive: String { pick("未激活", "Inactive") }
     public var markAsRead: String { pick("标为已读", "Mark as read") }
     public var markAllRead: String { pick("全部标为已读", "Mark all as read") }
     public var markAllReadHelp: String { pick("把当前简报里的未读邮件全部标为已读（⇧⌘K）", "Mark every unread message in the briefing as read (⇧⌘K)") }
@@ -291,6 +300,8 @@ public struct L10n: Sendable, Equatable {
     public var connectQQTitle: String { pick("连接 QQ 邮箱", "Connect QQ Mail") }
     public var qqEmailPlaceholder: String { pick("QQ 邮箱地址", "QQ email address") }
     public var qqAuthCodePlaceholder: String { pick("授权码", "Authorization code") }
+    public var showAuthCode: String { pick("显示授权码", "Show code") }
+    public var hideAuthCode: String { pick("隐藏授权码", "Hide code") }
     public var qqEmail: String { pick("邮箱地址", "Email address") }
     public var qqAuthCode: String { pick("授权码", "Authorization code") }
     public var qqAuthCodeHelp: String {

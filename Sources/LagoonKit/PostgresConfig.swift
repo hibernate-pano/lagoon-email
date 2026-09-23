@@ -10,7 +10,7 @@ public enum PostgresConfigError: Error, CustomStringConvertible {
     }
 }
 
-public struct PostgresConfig {
+public struct PostgresConfig: Sendable {
     public let host: String
     public let port: Int
     public let username: String

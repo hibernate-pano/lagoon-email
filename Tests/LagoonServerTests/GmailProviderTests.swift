@@ -31,7 +31,9 @@ final class GmailProviderTests: XCTestCase {
             ?? Data("{}".utf8)
     }
 
-    /// `users.messages.get?format=metadata` response.
+    /// `users.messages.get?format=metadata` response. Pass `labels` to set
+    /// the full label set (e.g. `["SENT"]`); otherwise `unread` controls a
+    /// single UNREAD label.
     private static func metadataBody(
         remoteId: String,
         from: String,
@@ -40,7 +42,8 @@ final class GmailProviderTests: XCTestCase {
         listUnsubscribe: Bool,
         messageId: String? = nil,
         inReplyTo: String? = nil,
-        references: String? = nil
+        references: String? = nil,
+        labels: [String]? = nil
     ) -> Data {
         var headers: [[String: String]] = [
             ["name": "From", "value": from],
@@ -65,7 +68,11 @@ final class GmailProviderTests: XCTestCase {
             "internalDate": "1700000000000",
             "payload": ["headers": headers],
         ]
-        if unread { message["labelIds"] = ["UNREAD"] }
+        if let labels {
+            message["labelIds"] = labels
+        } else if unread {
+            message["labelIds"] = ["UNREAD"]
+        }
         return (try? JSONSerialization.data(withJSONObject: message)) ?? Data("{}".utf8)
     }
 
@@ -570,6 +577,49 @@ final class GmailProviderTests: XCTestCase {
                     "<root@example.com> <parent@example.com>"
                 )
                 XCTAssertFalse(changes.resetRequired)
+            }
+        }
+    }
+
+    /// Sent-folder reply detection (V2 A2): a SENT-labeled message's
+    /// In-Reply-To/References are harvested as reply signals.
+    func test_sentMessage_harvestsReplySignals() async throws {
+        let oauthUser = "provider-\(UUID().uuidString)"
+        let access = "access-\(UUID().uuidString)"
+        let refresh = "rt-\(UUID().uuidString)"
+        let id = "sent-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(
+                    account,
+                    accessToken: access,
+                    refreshToken: refresh,
+                    expiresAt: Date().addingTimeInterval(3600),
+                    db: conn
+                )
+                installStub(
+                    tokenBody: tokenBody(accessToken: access),
+                    listBody: Self.listBody(ids: [id]),
+                    metadata: [
+                        id: Self.metadataBody(
+                            remoteId: id,
+                            from: "me@example.com",
+                            subject: "Re: lunch",
+                            unread: false,
+                            listUnsubscribe: false,
+                            messageId: "<reply@example.com>",
+                            inReplyTo: "<orig@example.com>",
+                            references: "<orig@example.com>",
+                            labels: ["SENT"]
+                        )
+                    ]
+                )
+
+                let changes = try await pull(makeProvider(account: account, db: conn))
+
+                XCTAssertEqual(changes.repliedMessageIds, ["<orig@example.com>"])
             }
         }
     }

@@ -159,12 +159,17 @@ bash scripts/test-guardrails.sh # prove the guardrail rules catch fixtures
   same AES-GCM credentials blob as the Gmail tokens, and never appear in logs,
   error strings or API responses (`GET /api/accounts` returns address, health and
   capabilities only).
-- **Server binds loopback only** (`LAGOON_SERVER_HOST`, default `127.0.0.1`); a
-  non-loopback host refuses to start. This is a deliberate stopgap because
-  **M0 has no API authentication** — anything that can reach the port can read
-  synced mail.
-- **Message bodies never stored server-side** — M0 stores headers/snippets only;
-  body encryption lands in M1.
+- **Server binds loopback only** (`LAGOON_SERVER_HOST`, default `127.0.0.1`) unless a
+  per-install API token is configured (`LAGOON_API_TOKEN`): with the token set, every
+  `/api/*` route needs `Authorization: Bearer <token>` (401 `api-unauthorized`
+  otherwise) and non-loopback binds are allowed. No token → legacy loopback-only
+  posture, unchanged. The Host-header check stays on regardless (DNS rebinding).
+  The client sends the token from `LAGOON_API_TOKEN` env or the stored settings
+  value; rotation is "change both ends and restart".
+- **Message bodies are stored server-side on first open** (V2 A3, `message_bodies`)
+  — write-through on `GET body`, cascade-deleted with their header row, covered by
+  the same AES-GCM-at-rest posture as the host database. Search (`GET /api/search`)
+  matches subject/snippet/sender/body (ILIKE + tsquery) with LIKE-special escaping.
 - **Gmail webhook is stubbed**: `POST /webhook/gmail` returns `501 Not
   Implemented` (it previously returned a misleading `200`); polling is the real
   sync path in M0.
@@ -301,7 +306,9 @@ Provider routing and defaults live in `config/providers.json`; see
 - **Reply detection**: a send action recorded by the reply route names the original
   message, and the briefing classifier treats it as handled (`.safeToArchive`, reason
   `replied`) instead of nagging in "needs reply". Replies sent from *other* mail
-  clients are invisible — the Sent folder is not synced (below).
+  clients are detected too (V2 A2): each sync round harvests In-Reply-To/References
+  from Sent-folder mail (IMAP Sent folder / Gmail SENT label) and records them as
+  reply signals. Sent mail itself is never stored as rows.
 - **Whitelist auto-archive** (spec principle #2): right-click a subscription-noise row
   → "Auto-archive this sender" creates an `auto_archive_rules` row and archives the
   message on the spot (both reversible — archive via ⌘Z, rule via ⋮ → Auto-archive
@@ -331,13 +338,14 @@ Provider routing and defaults live in `config/providers.json`; see
 ## Known limitations (by design)
 
 - No API authentication — the server is loopback-only for that reason
-- Reply detection sees only replies sent through Lagoon — mail replied to from
-  other clients still shows in "needs reply" until the Sent folder is synced
+- Cross-client reply signals do not count as handled work in time-saved
 - **Pre-M0.1 OAuth rows are unreadable, and pre-008 Gmail rows lost their token
   columns** — after migration 008 an existing Gmail account surfaces as
   `sync-failed: not-configured` and stops updating (it still appears in
   `GET /api/accounts`). Reconnect Gmail or delete the stale row.
-- Gmail polling every 30 s; `POST /webhook/gmail` returns `501`
+- Gmail push lands in seconds when configured (`LAGOON_WEBHOOK_SECRET` + Pub/Sub push
+  subscription → `POST /webhook/gmail`, scoped per-account wake); without the secret
+  the endpoint stays 501 and the 30 s poller remains the sync path
 - OAuth state stored in-process (lost on server restart)
 - No SwiftData local cache — the app refetches from the server
 - Gmail `historyId` incremental sync via the API only (no Pub/Sub push)

@@ -1,0 +1,11 @@
+-- V2 A1: multi-active concurrent sync.
+--
+-- Migration 013 enforced "exactly one active account" with the partial unique
+-- index `accounts_one_active`. The V2 terminal state syncs every connected
+-- mailbox concurrently, each under its own loop with its own cursor and
+-- backoff. `is_active` survives only as the client's selected-filter marker
+-- (which mailbox the UI shows), no longer as the sync owner's lock.
+--
+-- Non-destructive: only the index is dropped. Existing rows keep their
+-- `is_active` values so the client's current selection is preserved.
+DROP INDEX IF EXISTS accounts_one_active;

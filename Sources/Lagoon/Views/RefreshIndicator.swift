@@ -32,6 +32,7 @@ struct RefreshIndicatorModifier: ViewModifier {
                         .frame(width: 5, height: 5)
                         .padding(4)
                         .transition(.opacity)
+                        .accessibilityHidden(true)
                 }
             }
             .animation(.easeInOut(duration: 0.2), value: state)

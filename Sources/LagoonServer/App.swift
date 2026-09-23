@@ -19,14 +19,24 @@ struct LagoonServerMain {
 
         // M0 ships with no API authentication. Binding anything other than
         // loopback would expose /api/messages, /api/accounts and the OAuth
-        // callback to the network, so refuse to start.
-        guard cfg.isLoopback else {
+        // callback to the network, so refuse to start — unless a per-install
+        // API token is configured (V2 A5), which gates every /api/* route.
+        // The Host-header check stays on regardless (DNS rebinding).
+        let apiToken = ProcessInfo.processInfo.environment["LAGOON_API_TOKEN"]
+            .flatMap { $0.isEmpty ? nil : $0 }
+        if !cfg.isLoopback, apiToken == nil {
             die("""
                 refusing to start: LAGOON_SERVER_HOST=\(cfg.host) is not a loopback address.
-                Lagoon M0 has NO API authentication; binding a non-loopback interface would
-                expose the API to the network. M1 adds per-install bearer tokens. Use one of
-                127.0.0.1, ::1 or localhost (or unset LAGOON_SERVER_HOST).
+                Lagoon has NO API authentication without LAGOON_API_TOKEN; binding a non-loopback
+                interface would expose the API to the network. Either bind loopback
+                (127.0.0.1, ::1, localhost) or set LAGOON_API_TOKEN and configure the same
+                token on the client.
                 """)
+        }
+        if !cfg.isLoopback {
+            logger.warning("binding non-loopback with API token auth", metadata: [
+                "host": .string(cfg.host),
+            ])
         }
 
         // Tokens are AES-GCM encrypted with LAGOON_TOKEN_KEY. Fail closed at
@@ -106,18 +116,25 @@ struct LagoonServerMain {
         // share the single-flight refresh registry.
         let gmailClient = GmailClient()
         let tokens = GmailTokenService(db: db, oauth: google, logger: logger)
-        // The sync engine is the only writer of message rows: it asks the one
-        // active account's `MailProvider` for changes and applies them (spec
-        // §3.2/§3.4). Dormant accounts retain local state but own no connection.
-        let syncEngine = SyncEngine(db: db, logger: logger) { account in
-            MailProviderFactory.make(
-                account: account,
-                client: gmailClient,
-                tokens: tokens,
-                db: db,
-                logger: logger
-            )
-        }
+        // The sync engine is the only writer of message rows: each stored
+        // account's `MailProvider` is polled by its own loop and changes are
+        // applied per account (spec §3.2/§3.4). Each loop owns its Postgres
+        // connection (one in-flight query per connection): sharing `db`
+        // across loops desyncs the wire protocol under concurrency.
+        let syncEngine = SyncEngine(
+            db: db,
+            logger: logger,
+            makeProvider: { account in
+                MailProviderFactory.make(
+                    account: account,
+                    client: gmailClient,
+                    tokens: tokens,
+                    db: db,
+                    logger: logger
+                )
+            },
+            makeDB: { try await LagoonPostgres.connect(pgCfg, on: elg.any()) }
+        )
 
         // Spec §6.5: the AI Gateway is the only module that talks to LLM
         // providers. `nil` when no provider is configured (missing key/base
@@ -148,6 +165,7 @@ struct LagoonServerMain {
         // point any browser on this machine at 127.0.0.1 and read synced mail.
         // Reject requests whose Host is not loopback (Networking/HostGuard.swift).
         router.add(middleware: LoopbackHostMiddleware())
+        router.add(middleware: APIAuthMiddleware(token: apiToken))
         HealthRoutes.register(on: router)
         OAuthRoutes.register(
             on: router, db: db, oauth: google, sync: syncEngine, logger: logger
@@ -186,9 +204,10 @@ struct LagoonServerMain {
         BudgetRoutes.register(
             on: router,
             budget: usageBudget,
-            costTrackingAvailable: ai?.hasConfiguredRates ?? false
+            costTrackingAvailable: ai?.hasConfiguredRates ?? false,
+            gateway: ai
         )
-        GmailWebhookRoutes.register(on: router)
+        GmailWebhookRoutes.register(on: router, db: db, logger: logger, sync: syncEngine)
 
         let app = Application(
             router: router,
@@ -196,11 +215,12 @@ struct LagoonServerMain {
             logger: logger
         )
 
-        // Repair a zero-active state before the loop starts. More than one is
-        // impossible because migration 013 enforces a partial unique index.
+        // Repair a zero-selected state before the loops start. Every stored
+        // account gets its own loop; `is_active` only marks the mailbox the
+        // client shows first.
         try await AccountStore.reconcileActive(db: db)
 
-        // The active loop blocks inside `pullChanges` (IDLE for IMAP, polls for
+        // Each account's loop blocks inside `pullChanges` (IDLE for IMAP, polls for
         // Gmail), so one round per 5 minutes is the idle floor, not a busy loop.
         Task { await syncEngine.start() }
 

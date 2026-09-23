@@ -137,7 +137,8 @@ public enum MessageRoutes {
                     account: account,
                     remoteId: remoteId,
                     provider: provider,
-                    db: db
+                    db: db,
+                    logger: logger
                 )
                 return RouteJSON.response(body)
             } catch let error as MailError {
@@ -335,7 +336,8 @@ public enum MessageRoutes {
                     account: account,
                     remoteId: remoteId,
                     provider: provider,
-                    db: db
+                    db: db,
+                    logger: logger
                 )
             } catch let error as MailError {
                 return Self.providerError(error, logger: logger, remoteId: remoteId)
@@ -749,28 +751,71 @@ public enum MessageRoutes {
     /// effort: a row that vanished still yields the body text). Attachment
     /// data is stripped before the wire response — clients fetch each part
     /// separately via `/api/messages/{remoteId}/attachments/{aid}`.
+    /// Body with durable write-through (V2 A3): serve the stored parse when
+    /// present, otherwise fetch from the provider and persist for next time.
+    /// Bodies are immutable, so a stored row is never stale; a provider-side
+    /// `messageGone` drops the stale row and propagates the 410.
     static func fetchBody(
         account: Account,
         remoteId: String,
         provider: any MailProvider,
-        db: PostgresConnection
+        db: PostgresConnection,
+        logger: Logger
     ) async throws -> MessageBody {
-        let fetched = try await provider.fetchBody(remoteId: remoteId)
-        let stored = try? await MessageStore.find(remoteId: remoteId, accountId: account.id, db: db)
-        return MessageBody(
-            remoteId: remoteId,
-            subject: stored?.subject,
-            fromAddress: stored?.fromAddress ?? "",
-            fromName: stored?.fromName,
-            toAddress: nil,
-            receivedAt: stored?.receivedAt ?? Date(),
-            text: fetched.text,
-            html: fetched.html,
-            attachments: fetched.attachments.map { $0.toWire() },
-            hasMore: fetched.hasMore,
-            to: fetched.to,
-            cc: fetched.cc
-        )
+        if let stored = try? await BodyStore.get(
+            accountId: account.id, remoteId: remoteId, db: db
+        ) {
+            let header = try? await MessageStore.find(
+                remoteId: remoteId, accountId: account.id, db: db
+            )
+            return MessageBody(
+                remoteId: remoteId,
+                subject: header?.subject,
+                fromAddress: header?.fromAddress ?? "",
+                fromName: header?.fromName,
+                toAddress: nil,
+                receivedAt: header?.receivedAt ?? Date(),
+                text: stored.text,
+                html: stored.html,
+                attachments: stored.attachments.map { $0.toWire() },
+                hasMore: stored.hasMore,
+                to: stored.to,
+                cc: stored.cc
+            )
+        }
+        do {
+            let fetched = try await provider.fetchBody(remoteId: remoteId)
+            // Best-effort persist: a store failure must not fail the read
+            // the user is looking at.
+            do {
+                try await BodyStore.put(
+                    accountId: account.id, remoteId: remoteId, body: fetched, db: db
+                )
+            } catch {
+                logger.warning("body.persistFailed", metadata: [
+                    "remoteId": .string(remoteId),
+                    "err": .string("\(error)"),
+                ])
+            }
+            let stored = try? await MessageStore.find(remoteId: remoteId, accountId: account.id, db: db)
+            return MessageBody(
+                remoteId: remoteId,
+                subject: stored?.subject,
+                fromAddress: stored?.fromAddress ?? "",
+                fromName: stored?.fromName,
+                toAddress: nil,
+                receivedAt: stored?.receivedAt ?? Date(),
+                text: fetched.text,
+                html: fetched.html,
+                attachments: fetched.attachments.map { $0.toWire() },
+                hasMore: fetched.hasMore,
+                to: fetched.to,
+                cc: fetched.cc
+            )
+        } catch let error as MailError where error == .messageGone {
+            try? await BodyStore.delete(accountId: account.id, remoteId: remoteId, db: db)
+            throw error
+        }
     }
 
     // MARK: - Attachment + raw.eml routes

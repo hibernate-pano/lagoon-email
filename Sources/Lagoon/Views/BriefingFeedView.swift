@@ -18,6 +18,10 @@ struct BriefingFeedView: View {
     @State private var path: [String] = []
     @State private var scrollProxy: ScrollViewProxy?
     @State private var selectedGmailId: String? = nil
+    /// False when another surface is showing (RootView keeps both alive).
+    /// The poll loop sleeps instead of refreshing, and hidden shortcuts
+    /// are disabled by the parent — keep-alive without traffic or hotkeys.
+    var isVisible: Bool = true
 
     private let api = APIClient()
     private static let refreshInterval: Duration = .seconds(30)
@@ -81,7 +85,7 @@ struct BriefingFeedView: View {
             do { try await Task.sleep(for: Self.refreshInterval) } catch { return }
             // Never reorder the feed underneath an open message. The next
             // refresh happens when the user returns to the feed.
-            if path.isEmpty {
+            if isVisible, path.isEmpty {
                 await refresh()
             }
         }

@@ -12,6 +12,10 @@ struct MessageListView: View {
     @State private var errorBanner: ErrorBanner?
     @State private var path: [String] = []
     @State private var selection: Set<String> = []
+    /// False when another surface is showing (RootView keeps both alive).
+    /// The poll loop sleeps instead of refreshing — keep-alive costs no
+    /// traffic. Hidden shortcuts are disabled by the parent.
+    var isVisible: Bool = true
     private let api = APIClient()
 
     /// Switches back to the Briefing Feed from the toolbar button.
@@ -125,7 +129,8 @@ struct MessageListView: View {
             .accessibilityHidden(true)
         }
         // Initial load, then track the server's 30s poller while visible.
-        // SwiftUI cancels the task when the view disappears.
+        // The view stays alive across surface switches (RootView ZStack),
+        // so an invisible surface must sleep instead of polling.
         .task {
             await refresh()
             while !Task.isCancelled {
@@ -134,7 +139,9 @@ struct MessageListView: View {
                 } catch {
                     return
                 }
-                await refresh()
+                if isVisible {
+                    await refresh()
+                }
             }
         }
     }
@@ -228,6 +235,7 @@ struct MessageListView: View {
                         .fill(.tint)
                         .frame(width: 7, height: 7)
                         .padding(.top, 7)
+                        .accessibilityLabel(l10n.unreadDotLabel)
                 } else {
                     Color.clear.frame(width: 7, height: 7)
                 }

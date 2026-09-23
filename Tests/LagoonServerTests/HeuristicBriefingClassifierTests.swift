@@ -19,7 +19,8 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         _ remoteId: String,
         from: String,
         isRead: Bool = false,
-        daysAgo: Double = 0
+        daysAgo: Double = 0,
+        messageIdHeader: String? = nil
     ) -> MessageHeader {
         MessageHeader(
             id: UUID(),
@@ -32,7 +33,8 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
             snippet: nil,
             receivedAt: now.addingTimeInterval(-daysAgo * 24 * 60 * 60),
             isRead: isRead,
-            isArchived: false
+            isArchived: false,
+            messageIdHeader: messageIdHeader
         )
     }
 
@@ -61,6 +63,18 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
     func test_replied_landsInSafeToArchive_withRepliedReason() {
         let message = header("m-reply", from: "alice@example.com", isRead: false)
         let result = group(message, replied: ["m-reply"])
+        XCTAssertEqual(result.group, .safeToArchive)
+        XCTAssertEqual(result.reason, .replied)
+    }
+
+    /// Gmail rows are keyed by Gmail id while Sent harvesting yields
+    /// Message-IDs (V2 A2): the stored Message-ID header must match too.
+    func test_replied_matchesStoredMessageIDHeader() {
+        let message = header(
+            "gmail-123", from: "alice@example.com", isRead: false,
+            messageIdHeader: "<orig@example.com>"
+        )
+        let result = group(message, replied: ["<orig@example.com>"])
         XCTAssertEqual(result.group, .safeToArchive)
         XCTAssertEqual(result.reason, .replied)
     }

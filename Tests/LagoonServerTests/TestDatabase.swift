@@ -76,6 +76,16 @@ enum TestDatabase {
         return try await LagoonPostgres.connect(cfg, on: eventLoopGroup.any())
     }
 
+    /// A second connection for multi-loop tests: loops must never share one
+    /// (a Postgres connection serves one query at a time). Closed by the
+    /// engine that owns it; aborts the test when the test DB is unreachable.
+    static func requireConnection() async throws -> PostgresConnection {
+        guard let conn = try await connect() else {
+            throw XCTSkip("test database unavailable")
+        }
+        return conn
+    }
+
     // MARK: - Row-scoped cleanup (never DELETE the whole table)
 
     static func deleteAccount(id: UUID, db: PostgresConnection) async throws {

@@ -172,6 +172,10 @@ final class AutoArchiveTests: XCTestCase {
                 XCTAssertEqual(autoActions.count, 1)
                 XCTAssertEqual(autoActions.first?.payload["autoRule"], "true")
                 XCTAssertEqual(autoActions.first?.payload["remoteId"], "901")
+                XCTAssertEqual(
+                    autoActions.first?.payload["sender"], "noise@example.com",
+                    "the undo path retires the rule by this sender"
+                )
             }
         }
     }

@@ -84,6 +84,21 @@ public enum AutoArchiveStore {
         ).get()
     }
 
+    /// Remove the rule for one sender (undoing an auto-archive, V2 C2).
+    /// Same normalization as `create`, so records written before the
+    /// `sender` payload existed still match.
+    public static func deleteSender(
+        _ senderAddress: String,
+        accountId: UUID,
+        db: PostgresConnection
+    ) async throws {
+        let address = senderAddress.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        try await db.query(
+            "DELETE FROM auto_archive_rules WHERE account_id = $1 AND sender_address = $2",
+            [PostgresData(uuid: accountId), PostgresData(string: address)]
+        ).get()
+    }
+
     /// An address crosses the trust boundary. One ordinary mailbox, no display
     /// names, no lists, no whitespace or header fragments — same spirit as the
     /// new-message recipient check.

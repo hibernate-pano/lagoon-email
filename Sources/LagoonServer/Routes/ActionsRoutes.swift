@@ -480,6 +480,30 @@ public enum ActionsRoutes {
                 "UPDATE message_headers SET is_archived = FALSE WHERE remote_id = $1 AND account_id = $2",
                 [PostgresData(string: remoteId), PostgresData(uuid: account.id)]
             ).get()
+            // Undoing an auto-archive retires its rule (V2 C2): otherwise the
+            // next sync round re-archives the same sender and the undo was a
+            // lie. Sender prefers the action payload and falls back to the
+            // stored header for rows recorded before the payload carried it.
+            if action.payload["autoRule"] == "true" {
+                var sender = action.payload["sender"]
+                if sender == nil {
+                    sender = try? await MessageStore.find(
+                        remoteId: remoteId, accountId: account.id, db: db
+                    )?.fromAddress
+                }
+                if let sender {
+                    // Best-effort: the message already came back, so a rule
+                    // cleanup failure must not fail the undo.
+                    do {
+                        try await AutoArchiveStore.deleteSender(sender, accountId: account.id, db: db)
+                    } catch {
+                        logger.warning("undo.autoRuleCleanupFailed", metadata: [
+                            "actionId": .string("\(action.id)"),
+                            "err": .string("\(error)"),
+                        ])
+                    }
+                }
+            }
         case .markRead:
             guard let provider = makeProvider(account) else {
                 throw MailError.notConfigured("provider missing during undo")

@@ -46,18 +46,22 @@ struct TimeSavedBar: View {
     private func bar(_ report: TimeSavedReport) -> some View {
         VStack(spacing: 0) {
             Divider()
-            HStack(spacing: 6) {
-                Image(systemName: "clock.badge.checkmark")
-                    .foregroundStyle(.secondary)
-                Text(summary(report))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer()
+            // A real Button, not onTapGesture: keyboard focus, VoiceOver
+            // activation and click all work, with no visual change.
+            Button { showWeek = true } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "clock.badge.checkmark")
+                        .foregroundStyle(.secondary)
+                    Text(summary(report))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
-            .onTapGesture { showWeek = true }
+            .buttonStyle(.plain)
             .popover(isPresented: $showWeek, arrowEdge: .bottom) {
                 weekDetail(report)
             }

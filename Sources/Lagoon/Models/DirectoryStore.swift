@@ -10,6 +10,9 @@ import LagoonKit
 public final class DirectoryStore: ObservableObject {
     @Published public private(set) var accounts: [ConnectedAccount] = []
     @Published public private(set) var loadError: String?
+    /// Global AI degraded signal (V2 C1), refreshed with the directory.
+    /// Nil before the first poll or when the poll fails — unknown, not down.
+    @Published public private(set) var aiStatus: AIStatus?
 
     /// RootView re-polls on this cadence while the window is open. The server
     /// writes health from its active sync loop, so a slow poll is enough.
@@ -39,6 +42,11 @@ public final class DirectoryStore: ObservableObject {
             loadError = nil
         } catch {
             loadError = L10n.current.checkConnectionFailed + error.lagoonUIMessage
+        }
+        // Best-effort sidecar: a failed status poll keeps the last known
+        // value instead of flashing the banner off and on.
+        if let status = try? await api.fetchAIStatus() {
+            aiStatus = status
         }
     }
 

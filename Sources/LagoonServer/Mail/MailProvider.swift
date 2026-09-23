@@ -4,6 +4,20 @@ import LagoonKit
 /// Provider-neutral header row as it arrives from the wire, before it becomes a
 /// stored `MessageHeader`. `remoteId` is provider-native (Gmail message id /
 /// IMAP UID string) and only unique within one account.
+public extension RemoteHeader {
+    /// Split a threading header (In-Reply-To/References) into whitespace-
+    /// separated tokens, verbatim. Tokens keep their `<...>` brackets: the
+    /// store's Message-ID identity is the exact header string, so stripping
+    /// brackets would break the match. Shared by the IMAP and Gmail Sent
+    /// harvesters.
+    static func messageIDTokens(_ value: String) -> Set<String> {
+        Set(
+            value.split(whereSeparator: { $0.isWhitespace })
+                .map(String.init)
+                .filter { !$0.isEmpty }
+        )
+    }
+}
 public struct RemoteHeader: Sendable, Equatable {
     public var remoteId: String
     public var threadId: String
@@ -59,17 +73,24 @@ public struct MailChangeSet: Sendable {
     /// moved or deleted by another client; providers without a cheap complete
     /// view leave it nil.
     public var inboxRemoteIds: Set<String>?
+    /// Message-IDs (RFC 5322) this pull saw referenced from sent mail
+    /// (In-Reply-To/References of Sent-folder messages). The engine records
+    /// them as reply signals so mail answered from another client leaves
+    /// "needs reply" (V2 A2). Sent mail itself is never stored as rows.
+    public var repliedMessageIds: Set<String>
 
     public init(
         upserts: [RemoteHeader],
         resetRequired: Bool,
         cursor: MailSyncState,
-        inboxRemoteIds: Set<String>? = nil
+        inboxRemoteIds: Set<String>? = nil,
+        repliedMessageIds: Set<String> = []
     ) {
         self.upserts = upserts
         self.resetRequired = resetRequired
         self.cursor = cursor
         self.inboxRemoteIds = inboxRemoteIds
+        self.repliedMessageIds = repliedMessageIds
     }
 }
 

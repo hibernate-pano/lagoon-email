@@ -203,6 +203,48 @@ final class SyncEngineTests: XCTestCase {
         }
     }
 
+    /// (a3) Sent-folder reply signals (V2 A2) are recorded as `send` actions
+    /// with a `sentFolder` marker, flow into `repliedRemoteIds`, and are not
+    /// duplicated when the same IDs arrive again (Sent UIDVALIDITY reset).
+    func test_sentReplies_recordedOnceAsReplySignals() async throws {
+        let oauthUser = "sync-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(account, db: conn)
+
+                let cursor = MailSyncState(uidValidity: 42, lastUid: 900)
+                let provider = StubMailProvider(pulls: [
+                    .success(MailChangeSet(
+                        upserts: [.stub(remoteId: "901")],
+                        resetRequired: false,
+                        cursor: cursor,
+                        repliedMessageIds: ["<orig@example.com>"]
+                    )),
+                    .success(MailChangeSet(
+                        upserts: [],
+                        resetRequired: false,
+                        cursor: cursor,
+                        repliedMessageIds: ["<orig@example.com>"]
+                    )),
+                ])
+                let loop = makeLoop(db: conn, account: account, provider: provider)
+
+                await loop.round()
+                await loop.round()
+
+                let replied = try await AIActionStore.repliedRemoteIds(
+                    accountId: account.id, db: conn
+                )
+                XCTAssertTrue(replied.contains("<orig@example.com>"))
+                let sends = try await AIActionStore.recent(accountId: account.id, db: conn)
+                    .filter { $0.kind == .send }
+                XCTAssertEqual(sends.count, 1, "repeat Sent IDs must not duplicate the signal")
+            }
+        }
+    }
+
     /// (b) `resetRequired` (UIDVALIDITY change) wipes stale rows first, then the
     /// cursor is reset to the new identity space.
     func test_resetRequired_wipesStaleRowsBeforeApplying() async throws {
@@ -497,9 +539,10 @@ final class SyncEngineTests: XCTestCase {
 
     // MARK: - Supervision
 
-    /// (h) Switching the server's active account stops the old provider and
-    /// starts the selected one. The dormant mailbox keeps its stored cursor and
-    /// makes no further network calls.
+    /// (h) All stored accounts sync concurrently. The `is_active` marker is
+    /// only the client's selected filter: switching it restarts loops but
+    /// never parks any mailbox, and one mailbox's trouble never stops
+    /// another's mail.
     func test_switch_stopsOldAccount_andStartsSelectedAccount() async throws {
         let oauthA = "sync-a-\(UUID().uuidString)"
         let oauthB = "sync-b-\(UUID().uuidString)"
@@ -514,72 +557,86 @@ final class SyncEngineTests: XCTestCase {
                 try await seed(broken, db: conn)
                 try await seed(healthy, db: conn)
 
-                let providerA = StubMailProvider.once(MailChangeSet(
-                    upserts: [.stub(remoteId: "a-1")],
-                    resetRequired: false,
-                    cursor: MailSyncState(uidValidity: 8, lastUid: 1)
-                ))
-                let providerB = StubMailProvider.once(MailChangeSet(
-                    upserts: [.stub(remoteId: "b-1")],
-                    resetRequired: false,
-                    cursor: MailSyncState(uidValidity: 9, lastUid: 1)
-                ))
+                let providerA = StubMailProvider(pulls: [
+                    .success(MailChangeSet(
+                        upserts: [.stub(remoteId: "a-1")],
+                        resetRequired: false,
+                        cursor: MailSyncState(uidValidity: 8, lastUid: 1)
+                    )),
+                    .success(MailChangeSet(
+                        upserts: [],
+                        resetRequired: false,
+                        cursor: MailSyncState(uidValidity: 8, lastUid: 1)
+                    )),
+                ])
+                let providerB = StubMailProvider(pulls: [
+                    .success(MailChangeSet(
+                        upserts: [.stub(remoteId: "b-1")],
+                        resetRequired: false,
+                        cursor: MailSyncState(uidValidity: 9, lastUid: 1)
+                    )),
+                    .success(MailChangeSet(
+                        upserts: [],
+                        resetRequired: false,
+                        cursor: MailSyncState(uidValidity: 9, lastUid: 1)
+                    )),
+                ])
+                // Per-account providers: the multi-active engine syncs every
+                // stored row (including transient rows from parallel tests),
+                // so sharing one scripted provider across loops lets a stray
+                // loop consume the script. Keyed lookup keeps A/B deterministic.
+                let providers = [broken.id: providerA, healthy.id: providerB]
                 let engine = SyncEngine(
                     db: conn,
                     logger: Logger(label: "sync-switch-tests"),
                     makeProvider: { account in
-                        account.id == broken.id ? providerA : providerB
+                        providers[account.id] ?? StubMailProvider()
                     },
-                    sleep: { _ in }
+                    sleep: { _ in },
+                    makeDB: { try await TestDatabase.requireConnection() }
                 )
 
                 try await AccountStore.setActive(accountId: healthy.id, db: conn)
                 await engine.start()
                 defer { Task { await engine.stop() } }
 
-                // B owns the only loop.
-                var bSynced = false
+                // Both accounts own a loop: A and B sync concurrently.
+                var bothSynced = false
                 for _ in 0..<100 {
-                    if let health = try await health(healthy.id, db: conn),
-                       health.lastSyncAt != nil {
-                        bSynced = true
+                    let aHealth = try await health(broken.id, db: conn)
+                    let bHealth = try await health(healthy.id, db: conn)
+                    if aHealth?.lastSyncAt != nil, bHealth?.lastSyncAt != nil {
+                        bothSynced = true
                         break
                     }
                     try await Task.sleep(for: .milliseconds(50))
                 }
-                XCTAssertTrue(bSynced, "the selected B account must sync")
+                XCTAssertTrue(bothSynced, "both accounts must sync concurrently")
                 let bMessages = try await MessageStore.recent(
                     forAccount: healthy.id, limit: 50, db: conn
                 )
                 XCTAssertEqual(bMessages.map(\.remoteId), ["b-1"])
-                let aHealthBeforeSwitch = try await health(broken.id, db: conn)
-                XCTAssertNil(aHealthBeforeSwitch?.lastSyncAt, "dormant A must not sync")
-                // Select A. The old B task must be cancelled and awaited before
-                // A receives the provider.
+                let aMessagesBeforeSwitch = try await MessageStore.recent(
+                    forAccount: broken.id, limit: 50, db: conn
+                )
+                XCTAssertEqual(aMessagesBeforeSwitch.map(\.remoteId), ["a-1"])
+                // Switching the selection marker restarts loops but parks
+                // nothing: both mailboxes keep syncing.
                 try await AccountStore.setActive(accountId: broken.id, db: conn)
                 await engine.refresh()
-                var aSynced = false
+                var bothStillSynced = false
                 for _ in 0..<100 {
-                    if let health = try await health(broken.id, db: conn),
-                       health.lastSyncAt != nil {
-                        aSynced = true
+                    let aPulls = await providerA.pullCount
+                    let bPulls = await providerB.pullCount
+                    if aPulls >= 2, bPulls >= 2 {
+                        bothStillSynced = true
                         break
                     }
                     try await Task.sleep(for: .milliseconds(50))
                 }
-                XCTAssertTrue(aSynced, "selecting A must start its sync loop")
-                let aMessages = try await MessageStore.recent(
-                    forAccount: broken.id, limit: 50, db: conn
-                )
-                XCTAssertEqual(aMessages.map(\.remoteId), ["a-1"])
-
-                let bPullsAfterSwitch = await providerB.pullCount
-                try await Task.sleep(for: .milliseconds(100))
-                let bPullsAfterSettling = await providerB.pullCount
-                XCTAssertEqual(
-                    bPullsAfterSettling,
-                    bPullsAfterSwitch,
-                    "dormant B must make no network calls after the switch"
+                XCTAssertTrue(
+                    bothStillSynced,
+                    "switching the selection must not park any account's loop"
                 )
                 await engine.stop()
             }

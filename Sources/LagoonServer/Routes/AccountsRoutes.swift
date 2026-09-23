@@ -231,8 +231,9 @@ public enum AccountsRoutes {
         }
 
         // POST /api/accounts/{id}/activate -> 204 | 404 unknown-account
-        // Selects the single account that owns the sync loop. Dormant accounts
-        // retain their credentials, cursors and cached messages.
+        // Selects the mailbox the client shows. Sync is unaffected: every
+        // stored account owns its loop, so this only restarts the selected
+        // account's loop (recovers a parked loop after reconnect).
         router.post("api/accounts/:id/activate") { _, context -> Response in
             guard let accountId = UUID(uuidString: context.parameters.get("id") ?? "") else {
                 return RouteJSON.error(.notFound, "unknown-account")
@@ -246,7 +247,9 @@ public enum AccountsRoutes {
                 logger.error("accounts.activateFailed", metadata: ["err": .string("\(error)")])
                 return RouteJSON.error(.internalServerError, "internal-error")
             }
-            await sync?.refresh()
+            // Restart the selected account's loop without disturbing the
+            // other accounts' connections.
+            await sync?.refreshAccount(accountId)
             return Response(status: .noContent)
         }
 

@@ -72,7 +72,8 @@ public enum DraftRoutes {
                 return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
             }
             body = try await MessageRoutes.fetchBody(
-                account: account, remoteId: remoteId, provider: provider, db: db
+                account: account, remoteId: remoteId, provider: provider, db: db,
+                logger: logger
             )
         } catch let error as MailError {
             return MessageRoutes.providerError(error, logger: logger, remoteId: remoteId)
@@ -323,27 +324,42 @@ public enum SearchRoutes {
     private static func search(
         accountId: UUID, q: String, sender: String?, since: Date?, db: PostgresConnection
     ) async throws -> [MessageHeader] {
-        let pattern = "%\(q)%"
+        // LIKE specials in the query are data, not wildcards.
+        let escaped = q.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        let pattern = "%\(escaped)%"
+        // One path, two recalls: ILIKE substrings (precise, CJK-safe) ORed
+        // with a plainto_tsquery match (English inflection recall, backed by
+        // the GIN index). plainto_tsquery never throws on user input — the
+        // worst case is an empty query that matches nothing.
         let sql = """
-            SELECT id, account_id, remote_id, thread_id,
-                   from_address,
-                   NULLIF(from_name, '') as from_name,
-                   NULLIF(subject, '') as subject,
-                   NULLIF(snippet, '') as snippet,
-                   received_at, is_read, is_archived
-            FROM message_headers
-            WHERE account_id = $1
-              AND (subject ILIKE $2 OR snippet ILIKE $2 OR from_name ILIKE $2 OR from_address ILIKE $2)
-              AND ($3::text IS NULL OR from_address = $3)
-              AND ($4::timestamptz IS NULL OR received_at >= $4)
-            ORDER BY received_at DESC
+            SELECT m.id, m.account_id, m.remote_id, m.thread_id,
+                   m.from_address,
+                   NULLIF(m.from_name, '') as from_name,
+                   NULLIF(m.subject, '') as subject,
+                   NULLIF(m.snippet, '') as snippet,
+                   m.received_at, m.is_read, m.is_archived,
+                   m.message_id_header, m.in_reply_to, m.references_header
+            FROM message_headers m
+            LEFT JOIN message_bodies b
+              ON b.account_id = m.account_id AND b.remote_id = m.remote_id
+            WHERE m.account_id = $1
+              AND (m.subject ILIKE $2 ESCAPE '\\' OR m.snippet ILIKE $2 ESCAPE '\\'
+                   OR m.from_name ILIKE $2 ESCAPE '\\' OR m.from_address ILIKE $2 ESCAPE '\\'
+                   OR b.body_text ILIKE $2 ESCAPE '\\'
+                   OR to_tsvector('simple', coalesce(b.body_text, '')) @@ plainto_tsquery('simple', $5))
+              AND ($3::text IS NULL OR m.from_address = $3)
+              AND ($4::timestamptz IS NULL OR m.received_at >= $4)
+            ORDER BY m.received_at DESC
             LIMIT 100
         """
         let rows = try await db.query(sql, [
             PostgresData(uuid: accountId),
             PostgresData(string: pattern),
-            sender.map { PostgresData(string: $0) } ?? PostgresData(string: ""),
-            since.map { PostgresData(date: $0) } ?? PostgresData(date: Date.distantPast),
+            sender.map { PostgresData(string: $0) } ?? .null,
+            since.map { PostgresData(date: $0) } ?? .null,
+            PostgresData(string: q),
         ]).get()
         return try rows.map { try MessageStore.decode($0) }
     }
@@ -355,7 +371,8 @@ public enum BudgetRoutes {
     public static func register(
         on router: Router<BasicRequestContext>,
         budget: UsageBudget,
-        costTrackingAvailable: Bool
+        costTrackingAvailable: Bool,
+        gateway: AIGateway? = nil
     ) {
         router.get("api/usage") { _, _ -> Response in
             let cap = await budget.capUSD
@@ -368,6 +385,15 @@ public enum BudgetRoutes {
                 costTrackingAvailable: costTrackingAvailable
             )
             return RouteJSON.response(report)
+        }
+        // Global degraded signal for the client's banner (V2 C1). Nil
+        // gateway (heuristic-only install) reports unconfigured, never down.
+        router.get("api/ai-status") { _, _ -> Response in
+            RouteJSON.response(AIStatus(
+                configured: gateway?.isConfigured ?? false,
+                creditExhausted: gateway?.creditExhausted ?? false,
+                circuitOpen: gateway?.circuitOpen ?? false
+            ))
         }
     }
 }

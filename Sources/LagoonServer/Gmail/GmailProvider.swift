@@ -62,6 +62,8 @@ public actor GmailProvider: MailProvider {
         let deadline = ContinuousClock.now.advanced(by: waitUpTo)
         // Gmail's incremental cursor is not used yet (same as M0): the sync is
         // a re-read of the last 50 messages, so the cursor round-trips.
+        // Sent-folder state is derived, not tracked: every pull re-harvests
+        // threading references from SENT-labeled messages in the window.
         let next = MailSyncState(
             historyId: cursor.historyId,
             uidValidity: cursor.uidValidity,
@@ -70,9 +72,9 @@ public actor GmailProvider: MailProvider {
         )
         while true {
             let raw = try await fetchLatest()
-            let changed = changes(from: raw)
-            if !changed.isEmpty {
-                return MailChangeSet(upserts: changed, resetRequired: false, cursor: next)
+            let (changed, replied) = changes(from: raw)
+            if !changed.isEmpty || !replied.isEmpty {
+                return MailChangeSet(upserts: changed, resetRequired: false, cursor: next, repliedMessageIds: replied)
             }
             // Only block when a full interval is left; a shorter `waitUpTo`
             // means "one non-blocking poll". Nothing is lost by returning
@@ -127,20 +129,41 @@ public actor GmailProvider: MailProvider {
 
     /// Diff one poll against the previous one and refresh the baseline. Returns
     /// only new messages and messages whose read state flipped; the rest is
-    /// already in the store.
-    private func changes(from raw: [RawGmailMessage]) -> [RemoteHeader] {
+    /// already in the store. The second element harvests cross-client reply
+    /// signals (V2 A2): In-Reply-To/References of SENT-labeled messages.
+    private func changes(from raw: [RawGmailMessage]) -> (upserts: [RemoteHeader], replied: Set<String>) {
         var seen = Set<String>()
         seen.reserveCapacity(raw.count)
         var changed: [RemoteHeader] = []
+        var replied = Set<String>()
         for message in raw {
             let fingerprint = Self.fingerprint(message)
             seen.insert(fingerprint)
             if !lastSeen.contains(fingerprint) {
                 changed.append(Self.remoteHeader(from: message, accountId: account.id))
             }
+            if (message.labelIds ?? []).contains("SENT") {
+                replied.formUnion(Self.threadReferenceIDs(message: message))
+            }
         }
         lastSeen = seen
-        return changed
+        return (changed, replied)
+    }
+
+    /// Threading references of one Gmail message, same contract as the IMAP
+    /// harvester: the IDs this sent message answers.
+    static func threadReferenceIDs(message: RawGmailMessage) -> Set<String> {
+        func header(_ name: String) -> String? {
+            guard let value = message.payload?.headers?
+                .first(where: { $0.name.lowercased() == name })?
+                .value,
+                !value.isEmpty else { return nil }
+            return value
+        }
+        var ids = Set<String>()
+        if let reply = header("in-reply-to") { ids.formUnion(RemoteHeader.messageIDTokens(reply)) }
+        if let refs = header("references") { ids.formUnion(RemoteHeader.messageIDTokens(refs)) }
+        return ids
     }
 
     private static func fingerprint(_ raw: RawGmailMessage) -> String {
@@ -191,18 +214,12 @@ public actor GmailProvider: MailProvider {
     /// `attachments.get` call — `fetchAttachment(remoteId:attachmentId:)`
     /// does that work and returns the bytes.
     public func fetchBody(remoteId: String) async throws -> FetchedBody {
-        // M1.6 cache hit avoids the full Gmail message fetch when the
-        // user re-opens an email inside the 60s window.
-        if let cached = await MessageBodyCache.shared.get(
-            accountId: account.id, remoteId: remoteId
-        ) {
-            return cached
-        }
+        // No local cache here: the route serves parsed bodies from the
+        // durable BodyStore (V2 A3) and only calls this on a miss.
         let raw = try await perform { token in
             try await self.client.getMessageFull(accessToken: token, remoteId: remoteId)
         }
         let body = GmailBodyExtractor.fetchedBody(from: raw.payload)
-        await MessageBodyCache.shared.put(body, accountId: account.id, remoteId: remoteId)
         return body
     }
 

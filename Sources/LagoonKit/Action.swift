@@ -93,7 +93,20 @@ public struct SearchResponse: Codable, Sendable, Equatable {
     }
 }
 
-/// `GET /api/usage` response: this month's spend and the configured cap.
+/// `GET /api/ai-status` response: the global AI degraded signal (V2 C1).
+/// The client polls it with the directory and banners when the gateway
+/// cannot serve: unconfigured (heuristic-only), out of credit (top up),
+/// or circuit-open (transient provider errors, recovers on its own).
+public struct AIStatus: Codable, Sendable, Equatable {
+    public let configured: Bool
+    public let creditExhausted: Bool
+    public let circuitOpen: Bool
+    public init(configured: Bool, creditExhausted: Bool, circuitOpen: Bool) {
+        self.configured = configured
+        self.creditExhausted = creditExhausted
+        self.circuitOpen = circuitOpen
+    }
+}
 public struct UsageReport: Codable, Sendable, Equatable {
     public let monthUSD: Double
     public let capUSD: Double

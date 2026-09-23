@@ -573,4 +573,43 @@ final class AIGatewayTests: XCTestCase {
             guard case .redirectBlocked = error else { return XCTFail("unexpected \(error)") }
         }
     }
+
+    // MARK: - Degraded status (V2 C1)
+
+    private func summaryBody() -> MessageBody {
+        MessageBody(
+            remoteId: "g1",
+            subject: "Invoice",
+            fromAddress: "billing@example.com",
+            fromName: nil,
+            toAddress: nil,
+            receivedAt: Date(),
+            text: "Please pay by Friday."
+        )
+    }
+
+    /// A 402 marks the gateway credit-exhausted; the next success clears it.
+    /// The breaker stays shut (one failure is not a storm).
+    func test_creditExhausted_setOn402_clearedOnSuccess() async throws {
+        let ai = try gateway()
+        XCTAssertTrue(ai.isConfigured)
+        XCTAssertFalse(ai.creditExhausted)
+        XCTAssertFalse(ai.circuitOpen)
+
+        StubURLProtocol.set { _ in (402, Data(#"{"error":"insufficient credits"}"#.utf8)) }
+        do {
+            _ = try await ai.summarize(summaryBody(), language: nil, accountEmail: "me@example.com")
+            XCTFail("expected insufficientCredit")
+        } catch let error as LLMError {
+            guard case .insufficientCredit = error else { return XCTFail("unexpected \(error)") }
+        }
+        XCTAssertTrue(ai.creditExhausted)
+        XCTAssertFalse(ai.circuitOpen)
+
+        StubURLProtocol.set { _ in
+            (200, Data(#"{"choices":[{"message":{"content":"{\"summary\":\"s\",\"actionItems\":[]}"}}]}"#.utf8))
+        }
+        _ = try await ai.summarize(summaryBody(), language: nil, accountEmail: "me@example.com")
+        XCTAssertFalse(ai.creditExhausted, "a top-up recovers without a restart")
+    }
 }

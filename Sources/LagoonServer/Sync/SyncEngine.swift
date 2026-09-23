@@ -3,7 +3,7 @@ import Logging
 import PostgresNIO
 import LagoonKit
 
-/// One active account's sync loop.
+/// One account's sync loop.
 ///
 /// The loop owns a long-lived provider (one IMAP IDLE connection or Gmail
 /// poller) but never treats the account snapshot as mutable state. Each round
@@ -193,6 +193,7 @@ public actor AccountSyncLoop {
             account: account,
             capabilities: capabilities
         )
+        try await recordSentReplies(changes.repliedMessageIds, accountId: account.id)
         try await AccountStore.updateSyncState(
             accountId: account.id,
             syncState: changes.cursor,
@@ -240,7 +241,11 @@ public actor AccountSyncLoop {
             _ = try await AIActionStore.record(
                 accountId: account.id,
                 kind: .archive,
-                payload: ["remoteId": header.remoteId, "autoRule": "true"],
+                payload: [
+                    "remoteId": header.remoteId,
+                    "autoRule": "true",
+                    "sender": header.fromAddress.lowercased(),
+                ],
                 db: db
             )
             logger.info("autoarchive.applied", metadata: [
@@ -248,6 +253,24 @@ public actor AccountSyncLoop {
                 "from": .string(header.fromAddress),
                 "remoteId": .string(header.remoteId),
             ])
+        }
+    }
+
+    /// Cross-client reply signals (V2 A2). Sent-folder Message-IDs are
+    /// recorded as `send` actions with a `sentFolder` marker so they flow
+    /// through the existing replied pipeline (`repliedRemoteIds` matches on
+    /// the key, `timeSavedEvents` excludes the marker). Already-known IDs are
+    /// skipped, which also makes Sent UIDVALIDITY resets idempotent.
+    private func recordSentReplies(_ ids: Set<String>, accountId: UUID) async throws {
+        guard !ids.isEmpty else { return }
+        let known = try await AIActionStore.repliedRemoteIds(accountId: accountId, db: db)
+        for id in ids.subtracting(known) {
+            _ = try await AIActionStore.record(
+                accountId: accountId,
+                kind: .send,
+                payload: ["remoteId": id, "sentFolder": "true"],
+                db: db
+            )
         }
     }
 
@@ -321,31 +344,42 @@ public actor AccountSyncLoop {
     }
 }
 
-/// Supervises the one account that owns the provider connection.
+/// Supervises one sync loop per connected account, all running concurrently.
 ///
-/// Dormant accounts keep their rows, cursors, cached messages and credentials.
-/// Selecting a different account cancels and awaits the old loop before the new
-/// loop starts, so two mailboxes are never syncing at the same time.
+/// `is_active` is only the client's selected-filter marker (which mailbox the
+/// UI shows). Every stored account owns a loop with its own provider
+/// connection, cursor and backoff, so one mailbox's auth trouble never stops
+/// another's mail. Selecting a different account does not stop any loop.
 public actor SyncEngine {
     private let db: PostgresConnection
     private let logger: Logger
     private let makeProvider: @Sendable (Account) -> (any MailProvider)?
     private let sleep: @Sendable (Duration) async -> Void
+    /// Per-loop connection factory. A Postgres connection serves one query
+    /// at a time, so loops must not share `db` — each loop gets its own
+    /// connection here (production) or shares `db` when nil (single-loop
+    /// unit tests, where no concurrency exists).
+    ///
+    /// Full PostgresClient pool when accounts × traffic grows; per-loop
+    /// connections are the correct shape until then (N accounts = N conns).
+    private let makeDB: (@Sendable () async throws -> PostgresConnection)?
 
-    private var loop: AccountSyncLoop?
-    private var task: Task<Void, Never>?
-    private var activeAccountId: UUID?
+    private var loops: [UUID: AccountSyncLoop] = [:]
+    private var tasks: [UUID: Task<Void, Never>] = [:]
+    private var ownedDBs: [UUID: PostgresConnection] = [:]
 
     public init(
         db: PostgresConnection,
         logger: Logger,
         makeProvider: @escaping @Sendable (Account) -> (any MailProvider)?,
-        sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
+        sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) },
+        makeDB: (@Sendable () async throws -> PostgresConnection)? = nil
     ) {
         self.db = db
         self.logger = logger
         self.makeProvider = makeProvider
         self.sleep = sleep
+        self.makeDB = makeDB
     }
 
     public func start() async {
@@ -353,63 +387,95 @@ public actor SyncEngine {
     }
 
     public func stop() async {
-        task?.cancel()
-        if let task {
-            await task.value
-        }
-        task = nil
-        loop = nil
-        activeAccountId = nil
+        await teardown()
     }
 
-    /// Re-read the server's active account and make the one running loop match.
-    /// Explicit refreshes always restart, which also recovers a loop that parked
-    /// after an auth failure and is therefore already finished.
+    /// Cancel all loops and close every connection this engine created.
+    /// The shared `db` is never closed here — its owner closes it.
+    private func teardown() async {
+        let running = Array(tasks.values)
+        for task in running { task.cancel() }
+        for task in running { await task.value }
+        tasks = [:]
+        loops = [:]
+        for conn in ownedDBs.values { try? await conn.close() }
+        ownedDBs = [:]
+    }
+
+    /// Reconcile the running loops with the stored accounts: start a loop for
+    /// every account, drop loops whose account was deleted. Running loops are
+    /// restarted so a loop that parked after an auth failure recovers once the
+    /// user reconnects. Prefer `refreshAccount(_:)` when only one account
+    /// changed (activate/push) — this full restart is for connect/delete and
+    /// manual sync.
     public func refresh() async {
-        let account: Account?
+        let accounts: [Account]
         do {
-            account = try await AccountStore.active(db: db)
+            accounts = try await AccountStore.all(db: db)
         } catch {
             logger.error("sync.activeAccountFailed", metadata: ["err": .string("\(error)")])
             await sleep(.seconds(5))
             return
         }
-        guard let account else {
-            await stop()
-            return
+        await teardown()
+        for account in accounts {
+            await startLoop(for: account)
         }
-        await restart(with: account)
     }
 
-    /// Wake the current account immediately. The old provider is discarded so
-    /// a reconnect is guaranteed to use fresh credentials.
+    /// Wake every account immediately. Currently a refresh (full restart, see
+    /// above); split into per-account wakes only if this ever gets hot.
     public func requestImmediateSync() async {
         await refresh()
     }
 
-    /// Test/diagnostic hook.
-    func loop(forAccount id: UUID) -> AccountSyncLoop? {
-        activeAccountId == id ? loop : nil
+    /// Restart one account's loop (scoped wake). Used by the Gmail push
+    /// webhook and the activate route: neither should disturb the other
+    /// accounts' connections. A parked loop restarts here too, so reconnect
+    /// recovery works per account.
+    public func refreshAccount(_ id: UUID) async {
+        guard let account = try? await AccountStore.find(byId: id, db: db) else { return }
+        tasks[id]?.cancel()
+        if let task = tasks[id] { await task.value }
+        tasks[id] = nil
+        loops[id] = nil
+        if let conn = ownedDBs.removeValue(forKey: id) { try? await conn.close() }
+        await startLoop(for: account)
     }
 
-    private func restart(with account: Account) async {
-        task?.cancel()
-        if let task {
-            await task.value
-        }
-        task = nil
-        loop = nil
+    /// Test/diagnostic hook.
+    func loop(forAccount id: UUID) -> AccountSyncLoop? {
+        loops[id]
+    }
 
-        activeAccountId = account.id
+    /// Build and start one loop, owning a fresh connection when `makeDB`
+    /// is configured. A per-account factory failure skips only that account.
+    private func startLoop(for account: Account) async {
+        let loopDB: PostgresConnection
+        if let makeDB {
+            do {
+                loopDB = try await makeDB()
+            } catch {
+                // One mailbox's DB trouble must not stop another's mail.
+                logger.error("sync.loopDBFailed", metadata: [
+                    "account": .string(account.email),
+                    "err": .string("\(error)"),
+                ])
+                return
+            }
+            ownedDBs[account.id] = loopDB
+        } else {
+            loopDB = db
+        }
         let nextLoop = AccountSyncLoop(
             account: account,
-            db: db,
+            db: loopDB,
             logger: logger,
             makeProvider: makeProvider,
             sleep: sleep
         )
-        loop = nextLoop
-        task = Task {
+        loops[account.id] = nextLoop
+        tasks[account.id] = Task {
             await nextLoop.run()
         }
     }

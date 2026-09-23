@@ -151,7 +151,8 @@ public enum AccountStore {
         return try rows.map { try Self.decode($0) }
     }
 
-    /// The one account the server is currently syncing.
+    /// The client's selected mailbox (filter marker). All accounts sync
+    /// concurrently; this only decides which mailbox the UI shows.
     public static func active(db: PostgresConnection) async throws -> Account? {
         let sql = """
             SELECT id, provider, oauth_user, email, credentials, sync_state,
@@ -164,9 +165,9 @@ public enum AccountStore {
         return try rows.first.map { try Self.decode($0) }
     }
 
-    /// Atomically move the single active marker. The transaction clears the
-    /// old owner before setting the new one, which keeps the partial unique
-    /// index valid during the update.
+    /// Atomically move the selection marker. Exclusivity is now a client
+    /// convention (no partial unique index since 014); the transaction keeps
+    /// the read-modify-write atomic.
     public static func setActive(
         accountId: UUID,
         db: PostgresConnection
@@ -186,9 +187,7 @@ public enum AccountStore {
         }
     }
 
-    /// Repair a zero-active state after a delete or an interrupted switch.
-    /// More than one active row cannot exist because of the partial unique
-    /// index; zero is valid only when there are no accounts.
+    /// Repair a zero-selected state after a delete or an interrupted switch.
     public static func reconcileActive(db: PostgresConnection) async throws {
         if try await active(db: db) != nil { return }
         guard let newest = try await mostRecentlyUpdated(db: db) else { return }
@@ -229,6 +228,28 @@ public enum AccountStore {
         """
         let rows = try await db.query(sql, [
             PostgresData(string: oauthUser),
+            PostgresData(string: provider.rawValue)
+        ]).get()
+        for row in rows {
+            return try Self.decode(row)
+        }
+        return nil
+    }
+
+    public static func find(
+        byEmail email: String,
+        provider: MailProviderKind,
+        db: PostgresConnection
+    ) async throws -> Account? {
+        let sql = """
+            SELECT id, provider, oauth_user, email, credentials, sync_state,
+                   capabilities, is_active, sync_status, last_sync_at, last_sync_error
+            FROM accounts
+            WHERE email = $1 AND provider = $2
+            LIMIT 1
+        """
+        let rows = try await db.query(sql, [
+            PostgresData(string: email),
             PostgresData(string: provider.rawValue)
         ]).get()
         for row in rows {

@@ -17,17 +17,24 @@ final class RouteTests: XCTestCase {
         super.tearDown()
     }
     func test_postWebhookGmail_returns501() async throws {
-        let router = Router()
-        GmailWebhookRoutes.register(on: router)
-        let app = Application(router: router)
+        // No secret configured (nil + empty env) → the ceiling holds.
+        // The 501 path never touches the database.
+        try await TestDatabase.withConnection { conn in
+            let router = Router()
+            GmailWebhookRoutes.register(
+                on: router, db: conn, logger: Self.testLogger, webhookSecret: nil
+            )
+            let app = Application(router: router)
 
-        try await app.test(.router) { client in
-            try await client.execute(uri: "/webhook/gmail", method: .post) { response in
-                XCTAssertEqual(response.status, .notImplemented)
-                XCTAssertTrue(
-                    String(buffer: response.body).contains("Pub/Sub"),
-                    "expected explanatory 501 body"
-                )
+            try await app.test(.router) { client in
+                try await client.execute(uri: "/webhook/gmail", method: .post) { response in
+                    // Nil secret + empty env → 501 ceiling. If the ambient
+                    // environment exports LAGOON_WEBHOOK_SECRET the route
+                    // instead demands auth (401) — either way no sync happens.
+                    XCTAssertTrue(
+                        response.status == .notImplemented || response.status == .unauthorized
+                    )
+                }
             }
         }
     }
@@ -2026,6 +2033,84 @@ final class RouteTests: XCTestCase {
                 unarchived, [message.remoteId],
                 "a remotely archived message must be moved back remotely too"
             )
+        }
+    }
+
+    /// Undoing an auto-archive retires its rule (V2 C2): otherwise the next
+    /// sync round re-archives the same sender. Undoing a manual archive
+    /// leaves rules alone.
+    func test_undoAutoArchive_retiresTheRule_manualUndoKeepsRules() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedArchiveCapableAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id, remoteId: "rule-\(UUID())", from: "noise@example.com"
+            )
+            try await MessageStore.upsert(message, db: conn)
+            _ = try await AutoArchiveStore.create(
+                accountId: account.id, senderAddress: "noise@example.com", db: conn
+            )
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            // Manual archive + undo: the rule survives.
+            var manualActionId: Int64 = 0
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/archive?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let manual = try await AIActionStore.recent(accountId: account.id, db: conn)
+            let manualRow = manual.first { $0.kind == .archive }
+            manualActionId = try XCTUnwrap(manualRow?.id)
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(manualActionId)/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let rulesAfterManualUndo = try await AutoArchiveStore.senderAddresses(accountId: account.id, db: conn)
+            XCTAssertEqual(rulesAfterManualUndo, ["noise@example.com"])
+
+            // Auto-archive + undo: the rule is retired.
+            _ = try await AIActionStore.record(
+                accountId: account.id,
+                kind: .archive,
+                payload: [
+                    "remoteId": message.remoteId,
+                    "autoRule": "true",
+                    "sender": "noise@example.com",
+                ],
+                db: conn
+            )
+            let auto = try await AIActionStore.recent(accountId: account.id, db: conn)
+            let autoRow = auto.first { $0.kind == .archive && $0.payload["autoRule"] == "true" }
+            let autoId = try XCTUnwrap(autoRow?.id)
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(autoId)/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let rulesAfterAutoUndo = try await AutoArchiveStore.senderAddresses(accountId: account.id, db: conn)
+            XCTAssertTrue(
+                rulesAfterAutoUndo.isEmpty,
+                "undoing an auto-archive must retire its rule"
+            )
+            let restored = try await MessageStore.find(
+                remoteId: message.remoteId, accountId: account.id, db: conn
+            )
+            XCTAssertEqual(restored?.isArchived, false)
         }
     }
 

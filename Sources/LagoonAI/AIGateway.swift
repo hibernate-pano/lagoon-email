@@ -19,9 +19,30 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
     private let logger: Logger
     public let outputLanguage: String
     private let budget: BudgetPolicy
+    /// Global degraded-signal timestamps (V2 C1): credit exhaustion clears
+    /// on the next success, so a top-up recovers without a restart.
+    private let statusLock = NSLock()
+    private var lastCreditExhaustedAt: Date?
+    private var lastSuccessAt: Date?
 
     /// Dollar caps are enforceable only when every active provider exposes both
     /// prompt and completion rates.
+    public var isConfigured: Bool { !providers.isEmpty }
+
+    /// True when a credit failure arrived after the last success: the user
+    /// must top up; retries are pointless until then.
+    public var creditExhausted: Bool {
+        statusLock.lock(); defer { statusLock.unlock() }
+        guard let exhausted = lastCreditExhaustedAt else { return false }
+        guard let success = lastSuccessAt else { return true }
+        return exhausted > success
+    }
+
+    /// True when any provider's breaker is currently open (transient 5xx
+    /// storm, half-open probe pending). Recovers on its own.
+    public var circuitOpen: Bool {
+        providers.contains { breaker.isOpen($0.name) }
+    }
     public var hasConfiguredRates: Bool {
         !providers.isEmpty && providers.allSatisfy {
             $0.costPer1kPromptUsd != nil && $0.costPer1kCompletionUsd != nil
@@ -385,6 +406,9 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
         do {
             let completion = try await provider.complete(capability: capability, system: system, user: user)
             breaker.recordSuccess(provider.name)
+            statusLock.lock()
+            lastSuccessAt = Date()
+            statusLock.unlock()
             log(capability: capability, provider: provider, completion: completion, outcome: "ok")
             return completion
         } catch {
@@ -399,6 +423,9 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
                 breaker.recordFailure(provider.name)
             case LLMError.insufficientCredit:
                 breaker.recordFailure(provider.name)
+                statusLock.lock()
+                lastCreditExhaustedAt = Date()
+                statusLock.unlock()
             default:
                 break
             }

@@ -72,11 +72,14 @@ public enum AIActionStore {
         return try rows.rows.first.map { try Self.decode($0) }
     }
 
-    /// remoteIds Lagoon actually sent a reply to. The reply route records the
+    /// remoteIds Lagoon actually sent a reply to, plus Message-IDs harvested
+    /// from Sent-folder mail (cross-client replies, V2 A2 — recorded as
+    /// `send` actions with a `sentFolder` marker). The reply route records the
     /// *original* message's remoteId in the send action's payload, so this is
     /// the authoritative "already replied" signal for the briefing classifier.
-    /// Replies sent from other mail clients are invisible here — the Sent
-    /// folder is never synced (known limitation, spec 2026-09-19 §2).
+    /// The classifier matches rows on both `remoteId` and the stored
+    /// Message-ID header, which is what covers Gmail (Gmail rows are keyed by
+    /// Gmail id, not Message-ID).
     public static func repliedRemoteIds(
         accountId: UUID,
         db: PostgresConnection
@@ -95,7 +98,9 @@ public enum AIActionStore {
 
     /// Audited (kind, createdAt) events for the time-saved report, with
     /// actions that were later undone excluded — an undone archive is not a
-    /// handled message. `since` bounds the query; the caller aggregates.
+    /// handled message. Cross-client reply signals (`send` with a `sentFolder`
+    /// marker, V2 A2) are excluded too: no Lagoon work happened. `since`
+    /// bounds the query; the caller aggregates.
     public static func timeSavedEvents(
         accountId: UUID,
         since: Date,
@@ -105,6 +110,7 @@ public enum AIActionStore {
             SELECT a.kind, a.created_at
             FROM ai_actions a
             WHERE a.account_id = $1 AND a.created_at >= $2
+              AND NOT (a.kind = 'send' AND a.payload ? 'sentFolder')
               AND NOT EXISTS (
                   SELECT 1 FROM ai_actions u
                   WHERE u.account_id = a.account_id AND u.kind = 'undo'

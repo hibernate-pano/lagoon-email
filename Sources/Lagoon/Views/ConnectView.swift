@@ -23,6 +23,7 @@ struct ConnectView: View {
     @State private var mode: Mode = .qq
     @State private var qqEmail = ""
     @State private var qqAuthCode = ""
+    @State private var showAuthCode = false
     @State private var isConnecting = false
     /// The in-flight QQ connect/adopt task, so Cancel and `.onDisappear` can
     /// actually stop the request instead of letting it complete after dismissal.
@@ -175,9 +176,30 @@ struct ConnectView: View {
             Text(l10n.qqAuthCodePlaceholder)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            SecureField(l10n.qqAuthCodePlaceholder, text: $qqAuthCode)
+            HStack(spacing: 6) {
+                Group {
+                    if showAuthCode {
+                        TextField(l10n.qqAuthCodePlaceholder, text: $qqAuthCode)
+                    } else {
+                        SecureField(l10n.qqAuthCodePlaceholder, text: $qqAuthCode)
+                    }
+                }
                 .textFieldStyle(.roundedBorder)
                 .focused($focusedField, equals: .authCode)
+                Button {
+                    showAuthCode.toggle()
+                } label: {
+                    Label(
+                        showAuthCode ? l10n.hideAuthCode : l10n.showAuthCode,
+                        systemImage: showAuthCode ? "eye.slash" : "eye"
+                    )
+                    .labelStyle(.iconOnly)
+                }
+                .help(showAuthCode ? l10n.hideAuthCode : l10n.showAuthCode)
+            }
+            Text(l10n.qqAuthCodeHelp)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
         .frame(maxWidth: 320)
         Button {

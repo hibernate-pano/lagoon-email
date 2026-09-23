@@ -77,8 +77,27 @@ public final class APIClient: Sendable {
     public let baseURL: URL
     private let session: URLSession
 
+    /// Per-install API token (V2 A5): `LAGOON_API_TOKEN` env wins, else the
+    /// value stored by the settings UI. Nil/empty → no header (legacy server
+    /// with auth unconfigured keeps working).
+
     /// Base URL resolution: `LAGOON_SERVER_URL` if set and parseable, otherwise
     /// the M0 local default. The literal is known-good; `??` avoids a force unwrap.
+    static var apiToken: String? {
+        if let raw = ProcessInfo.processInfo.environment["LAGOON_API_TOKEN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            return raw
+        }
+        let stored = UserDefaults.standard.string(forKey: "lagoon.apiToken")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (stored?.isEmpty == false) ? stored : nil
+    }
+
+    /// Persist the token entered in settings (env wins at runtime regardless).
+    public static func storeAPIToken(_ token: String) {
+        UserDefaults.standard.set(token, forKey: "lagoon.apiToken")
+    }
+
     private static func resolvedBaseURL() -> URL {
         if let raw = ProcessInfo.processInfo.environment["LAGOON_SERVER_URL"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !raw.isEmpty,
@@ -144,6 +163,16 @@ public final class APIClient: Sendable {
         let dec = JSONDecoder()
         dec.dateDecodingStrategy = .iso8601
         return try dec.decode([ConnectedAccount].self, from: data)
+    }
+
+    /// Global AI degraded signal for the banner (V2 C1). Best-effort:
+    /// callers treat failure as "unknown", never as down.
+    public func fetchAIStatus() async throws -> AIStatus {
+        let url = baseURL.appendingPathComponent("api/ai-status")
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try JSONDecoder().decode(AIStatus.self, from: data)
     }
 
     // MARK: - M1.6 attachments + raw message
@@ -634,6 +663,10 @@ public final class APIClient: Sendable {
     /// to the retry layer. Callers therefore receive the validated
     /// (Data, URLResponse) and skip their own `validate(...)` call.
     private func send(_ request: URLRequest, timeout: APITimeout) async throws -> (Data, URLResponse) {
+        var request = request
+        if let token = Self.apiToken, !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         let attempt: () async throws -> (Data, URLResponse) = {
             let (data, resp) = try await self.session.data(for: request)
             try Self.validate(resp, data: data)

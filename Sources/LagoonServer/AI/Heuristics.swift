@@ -4,10 +4,10 @@ import LagoonKit
 /// Deterministic, offline classifier used when no LLM provider is configured
 /// (and as the fallback when the AI classifier errors).
 ///
-/// Reply detection is wired but partial (spec 2026-09-19 §2): it sees replies
-/// sent through Lagoon (audited as send actions). Mail replied to from other
-/// clients is invisible — the Sent folder is not synced — so those messages
-/// can still land in `needsReply`.
+/// Reply detection sees replies sent through Lagoon (audited as send actions)
+/// and replies sent from other clients (Sent-folder threading references
+/// harvested by the providers, V2 A2 — matched on row remoteId or stored
+/// Message-ID header).
 public struct HeuristicBriefingClassifier: BriefingClassifying {
     /// Extra context the protocol method cannot carry on `MessageHeader`:
     /// local pins, (when a data source exists) which messages carry a
@@ -106,8 +106,11 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
         }
         // Already replied = already handled: leave "needs reply" even when the
         // message is unread (replies usually follow a read, but the send
-        // audit is the stronger signal either way).
-        if repliedRemoteIds.contains(message.remoteId) {
+        // audit is the stronger signal either way). Gmail rows are keyed by
+        // Gmail id while Sent harvesting yields Message-IDs, so both the row
+        // id and the stored Message-ID header are matched.
+        if repliedRemoteIds.contains(message.remoteId)
+            || message.messageIdHeader.map({ repliedRemoteIds.contains($0) }) == true {
             return (.safeToArchive, .replied)
         }
         let sevenDays: TimeInterval = 7 * 24 * 60 * 60

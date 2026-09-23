@@ -48,13 +48,22 @@ struct RootView: View {
             if let banner = priorityBanner {
                 NoticeBannerView(banner: banner, onDismiss: { dismissPriorityBanner(banner) })
             }
-            Group {
-                switch surface {
-                case .briefing:
-                    BriefingFeedView(onShowAllMessages: { surface = .allMessages })
-                case .allMessages:
-                    MessageListView(onShowBriefing: { surface = .briefing })
-                }
+            // Both surfaces stay alive across switches (ZStack, not a Group
+            // switch): scroll position, selection and navigation path survive
+            // a ⌘0 round-trip. The hidden surface is inert (no hit testing,
+            // no shortcuts, hidden from VoiceOver) and its poller sleeps via
+            // `isVisible`, so keep-alive costs no traffic.
+            ZStack {
+                BriefingFeedView(isVisible: surface == .briefing, onShowAllMessages: { surface = .allMessages })
+                    .opacity(surface == .briefing ? 1 : 0)
+                    .disabled(surface != .briefing)
+                    .allowsHitTesting(surface == .briefing)
+                    .accessibilityHidden(surface != .briefing)
+                MessageListView(isVisible: surface == .allMessages, onShowBriefing: { surface = .briefing })
+                    .opacity(surface == .allMessages ? 1 : 0)
+                    .disabled(surface != .allMessages)
+                    .allowsHitTesting(surface == .allMessages)
+                    .accessibilityHidden(surface != .allMessages)
             }
             .id(accounts.accountId)
         }
@@ -231,6 +240,7 @@ struct RootView: View {
     private var priorityBanner: ErrorBanner? {
         if let banner = undoErrorBanner { return banner }
         if let banner = syncHealthBanner { return banner }
+        if let banner = aiStatusBanner { return banner }
         if let banner = loadErrorBanner { return banner }
         return errorCenter.banner
     }
@@ -310,6 +320,30 @@ struct RootView: View {
         }
     }
 
+    /// Global AI degraded banner (V2 C1): credit exhaustion needs a top-up,
+    /// circuit-open recovers on its own. Retry re-polls the status; the
+    /// credit flag itself clears on the next successful AI call after top-up.
+    private var aiStatusBanner: ErrorBanner? {
+        guard let status = directory.aiStatus, status.configured else { return nil }
+        if status.creditExhausted {
+            return ErrorBanner(
+                severity: .warning,
+                title: l10n.aiCreditTitle,
+                detail: l10n.aiCreditDetail,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.retrySync() }
+            )
+        }
+        if status.circuitOpen {
+            return ErrorBanner(
+                severity: .info,
+                title: l10n.aiCircuitTitle,
+                detail: l10n.aiCircuitDetail
+            )
+        }
+        return nil
+    }
+
     // MARK: - Account menu
 
     @ViewBuilder
@@ -337,6 +371,7 @@ struct RootView: View {
                 Circle()
                     .fill(statusColor(for: directory.active))
                     .frame(width: 8, height: 8)
+                    .accessibilityLabel(syncStatusLabel(for: directory.active))
                 Text(directory.active?.email ?? l10n.accountsMenuHelp)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -367,6 +402,15 @@ struct RootView: View {
         case .ok: return .green
         case .degraded, .error: return .yellow
         case .needsReconnect: return .red
+        }
+    }
+
+    private func syncStatusLabel(for account: ConnectedAccount?) -> String {
+        guard let account, account.isActive else { return l10n.syncStatusInactive }
+        switch account.syncHealth.status {
+        case .ok: return l10n.syncStatusOk
+        case .degraded, .error: return l10n.syncStatusDegraded
+        case .needsReconnect: return l10n.syncStatusNeedsReconnect
         }
     }
 
@@ -439,6 +483,9 @@ struct RootView: View {
             .accessibilityLabel(l10n.surface)
             .help(l10n.surfaceHelp)
         }
+        // Overflow order, most-protected first: compose and search are
+        // primaryAction (last to disappear); the language picker lives in
+        // the ⋯ menu because it is touched once per install, not per triage.
         ToolbarItem(placement: .primaryAction) {
             Button { showCompose = true } label: {
                 Label(l10n.newMessage, systemImage: "square.and.pencil")
@@ -448,21 +495,13 @@ struct RootView: View {
             .help(l10n.newMessageHelp)
         }
         ToolbarItem(placement: .primaryAction) {
-            Picker(l10n.languageLabel, selection: $languageTag) {
-                ForEach(AppLanguage.allCases) { language in
-                    Text(language.displayName).tag(language.rawValue)
-                }
-            }
-            .pickerStyle(.menu)
-            .fixedSize()
-            .accessibilityLabel(l10n.languageLabel)
-        }
-        ToolbarItemGroup(placement: .automatic) {
             Button { showSearch = true } label: {
                 Label(l10n.search, systemImage: "magnifyingglass")
             }
             .keyboardShortcut("f", modifiers: .command)
             .help(l10n.shortcutSearch)
+        }
+        ToolbarItemGroup(placement: .automatic) {
             Menu {
                 Button(l10n.budgetThisMonth) { Task { @MainActor in showUsage = true } }
                     .keyboardShortcut("b", modifiers: [.command])
@@ -477,6 +516,13 @@ struct RootView: View {
                     set: { SoundEffects.isEnabled = $0 }
                 ))
                 .help(l10n.soundEnabledHelp)
+                Divider()
+                Picker(l10n.languageLabel, selection: $languageTag) {
+                    ForEach(AppLanguage.allCases) { language in
+                        Text(language.displayName).tag(language.rawValue)
+                    }
+                }
+                .accessibilityLabel(l10n.languageLabel)
                 Divider()
                 Button(l10n.aboutTitle) { showAbout = true }
             } label: {
