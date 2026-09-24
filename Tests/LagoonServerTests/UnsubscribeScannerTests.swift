@@ -74,6 +74,26 @@ final class UnsubscribeScannerTests: XCTestCase {
         )
     }
 
+    /// The Windows Insider regression: neither the anchor text nor the
+    /// tracking href contains "unsubscribe" — only "leave the program" /
+    /// "stop receiving" language does. Without those keywords the whole
+    /// resolution chain fell through to 422 "未检测到退订链接".
+    func test_bodyLinks_leaveProgramPhrasing() {
+        let html = #"""
+        <p>If you wish to stop receiving Program emails, you will need to leave the program.</p>
+        <a target="_blank" href="https://t135.e-mails.microsoft.com/r/?id=h2,14b8adf7">Find out how to leave the program</a>
+        """#
+        XCTAssertEqual(
+            UnsubscribeScanner.bodyLinks(in: html),
+            ["https://t135.e-mails.microsoft.com/r/?id=h2,14b8adf7"]
+        )
+    }
+
+    func test_bodyLinks_emailPreferencesPhrasing() {
+        let html = #"<a href="https://ex.com/c/123">Manage your email preferences</a>"#
+        XCTAssertEqual(UnsubscribeScanner.bodyLinks(in: html), ["https://ex.com/c/123"])
+    }
+
     // MARK: - SSRF guard
 
     func test_isSafe_rejectsNonHTTPSchemes() async {

@@ -270,9 +270,9 @@ public enum ActionsRoutes {
         let publisher = target.publisher
         let unsubscribeURL = target.url
 
-        let unsubscribed: Bool
+        let outcome: UnsubHit
         do {
-            unsubscribed = try await hitUnsubscribe(url: unsubscribeURL)
+            outcome = try await hitUnsubscribe(url: unsubscribeURL)
         } catch {
             logger.warning("unsubscribe.requestFailed", metadata: [
                 "remoteId": .string(remoteId),
@@ -280,7 +280,16 @@ public enum ActionsRoutes {
             ])
             return RouteJSON.error(.badGateway, "unsubscribe-failed")
         }
-        guard unsubscribed else {
+        switch outcome {
+        case .completed:
+            break
+        case .landingPage:
+            // 2xx, but the final page still offers an unsubscribe entry —
+            // a tracking redirect landed on an instructions page, not a
+            // completed unsubscribe. Recording success here would archive
+            // the mail and lie to the user.
+            return RouteJSON.error(.unprocessableContent, "unsubscribe-page-required")
+        case .failed:
             return RouteJSON.error(.badGateway, "unsubscribe-failed")
         }
 
@@ -671,6 +680,16 @@ public enum ActionsRoutes {
         return url.host
     }
 
+    /// Outcome of hitting an unsubscribe endpoint — 2xx alone is NOT success:
+    /// a tracking link can 302 to a "how to leave" page that merely *offers*
+    /// an unsubscribe entry, and recording that as done would archive the
+    /// mail and leave the user subscribed.
+    enum UnsubHit {
+        case completed
+        case landingPage
+        case failed
+    }
+
     /// Best-effort POST or GET to the unsubscribe endpoint. Many publishers use
     /// a tracking pixel (GET); some use a form (POST). We try POST first.
     ///
@@ -678,7 +697,7 @@ public enum ActionsRoutes {
     /// re-checked against the SSRF guard, because a public URL that 302s to
     /// loopback or 169.254.169.254 would otherwise defeat `isSafe`. An
     /// unsafe hop cancels the task (fail closed → the caller sees 502).
-    private static func hitUnsubscribe(url: URL) async throws -> Bool {
+    private static func hitUnsubscribe(url: URL) async throws -> UnsubHit {
         // ponytail: seam for offline route tests — nil in production; drop
         // it if a real transport abstraction ever becomes necessary.
         if let probe = hitUnsubscribeProbe { return try await probe(url) }
@@ -686,22 +705,33 @@ public enum ActionsRoutes {
         request.httpMethod = "POST"
         request.timeoutInterval = 15
         request.setValue("Lagoon/1.0", forHTTPHeaderField: "User-Agent")
-        let (_, response) = try await guardedSession.data(for: request)
+        let (data, response) = try await guardedSession.data(for: request)
         if let http = response as? HTTPURLResponse, (200..<400).contains(http.statusCode) {
-            return true
+            return classifyHit(data: data)
         }
         var getRequest = URLRequest(url: url)
         getRequest.httpMethod = "GET"
         getRequest.timeoutInterval = 15
-        let (_, getResponse) = try await guardedSession.data(for: getRequest)
+        let (getData, getResponse) = try await guardedSession.data(for: getRequest)
         if let http = getResponse as? HTTPURLResponse, (200..<400).contains(http.statusCode) {
-            return true
+            return classifyHit(data: getData)
         }
-        return false
+        return .failed
+    }
+
+    /// ponytail: a 2xx body is "completed" unless it re-offers unsubscribe
+    /// links (same scanner as the email body). Ceiling: a confirmation page
+    /// with a preferences-center footer link degrades to manual instead of
+    /// auto-completing — honest fallback, not a false success.
+    static func classifyHit(data: Data) -> UnsubHit {
+        guard let body = String(data: data, encoding: .utf8),
+              !UnsubscribeScanner.bodyLinks(in: body).isEmpty
+        else { return .completed }
+        return .landingPage
     }
 
     /// ponytail: seam for offline route tests; nil in production.
-    static var hitUnsubscribeProbe: (@Sendable (URL) async throws -> Bool)?
+    static var hitUnsubscribeProbe: (@Sendable (URL) async throws -> UnsubHit)?
 
     private static let guardedSession: URLSession = {
         let config = URLSessionConfiguration.ephemeral

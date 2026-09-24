@@ -417,6 +417,12 @@ public struct L10n: Sendable, Equatable {
     public var unsubscribeUnavailable: String {
         pick("未检测到退订链接", "No unsubscribe link detected")
     }
+    public var unsubscribePageRequired: String {
+        pick(
+            "退订需要在网页上完成确认，请打开原邮件按指引操作。",
+            "This publisher requires confirmation on the web. Open the original email and follow its instructions."
+        )
+    }
     public var overrideFailed: String { pick("改分组失败：", "Could not change group: ") }
     public var searchFailed: String { pick("搜索失败：", "Search failed: ") }
 

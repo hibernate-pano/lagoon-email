@@ -98,7 +98,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         let recorder = URLRecorder()
         ActionsRoutes.hitUnsubscribeProbe = { url in
             recorder.append(url)
-            return false
+            return .failed
         }
 
         try await TestDatabase.withConnection(cleanup: cleanup(account)) { conn in
@@ -131,7 +131,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         let recorder = URLRecorder()
         ActionsRoutes.hitUnsubscribeProbe = { url in
             recorder.append(url)
-            return true
+            return .completed
         }
 
         try await TestDatabase.withConnection(cleanup: cleanup(account)) { conn in
@@ -188,7 +188,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         let recorder = URLRecorder()
         ActionsRoutes.hitUnsubscribeProbe = { url in
             recorder.append(url)
-            return true
+            return .completed
         }
 
         try await TestDatabase.withConnection(cleanup: cleanup(account)) { conn in
@@ -221,7 +221,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         )
         ActionsRoutes.hitUnsubscribeProbe = { _ in
             XCTFail("mailto must never be fetched")
-            return false
+            return .failed
         }
 
         try await TestDatabase.withConnection(cleanup: cleanup(account)) { conn in
@@ -251,7 +251,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         let recorder = URLRecorder()
         ActionsRoutes.hitUnsubscribeProbe = { url in
             recorder.append(url)
-            return true
+            return .completed
         }
 
         try await TestDatabase.withConnection(cleanup: cleanup(account)) { conn in
@@ -284,7 +284,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         await provider.configureUnsubscribe(rawHeaders: [:], headerError: .messageGone)
         ActionsRoutes.hitUnsubscribeProbe = { _ in
             XCTFail("no candidate may be fetched")
-            return false
+            return .failed
         }
 
         try await TestDatabase.withConnection(cleanup: cleanup(account)) { conn in
@@ -306,5 +306,79 @@ final class UnsubscribeRouteTests: XCTestCase {
                 }
             }
         }
+    }
+
+    /// 2xx whose body still offers unsubscribe links = we only opened an
+    /// instructions page (the Windows Insider case: tracking link → 302 →
+    /// "how to leave" page). Must return unsubscribe-page-required and must
+    /// NOT archive/record success.
+    func test_landingPage_returnsPageRequiredNotSuccess() async throws {
+        let account = makeAccount()
+        let provider = StubMailProvider()
+        await provider.configureUnsubscribe(rawHeaders: [:])
+        let recorder = URLRecorder()
+        ActionsRoutes.hitUnsubscribeProbe = { url in
+            recorder.append(url)
+            return .landingPage
+        }
+
+        try await TestDatabase.withConnection(cleanup: cleanup(account)) { conn in
+            try await AccountStore.upsert(account, credentials: Data([1, 2, 3]), db: conn)
+            try await MessageStore.upsert(
+                self.header(accountId: account.id, remoteId: "u-page"), db: conn
+            )
+            try await MessageStore.mergeUnsubscribeLinks(
+                remoteId: "u-page", accountId: account.id,
+                links: ["https://8.8.8.8/unsubscribe?u=1"], db: conn
+            )
+            let app = Application(router: Self.makeRouter(provider: provider, db: conn))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/u-page/unsubscribe?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .unprocessableContent, Self.body(of: response))
+                    XCTAssertTrue(Self.body(of: response).contains("unsubscribe-page-required"))
+                }
+            }
+            let row = try await MessageStore.find(
+                remoteId: "u-page", accountId: account.id, db: conn
+            )
+            XCTAssertEqual(row?.isArchived, false, "an opened page must not archive the mail")
+            let actions = try await conn.query(
+                "SELECT count(*) AS n FROM ai_actions WHERE account_id = $1 AND kind = 'unsubscribe'",
+                [PostgresData(uuid: account.id)]
+            ).get()
+            let n = try actions.rows.first?.makeRandomAccess()["n"].decode(Int.self)
+            XCTAssertEqual(n, 0, "no success may be recorded for a landing page")
+        }
+    }
+
+    /// classifyHit: empty/plain 2xx bodies complete; a body that re-offers
+    /// unsubscribe links is only a landing page; non-UTF8 data completes.
+    func test_classifyHit_distinguishesConfirmationFromLandingPage() {
+        XCTAssertEqual(
+            ActionsRoutes.classifyHit(data: Data()), .completed,
+            "empty ack (one-click endpoint) is success"
+        )
+        XCTAssertEqual(
+            ActionsRoutes.classifyHit(data: Data("OK".utf8)), .completed
+        )
+        XCTAssertEqual(
+            ActionsRoutes.classifyHit(
+                data: Data(#"<p>You have been unsubscribed.</p>"#.utf8)
+            ), .completed,
+            "confirmation page without a new unsubscribe entry is success"
+        )
+        XCTAssertEqual(
+            ActionsRoutes.classifyHit(
+                data: Data(#"<a href="https://ex.com/leave">Find out how to leave the program</a>"#.utf8)
+            ), .landingPage,
+            "a page that still offers an unsubscribe entry is not a completed unsubscribe"
+        )
+        XCTAssertEqual(
+            ActionsRoutes.classifyHit(data: Data([0xff, 0xfe, 0x00, 0x80])), .completed,
+            "non-text bodies cannot re-offer links"
+        )
     }
 }

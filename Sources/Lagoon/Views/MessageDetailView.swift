@@ -931,6 +931,14 @@ struct MessageDetailView: View {
                         actionLabel: l10n.openOriginal,
                         action: { [self] in self.openOriginalMail() }
                     )
+                } else if code == "unsubscribe-page-required" {
+                    actionBanner = ErrorBanner(
+                        severity: .error,
+                        title: l10n.unsubscribeFailedTitle,
+                        detail: l10n.unsubscribePageRequired,
+                        actionLabel: l10n.openOriginal,
+                        action: { [self] in self.openOriginalMail() }
+                    )
                 } else if code == "unsubscribe-unavailable" {
                     actionBanner = ErrorBanner(
                         severity: .error,

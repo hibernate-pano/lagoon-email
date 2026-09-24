@@ -19,7 +19,8 @@ public enum UnsubscribeScanner {
     /// are case-insensitive via lowercasing; Chinese has no case.
     static let keywords = [
         "unsubscribe", "un-subscribe", "opt-out", "optout", "opt out",
-        "list-unsubscribe",
+        "list-unsubscribe", "stop receiving", "leave the program",
+        "email preferences", "contact preferences",
         "退订", "退訂", "取消订阅", "取消訂閱", "撤销订阅", "不再接收", "停止接收",
     ]
 
