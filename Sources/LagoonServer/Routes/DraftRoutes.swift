@@ -103,8 +103,9 @@ public enum DraftRoutes {
             return errorResponse(.badGateway, "ai-error", logger: logger, error: error)
         }
 
+        let draft: DraftReply
         do {
-            _ = try await DraftReplyStore.create(
+            draft = try await DraftReplyStore.create(
                 accountId: accountId, remoteId: remoteId, variants: variants, db: db
             )
             _ = try await AIActionStore.record(
@@ -116,12 +117,12 @@ public enum DraftRoutes {
         } catch {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
-        do {
-            let drafts = try await DraftReplyStore.list(accountId: accountId, remoteId: remoteId, db: db)
-            return RouteJSON.response(DraftListResponse(drafts: drafts))
-        } catch {
-            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
-        }
+        // Answer with the bare DraftReply APIClient.generateDrafts decodes.
+        // This used to re-list every draft for the message inside a
+        // server-local {"drafts":[…]} envelope, so the 200 body never matched
+        // the client's type: generation succeeded (rows + action recorded)
+        // while the UI reported "未能读取数据，因为数据丢失" on every click.
+        return RouteJSON.response(draft)
     }
 
     private static func chooseHandler(

@@ -303,6 +303,52 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(queryValue("accountId", in: request), accountId.uuidString)
     }
 
+    /// POST /draft answers with a bare DraftReply (DraftRouteTests pins the
+    /// server side). Regression: the server once wrapped it in
+    /// {"drafts":[…]} — every generate then failed client-side with
+    /// DecodingError "未能读取数据，因为数据丢失" even though the LLM call,
+    /// the draft row and the audit row had all succeeded.
+    func test_generateDrafts_decodesBareDraftReply() async throws {
+        let accountId = UUID()
+        let body = Data("""
+        {"id":42,"accountId":"\(accountId.uuidString)","remoteId":"msg-1",
+         "variants":["a","b","c"],"chosenVariant":null,
+         "createdAt":"2026-09-24T09:02:31Z"}
+        """.utf8)
+        stub(status: 200, body: body)
+
+        let draft = try await makeClient().generateDrafts(remoteId: "msg-1", accountId: accountId)
+
+        XCTAssertEqual(draft.id, 42)
+        XCTAssertEqual(draft.variants, ["a", "b", "c"])
+        XCTAssertNil(draft.chosenVariant)
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/api/messages/msg-1/draft")
+        XCTAssertEqual(queryValue("accountId", in: request), accountId.uuidString)
+    }
+
+    /// The old envelope shape must fail loudly here — if this ever starts
+    /// passing, the two sides have drifted apart again and the UI is about
+    /// to show a decode error to the user.
+    func test_generateDrafts_oldEnvelopeShape_doesNotDecode() async throws {
+        let accountId = UUID()
+        let body = Data("""
+        {"drafts":[{"id":42,"accountId":"\(accountId.uuidString)","remoteId":"msg-1",
+          "variants":["a"],"chosenVariant":null,"createdAt":"2026-09-24T09:02:31Z"}]}
+        """.utf8)
+        stub(status: 200, body: body)
+
+        do {
+            _ = try await makeClient().generateDrafts(remoteId: "msg-1", accountId: accountId)
+            XCTFail("the drafts envelope must not decode as a bare DraftReply")
+        } catch is DecodingError {
+            // expected — and this is exactly what the user saw as
+            // "未能读取数据，因为数据丢失".
+        }
+    }
+
     func test_setPinned_postsAndSendsPinnedQueryForBothValues() async throws {
         let accountId = UUID()
         stub(status: 204, body: Data())

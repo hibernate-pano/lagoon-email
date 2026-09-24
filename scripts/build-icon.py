@@ -4,9 +4,9 @@
 Produces a `.iconset/` folder with the 10 PNG sizes macOS expects, then
 runs `iconutil` to fold them into `Support/Lagoon.icns`.
 
-Design: deep teal → ocean blue rounded square with three concentric
-arcs (a calm ripple) in the lower-right. Single warm accent on the
-outermost arc. Flat / near-flat — no glossy gradients on the mark.
+Design: ivory rounded square with the ripple drawn in lagoon teal
+(plus the warm accent on the outermost arc) — a light icon that reads
+cleanly against both light and dark Finder backgrounds.
 
 Run from the repo root:
     python3 scripts/build-icon.py
@@ -42,10 +42,11 @@ SIZES: list[tuple[str, int]] = [
     ("512x512@2x", 1024),
 ]
 
-# Brand palette — deep teal → ocean blue gradient + single accent.
-BG_TOP = (14, 58, 74)        # #0E3A4A
-BG_BOTTOM = (31, 111, 132)   # #1F6F84
-ACCENT = (232, 163, 92)      # #E8A35C (sundown orange)
+# Brand palette — ivory ground, teal mark (light icon, not dark).
+BG_TOP = (255, 255, 255)      # #FFFFFF pure white at the top
+BG_BOTTOM = (253, 248, 238)   # #FDF8EE ivory at the bottom
+ACCENT = (232, 163, 92)       # #E8A35C (sundown orange)
+TEAL = (31, 111, 132)         # #1F6F84 — the mark colour on ivory
 WHITE = (255, 255, 255)
 
 
@@ -54,7 +55,7 @@ def lerp(a: int, b: int, t: float) -> int:
 
 
 def vertical_gradient(size: int) -> Image.Image:
-    """Deep teal → ocean blue gradient that fills the entire square."""
+    """White → ivory gradient that fills the entire square."""
     img = Image.new("RGB", (size, size))
     px = img.load()
     for y in range(size):
@@ -80,8 +81,8 @@ def rounded_mask(size: int) -> Image.Image:
 
 def ripple_arcs(size: int) -> Image.Image:
     """Three concentric arcs (a calm ripple), lower-right of the icon.
-    Drawn in white at varying opacities for the inner two; the outer
-    arc uses the accent colour so it reads as 'sun on water'.
+    Drawn in teal at varying opacities for the inner two; the outer
+    arc keeps the accent colour so it reads as 'sun on water'.
 
     Coordinates are normalised to size so the same drawing scales to
     every PNG dimension without per-size logic.
@@ -94,13 +95,13 @@ def ripple_arcs(size: int) -> Image.Image:
     # kissing the corner and the resulting .icns looked cropped.
     cx = int(size * 0.55)
     cy = int(size * 0.60)
-    # Three radii, in order: outermost (accent), middle (white 70%),
-    # innermost (white 90%). Stroke width scales with size.
+    # Three radii, in order: outermost (accent), middle (teal 70%),
+    # innermost (teal 95%). Stroke width scales with size.
     stroke = max(1, int(size * 0.022))
     rings = [
         (int(size * 0.27), ACCENT + (255,), stroke),
-        (int(size * 0.19), WHITE + (180,), max(1, stroke - 1)),
-        (int(size * 0.11), WHITE + (235,), max(1, stroke - 1)),
+        (int(size * 0.19), TEAL + (175,), max(1, stroke - 1)),
+        (int(size * 0.11), TEAL + (240,), max(1, stroke - 1)),
     ]
     for radius, color, width in rings:
         bbox = (cx - radius, cy - radius, cx + radius, cy + radius)
