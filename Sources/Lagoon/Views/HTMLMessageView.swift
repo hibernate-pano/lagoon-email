@@ -2,6 +2,29 @@ import SwiftUI
 import WebKit
 import LagoonKit
 
+/// WKWebView that forwards scroll gestures up the responder chain, making
+/// the outer SwiftUI ScrollView the single scroller. Size measurement is
+/// the primary path (the frame matches content, so there is nothing to
+/// scroll inside); this subclass is the guarantee that the floor height
+/// shown *before* measurement never becomes a hidden nested scroller —
+/// hiding the scrollbar indicator alone does not block the wheel.
+///
+/// `forwardsScrollWheel = false` restores stock behaviour, used by
+/// `HTMLMessageView.restoreEmbeddedScrolling` when height measurement
+/// fails permanently: content then degrades to visible internal scrolling
+/// instead of clipping behind an invisible wall.
+final class PassThroughScrollWebView: WKWebView {
+    var forwardsScrollWheel = true
+
+    override func scrollWheel(with event: NSEvent) {
+        if forwardsScrollWheel, let next = nextResponder {
+            next.scrollWheel(with: event)
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
+}
+
 /// Renders an HTML email body inside a sandboxed `WKWebView` (spec §3.3).
 ///
 /// **Security:**
@@ -26,7 +49,7 @@ struct HTMLMessageView: NSViewRepresentable {
     ///
     /// `WKWebView` has no intrinsic content size: left to itself it
     /// collapses to whatever `minHeight` the caller set and scrolls
-    /// internally, so a long email lived in a 200pt-tall box with its own
+    /// internally, so a long email lived in a floor-height box with its own
     /// scrollbar while the surrounding page had empty space below. The
     /// observed `NSScrollView.contentSize` is the document size, which is
     /// what the outer SwiftUI `ScrollView` needs to lay out the whole
@@ -42,10 +65,40 @@ struct HTMLMessageView: NSViewRepresentable {
         // M1.6: mail has no legitimate need for JS. Disabling is the only
         // way to neutralize a `<script>` tag or `javascript:` href.
         config.defaultWebpagePreferences.allowsContentJavaScript = false
-        let view = WKWebView(frame: .zero, configuration: config)
+        let view = PassThroughScrollWebView(frame: .zero, configuration: config)
         view.setValue(false, forKey: "drawsBackground")
         view.navigationDelegate = context.coordinator
+        // Single-scroller contract, asserted once here: gestures pass
+        // through to the outer SwiftUI ScrollView (subclass) and the
+        // internal bar indicators are hidden. With the parent sizing the
+        // frame to measured content there is then nothing inside to
+        // scroll at all — until measurement fails, which is what the
+        // restore fallback in `didFinish` is for.
+        Self.disableEmbeddedScrolling(in: view)
         return view
+    }
+
+    /// Hides the WebView's internal scrollbar *indicators*. Hiding the bar
+    /// does not block the gesture — blocking is the subclass's job — the
+    /// two together are the single-scroller contract. Asserted once at
+    /// `makeNSView`: re-asserting later would fight the measurement-failure
+    /// fallback in `restoreEmbeddedScrolling` (indicators off + gestures
+    /// no longer forwarded = scrolling with no visible bar, again).
+    static func disableEmbeddedScrolling(in webView: WKWebView) {
+        guard let scrollView = Coordinator.findScrollView(in: webView) else { return }
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+    }
+
+    /// Escape hatch for permanent height-measurement failure: gestures stop
+    /// passing through and the vertical bar reappears, so content stays
+    /// reachable instead of clipped at the floor.
+    static func restoreEmbeddedScrolling(in webView: WKWebView) {
+        if let view = webView as? PassThroughScrollWebView {
+            view.forwardsScrollWheel = false
+        }
+        guard let scrollView = Coordinator.findScrollView(in: webView) else { return }
+        scrollView.hasVerticalScroller = true
     }
 
     /// Reload the WebView when the underlying HTML or inline-image map
@@ -84,6 +137,9 @@ struct HTMLMessageView: NSViewRepresentable {
             guard let scrollView = Self.findScrollView(in: webView),
                   let documentView = scrollView.documentView
             else { return }
+            // Scroller flags are set once in `makeNSView` — re-asserting
+            // here would fight `restoreEmbeddedScrolling`'s fallback after
+            // a permanent measurement failure.
             if observedDocumentView === documentView { return }
             if let frameObserver {
                 NotificationCenter.default.removeObserver(frameObserver)
@@ -126,7 +182,7 @@ struct HTMLMessageView: NSViewRepresentable {
         /// hides it, the search returns nil and the caller keeps whatever
         /// height it last had — the body renders at its previous size
         /// rather than crashing or collapsing.
-        private static func findScrollView(in view: NSView) -> NSScrollView? {
+        fileprivate static func findScrollView(in view: NSView) -> NSScrollView? {
             if let scrollView = view as? NSScrollView { return scrollView }
             for subview in view.subviews {
                 if let found = findScrollView(in: subview) { return found }
@@ -171,6 +227,16 @@ struct HTMLMessageView: NSViewRepresentable {
         /// frame-changed notifications as images decode and fonts settle.
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             observeDocumentHeight(of: webView)
+            // Measurement can fail permanently (WebKit's private view
+            // hierarchy changed, width guard never satisfied). The outer
+            // frame would then sit on the floor with gestures passing
+            // through — invisible clipping, worse than the original
+            // nested scrollbar. After a grace period with no height,
+            // restore the WebView's own scrolling: ugly, but visible.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak webView] in
+                guard let webView, self.contentHeight.wrappedValue <= 1 else { return }
+                HTMLMessageView.restoreEmbeddedScrolling(in: webView)
+            }
         }
     }
 
@@ -211,6 +277,10 @@ struct HTMLMessageView: NSViewRepresentable {
         context.coordinator.html = withCSS
         context.coordinator.resolvedCidCount = nextCidCount
         webView.loadHTMLString(withCSS, baseURL: nil)
+        // Measurement starts in `didFinish`, not here: until the load
+        // commits, `scrollView.documentView` is still the previous
+        // document (or the blank first-load one), so an early observation
+        // would attach to the wrong view and report a useless height.
     }
 
     /// Prepends `fluidCSS` to whatever `<head>` (or implicit head) the email

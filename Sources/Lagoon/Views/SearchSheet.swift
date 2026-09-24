@@ -88,6 +88,10 @@ struct SearchSheet: View {
                             path = next.map { [$0] } ?? []
                         }
                     )
+                    // Same reset contract as the BriefingFeed/MessageList
+                    // entries: without this the destination reuses the
+                    // previous message's @State (stale body, stale height).
+                    .id(remoteId)
                 }
             }
         }

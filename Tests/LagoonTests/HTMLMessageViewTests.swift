@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 @testable import Lagoon
 
 /// Tests for `HTMLMessageView`'s head-level CSS injection. The CSS makes
@@ -88,5 +89,63 @@ final class HTMLMessageViewTests: XCTestCase {
         XCTAssertTrue(out.contains("data:"), "cid: must be replaced with a data: URL")
         XCTAssertFalse(out.contains("cid:logo@example.com"), "original cid: must be gone")
         XCTAssertTrue(out.contains("max-width: 100%"), "fluid CSS must still be injected")
+    }
+
+    // MARK: - Single-scroller contract (PassThroughScrollWebView)
+
+    /// The core guarantee: wheel events pass through to the responder
+    /// chain instead of being consumed by the WebView. Guards the pair of
+    /// regressions behind "nested scroll box" — gestures bouncing back
+    /// after a measurement hiccup, and gestures silently swallowed.
+    func test_scrollWheel_forwardsUpTheResponderChain() {
+        let container = ScrollCaptureView()
+        let webView = PassThroughScrollWebView(frame: .zero)
+        container.addSubview(webView)
+        defer { webView.removeFromSuperview() }
+
+        XCTAssertFalse(container.captured, "sanity: nothing captured before the event")
+        webView.scrollWheel(with: Self.wheelEvent)
+        XCTAssertTrue(
+            container.captured,
+            "gesture must reach the responder chain (the outer ScrollView)"
+        )
+    }
+
+    /// Fallback mode (measurement failed): the WebView keeps its own
+    /// scrolling — the event must NOT be forwarded away.
+    func test_scrollWheel_fallbackStopsForwarding() {
+        let container = ScrollCaptureView()
+        let webView = PassThroughScrollWebView(frame: .zero)
+        webView.forwardsScrollWheel = false
+        container.addSubview(webView)
+        defer { webView.removeFromSuperview() }
+
+        webView.scrollWheel(with: Self.wheelEvent)
+        XCTAssertFalse(container.captured, "fallback must keep gestures inside the WebView")
+    }
+
+    private static let wheelEvent: NSEvent = {
+        // `NSEvent.mouseEvent(with:)` rejects .scrollWheel (asserts the
+        // mouse mask), and the otherEvent factory's Swift overlay is
+        // finicky across SDKs — build a real scroll CGEvent and wrap it.
+        let cg = CGEvent(
+            scrollWheelEvent2Source: nil,
+            units: .pixel,
+            wheelCount: 1,
+            wheel1: -10,
+            wheel2: 0,
+            wheel3: 0
+        )!
+        return NSEvent(cgEvent: cg)!
+    }()
+}
+
+/// Test double that records wheel events reaching it via the responder
+/// chain — stands in for the outer SwiftUI ScrollView in the app.
+private final class ScrollCaptureView: NSView {
+    var captured = false
+    override func scrollWheel(with event: NSEvent) {
+        captured = true
+        super.scrollWheel(with: event)
     }
 }

@@ -135,13 +135,18 @@ struct MessageDetailView: View {
                 bodySection
             }
             .padding(24)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            // Reading column: metadata + summary + body all share one width so
-            // they look like a single coherent strip rather than a narrow header
-            // over a stretched-out page. On narrow windows this is a no-op
-            // (the VStack already fills); on wide windows the column stops at
-            // `readingColumnWidth` and centers via the inner alignment.
-            .frame(maxWidth: Self.readingColumnWidth, alignment: .leading)
+            // Frame order is load-bearing — a frame probe caught the wrong
+            // order shipping once: `.frame(maxWidth: 900, alignment:)`
+            // only arranges children *inside* the 900pt box, and this
+            // VStack always fills that box, so the alignment can never
+            // move the column. Cap first (inner frame), then fill the
+            // window and center the capped column (outer frame). The cap
+            // itself stays: full-bleed text on ultrawide hurts readability
+            // — the fix is symmetric whitespace, not wider text. `.top` =
+            // horizontal center + vertical pin (height is unbounded inside
+            // the ScrollView, so the vertical half is belt-and-braces).
+            .frame(maxWidth: Self.readingColumnWidth)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .navigationTitle(subjectText)
         .toolbar { toolbarContent }
@@ -345,21 +350,43 @@ struct MessageDetailView: View {
     }
 
     private var metadata: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(subjectText).font(.title2).bold().textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-            Text(fromDisplay).font(.callout).textSelection(.enabled)
-            if let toDisplay { Text(l10n.recipient(toDisplay)).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
-            if let ccDisplay { Text("\(l10n.replyCc): \(ccDisplay)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
-            if let receivedAt {
-                Text(receivedAt.formatted(date: .complete, time: .shortened))
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            if let snippet = header?.snippet ?? messageBody?.text {
-                Text(snippet.prefix(140)).font(.caption).foregroundStyle(.secondary)
-            }
-        }
+        // Header card: same GroupBox language as the AI summary below, so
+        // the top of the page looks designed instead of naked text on glass.
         // Width comes from the parent `body`'s reading-column frame — no
         // need to repeat it here.
+        GroupBox {
+            HStack(alignment: .top, spacing: 12) {
+                // Sender not loaded yet (body still in flight, header nil):
+                // skip the avatar — SenderAvatar's "?" fallback reads as
+                // an error state; this is just "not loaded yet".
+                if !senderEmail.isEmpty {
+                    SenderAvatar(email: senderEmail, displayName: senderName)
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(subjectText).font(.title2).bold().textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(fromDisplay).font(.callout).textSelection(.enabled)
+                    if let toDisplay { Text(l10n.recipient(toDisplay)).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+                    if let ccDisplay { Text("\(l10n.replyCc): \(ccDisplay)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+                    if let receivedAt {
+                        Text(receivedAt.formatted(date: .complete, time: .shortened))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if let snippet = header?.snippet ?? messageBody?.text {
+                        Text(snippet.prefix(140)).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Raw sender identity for the avatar (fromDisplay folds name+address
+    /// into one string, which the avatar cannot use).
+    private var senderEmail: String {
+        messageBody?.fromAddress ?? header?.fromAddress ?? ""
+    }
+
+    private var senderName: String? {
+        messageBody?.fromName ?? header?.fromName
     }
 
     private var subjectText: String {
@@ -473,16 +500,18 @@ struct MessageDetailView: View {
         if let html = body.html, !html.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 // The WebView reports its rendered document height back so
-                // this frame matches it exactly. Without the measured
-                // height the WebView collapses to `minHeight` and scrolls
-                // inside itself while the page below stays empty — the
-                // "body doesn't fill the window" bug.
+                // this frame matches content exactly — one outer scroller.
+                // The 80pt floor covers only the layout pass before the
+                // first measurement lands. If measurement fails
+                // *permanently*, HTMLMessageView restores its own internal
+                // scrolling after a 1s grace period rather than clipping
+                // content behind an invisible wall.
                 HTMLMessageView(
                     html: html,
                     attachmentsByCid: inlineImageData,
                     contentHeight: $htmlContentHeight
                 )
-                .frame(height: max(200, htmlContentHeight))
+                .frame(height: max(80, htmlContentHeight))
                 if isLoadingInlineImages {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
@@ -503,15 +532,14 @@ struct MessageDetailView: View {
     }
 
     private func attachmentsSection(_ attachments: [Attachment]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Divider().padding(.vertical, 4)
-            Text(l10n.attachments)
-                .font(.headline)
-            ForEach(attachments) { attachment in
+        GroupBox {
+            ForEach(Array(attachments.enumerated()), id: \.element.id) { index, attachment in
+                if index > 0 { Divider() }
                 attachmentRow(attachment)
             }
+        } label: {
+            Label(l10n.attachments, systemImage: "paperclip")
         }
-        .padding(.top, 8)
     }
 
     @ViewBuilder
