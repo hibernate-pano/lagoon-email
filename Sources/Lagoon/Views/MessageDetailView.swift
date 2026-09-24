@@ -152,6 +152,11 @@ struct MessageDetailView: View {
         .toolbar { toolbarContent }
         .noticeBanner($actionBanner)
         .noticeBanner($pinBanner)
+        .onAppear {
+            if ProcessInfo.processInfo.environment["LAGOON_OPEN_MESSAGE"] != nil {
+                BriefingFeedView.debugLog("detail mounted remoteId=\(remoteId)")
+            }
+        }
         .task {
             await loadBody()
             if bodyError == nil {

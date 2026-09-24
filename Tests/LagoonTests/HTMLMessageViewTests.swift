@@ -1,5 +1,7 @@
 import XCTest
 import AppKit
+import SwiftUI
+import WebKit
 @testable import Lagoon
 
 /// Tests for `HTMLMessageView`'s head-level CSS injection. The CSS makes
@@ -138,6 +140,45 @@ final class HTMLMessageViewTests: XCTestCase {
         )!
         return NSEvent(cgEvent: cg)!
     }()
+
+    // MARK: - Measurement without the private scroll-view hierarchy
+
+    /// macOS 26/27 removed `WKWebView`'s internal `NSScrollView` from the
+    /// AppKit hierarchy (probed: `WKWebView → WKFlippedView`, no scroll
+    /// view). The old DFS-based measurement found nothing, the height
+    /// binding stayed 0, and every body collapsed to the 80pt floor with
+    /// the fallback inner scrollbar — the "one line + slider, screen
+    /// mostly blank" bug. The evalJS polling channel must report the real
+    /// document height on any OS.
+    @MainActor
+    func test_measurementReportsHeightWithoutPrivateScrollView() {
+        let box = HeightBox()
+        let coordinator = HTMLMessageView.Coordinator(
+            contentHeight: Binding(get: { box.value }, set: { box.value = $0 })
+        )
+        let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 900, height: 80))
+        webView.navigationDelegate = coordinator
+        webView.loadHTMLString(
+            "<html><body>" + String(repeating: "line of mail body<br>", count: 60) + "</body></html>",
+            baseURL: nil
+        )
+        // Pump the main run loop so the load finishes, didFinish fires, and
+        // the measurement task's @MainActor work runs between samples.
+        // First honest sample lands at ~150ms debounce + 250ms poll.
+        let deadline = Date().addingTimeInterval(10)
+        while box.value <= 500, Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
+        }
+        XCTAssertGreaterThan(
+            box.value, 500,
+            "height never reported — the body would collapse to the 80pt floor"
+        )
+    }
+}
+
+/// Test-local binding storage for the measurement test.
+private final class HeightBox {
+    var value: CGFloat = 0
 }
 
 /// Test double that records wheel events reaching it via the responder

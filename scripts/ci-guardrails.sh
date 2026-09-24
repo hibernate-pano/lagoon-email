@@ -72,6 +72,26 @@ for my $file (@ARGV) {
                 push @lits, { line => line_of($src, $open_end), text => $1,
                               s => $open_end, e => pos($src) };
             } else { last; }
+        } elsif ($src =~ /\G(\#+)"/gc) {   # raw string #"…"# / ##"…"##
+            # Bound the literal by the matching quote plus hash run so a
+            # quote inside a regex character class cannot desynchronize
+            # the scan — a desync swallows following code lines and turns
+            # their identifiers (e.g. seen.insert) into false SQL hits.
+            my $hashes = $1;
+            my $open_end = pos($src);
+            my $text = '';
+            my $closed = 0;
+            while (pos($src) < length($src)) {
+                if ($src =~ /\G(\.)/gcs) { $text .= $1; next; }        # escaped char keeps backslash (\#( interpolation )
+                if ($src =~ /\G"\Q$hashes\E(?!#)/gc) { $closed = 1; last; }
+                my $ch = substr($src, pos($src), 1);
+                pos($src) = pos($src) + 1;
+                $text .= $ch;
+            }
+            if ($closed) {
+                push @lits, { line => line_of($src, $open_end), text => $text,
+                              s => $open_end, e => pos($src) };
+            } else { last; }
         } elsif ($src =~ /\G"/gc) { # single-line string open
             my $open_end = pos($src);
             my $text = '';

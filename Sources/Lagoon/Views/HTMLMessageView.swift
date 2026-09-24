@@ -15,6 +15,19 @@ import LagoonKit
 /// instead of clipping behind an invisible wall.
 final class PassThroughScrollWebView: WKWebView {
     var forwardsScrollWheel = true
+    /// Fired when this view's width changes. A window resize reflows the
+    /// document, so its height changes with it and the parent's frame must
+    /// follow — measurement polling otherwise only runs right after a load.
+    var onWidthChange: (() -> Void)?
+    private var lastMeasuredWidth: CGFloat = 0
+
+    override func layout() {
+        super.layout()
+        if bounds.width > 50, abs(bounds.width - lastMeasuredWidth) > 0.5 {
+            lastMeasuredWidth = bounds.width
+            onWidthChange?()
+        }
+    }
 
     override func scrollWheel(with event: NSEvent) {
         if forwardsScrollWheel, let next = nextResponder {
@@ -51,9 +64,10 @@ struct HTMLMessageView: NSViewRepresentable {
     /// collapses to whatever `minHeight` the caller set and scrolls
     /// internally, so a long email lived in a floor-height box with its own
     /// scrollbar while the surrounding page had empty space below. The
-    /// observed `NSScrollView.contentSize` is the document size, which is
-    /// what the outer SwiftUI `ScrollView` needs to lay out the whole
-    /// message (metadata + body + attachments) as one scrollable column.
+    /// Coordinator polls `scrollHeight` via `startMeasuring` and writes the
+    /// document height here — what the outer SwiftUI `ScrollView` needs to
+    /// lay out the whole message (metadata + body + attachments) as one
+    /// scrollable column.
     @Binding var contentHeight: CGFloat
 
     func makeCoordinator() -> Coordinator {
@@ -75,6 +89,11 @@ struct HTMLMessageView: NSViewRepresentable {
         // scroll at all — until measurement fails, which is what the
         // restore fallback in `didFinish` is for.
         Self.disableEmbeddedScrolling(in: view)
+        let coordinator = context.coordinator
+        view.onWidthChange = { [weak view] in
+            guard let view else { return }
+            coordinator.startMeasuring(on: view)
+        }
         return view
     }
 
@@ -113,8 +132,7 @@ struct HTMLMessageView: NSViewRepresentable {
         var html: String = ""
         var resolvedCidCount: Int = 0
         private let contentHeight: Binding<CGFloat>
-        private var frameObserver: NSObjectProtocol?
-        private weak var observedDocumentView: NSView?
+        private var measureTask: Task<Void, Never>?
 
         init(contentHeight: Binding<CGFloat>) {
             self.contentHeight = contentHeight
@@ -122,58 +140,49 @@ struct HTMLMessageView: NSViewRepresentable {
         }
 
         /// SwiftUI asks for the height; WebKit owns it. We bridge them by
-        /// watching the WebView's internal document view's frame.
+        /// asking the page for `scrollHeight` through `evaluateJavaScript`.
         ///
-        /// macOS does not expose `WKWebView.scrollView` (that is the iOS
-        /// surface) and `NSScrollView.contentSize` is the *visible* area,
-        /// not the document size, so neither helps. The document view's
-        /// frame is the rendered document height — exactly what the outer
-        /// SwiftUI `ScrollView` needs to lay the whole message out as one
-        /// column.
+        /// The previous channel — DFS for the WebView's private
+        /// `NSScrollView` and observing its document view's frame — worked
+        /// through macOS 15, but on macOS 26/27 that hierarchy is gone
+        /// (probed: `WKWebView → WKFlippedView`, no scroll view), so
+        /// measurement silently never ran and every body collapsed to the
+        /// 80pt floor with the fallback inner scrollbar restored. The JS
+        /// expression is a fixed trusted string; `allowsContentJavaScript
+        /// = false` still blocks the page's own scripts (probed: page-set
+        /// globals stay `undefined` while this API call answers).
         ///
-        /// Re-attached after every navigation because `loadHTMLString`
-        /// replaces the document view.
-        func observeDocumentHeight(of webView: WKWebView) {
-            guard let scrollView = Self.findScrollView(in: webView),
-                  let documentView = scrollView.documentView
-            else { return }
-            // Scroller flags are set once in `makeNSView` — re-asserting
-            // here would fight `restoreEmbeddedScrolling`'s fallback after
-            // a permanent measurement failure.
-            if observedDocumentView === documentView { return }
-            if let frameObserver {
-                NotificationCenter.default.removeObserver(frameObserver)
-            }
-            observedDocumentView = documentView
-            documentView.postsFrameChangedNotifications = true
-            frameObserver = NotificationCenter.default.addObserver(
-                forName: NSView.frameDidChangeNotification,
-                object: documentView,
-                queue: .main
-            ) { [weak self] _ in
-                // `queue: .main` guarantees the main thread; hopping
-                // through a MainActor task keeps the compiler happy
-                // without `assumeIsolated`'s hard crash if that ever
-                // stops being true.
-                Task { @MainActor in
-                    self?.reportHeight()
+        /// Polled rather than one-shot: images decode and fonts settle
+        /// after `didFinish`, so a height that stops changing early can
+        /// still grow — stopping after a few stable polls clipped
+        /// late-loading images. The loop therefore runs a fixed ~10s
+        /// window (40 × 250ms) after a 150ms debounce; a window resize
+        /// reflows the document and `onWidthChange` restarts the window.
+        func startMeasuring(on webView: WKWebView) {
+            measureTask?.cancel()
+            measureTask = Task { @MainActor [weak webView] in
+                // Debounce: a live resize delivers one layout() per frame —
+                // wait for the burst to settle before the first sample.
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                for _ in 0..<40 {
+                    guard !Task.isCancelled, let webView else { return }
+                    if let height = await Self.documentHeight(of: webView), height > 1,
+                       abs(self.contentHeight.wrappedValue - height) > 0.5 {
+                        self.contentHeight.wrappedValue = height
+                    }
+                    try? await Task.sleep(nanoseconds: 250_000_000)
                 }
             }
-            reportHeight()
         }
 
-        private func reportHeight() {
-            guard let documentView = observedDocumentView else { return }
-            // A document laid out at zero width reports a nonsense height
-            // (one character per line). Wait for SwiftUI to give the
-            // WebView a real width; the frame-changed notification fires
-            // again once it does.
-            guard documentView.frame.width > 50 else { return }
-            let height = documentView.frame.height
-            guard height > 1 else { return }
-            if abs(contentHeight.wrappedValue - height) > 0.5 {
-                contentHeight.wrappedValue = height
-            }
+        /// `scrollHeight` of the taller of documentElement/body, or nil on
+        /// any evaluation failure (empty document before the first load,
+        /// unresponsive page process) — the caller treats nil as "not
+        /// measured yet" and keeps polling.
+        private static func documentHeight(of webView: WKWebView) async -> CGFloat? {
+            let expression = "Math.max(document.documentElement?.scrollHeight ?? 0, document.body?.scrollHeight ?? 0)"
+            guard let result = try? await webView.evaluateJavaScript(expression) else { return nil }
+            return (result as? NSNumber).map { CGFloat($0.doubleValue) }
         }
 
         /// Depth-first search for the first `NSScrollView` under `view`.
@@ -190,11 +199,6 @@ struct HTMLMessageView: NSViewRepresentable {
             return nil
         }
 
-        deinit {
-            if let frameObserver {
-                NotificationCenter.default.removeObserver(frameObserver)
-            }
-        }
 
         /// Open links in the user's default browser instead of navigating
         /// the WebView. We still allow the *initial* `loadHTMLString` (no
@@ -226,10 +230,10 @@ struct HTMLMessageView: NSViewRepresentable {
         /// first `reportHeight()` fires here; later ones come from the
         /// frame-changed notifications as images decode and fonts settle.
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            observeDocumentHeight(of: webView)
-            // Measurement can fail permanently (WebKit's private view
-            // hierarchy changed, width guard never satisfied). The outer
-            // frame would then sit on the floor with gestures passing
+            startMeasuring(on: webView)
+            // Measurement can fail permanently (evaluateJavaScript never
+            // answers: empty document, unresponsive page process). The
+            // outer frame would then sit on the floor with gestures passing
             // through — invisible clipping, worse than the original
             // nested scrollbar. After a grace period with no height,
             // restore the WebView's own scrolling: ugly, but visible.

@@ -13,6 +13,11 @@ actor StubMailProvider: MailProvider {
     /// state machine across several rounds.
     private let persistentFailure: MailError?
     private var body = "stub body"
+    /// Unsubscribe-route knobs (defaults preserve the original behavior).
+    private var rawHeaders: [String: String] = ["list-unsubscribe": "<mailto:unsubscribe@example.com>"]
+    private var headerError: MailError?
+    private var bodyHTML: String?
+    private(set) var bodyFetchCount = 0
     private var sendResult: Result<String?, MailError> = .success("stub-message-id")
 
     private(set) var pullCount = 0
@@ -48,7 +53,8 @@ actor StubMailProvider: MailProvider {
     }
 
     func fetchBody(remoteId: String) async throws -> FetchedBody {
-        FetchedBody(text: body, html: nil, attachments: [], hasMore: false)
+        bodyFetchCount += 1
+        return FetchedBody(text: body, html: bodyHTML, attachments: [], hasMore: false)
     }
 
     func fetchAttachment(remoteId: String, attachmentId: String) async throws -> FetchedAttachmentBytes {
@@ -60,7 +66,20 @@ actor StubMailProvider: MailProvider {
     }
 
     func fetchRawHeaderValues(remoteId: String) async throws -> [String: String] {
-        ["list-unsubscribe": "<mailto:unsubscribe@example.com>"]
+        if let headerError { throw headerError }
+        return rawHeaders
+    }
+
+    /// Configure the live-header read, its failure mode, and the body html.
+    /// Used by `UnsubscribeRouteTests` to drive the resolution chain.
+    func configureUnsubscribe(
+        rawHeaders: [String: String],
+        headerError: MailError? = nil,
+        bodyHTML: String? = nil
+    ) {
+        self.rawHeaders = rawHeaders
+        self.headerError = headerError
+        self.bodyHTML = bodyHTML
     }
 
     func setRead(remoteId: String, isRead: Bool) async throws {}

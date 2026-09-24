@@ -36,6 +36,19 @@ struct BriefingFeedView: View {
 
     var onShowAllMessages: () -> Void = {}
 
+    /// Debug file log for the headless toolbar-crash repro — survives
+    /// LaunchServices fd redirection, unlike stderr prints.
+    static func debugLog(_ message: String) {
+        let path = "/tmp/lagoon-debug.log"
+        if !FileManager.default.fileExists(atPath: path) {
+            FileManager.default.createFile(atPath: path, contents: nil)
+        }
+        guard let handle = FileHandle(forWritingAtPath: path) else { return }
+        defer { try? handle.close() }
+        try? handle.seekToEnd()
+        try? handle.write(contentsOf: (message + "\n").data(using: .utf8) ?? Data())
+    }
+
     var body: some View {
         NavigationStack(path: $path) {
             ScrollViewReader { proxy in
@@ -63,6 +76,47 @@ struct BriefingFeedView: View {
             }
         }
         .frame(minWidth: 720, minHeight: 480)
+        .onAppear {
+            // Debug hook: LAGOON_OPEN_MESSAGE=<remoteId> pushes a message
+            // detail at launch — headless repro for the toolbar-insert
+            // (NSCalendarDate) crash without needing to click through the UI.
+            let seed = ProcessInfo.processInfo.environment["LAGOON_OPEN_MESSAGE"]
+            if seed != nil {
+                BriefingFeedView.debugLog("onAppear seed=\(seed ?? "nil") pathCount=\(path.count)")
+            }
+            if path.isEmpty,
+               let remoteId = seed,
+               !remoteId.isEmpty {
+                // Delayed so the window's toolbar settles on the root
+                // (list) content first — the push then exercises the LIVE
+                // toolbar swap, which is where the NSCalendarDate decode
+                // fires in the field crashes.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                    guard self.path.isEmpty else { return }
+                    self.path = [remoteId]
+                    BriefingFeedView.debugLog("seeded path with \(remoteId)")
+                }
+                // Torture mode: repeated pop/push cycles — every swap
+                // re-serializes and re-inserts the detail toolbar items,
+                // which is where the NSCalendarDate decode fires in the
+                // field crashes.
+                if ProcessInfo.processInfo.environment["LAGOON_DEBUG_TORTURE"] == "1" {
+                    func cycle(_ n: Int) {
+                        guard n > 0 else { return }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+                            self.path = []
+                            BriefingFeedView.debugLog("torture pop \(n)")
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                                self.path = [remoteId]
+                                BriefingFeedView.debugLog("torture push \(n)")
+                                cycle(n - 1)
+                            }
+                        }
+                    }
+                    cycle(5)
+                }
+            }
+        }
         .task {
             await refresh()
             await poll()

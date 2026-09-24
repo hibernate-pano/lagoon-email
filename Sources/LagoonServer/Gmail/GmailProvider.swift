@@ -193,6 +193,7 @@ public actor GmailProvider: MailProvider {
             receivedAt: receivedAt,
             isRead: !(raw.labelIds ?? []).contains("UNREAD"),
             listUnsubscribe: hasListUnsubscribe(raw),
+            unsubscribeLinks: UnsubscribeScanner.headerLinks(header("list-unsubscribe") ?? ""),
             messageIdHeader: header("message-id"),
             inReplyTo: header("in-reply-to"),
             references: header("references")

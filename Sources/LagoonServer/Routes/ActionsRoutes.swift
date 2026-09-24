@@ -193,28 +193,82 @@ public enum ActionsRoutes {
             return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
         }
 
-        let publisher: String
-        let unsubscribeURL: URL
+        // Resolution order for 一键退订:
+        //   1. live List-Unsubscribe header (parsed by the same scanner as
+        //      the body, so bare unbracketed URLs work too)
+        //   2. links harvested earlier (sync-time header + first-open body)
+        //   3. the HTML body, fetched and scanned on the spot
+        // A failed header read no longer aborts the chain: stored links may
+        // still resolve offline; the error is only returned when nothing
+        // resolves (a 422 would falsely claim "no link" when we could not
+        // check at all). Healthy read + nothing found → 422
+        // unsubscribe-unavailable → the UI shows "未检测到退订链接".
+        // Every fetched URL — including every redirect hop — passes the SSRF guard.
+        var target: (url: URL, publisher: String)?
+        var headerFailureResponse: Response?
         do {
             let headers = try await provider.fetchRawHeaderValues(remoteId: remoteId)
-            guard let raw = headers.first(where: { $0.key.lowercased() == "list-unsubscribe" })?.value,
-                  let url = firstUnsubscribeURL(raw) else {
-                return RouteJSON.error(.unprocessableContent, "unsubscribe-unavailable")
+            if let raw = headers.first(where: { $0.key.lowercased() == "list-unsubscribe" })?.value {
+                switch await pickUnsubTarget(links: UnsubscribeScanner.headerLinks(raw)) {
+                case .http(let url, let pub):
+                    target = (url, extractPublisher(raw) ?? pub)
+                case .manual:
+                    return RouteJSON.error(.unprocessableContent, "unsubscribe-manual-required")
+                case nil:
+                    break
+                }
             }
-            publisher = extractPublisher(raw) ?? ""
-            if url.scheme?.lowercased() == "mailto" {
-                return RouteJSON.error(.unprocessableContent, "unsubscribe-manual-required")
-            }
-            unsubscribeURL = url
         } catch let error as MailError {
-            return MessageRoutes.providerError(error, logger: logger, remoteId: remoteId)
+            headerFailureResponse = MessageRoutes.providerError(error, logger: logger, remoteId: remoteId)
         } catch {
             logger.warning("unsubscribe.fetchFailed", metadata: [
                 "remoteId": .string(remoteId),
                 "label": .string(MessageRoutes.providerLabel(error)),
             ])
-            return RouteJSON.error(.badGateway, "provider-unreachable")
+            headerFailureResponse = RouteJSON.error(.badGateway, "provider-unreachable")
         }
+
+        if target == nil {
+            switch await pickUnsubTarget(links: storedUnsubscribeLinks(
+                remoteId: remoteId, accountId: accountId, db: db
+            )) {
+            case .http(let url, let pub):
+                target = (url, pub)
+            case .manual:
+                return RouteJSON.error(.unprocessableContent, "unsubscribe-manual-required")
+            case nil:
+                break
+            }
+        }
+
+        if target == nil,
+           let body = try? await MessageRoutes.fetchBody(
+               account: account, remoteId: remoteId, provider: provider, db: db, logger: logger
+           ) {
+            let links = UnsubscribeScanner.bodyLinks(in: body.html ?? body.text)
+            if !links.isEmpty {
+                // Persist the discovery for next time (best-effort).
+                try? await MessageStore.mergeUnsubscribeLinks(
+                    remoteId: remoteId, accountId: accountId, links: links, db: db
+                )
+                switch await pickUnsubTarget(links: links) {
+                case .http(let url, let pub):
+                    target = (url, pub)
+                case .manual:
+                    return RouteJSON.error(.unprocessableContent, "unsubscribe-manual-required")
+                case nil:
+                    break
+                }
+            }
+        }
+
+        guard let target else {
+            // Could-not-check (provider error) is not the same as no-link.
+            return headerFailureResponse
+                ?? RouteJSON.error(.unprocessableContent, "unsubscribe-unavailable")
+        }
+        let publisher = target.publisher
+        let unsubscribeURL = target.url
 
         let unsubscribed: Bool
         do {
@@ -554,6 +608,48 @@ public enum ActionsRoutes {
 
     /// Pulls the first usable URL out of a `List-Unsubscribe` header. The header
     /// can contain `<mailto:…>`, `<https://…>`, or bare URLs. We prefer https.
+    private enum UnsubTarget {
+        case http(URL, String)
+        case manual
+    }
+
+    /// First usable candidate: any safe http(s) URL wins (一键优先); a
+    /// mailto: only reports "manual required" when nothing automatable
+    /// exists. Unsafe candidates are skipped.
+    private static func pickUnsubTarget(links: [String]) async -> UnsubTarget? {
+        var manual = false
+        for candidate in links {
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let url = URL(string: trimmed),
+                  let scheme = url.scheme?.lowercased()
+            else { continue }
+            if scheme == "mailto" {
+                manual = true
+                continue
+            }
+            guard scheme == "http" || scheme == "https" else { continue }
+            if await UnsubscribeScanner.isSafe(url: url) {
+                return .http(url, url.host ?? "")
+            }
+        }
+        return manual ? .manual : nil
+    }
+
+    /// Harvested candidates from the header row; empty on any read failure
+    /// (the caller falls through to the live body scan).
+    private static func storedUnsubscribeLinks(
+        remoteId: String, accountId: UUID, db: PostgresConnection
+    ) async -> [String] {
+        guard let rows = try? await db.query(
+            "SELECT unsubscribe_links FROM message_headers WHERE remote_id = $1 AND account_id = $2",
+            [PostgresData(string: remoteId), PostgresData(uuid: accountId)]
+        ).get(),
+            let row = rows.rows.first
+        else { return [] }
+        let r = row.makeRandomAccess()
+        return (try? r["unsubscribe_links"].decode([String].self)) ?? []
+    }
+
     private static func firstUnsubscribeURL(_ header: String) -> URL? {
         if let url = extractURLWithRegex(header, pattern: #"<(https?://[^>]+)>"#) {
             return url
@@ -577,22 +673,66 @@ public enum ActionsRoutes {
 
     /// Best-effort POST or GET to the unsubscribe endpoint. Many publishers use
     /// a tracking pixel (GET); some use a form (POST). We try POST first.
+    ///
+    /// Redirects go through `guardedSession`'s delegate: EVERY hop is
+    /// re-checked against the SSRF guard, because a public URL that 302s to
+    /// loopback or 169.254.169.254 would otherwise defeat `isSafe`. An
+    /// unsafe hop cancels the task (fail closed → the caller sees 502).
     private static func hitUnsubscribe(url: URL) async throws -> Bool {
+        // ponytail: seam for offline route tests — nil in production; drop
+        // it if a real transport abstraction ever becomes necessary.
+        if let probe = hitUnsubscribeProbe { return try await probe(url) }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 15
         request.setValue("Lagoon/1.0", forHTTPHeaderField: "User-Agent")
-        let (_, response) = try await URLSession.shared.data(for: request)
+        let (_, response) = try await guardedSession.data(for: request)
         if let http = response as? HTTPURLResponse, (200..<400).contains(http.statusCode) {
             return true
         }
         var getRequest = URLRequest(url: url)
         getRequest.httpMethod = "GET"
         getRequest.timeoutInterval = 15
-        let (_, getResponse) = try await URLSession.shared.data(for: getRequest)
+        let (_, getResponse) = try await guardedSession.data(for: getRequest)
         if let http = getResponse as? HTTPURLResponse, (200..<400).contains(http.statusCode) {
             return true
         }
         return false
+    }
+
+    /// ponytail: seam for offline route tests; nil in production.
+    static var hitUnsubscribeProbe: (@Sendable (URL) async throws -> Bool)?
+
+    private static let guardedSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 30
+        return URLSession(configuration: config, delegate: RedirectGuard(), delegateQueue: nil)
+    }()
+
+    /// Re-validates each redirect hop against the SSRF guard — the P0 fix
+    /// for "public URL redirects to an internal target".
+    private final class RedirectGuard: NSObject, URLSessionTaskDelegate {
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping (URLRequest?) -> Void
+        ) {
+            guard let url = request.url else {
+                task.cancel()
+                completionHandler(nil)
+                return
+            }
+            Task {
+                if await UnsubscribeScanner.isSafe(url: url) {
+                    completionHandler(request)
+                } else {
+                    task.cancel()
+                    completionHandler(nil)
+                }
+            }
+        }
     }
 }

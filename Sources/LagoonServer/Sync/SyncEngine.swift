@@ -178,6 +178,7 @@ public actor AccountSyncLoop {
             try await MessageStore.upsert(
                 Self.message(from: header, accountId: account.id),
                 listUnsubscribe: header.listUnsubscribe,
+                unsubscribeLinks: header.unsubscribeLinks,
                 db: db
             )
         }

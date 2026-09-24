@@ -415,7 +415,7 @@ public struct L10n: Sendable, Equatable {
         )
     }
     public var unsubscribeUnavailable: String {
-        pick("这封邮件没有可用的退订链接。", "This message has no usable unsubscribe link.")
+        pick("未检测到退订链接", "No unsubscribe link detected")
     }
     public var overrideFailed: String { pick("改分组失败：", "Could not change group: ") }
     public var searchFailed: String { pick("搜索失败：", "Search failed: ") }

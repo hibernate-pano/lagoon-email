@@ -797,6 +797,15 @@ public enum MessageRoutes {
                     "err": .string("\(error)"),
                 ])
             }
+            // 一键退订: harvest unsubscribe links while the fresh HTML is in
+            // hand — this is the proactive scan the moment the body first
+            // lands, so the endpoint can answer without re-fetching.
+            try? await MessageStore.mergeUnsubscribeLinks(
+                remoteId: remoteId,
+                accountId: account.id,
+                links: UnsubscribeScanner.bodyLinks(in: fetched.html ?? fetched.text),
+                db: db
+            )
             let stored = try? await MessageStore.find(remoteId: remoteId, accountId: account.id, db: db)
             return MessageBody(
                 remoteId: remoteId,

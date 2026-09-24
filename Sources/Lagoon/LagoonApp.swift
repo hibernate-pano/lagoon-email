@@ -26,6 +26,23 @@ struct LagoonApp: App {
             .onAppear {
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
+                // Debug torture: resize storm while the detail toolbar is
+                // active — forces toolbar width renegotiation, the overflow
+                // (») item path, and the app's own NSWindow Frame
+                // defaults writes (the preferencesDidChange in the field
+                // crash stack). Gated so normal launches never run it.
+                guard ProcessInfo.processInfo.environment["LAGOON_DEBUG_TORTURE"] == "1" else { return }
+                let sizes: [(CGFloat, CGFloat)] = [(720, 480), (1500, 950), (900, 620), (1240, 877)]
+                var i = 0
+                func resizeCycle() {
+                    guard i < 24, let window = NSApp.windows.first(where: { $0.isVisible }) else { return }
+                    let (w, h) = sizes[i % sizes.count]
+                    window.setContentSize(NSSize(width: w, height: h))
+                    BriefingFeedView.debugLog("torture resize \(Int(w))x\(Int(h)) n=\(i)")
+                    i += 1
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: resizeCycle)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: resizeCycle)
             }
         }
         .windowResizability(.contentMinSize)

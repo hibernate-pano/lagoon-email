@@ -28,6 +28,11 @@ public struct RemoteHeader: Sendable, Equatable {
     public var receivedAt: Date
     public var isRead: Bool
     public var listUnsubscribe: Bool
+    /// Unsubscribe candidates parsed from the `List-Unsubscribe` header at
+    /// harvest time (RFC 2369 angle-bracketed URLs, bare fallback). Stored
+    /// on the header row so the one-click endpoint can answer without a
+    /// provider round-trip — this is the receive-time half of 一键退订.
+    public var unsubscribeLinks: [String]
     public var messageIdHeader: String?
     public var inReplyTo: String?
     public var references: String?
@@ -42,6 +47,7 @@ public struct RemoteHeader: Sendable, Equatable {
         receivedAt: Date,
         isRead: Bool,
         listUnsubscribe: Bool = false,
+        unsubscribeLinks: [String] = [],
         messageIdHeader: String? = nil,
         inReplyTo: String? = nil,
         references: String? = nil
@@ -55,6 +61,7 @@ public struct RemoteHeader: Sendable, Equatable {
         self.receivedAt = receivedAt
         self.isRead = isRead
         self.listUnsubscribe = listUnsubscribe
+        self.unsubscribeLinks = unsubscribeLinks
         self.messageIdHeader = messageIdHeader
         self.inReplyTo = inReplyTo
         self.references = references

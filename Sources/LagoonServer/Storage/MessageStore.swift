@@ -14,6 +14,7 @@ public enum MessageStore {
     public static func upsert(
         _ m: MessageHeader,
         listUnsubscribe: Bool = false,
+        unsubscribeLinks: [String] = [],
         db: PostgresConnection
     ) async throws {
         let sql = """
@@ -21,12 +22,14 @@ public enum MessageStore {
                 id, account_id, remote_id, thread_id,
                 from_address, from_name, subject, snippet,
                 received_at, is_read, is_archived, list_unsubscribe,
-                message_id_header, in_reply_to, references_header, fetched_at
+                message_id_header, in_reply_to, references_header,
+                unsubscribe_links, fetched_at
             ) VALUES (
                 $1, $2, $3, $4,
                 $5, $6, $7, $8,
                 $9, $10, $11, $12,
-                $13, $14, $15, now()
+                $13, $14, $15,
+                (ARRAY(SELECT jsonb_array_elements_text($16::jsonb))), now()
             )
             ON CONFLICT (account_id, remote_id) DO UPDATE SET
                 subject = EXCLUDED.subject,
@@ -36,8 +39,15 @@ public enum MessageStore {
                 message_id_header = COALESCE(EXCLUDED.message_id_header, message_headers.message_id_header),
                 in_reply_to = COALESCE(EXCLUDED.in_reply_to, message_headers.in_reply_to),
                 references_header = COALESCE(EXCLUDED.references_header, message_headers.references_header),
+                unsubscribe_links = ARRAY(
+                    SELECT u FROM unnest(message_headers.unsubscribe_links
+                        || EXCLUDED.unsubscribe_links)
+                    WITH ORDINALITY AS r(u, o)
+                    GROUP BY u ORDER BY min(o)
+                ),
                 fetched_at = now()
         """
+        let linksData = try JSONEncoder().encode(unsubscribeLinks)
         try await db.query(sql, [
             PostgresData(uuid: m.id),
             PostgresData(uuid: m.accountId),
@@ -53,7 +63,38 @@ public enum MessageStore {
             PostgresData(bool: listUnsubscribe),
             m.messageIdHeader.map { PostgresData(string: $0) } ?? .null,
             m.inReplyTo.map { PostgresData(string: $0) } ?? .null,
-            m.references.map { PostgresData(string: $0) } ?? .null
+            m.references.map { PostgresData(string: $0) } ?? .null,
+            PostgresData(jsonb: linksData)
+        ]).get()
+    }
+
+    /// Merge discovered unsubscribe candidates into a header row, first
+    /// occurrence wins so harvest order (header links first, then body) is
+    /// preserved and repeated syncs cannot grow the array. Best-effort at
+    /// every call site: discovery failure must never fail the read or the
+    /// action that found the links.
+    public static func mergeUnsubscribeLinks(
+        remoteId: String,
+        accountId: UUID,
+        links: [String],
+        db: PostgresConnection
+    ) async throws {
+        guard !links.isEmpty else { return }
+        let data = try JSONEncoder().encode(links)
+        let sql = """
+            UPDATE message_headers
+            SET unsubscribe_links = (ARRAY(
+                SELECT u FROM unnest(unsubscribe_links
+                    || ARRAY(SELECT jsonb_array_elements_text($3::jsonb)))
+                WITH ORDINALITY AS r(u, o)
+                GROUP BY u ORDER BY min(o)
+            ))
+            WHERE remote_id = $1 AND account_id = $2
+        """
+        try await db.query(sql, [
+            PostgresData(string: remoteId),
+            PostgresData(uuid: accountId),
+            PostgresData(jsonb: data),
         ]).get()
     }
 

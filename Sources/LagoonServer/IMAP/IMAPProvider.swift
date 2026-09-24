@@ -794,6 +794,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             receivedAt: fetched.internalDate ?? Date(),
             isRead: Self.isRead(flags: fetched.flags),
             listUnsubscribe: decoded("list-unsubscribe") != nil,
+            unsubscribeLinks: UnsubscribeScanner.headerLinks(decoded("list-unsubscribe") ?? ""),
             messageIdHeader: messageID,
             inReplyTo: decoded("in-reply-to"),
             references: decoded("references")
