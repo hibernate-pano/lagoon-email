@@ -153,9 +153,11 @@ struct MessageDetailView: View {
         .noticeBanner($actionBanner)
         .noticeBanner($pinBanner)
         .onAppear {
+            #if DEBUG
             if ProcessInfo.processInfo.environment["LAGOON_OPEN_MESSAGE"] != nil {
                 BriefingFeedView.debugLog("detail mounted remoteId=\(remoteId)")
             }
+            #endif
         }
         .task {
             await loadBody()
@@ -507,9 +509,12 @@ struct MessageDetailView: View {
                 // The WebView reports its rendered document height back so
                 // this frame matches content exactly — one outer scroller.
                 // The 80pt floor covers only the layout pass before the
-                // first measurement lands. If measurement fails
-                // *permanently*, HTMLMessageView restores its own internal
-                // scrolling after a 1s grace period rather than clipping
+                // first measurement lands: HTMLMessageView only writes
+                // heights that are *taller than the current frame*, so a
+                // viewport-height ("wrong") measurement can never be
+                // mistaken for a real one here. If no usable height ever
+                // arrives, the view stops forwarding the wheel after a 1s
+                // grace period and scrolls internally instead of clipping
                 // content behind an invisible wall.
                 HTMLMessageView(
                     html: html,
@@ -517,6 +522,14 @@ struct MessageDetailView: View {
                     contentHeight: $htmlContentHeight
                 )
                 .frame(height: max(80, htmlContentHeight))
+                // Keep the body reachable for VoiceOver: the region is a
+                // container of the WebView's own elements rather than one
+                // opaque node.
+                // # ponytail: no `l10n.messageBody` key exists yet, so the
+                // container is unlabelled. Add one to L10n.swift (both
+                // languages) and set `.accessibilityLabel(l10n.messageBody)`
+                // here — LocalizationTests will then cover both strings.
+                .accessibilityElement(children: .contain)
                 if isLoadingInlineImages {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
@@ -929,15 +942,26 @@ struct MessageDetailView: View {
                         title: l10n.unsubscribeFailedTitle,
                         detail: l10n.unsubscribeManualRequired,
                         actionLabel: l10n.openOriginal,
-                        action: { [self] in self.openOriginalMail() }
+                        // `openOriginalMail()` is main-actor isolated and
+                        // the banner action is a plain async closure; this
+                        // is an error under the Swift 6 language mode.
+                        action: { @MainActor [self] in self.openOriginalMail() }
                     )
                 } else if code == "unsubscribe-page-required" {
+                    // Not a failure: a publisher that wants a web
+                    // confirmation is a normal outcome of one-click
+                    // unsubscribe, so the banner is informational and the
+                    // original mail is the place to finish it.
+                    // # ponytail: the title reuses `l10n.unsubscribe`
+                    // because L10n.swift is outside this change's scope.
+                    // Add a `unsubscribeWebConfirmationTitle` key (zh + en)
+                    // there and use it; LocalizationTests covers both.
                     actionBanner = ErrorBanner(
-                        severity: .error,
-                        title: l10n.unsubscribeFailedTitle,
+                        severity: .info,
+                        title: l10n.unsubscribe,
                         detail: l10n.unsubscribePageRequired,
                         actionLabel: l10n.openOriginal,
-                        action: { [self] in self.openOriginalMail() }
+                        action: { @MainActor [self] in self.openOriginalMail() }
                     )
                 } else if code == "unsubscribe-unavailable" {
                     actionBanner = ErrorBanner(

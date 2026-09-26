@@ -5,7 +5,19 @@ import XCTest
 /// SSRF guard. The guard is the trust boundary — body URLs come from
 /// attacker-controlled email, so a regression there is a server-side
 /// request-forgery hole, not a UX bug.
+///
+/// The DNS branch is driven through `UnsubscribeScanner.resolveOverride`
+/// (DEBUG-only seam, nil in production): literal-IP fixtures cannot express
+/// "this name resolves to a public AND a private address", which is the shape
+/// that actually matters.
 final class UnsubscribeScannerTests: XCTestCase {
+
+    override func tearDown() {
+        #if DEBUG
+        UnsubscribeScanner.resolveOverride = nil
+        #endif
+        super.tearDown()
+    }
 
     // MARK: - Header
 
@@ -138,6 +150,79 @@ final class UnsubscribeScannerTests: XCTestCase {
             let safe = await UnsubscribeScanner.isSafe(url: url)
             XCTAssertTrue(safe, "\(raw) should pass")
         }
+    }
+
+    /// The DNS path, end to end: a name we have never seen must not be waved
+    /// through. Two worlds are covered by one assertion — a normal resolver
+    /// returns NXDOMAIN (empty list ⇒ unsafe) and a hijacking resolver returns
+    /// a non-public address (198.18.0.0/15, 2001:2::/16), which
+    /// `isPublicAddress` rejects. Either way: refused.
+    func test_isSafe_rejectsUnknownHostViaRealResolver() async {
+        for raw in [
+            "https://nonexistent-host.invalid/u",
+            "https://lagoon-does-not-resolve.example/u",
+        ] {
+            guard let url = URL(string: raw) else { continue }
+            let safe = await UnsubscribeScanner.isSafe(url: url)
+            XCTAssertFalse(safe, "a name we cannot vouch for must be rejected (\(raw))")
+        }
+    }
+
+    /// The multi-address rule, which no literal-IP fixture can reach: a name
+    /// that resolves to BOTH a public and a private address is the real attack
+    /// shape (a DNS entry pointing at 10.x behind a public-looking name) and
+    /// must be rejected — every resolved address has to be public.
+    func test_isSafe_rejectsHostWithOnePrivateAddressAmongPublic() async {
+        #if DEBUG
+        UnsubscribeScanner.resolveOverride = { _ in
+            [[8, 8, 8, 8], [10, 0, 0, 1]] // one public, one RFC1918
+        }
+        #endif
+        let url = URL(string: "https://mixed.example/u")!
+        let safe = await UnsubscribeScanner.isSafe(url: url)
+        XCTAssertFalse(safe, "one private address poisons the whole name")
+
+        // …and the same mixed set with the private address first, so the rule
+        // cannot be satisfied by accidentally reading only addresses[0].
+        #if DEBUG
+        UnsubscribeScanner.resolveOverride = { _ in
+            [[169, 254, 169, 254], [8, 8, 8, 8]] // metadata + public
+        }
+        #endif
+        let safe2 = await UnsubscribeScanner.isSafe(url: url)
+        XCTAssertFalse(safe2, "order must not matter: every address is checked")
+    }
+
+    /// Positive control for the same seam: an all-public answer still passes,
+    /// so the rejections above are about the private address, not the seam.
+    func test_isSafe_acceptsHostWhenEveryAddressIsPublic() async {
+        #if DEBUG
+        UnsubscribeScanner.resolveOverride = { _ in [[8, 8, 8, 8], [1, 1, 1, 1]] }
+        #endif
+        let safe = await UnsubscribeScanner.isSafe(url: URL(string: "https://all-public.example/u")!)
+        XCTAssertTrue(safe, "an all-public answer must pass")
+
+        #if DEBUG
+        UnsubscribeScanner.resolveOverride = { host in
+            // The seam is per-host: only the named host is stubbed.
+            host == "all-public.example" ? [[8, 8, 8, 8]] : []
+        }
+        #endif
+        let unrelated = await UnsubscribeScanner.isSafe(url: URL(string: "https://unrelated.example/u")!)
+        XCTAssertFalse(
+            unrelated,
+            "an unstubbed host resolves to nothing and must fail closed"
+        )
+    }
+
+    /// The fail-closed branch, deterministically: an empty answer is not
+    /// "no objection", it is unsafe.
+    func test_isSafe_rejectsUnresolvableHost() async {
+        #if DEBUG
+        UnsubscribeScanner.resolveOverride = { _ in [] } // NXDOMAIN
+        #endif
+        let safe = await UnsubscribeScanner.isSafe(url: URL(string: "https://nx.example/u")!)
+        XCTAssertFalse(safe, "unresolvable must be treated as unsafe")
     }
 
     // MARK: - Classification units

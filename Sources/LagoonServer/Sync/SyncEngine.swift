@@ -354,12 +354,18 @@ public actor AccountSyncLoop {
 public actor SyncEngine {
     private let db: PostgresConnection
     private let logger: Logger
-    private let makeProvider: @Sendable (Account) -> (any MailProvider)?
+    private let makeProvider: @Sendable (Account, PostgresConnection) -> (any MailProvider)?
     private let sleep: @Sendable (Duration) async -> Void
     /// Per-loop connection factory. A Postgres connection serves one query
     /// at a time, so loops must not share `db` — each loop gets its own
     /// connection here (production) or shares `db` when nil (single-loop
     /// unit tests, where no concurrency exists).
+    ///
+    /// The same connection is handed to the provider builder together with the
+    /// account: a provider that falls back to the DB for credentials
+    /// (IMAPProvider's `CredentialVault.read`) must query on the loop's own
+    /// connection, never the shared one, or the per-loop invariant silently
+    /// reintroduces the shared-connection desync.
     ///
     /// Full PostgresClient pool when accounts × traffic grows; per-loop
     /// connections are the correct shape until then (N accounts = N conns).
@@ -368,11 +374,22 @@ public actor SyncEngine {
     private var loops: [UUID: AccountSyncLoop] = [:]
     private var tasks: [UUID: Task<Void, Never>] = [:]
     private var ownedDBs: [UUID: PostgresConnection] = [:]
+    /// Serializes restarts of one account. Actor isolation does NOT do this:
+    /// every `await` is a reentrancy point, so two concurrent callers used to
+    /// interleave their cancel/teardown/start and the second one closed the
+    /// connection the first had just handed to a live loop. Each new restart
+    /// waits for the previous one to finish first.
+    private struct RestartTail: Sendable {
+        let generation: UInt64
+        let work: Task<Void, Never>
+    }
+    private var restartTails: [UUID: RestartTail] = [:]
+    private var generation: UInt64 = 0
 
     public init(
         db: PostgresConnection,
         logger: Logger,
-        makeProvider: @escaping @Sendable (Account) -> (any MailProvider)?,
+        makeProvider: @escaping @Sendable (Account, PostgresConnection) -> (any MailProvider)?,
         sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) },
         makeDB: (@Sendable () async throws -> PostgresConnection)? = nil
     ) {
@@ -401,6 +418,19 @@ public actor SyncEngine {
         loops = [:]
         for conn in ownedDBs.values { try? await conn.close() }
         ownedDBs = [:]
+        // Drop queued restarts: a restart that has not started yet must not
+        // install a loop after this teardown finished.
+        restartTails = [:]
+    }
+
+    /// Cancel one account's task and close the connection that task owns.
+    /// Idempotent: safe on an id with nothing installed.
+    private func stopLoop(for id: UUID) async {
+        tasks[id]?.cancel()
+        if let task = tasks[id] { await task.value }
+        tasks[id] = nil
+        loops[id] = nil
+        if let conn = ownedDBs.removeValue(forKey: id) { try? await conn.close() }
     }
 
     /// Reconcile the running loops with the stored accounts: start a loop for
@@ -435,12 +465,33 @@ public actor SyncEngine {
     /// accounts' connections. A parked loop restarts here too, so reconnect
     /// recovery works per account.
     public func refreshAccount(_ id: UUID) async {
-        guard let account = try? await AccountStore.find(byId: id, db: db) else { return }
-        tasks[id]?.cancel()
-        if let task = tasks[id] { await task.value }
-        tasks[id] = nil
-        loops[id] = nil
-        if let conn = ownedDBs.removeValue(forKey: id) { try? await conn.close() }
+        generation &+= 1
+        let mine = generation
+        let previous = restartTails[id]?.work
+        let work = Task { [self] in
+            // Chain behind any restart still in flight for this account.
+            await previous?.value
+            await restartAccountNow(id, generation: mine)
+        }
+        restartTails[id] = RestartTail(generation: mine, work: work)
+        await work.value
+        // Only the newest generation clears the slot; older callers must not
+        // drop the tail a newer restart is using.
+        if restartTails[id]?.generation == mine { restartTails[id] = nil }
+    }
+
+    /// The restart body, run serialized per account (see `refreshAccount`).
+    private func restartAccountNow(_ id: UUID, generation: UInt64) async {
+        // A `stop()` (or a `refresh()`) that ran while this restart was queued
+        // already decided what the engine should be running; do not resurrect.
+        guard restartTails[id]?.generation == generation else { return }
+        // A deleted account keeps an IMAP session and a Postgres connection
+        // alive until its loop self-parks on the next round: tear it down now.
+        guard let account = try? await AccountStore.find(byId: id, db: db) else {
+            await stopLoop(for: id)
+            return
+        }
+        await stopLoop(for: id)
         await startLoop(for: account)
     }
 
@@ -451,7 +502,14 @@ public actor SyncEngine {
 
     /// Build and start one loop, owning a fresh connection when `makeDB`
     /// is configured. A per-account factory failure skips only that account.
+    ///
+    /// Idempotent: any existing entry for this account is cancelled and its
+    /// connection closed *before* the new one is installed. Two restarts that
+    /// interleave (a push racing `refresh()`, or two pushes for one mailbox)
+    /// therefore end with exactly one live loop and one owned connection
+    /// instead of an untracked zombie loop plus a leaked connection.
     private func startLoop(for account: Account) async {
+        await stopLoop(for: account.id)
         let loopDB: PostgresConnection
         if let makeDB {
             do {
@@ -472,7 +530,9 @@ public actor SyncEngine {
             account: account,
             db: loopDB,
             logger: logger,
-            makeProvider: makeProvider,
+            // The provider gets the loop's own connection, never the shared
+            // one (see `makeProvider`).
+            makeProvider: { self.makeProvider($0, loopDB) },
             sleep: sleep
         )
         loops[account.id] = nextLoop

@@ -38,16 +38,38 @@ struct BriefingFeedView: View {
 
     /// Debug file log for the headless toolbar-crash repro — survives
     /// LaunchServices fd redirection, unlike stderr prints.
+    ///
+    /// DEBUG-only on purpose: it writes message remoteIds and window sizes,
+    /// which is not something a shipping binary should put in a
+    /// world-readable file just because the *call sites* are env-gated.
+    /// The file also lives in the app's temporary directory with 0600
+    /// permissions, and the write is off the main actor — a synchronous
+    /// `FileHandle` round trip on the main thread is a stutter waiting
+    /// for a slow disk.
+    #if DEBUG
     static func debugLog(_ message: String) {
-        let path = "/tmp/lagoon-debug.log"
-        if !FileManager.default.fileExists(atPath: path) {
-            FileManager.default.createFile(atPath: path, contents: nil)
+        let path = NSTemporaryDirectory() + "lagoon-debug.log"
+        let line = (message + "\n").data(using: .utf8) ?? Data()
+        debugLogQueue.async {
+            if !FileManager.default.fileExists(atPath: path) {
+                FileManager.default.createFile(
+                    atPath: path,
+                    contents: nil,
+                    attributes: [.posixPermissions: 0o600]
+                )
+            }
+            guard let handle = FileHandle(forWritingAtPath: path) else { return }
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: line)
         }
-        guard let handle = FileHandle(forWritingAtPath: path) else { return }
-        defer { try? handle.close() }
-        try? handle.seekToEnd()
-        try? handle.write(contentsOf: (message + "\n").data(using: .utf8) ?? Data())
     }
+
+    private static let debugLogQueue = DispatchQueue(
+        label: "dev.lagoon.debug-log",
+        qos: .utility
+    )
+    #endif
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -81,9 +103,11 @@ struct BriefingFeedView: View {
             // detail at launch — headless repro for the toolbar-insert
             // (NSCalendarDate) crash without needing to click through the UI.
             let seed = ProcessInfo.processInfo.environment["LAGOON_OPEN_MESSAGE"]
+            #if DEBUG
             if seed != nil {
                 BriefingFeedView.debugLog("onAppear seed=\(seed ?? "nil") pathCount=\(path.count)")
             }
+            #endif
             if path.isEmpty,
                let remoteId = seed,
                !remoteId.isEmpty {
@@ -94,12 +118,15 @@ struct BriefingFeedView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
                     guard self.path.isEmpty else { return }
                     self.path = [remoteId]
+                    #if DEBUG
                     BriefingFeedView.debugLog("seeded path with \(remoteId)")
+                    #endif
                 }
                 // Torture mode: repeated pop/push cycles — every swap
                 // re-serializes and re-inserts the detail toolbar items,
                 // which is where the NSCalendarDate decode fires in the
                 // field crashes.
+                #if DEBUG
                 if ProcessInfo.processInfo.environment["LAGOON_DEBUG_TORTURE"] == "1" {
                     func cycle(_ n: Int) {
                         guard n > 0 else { return }
@@ -115,6 +142,7 @@ struct BriefingFeedView: View {
                     }
                     cycle(5)
                 }
+                #endif
             }
         }
         .task {

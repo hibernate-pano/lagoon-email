@@ -296,8 +296,17 @@ public enum UnsubscribeScanner {
 
     /// Resolve A/AAAA off the event loop; empty on any failure (the caller
     /// treats unresolvable as unsafe). Returns one entry per address.
+    ///
+    /// The injectable seam below changes nothing about *what* this decides —
+    /// it only lets a test supply the address list that a real `getaddrinfo`
+    /// would return, because the multi-address rule (every address must be
+    /// public) is impossible to exercise offline: fixtures use literal IPs
+    /// and no public host's A records can be pinned in a hermetic test.
     static func resolve(_ host: String) async -> [[UInt8]] {
-        await withCheckedContinuation { continuation in
+        #if DEBUG
+        if let override = resolveOverride { return await override(host) }
+        #endif
+        return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 var hints = addrinfo()
                 hints.ai_family = AF_UNSPEC
@@ -338,4 +347,11 @@ public enum UnsubscribeScanner {
             }
         }
     }
+
+    #if DEBUG
+    /// ponytail: seam for offline tests of the DNS branch; nil in production,
+    /// so the released binary always goes through `getaddrinfo`. Drop it if a
+    /// real resolver abstraction ever becomes necessary.
+    static var resolveOverride: (@Sendable (String) async -> [[UInt8]])?
+    #endif
 }

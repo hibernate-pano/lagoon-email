@@ -204,16 +204,29 @@ public enum ActionsRoutes {
         // check at all). Healthy read + nothing found → 422
         // unsubscribe-unavailable → the UI shows "未检测到退订链接".
         // Every fetched URL — including every redirect hop — passes the SSRF guard.
+        // 4. nothing automatable anywhere, but some stage offered a
+        //    mailto: → 422 unsubscribe-manual-required (only after ALL
+        //    three stages ran: a mailto in the header must not short-
+        //    circuit an https link in the stored list or the body)
         var target: (url: URL, publisher: String)?
         var headerFailureResponse: Response?
+        var bodyFailureResponse: Response?
+        /// A mailto: was offered by some stage. Accumulated, NOT acted on
+        /// immediately: headerLinks/bodyLinks admit the mailto scheme and the
+        /// sync-time writers persist it, so bailing out per stage meant a
+        /// mailto-only header 422'd a message whose body had a real link.
+        var sawMailto = false
         do {
             let headers = try await provider.fetchRawHeaderValues(remoteId: remoteId)
             if let raw = headers.first(where: { $0.key.lowercased() == "list-unsubscribe" })?.value {
                 switch await pickUnsubTarget(links: UnsubscribeScanner.headerLinks(raw)) {
                 case .http(let url, let pub):
-                    target = (url, extractPublisher(raw) ?? pub)
+                    // Publisher = the host we actually chose, not the first
+                    // URL in the header (they can differ, and the first URL
+                    // may be the one we skipped as unsafe).
+                    target = (url, pub)
                 case .manual:
-                    return RouteJSON.error(.unprocessableContent, "unsubscribe-manual-required")
+                    sawMailto = true
                 case nil:
                     break
                 }
@@ -235,37 +248,57 @@ public enum ActionsRoutes {
             case .http(let url, let pub):
                 target = (url, pub)
             case .manual:
-                return RouteJSON.error(.unprocessableContent, "unsubscribe-manual-required")
+                sawMailto = true
             case nil:
                 break
             }
         }
 
-        if target == nil,
-           let body = try? await MessageRoutes.fetchBody(
-               account: account, remoteId: remoteId, provider: provider, db: db, logger: logger
-           ) {
-            let links = UnsubscribeScanner.bodyLinks(in: body.html ?? body.text)
-            if !links.isEmpty {
-                // Persist the discovery for next time (best-effort).
-                try? await MessageStore.mergeUnsubscribeLinks(
-                    remoteId: remoteId, accountId: accountId, links: links, db: db
+        if target == nil {
+            // A body-fetch failure must NOT be swallowed into a 422: we did
+            // not find "no link", we could not look. It is kept in its own
+            // slot and preferred over the 422 (the invariant the header stage
+            // already implements).
+            do {
+                let body = try await MessageRoutes.fetchBody(
+                    account: account, remoteId: remoteId, provider: provider, db: db, logger: logger
                 )
-                switch await pickUnsubTarget(links: links) {
-                case .http(let url, let pub):
-                    target = (url, pub)
-                case .manual:
-                    return RouteJSON.error(.unprocessableContent, "unsubscribe-manual-required")
-                case nil:
-                    break
+                let links = UnsubscribeScanner.bodyLinks(in: body.html ?? body.text)
+                if !links.isEmpty {
+                    // Persist the discovery for next time (best-effort).
+                    try? await MessageStore.mergeUnsubscribeLinks(
+                        remoteId: remoteId, accountId: accountId, links: links, db: db
+                    )
+                    switch await pickUnsubTarget(links: links) {
+                    case .http(let url, let pub):
+                        target = (url, pub)
+                    case .manual:
+                        sawMailto = true
+                    case nil:
+                        break
+                    }
                 }
+            } catch let error as MailError {
+                bodyFailureResponse = MessageRoutes.providerError(
+                    error, logger: logger, remoteId: remoteId
+                )
+            } catch {
+                logger.warning("unsubscribe.bodyFetchFailed", metadata: [
+                    "remoteId": .string(remoteId),
+                    "label": .string(MessageRoutes.providerLabel(error)),
+                ])
+                bodyFailureResponse = RouteJSON.error(.badGateway, "provider-unreachable")
             }
         }
 
         guard let target else {
             // Could-not-check (provider error) is not the same as no-link.
-            return headerFailureResponse
-                ?? RouteJSON.error(.unprocessableContent, "unsubscribe-unavailable")
+            if let headerFailureResponse { return headerFailureResponse }
+            if let bodyFailureResponse { return bodyFailureResponse }
+            if sawMailto {
+                return RouteJSON.error(.unprocessableContent, "unsubscribe-manual-required")
+            }
+            return RouteJSON.error(.unprocessableContent, "unsubscribe-unavailable")
         }
         let publisher = target.publisher
         let unsubscribeURL = target.url
@@ -625,6 +658,9 @@ public enum ActionsRoutes {
     /// First usable candidate: any safe http(s) URL wins (一键优先); a
     /// mailto: only reports "manual required" when nothing automatable
     /// exists. Unsafe candidates are skipped.
+    ///
+    /// The caller ACCUMULATES `.manual` across stages instead of returning it
+    /// on sight — see the handler.
     private static func pickUnsubTarget(links: [String]) async -> UnsubTarget? {
         var manual = false
         for candidate in links {
@@ -659,27 +695,6 @@ public enum ActionsRoutes {
         return (try? r["unsubscribe_links"].decode([String].self)) ?? []
     }
 
-    private static func firstUnsubscribeURL(_ header: String) -> URL? {
-        if let url = extractURLWithRegex(header, pattern: #"<(https?://[^>]+)>"#) {
-            return url
-        }
-        return extractURLWithRegex(header, pattern: #"<(mailto:[^>]+)>"#)
-    }
-
-    private static func extractURLWithRegex(_ header: String, pattern: String) -> URL? {
-        guard let range = header.range(of: pattern, options: .regularExpression) else {
-            return nil
-        }
-        let match = header[range].dropFirst().dropLast()
-        return URL(string: String(match))
-    }
-
-    /// Extracts a publisher name like "<https://example.com/unsubscribe?id=…>".
-    private static func extractPublisher(_ header: String) -> String? {
-        guard let url = firstUnsubscribeURL(header) else { return nil }
-        return url.host
-    }
-
     /// Outcome of hitting an unsubscribe endpoint — 2xx alone is NOT success:
     /// a tracking link can 302 to a "how to leave" page that merely *offers*
     /// an unsubscribe entry, and recording that as done would archive the
@@ -693,28 +708,60 @@ public enum ActionsRoutes {
     /// Best-effort POST or GET to the unsubscribe endpoint. Many publishers use
     /// a tracking pixel (GET); some use a form (POST). We try POST first.
     ///
-    /// Redirects go through `guardedSession`'s delegate: EVERY hop is
-    /// re-checked against the SSRF guard, because a public URL that 302s to
-    /// loopback or 169.254.169.254 would otherwise defeat `isSafe`. An
-    /// unsafe hop cancels the task (fail closed → the caller sees 502).
-    private static func hitUnsubscribe(url: URL) async throws -> UnsubHit {
-        // ponytail: seam for offline route tests — nil in production; drop
-        // it if a real transport abstraction ever becomes necessary.
+    /// Redirects go through the session's delegate: EVERY hop is re-checked
+    /// against the SSRF guard, because a public URL that 302s to loopback or
+    /// 169.254.169.254 would otherwise defeat `isSafe`. An unsafe hop cancels
+    /// the task (fail closed).
+    ///
+    /// ponytail: ceiling — one wall-clock budget for BOTH attempts
+    /// (`unsubscribeTimeout`), a streaming body cap (`maxUnsubscribeBodyBytes`)
+    /// and a per-attempt timeout. The budget is enforced by cancelling the
+    /// task group, so the hard floor is "whatever URLSession still owes us":
+    /// if the transport ignored cancellation the worst case degrades to
+    /// per-attempt timeouts, not to an unbounded hang.
+    static func hitUnsubscribe(
+        url: URL, session: URLSession = guardedSession
+    ) async throws -> UnsubHit {
+        #if DEBUG
+        // ponytail: seam for offline route tests — absent from release builds.
         if let probe = hitUnsubscribeProbe { return try await probe(url) }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 15
-        request.setValue("Lagoon/1.0", forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await guardedSession.data(for: request)
-        if let http = response as? HTTPURLResponse, (200..<400).contains(http.statusCode) {
-            return classifyHit(data: data)
+        #endif
+        return try await withThrowingTaskGroup(of: UnsubHit.self) { group in
+            group.addTask { try await Self.attemptUnsubscribe(url: url, session: session) }
+            group.addTask {
+                try await Task.sleep(for: Self.unsubscribeTimeout)
+                throw URLError(.timedOut)
+            }
+            let first = try await group.next() ?? .failed
+            group.cancelAll()
+            return first
         }
-        var getRequest = URLRequest(url: url)
-        getRequest.httpMethod = "GET"
-        getRequest.timeoutInterval = 15
-        let (getData, getResponse) = try await guardedSession.data(for: getRequest)
-        if let http = getResponse as? HTTPURLResponse, (200..<400).contains(http.statusCode) {
-            return classifyHit(data: getData)
+    }
+
+    /// One POST, then one GET. 2xx only is a candidate for success; anything
+    /// else is not. In particular a 3xx must NEVER be classified: with the
+    /// redirect guard in place a 3xx that reaches us is either a hop the guard
+    /// refused or a chain the server cut short — recording that as completed
+    /// would archive the mail and tell the user they unsubscribed.
+    private static func attemptUnsubscribe(url: URL, session: URLSession) async throws -> UnsubHit {
+        for method in ["POST", "GET"] {
+            var request = URLRequest(url: url)
+            request.httpMethod = method
+            request.timeoutInterval = 10
+            request.setValue("Lagoon/1.0", forHTTPHeaderField: "User-Agent")
+            let data: Data
+            let response: URLResponse
+            do {
+                (data, response) = try await session.data(for: request)
+            } catch let error as URLError where error.code == .cancelled {
+                // A refused redirect hop or a body past the streaming cap:
+                // a deliberate stop, not a transport fault — report failure
+                // instead of bubbling a 500.
+                return .failed
+            }
+            guard let http = response as? HTTPURLResponse else { continue }
+            if (200..<300).contains(http.statusCode) { return classifyHit(data: data) }
+            if (300..<400).contains(http.statusCode) { return .failed }
         }
         return .failed
     }
@@ -730,19 +777,49 @@ public enum ActionsRoutes {
         return .landingPage
     }
 
-    /// ponytail: seam for offline route tests; nil in production.
-    static var hitUnsubscribeProbe: (@Sendable (URL) async throws -> UnsubHit)?
+    /// Streaming cap on the unsubscribe response: `data(for:)` would buffer
+    /// an attacker-chosen body whole before we ever regex it. Past the cap the
+    /// task is failed, which the attempt loop reports as `.failed`.
+    static let maxUnsubscribeBodyBytes = 256 * 1024
+    /// Wall-clock budget covering both the POST and the GET attempt.
+    static let unsubscribeTimeout: Duration = .seconds(30)
 
-    private static let guardedSession: URLSession = {
+    #if DEBUG
+    /// ponytail: seam for offline route tests; absent from release builds, so
+    /// the production binary cannot be talked into skipping the SSRF-guarded
+    /// session.
+    static var hitUnsubscribeProbe: (@Sendable (URL) async throws -> UnsubHit)?
+    #endif
+
+    private static let guardedSession: URLSession = makeProbeSession()
+
+    /// The one session the unsubscribe probe uses: SSRF-checked redirects and
+    /// a streaming body cap in one delegate. Internal so tests can build the
+    /// same session over a stub `URLProtocol`.
+    static func makeProbeSession(maxBodyBytes: Int = maxUnsubscribeBodyBytes) -> URLSession {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 15
-        config.timeoutIntervalForResource = 30
-        return URLSession(configuration: config, delegate: RedirectGuard(), delegateQueue: nil)
-    }()
+        config.timeoutIntervalForRequest = 10
+        config.timeoutIntervalForResource = 20
+        return URLSession(
+            configuration: config,
+            delegate: RedirectGuard(maxBodyBytes: maxBodyBytes),
+            delegateQueue: nil
+        )
+    }
 
     /// Re-validates each redirect hop against the SSRF guard — the P0 fix
-    /// for "public URL redirects to an internal target".
-    private final class RedirectGuard: NSObject, URLSessionTaskDelegate {
+    /// for "public URL redirects to an internal target" — and caps how much of
+    /// the response we are willing to buffer.
+    final class RedirectGuard: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
+        private let maxBodyBytes: Int
+        private let lock = NSLock()
+        private var received: [Int: Int] = [:]
+
+        init(maxBodyBytes: Int) {
+            self.maxBodyBytes = maxBodyBytes
+            super.init()
+        }
+
         func urlSession(
             _ session: URLSession,
             task: URLSessionTask,
@@ -763,6 +840,29 @@ public enum ActionsRoutes {
                     completionHandler(nil)
                 }
             }
+        }
+
+        func urlSession(
+            _ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data,
+            completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+        ) {
+            lock.lock()
+            let total = (received[dataTask.taskIdentifier] ?? 0) + data.count
+            received[dataTask.taskIdentifier] = total
+            lock.unlock()
+            if total > maxBodyBytes {
+                // `URLSession.ResponseDisposition` has no "fail" case, so the
+                // cap cancels the task: `data(for:)` throws `.cancelled`,
+                // which the attempt loop reports as `.failed`.
+                dataTask.cancel()
+            }
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            lock.lock()
+            received[task.taskIdentifier] = nil
+            lock.unlock()
         }
     }
 }

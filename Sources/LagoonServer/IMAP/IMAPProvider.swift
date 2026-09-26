@@ -208,7 +208,15 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         let pollInterval = max(.milliseconds(1), min(Self.pollInterval, waitUpTo / 2))
         while true {
             let change = try await round(after: cursor)
-            if !change.upserts.isEmpty || change.resetRequired { return change }
+            // A round that only harvested new sent Message-IDs still has to be
+            // returned: dropping it here loses the reply signal and leaves the
+            // persisted sent cursor behind, so the next round re-scans the same
+            // 200-message Sent backfill forever. Same contract as the Gmail
+            // path, which returns on `repliedMessageIds` too.
+            if !change.upserts.isEmpty || change.resetRequired
+                || !change.repliedMessageIds.isEmpty {
+                return change
+            }
             let remaining = ContinuousClock.now.duration(to: deadline)
             guard remaining > .zero else { return change }
             if negotiated.contains("IDLE") {

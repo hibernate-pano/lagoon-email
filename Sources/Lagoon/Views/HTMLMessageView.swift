@@ -2,17 +2,20 @@ import SwiftUI
 import WebKit
 import LagoonKit
 
-/// WKWebView that forwards scroll gestures up the responder chain, making
-/// the outer SwiftUI ScrollView the single scroller. Size measurement is
-/// the primary path (the frame matches content, so there is nothing to
-/// scroll inside); this subclass is the guarantee that the floor height
-/// shown *before* measurement never becomes a hidden nested scroller —
-/// hiding the scrollbar indicator alone does not block the wheel.
+/// Single-scroller contract, in full:
+/// - gestures pass through to the outer SwiftUI ScrollView (this subclass)
+/// - the frame is sized to the measured document height, so there is
+///   nothing left to scroll inside the WebView
+/// - if measurement fails, `forwardsScrollWheel` is set back to `false`
+///   and the WebView's own scrolling takes over (see
+///   `HTMLMessageView.Coordinator.startMeasuring`) — the *only* fallback,
+///   and it is reversible: the next real height sample re-arms forwarding.
 ///
-/// `forwardsScrollWheel = false` restores stock behaviour, used by
-/// `HTMLMessageView.restoreEmbeddedScrolling` when height measurement
-/// fails permanently: content then degrades to visible internal scrolling
-/// instead of clipping behind an invisible wall.
+/// There is deliberately no scrollbar manipulation. Hiding an internal bar
+/// never blocked anything: on every OS the app ships on (probed on macOS
+/// 27.2) the WebView's hierarchy is `WKWebView → WKFlippedView` with no
+/// `NSScrollView` anywhere, so any code reaching for the private scroller
+/// silently no-ops. Blocking nested scrolling was always the wheel's job.
 final class PassThroughScrollWebView: WKWebView {
     var forwardsScrollWheel = true
     /// Fired when this view's width changes. A window resize reflows the
@@ -35,6 +38,56 @@ final class PassThroughScrollWebView: WKWebView {
         } else {
             super.scrollWheel(with: event)
         }
+    }
+
+    // MARK: - Keyboard scrolling (same contract as the wheel)
+    //
+    // With the frame sized to content there is nothing to scroll inside
+    // the WebView, so arrow keys / PageDown delivered to the focused
+    // WebView would move nothing and swallow the gesture. A keyboard user
+    // would have no path to the tail of a long message — the one case the
+    // change set exists to prevent. Forward instead, exactly like the
+    // wheel: next responder first, stock behaviour in fallback mode.
+    override func scrollLineDown(_ sender: Any?) {
+        forwardKeyboardScroll(fallback: { super.scrollLineDown(sender) }) { $0.scrollLineDown(sender) }
+    }
+
+    override func scrollLineUp(_ sender: Any?) {
+        forwardKeyboardScroll(fallback: { super.scrollLineUp(sender) }) { $0.scrollLineUp(sender) }
+    }
+
+    override func scrollPageDown(_ sender: Any?) {
+        forwardKeyboardScroll(fallback: { super.scrollPageDown(sender) }) { $0.scrollPageDown(sender) }
+    }
+
+    override func scrollPageUp(_ sender: Any?) {
+        forwardKeyboardScroll(fallback: { super.scrollPageUp(sender) }) { $0.scrollPageUp(sender) }
+    }
+
+    override func scrollToEndOfDocument(_ sender: Any?) {
+        forwardKeyboardScroll(fallback: { super.scrollToEndOfDocument(sender) }) {
+            $0.scrollToEndOfDocument(sender)
+        }
+    }
+
+    override func scrollToBeginningOfDocument(_ sender: Any?) {
+        forwardKeyboardScroll(fallback: { super.scrollToBeginningOfDocument(sender) }) {
+            $0.scrollToBeginningOfDocument(sender)
+        }
+    }
+
+    /// Hands a keyboard scroll action to the next responder (the outer
+    /// scroller) while forwarding is on; in fallback mode the WebView keeps
+    /// the gesture and scrolls itself.
+    private func forwardKeyboardScroll(
+        fallback: () -> Void,
+        _ action: (NSResponder) -> Void
+    ) {
+        guard forwardsScrollWheel, let next = nextResponder else {
+            fallback()
+            return
+        }
+        action(next)
     }
 }
 
@@ -74,21 +127,25 @@ struct HTMLMessageView: NSViewRepresentable {
         Coordinator(contentHeight: $contentHeight)
     }
 
-    func makeNSView(context: Context) -> WKWebView {
+    // `PassThroughScrollWebView`, not `WKWebView`: the single-scroller
+    // contract lives in the subclass, so the teardown hook has to be able
+    // to detach the width-change closure without a cast.
+    func makeNSView(context: Context) -> PassThroughScrollWebView {
         let config = WKWebViewConfiguration()
         // M1.6: mail has no legitimate need for JS. Disabling is the only
         // way to neutralize a `<script>` tag or `javascript:` href.
+        // It does NOT block our own `evaluateJavaScript` measurement calls
+        // (probed on macOS 27.2, and locked by
+        // `test_evaluateJavaScriptWorksWithContentJavaScriptDisabled`).
         config.defaultWebpagePreferences.allowsContentJavaScript = false
         let view = PassThroughScrollWebView(frame: .zero, configuration: config)
         view.setValue(false, forKey: "drawsBackground")
         view.navigationDelegate = context.coordinator
-        // Single-scroller contract, asserted once here: gestures pass
-        // through to the outer SwiftUI ScrollView (subclass) and the
-        // internal bar indicators are hidden. With the parent sizing the
-        // frame to measured content there is then nothing inside to
-        // scroll at all — until measurement fails, which is what the
-        // restore fallback in `didFinish` is for.
-        Self.disableEmbeddedScrolling(in: view)
+        // Single-scroller contract, asserted here and nowhere else: the
+        // subclass forwards wheel + keyboard scroll to the outer SwiftUI
+        // ScrollView. Nothing about the internal bar is touched — see
+        // `PassThroughScrollWebView`'s doc comment for why that code is
+        // gone rather than merely unused.
         let coordinator = context.coordinator
         view.onWidthChange = { [weak view] in
             guard let view else { return }
@@ -97,27 +154,15 @@ struct HTMLMessageView: NSViewRepresentable {
         return view
     }
 
-    /// Hides the WebView's internal scrollbar *indicators*. Hiding the bar
-    /// does not block the gesture — blocking is the subclass's job — the
-    /// two together are the single-scroller contract. Asserted once at
-    /// `makeNSView`: re-asserting later would fight the measurement-failure
-    /// fallback in `restoreEmbeddedScrolling` (indicators off + gestures
-    /// no longer forwarded = scrolling with no visible bar, again).
-    static func disableEmbeddedScrolling(in webView: WKWebView) {
-        guard let scrollView = Coordinator.findScrollView(in: webView) else { return }
-        scrollView.hasVerticalScroller = false
-        scrollView.hasHorizontalScroller = false
-    }
-
-    /// Escape hatch for permanent height-measurement failure: gestures stop
-    /// passing through and the vertical bar reappears, so content stays
-    /// reachable instead of clipped at the floor.
-    static func restoreEmbeddedScrolling(in webView: WKWebView) {
-        if let view = webView as? PassThroughScrollWebView {
-            view.forwardsScrollWheel = false
-        }
-        guard let scrollView = Coordinator.findScrollView(in: webView) else { return }
-        scrollView.hasVerticalScroller = true
+    /// Teardown. Both hooks the old code was missing: the polling task is
+    /// unstructured and strongly captures the coordinator (hence the
+    /// `contentHeight` binding), so without this it can outlive the view,
+    /// and `onWidthChange` would keep a fired closure attached to a view
+    /// SwiftUI no longer owns.
+    static func dismantleNSView(_ webView: PassThroughScrollWebView, coordinator: Coordinator) {
+        webView.onWidthChange = nil
+        webView.navigationDelegate = nil
+        coordinator.cancelMeasurement()
     }
 
     /// Reload the WebView when the underlying HTML or inline-image map
@@ -133,6 +178,27 @@ struct HTMLMessageView: NSViewRepresentable {
         var resolvedCidCount: Int = 0
         private let contentHeight: Binding<CGFloat>
         private var measureTask: Task<Void, Never>?
+        private var fallbackTask: Task<Void, Never>?
+
+        /// Bursty phase: 40 samples × 250ms ≈ 10s, stopped early once the
+        /// height settles (3 consecutive identical samples).
+        /// `var`, not `let`, so tests can shrink the schedule instead of
+        /// sleeping 40 seconds; production never writes them.
+        static var burstIterations = 40
+        static var burstInterval: UInt64 = 250_000_000
+        static let debounce: UInt64 = 150_000_000
+        static let stableSampleLimit = 3
+        /// A height that is not *more* than the viewport by this margin is
+        /// treated as "not measured" — see `isMeasured`.
+        static let viewportEpsilon: CGFloat = 8
+        /// Slow-growth tail: a heartbeat well past the burst window
+        /// (late CDN images, web fonts, `loading=lazy`, `didFinish` before
+        /// image decode settles). Bounded so it cannot run forever.
+        static var heartbeatIterations = 15
+        static var heartbeatInterval: UInt64 = 2_000_000_000
+        /// How long after `didFinish` we wait for a usable height before
+        /// handing scrolling back to the WebView.
+        static var fallbackGraceSeconds: Double = 1.0
 
         init(contentHeight: Binding<CGFloat>) {
             self.contentHeight = contentHeight
@@ -154,51 +220,110 @@ struct HTMLMessageView: NSViewRepresentable {
         ///
         /// Polled rather than one-shot: images decode and fonts settle
         /// after `didFinish`, so a height that stops changing early can
-        /// still grow — stopping after a few stable polls clipped
-        /// late-loading images. The loop therefore runs a fixed ~10s
-        /// window (40 × 250ms) after a 150ms debounce; a window resize
-        /// reflows the document and `onWidthChange` restarts the window.
+        /// still grow — stopping after a few polls clipped late-loading
+        /// images. Two bounded phases:
+        ///
+        /// 1. **Burst** — 150ms debounce, then 40 samples 250ms apart
+        ///    (~10s), ending early once 3 consecutive samples agree.
+        ///    A window resize reflows the document and `onWidthChange`
+        ///    restarts the whole thing.
+        /// 2. **Heartbeat** — the burst used to be the *end* of
+        ///    measurement, so anything that grew after ~10s (slow CDN
+        ///    image, web font, `loading=lazy`) stayed short forever, and
+        ///    because the wheel is forwarded to an outer scroller with
+        ///    nothing left to scroll, the tail of the email was
+        ///    unreachable. The heartbeat samples every 2s for 15 more
+        ///    iterations (~30s) and stops as soon as it is cancelled
+        ///    (teardown, reload, resize).
         func startMeasuring(on webView: WKWebView) {
             measureTask?.cancel()
             measureTask = Task { @MainActor [weak webView] in
                 // Debounce: a live resize delivers one layout() per frame —
                 // wait for the burst to settle before the first sample.
-                try? await Task.sleep(nanoseconds: 150_000_000)
-                for _ in 0..<40 {
+                try? await Task.sleep(nanoseconds: Self.debounce)
+                var stableRun = 0
+                var last: CGFloat = 0
+                for _ in 0..<Self.burstIterations {
                     guard !Task.isCancelled, let webView else { return }
-                    if let height = await Self.documentHeight(of: webView), height > 1,
-                       abs(self.contentHeight.wrappedValue - height) > 0.5 {
-                        self.contentHeight.wrappedValue = height
+                    if let height = await Self.measuredHeight(of: webView) {
+                        stableRun = abs(height - last) <= 0.5 ? stableRun + 1 : 0
+                        last = height
+                        self.commit(height, to: webView)
                     }
-                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    if stableRun >= Self.stableSampleLimit { break }
+                    try? await Task.sleep(nanoseconds: Self.burstInterval)
+                }
+                for _ in 0..<Self.heartbeatIterations {
+                    try? await Task.sleep(nanoseconds: Self.heartbeatInterval)
+                    guard !Task.isCancelled, let webView else { return }
+                    guard let height = await Self.measuredHeight(of: webView) else { continue }
+                    self.commit(height, to: webView)
                 }
             }
         }
 
-        /// `scrollHeight` of the taller of documentElement/body, or nil on
-        /// any evaluation failure (empty document before the first load,
-        /// unresponsive page process) — the caller treats nil as "not
-        /// measured yet" and keeps polling.
-        private static func documentHeight(of webView: WKWebView) async -> CGFloat? {
+        /// Cancels the polling task and the pending fallback check. Called
+        /// from `dismantleNSView` (and implicitly by `startMeasuring`,
+        /// which cancels before re-arming).
+        func cancelMeasurement() {
+            measureTask?.cancel()
+            measureTask = nil
+            fallbackTask?.cancel()
+            fallbackTask = nil
+        }
+
+        /// `scrollHeight` of the taller of documentElement/body, accepted
+        /// only when it is *bigger than the viewport*.
+        ///
+        /// The old filter was `height > 1`, which is nearly no filter at
+        /// all: an email with `body { overflow: hidden }` or
+        /// `html { height: 100% }` measures exactly the viewport, which
+        /// is > 1, so a *wrong* measurement was written into the binding,
+        /// the parent clamped it to the 80pt floor, and the wheel was
+        /// forwarded away — the email tail clipped behind an invisible
+        /// wall. Samples equal to the frame are "not measured" and are
+        /// dropped, so the parent keeps showing the pre-measurement floor
+        /// and the fallback below takes over.
+        private static func measuredHeight(of webView: WKWebView) async -> CGFloat? {
             let expression = "Math.max(document.documentElement?.scrollHeight ?? 0, document.body?.scrollHeight ?? 0)"
             guard let result = try? await webView.evaluateJavaScript(expression) else { return nil }
-            return (result as? NSNumber).map { CGFloat($0.doubleValue) }
+            guard let height = (result as? NSNumber).map({ CGFloat($0.doubleValue) }),
+                  isMeasured(height, frameHeight: webView.bounds.height)
+            else { return nil }
+            return height
         }
 
-        /// Depth-first search for the first `NSScrollView` under `view`.
-        /// The class is private to WebKit, so there is no API for this;
-        /// the nesting has been stable across macOS 11–15. If a future OS
-        /// hides it, the search returns nil and the caller keeps whatever
-        /// height it last had — the body renders at its previous size
-        /// rather than crashing or collapsing.
-        fileprivate static func findScrollView(in view: NSView) -> NSScrollView? {
-            if let scrollView = view as? NSScrollView { return scrollView }
-            for subview in view.subviews {
-                if let found = findScrollView(in: subview) { return found }
+        /// "Measured" means *taller than what the frame already is*. A
+        /// value within `viewportEpsilon` of the frame height is the
+        /// viewport reporting itself, not a document height.
+        static func isMeasured(_ height: CGFloat, frameHeight: CGFloat) -> Bool {
+            height > frameHeight + viewportEpsilon
+        }
+
+        /// Writes a real height back to the parent and re-arms gesture
+        /// forwarding.
+        ///
+        /// The re-arm matters because the fallback is one-way unless
+        /// something undoes it: a single 1s grace trip (page-process
+        /// stall, empty document) latched `forwardsScrollWheel = false`,
+        /// and a later successful measurement left the WebView with its
+        /// own scroller inside a frame that already matched its content —
+        /// the nested scroll box this design removed, with no way back.
+        /// Any committed height means the frame matches content again, so
+        /// forwarding must go back on.
+        @discardableResult
+        func commit(_ height: CGFloat, to webView: WKWebView) -> Bool {
+            // Re-arm on *any* accepted sample, even one that does not move
+            // the binding: a same-height sample still means the frame
+            // matches content, so the WebView must not keep its own
+            // scroller.
+            if let passthrough = webView as? PassThroughScrollWebView {
+                passthrough.forwardsScrollWheel = true
             }
-            return nil
+            guard abs(contentHeight.wrappedValue - height) > 0.5 else { return false }
+            contentHeight.wrappedValue = height
+            return true
         }
-
 
         /// Open links in the user's default browser instead of navigating
         /// the WebView. We still allow the *initial* `loadHTMLString` (no
@@ -225,21 +350,30 @@ struct HTMLMessageView: NSViewRepresentable {
             decisionHandler(.allow)
         }
 
-        /// `loadHTMLString` swaps in a fresh document view, so the height
-        /// observer has to be re-attached after every navigation. The
-        /// first `reportHeight()` fires here; later ones come from the
-        /// frame-changed notifications as images decode and fonts settle.
+        /// `loadHTMLString` swaps in a fresh document view, so measurement
+        /// restarts here for every navigation. The first honest sample
+        /// lands after the 150ms debounce; later ones come from the
+        /// polling loop as images decode and fonts settle.
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             startMeasuring(on: webView)
             // Measurement can fail permanently (evaluateJavaScript never
             // answers: empty document, unresponsive page process). The
             // outer frame would then sit on the floor with gestures passing
-            // through — invisible clipping, worse than the original
-            // nested scrollbar. After a grace period with no height,
-            // restore the WebView's own scrolling: ugly, but visible.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak webView] in
-                guard let webView, self.contentHeight.wrappedValue <= 1 else { return }
-                HTMLMessageView.restoreEmbeddedScrolling(in: webView)
+            // through — invisible clipping, worse than the original nested
+            // scrollbar. After a grace period with no *usable* height,
+            // hand scrolling back to the WebView: ugly, but visible.
+            // "Usable" means taller than the frame, not merely > 0 — a
+            // viewport-height sample is a wrong measurement, not a
+            // measurement (see `isMeasured`).
+            fallbackTask?.cancel()
+            fallbackTask = Task { @MainActor [weak webView] in
+                try? await Task.sleep(nanoseconds: UInt64(Self.fallbackGraceSeconds * 1_000_000_000))
+                guard !Task.isCancelled, let webView else { return }
+                guard !Self.isMeasured(
+                    self.contentHeight.wrappedValue,
+                    frameHeight: webView.bounds.height
+                ) else { return }
+                (webView as? PassThroughScrollWebView)?.forwardsScrollWheel = false
             }
         }
     }
@@ -265,7 +399,7 @@ struct HTMLMessageView: NSViewRepresentable {
     </style>
     """
 
-    func updateNSView(_ webView: WKWebView, context: Context) {
+    func updateNSView(_ webView: PassThroughScrollWebView, context: Context) {
         let resolved = Self.resolveCidReferences(in: html, with: attachmentsByCid)
         // Inject the fluid CSS into the head — or wrap a minimal head around
         // documents that have no `<head>` at all (rare but legal HTML).

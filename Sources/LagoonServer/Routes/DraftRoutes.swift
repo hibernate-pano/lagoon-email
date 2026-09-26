@@ -331,9 +331,23 @@ public enum SearchRoutes {
             .replacingOccurrences(of: "_", with: "\\_")
         let pattern = "%\(escaped)%"
         // One path, two recalls: ILIKE substrings (precise, CJK-safe) ORed
-        // with a plainto_tsquery match (English inflection recall, backed by
-        // the GIN index). plainto_tsquery never throws on user input — the
-        // worst case is an empty query that matches nothing.
+        // with a plainto_tsquery match (English inflection recall). The
+        // tsvector expression must match `message_bodies_fts_idx` exactly —
+        // `coalesce(body_text, '')` here would be a *different* expression
+        // from the indexed `body_text`, and the index could never be chosen.
+        // `body_text` is NOT NULL (migration 015), so the left join's NULL side
+        // simply fails the `@@` instead of needing a coalesce.
+        // plainto_tsquery never throws on user input — the worst case is an
+        // empty query that matches nothing.
+        //
+        // # ponytail: matching the indexed expression only makes the index
+        // *eligible*; the leading-wildcard `b.body_text ILIKE '%q%'` arm of the
+        // same OR still forces a sequential scan for the combined predicate, so
+        // this query is not index-backed end to end. Upgrade path: split into
+        // two queries (a GIN-only tsvector match UNIONed with the header/body
+        // ILIKE pass) once body recall grows enough to hurt, or drop the ILIKE
+        // arm behind a "match all words" mode. Deliberately not done here: the
+        // brief says do not restructure the search.
         let sql = """
             SELECT m.id, m.account_id, m.remote_id, m.thread_id,
                    m.from_address,
@@ -349,7 +363,7 @@ public enum SearchRoutes {
               AND (m.subject ILIKE $2 ESCAPE '\\' OR m.snippet ILIKE $2 ESCAPE '\\'
                    OR m.from_name ILIKE $2 ESCAPE '\\' OR m.from_address ILIKE $2 ESCAPE '\\'
                    OR b.body_text ILIKE $2 ESCAPE '\\'
-                   OR to_tsvector('simple', coalesce(b.body_text, '')) @@ plainto_tsquery('simple', $5))
+                   OR to_tsvector('simple', b.body_text) @@ plainto_tsquery('simple', $5))
               AND ($3::text IS NULL OR m.from_address = $3)
               AND ($4::timestamptz IS NULL OR m.received_at >= $4)
             ORDER BY m.received_at DESC

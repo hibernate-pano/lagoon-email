@@ -35,6 +35,16 @@ public actor GmailProvider: MailProvider {
     /// per account.
     private var lastSeen: Set<String> = []
 
+    /// Reply Message-IDs already handed to `SyncEngine` in an earlier poll.
+    /// `replied` is re-derived from the whole 50-message window on every poll
+    /// (SENT mail is always inside it — `messages.list` has no `q` filter), so
+    /// without a baseline every poll would re-report the same IDs *and* skip
+    /// the sleep below, turning the sync loop into a hot `messages.list` +
+    /// 50×`messages.get` hammer that burns the per-user quota into 429s.
+    /// Refreshed with the same window idiom as `lastSeen`, so each distinct
+    /// sent Message-ID yields exactly one reply signal per process lifetime.
+    private var reportedReplies: Set<String> = []
+
     public init(
         account: Account,
         client: GmailClient,
@@ -63,7 +73,9 @@ public actor GmailProvider: MailProvider {
         // Gmail's incremental cursor is not used yet (same as M0): the sync is
         // a re-read of the last 50 messages, so the cursor round-trips.
         // Sent-folder state is derived, not tracked: every pull re-harvests
-        // threading references from SENT-labeled messages in the window.
+        // threading references from SENT-labeled messages in the window, and
+        // `changes(from:)` reports only the ones no earlier poll reported — so
+        // the sent window cannot pin this loop open.
         let next = MailSyncState(
             historyId: cursor.historyId,
             uidValidity: cursor.uidValidity,
@@ -130,7 +142,19 @@ public actor GmailProvider: MailProvider {
     /// Diff one poll against the previous one and refresh the baseline. Returns
     /// only new messages and messages whose read state flipped; the rest is
     /// already in the store. The second element harvests cross-client reply
-    /// signals (V2 A2): In-Reply-To/References of SENT-labeled messages.
+    /// signals (V2 A2): In-Reply-To/References of SENT-labeled messages, minus
+    /// the ones an earlier poll already reported.
+    ///
+    /// # ponytail: the reply baseline lives in memory, so a process restart
+    /// re-reports the SENT window once (one fast pull, not a hot loop — the
+    /// engine dedupes the IDs against `ai_actions`, so no duplicate rows land).
+    /// Upgrade path: persist the baseline in `MailSyncState` (it already
+    /// round-trips a `sentFolder`/`sentLastUid` triple that only IMAP writes)
+    /// by adding a `repliedMessageIds` field, or store the newest sent
+    /// `internalDate` in `sentLastUid` and skip the window below it.
+    /// Deliberately not done here: `Sources/LagoonKit/MailSyncState.swift` and
+    /// `Sources/LagoonServer/Sync/SyncEngine.swift` are outside this change's
+    /// file scope.
     private func changes(from raw: [RawGmailMessage]) -> (upserts: [RemoteHeader], replied: Set<String>) {
         var seen = Set<String>()
         seen.reserveCapacity(raw.count)
@@ -147,7 +171,13 @@ public actor GmailProvider: MailProvider {
             }
         }
         lastSeen = seen
-        return (changed, replied)
+        // Only IDs this poll has never reported. `SyncEngine.recordSentReplies`
+        // already dedupes against the store, so a repeated ID is harmless
+        // there — but re-reporting one also re-triggers the early return below,
+        // and that is what made the loop spin.
+        let fresh = replied.subtracting(reportedReplies)
+        reportedReplies = replied
+        return (changed, fresh)
     }
 
     /// Threading references of one Gmail message, same contract as the IMAP

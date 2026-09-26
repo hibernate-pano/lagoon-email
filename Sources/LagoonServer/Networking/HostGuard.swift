@@ -32,7 +32,7 @@ public enum LoopbackHost {
     }
 }
 
-/// Rejects requests whose host is not loopback.
+/// Rejects requests whose host is not in the allow-list.
 ///
 /// M1 has no API authentication, so the server binds 127.0.0.1. A loopback
 /// bind is not a security boundary on its own: a page in any browser on this
@@ -41,7 +41,14 @@ public enum LoopbackHost {
 /// attacker-controlled hostname as the request authority, so validating it
 /// closes that path. (A per-install bearer token is the M2 fix for
 /// non-browser local callers.)
+///
+/// `allowedNames` defaults to the loopback names. It is *widened* (never
+/// removed) to the configured bind address when an API token is configured —
+/// see `ServerConfig.allowedHostNames(apiToken:)` — so the advertised
+/// "non-loopback bind + LAGOON_API_TOKEN" posture actually works while the
+/// Host check itself keeps doing the DNS-rebinding work.
 public struct LoopbackHostMiddleware<Context: RequestContext>: RouterMiddleware {
+    /// Host names (any port) a legitimate client may address.
     public let allowedNames: Set<String>
     /// Reads the client-supplied host. HTTP/1.1 derives `authority` from the
     /// Host header and HTTP/2 from `:authority`; both surface as

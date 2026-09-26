@@ -46,6 +46,17 @@ final class BodyStoreTests: XCTestCase {
         FetchedBody(text: text, html: "<p>\(text)</p>", attachments: [], hasMore: false)
     }
 
+    private func addressedBody(text: String) -> FetchedBody {
+        FetchedBody(
+            text: text,
+            html: "<p>\(text)</p>",
+            attachments: [],
+            hasMore: false,
+            to: ["alice@example.com", "bob@example.com"],
+            cc: ["carol@example.com"]
+        )
+    }
+
     private func cleanup(_ account: Account) -> @Sendable (PostgresConnection) async -> Void {
         { conn in
             try? await TestDatabase.deleteMessages(accountId: account.id, db: conn)
@@ -81,6 +92,139 @@ final class BodyStoreTests: XCTestCase {
             let updated = try XCTUnwrap(refetched)
             XCTAssertEqual(updated.text, "v2")
         }
+    }
+
+    /// Recipients must survive the store: without them a re-open answered
+    /// `to: [], cc: []` and the client degraded reply-all to
+    /// reply-to-sender (the 60s memory cache it replaced did keep them).
+    func test_put_get_roundTripsToAndCcRecipients() async throws {
+        let account = makeAccount()
+        try await TestDatabase.withConnection(cleanup: cleanup(account)) { conn in
+            try await seed(account, db: conn)
+            try await MessageStore.upsert(
+                header(accountId: account.id, remoteId: "b4", subject: "s"), db: conn
+            )
+
+            try await BodyStore.put(
+                accountId: account.id, remoteId: "b4",
+                body: addressedBody(text: "lunch?"), db: conn
+            )
+            let fetched = try await BodyStore.get(accountId: account.id, remoteId: "b4", db: conn)
+            let stored = try XCTUnwrap(fetched)
+            XCTAssertEqual(stored.to, ["alice@example.com", "bob@example.com"])
+            XCTAssertEqual(stored.cc, ["carol@example.com"])
+
+            // Overwriting with a fresh fetch replaces them wholesale.
+            try await BodyStore.put(
+                accountId: account.id, remoteId: "b4", body: body(text: "v2"), db: conn
+            )
+            let refetchedRow = try await BodyStore.get(accountId: account.id, remoteId: "b4", db: conn)
+            let refetched = try XCTUnwrap(refetchedRow)
+            XCTAssertTrue(refetched.to.isEmpty)
+            XCTAssertTrue(refetched.cc.isEmpty)
+        }
+    }
+
+    /// The regression as the user saw it: the SECOND (store-hit) body must
+    /// equal the FIRST (provider) body, recipients included.
+    func test_bodyRoute_storeHit_matchesProviderBodyIncludingRecipients() async throws {
+        let account = makeAccount()
+        try await TestDatabase.withConnection(cleanup: cleanup(account)) { conn in
+            try await seed(account, db: conn)
+            try await MessageStore.upsert(
+                header(accountId: account.id, remoteId: "b5", subject: "lunch"), db: conn
+            )
+
+            let provider = RecipientBodyProvider()
+            let router = Router<BasicRequestContext>()
+            let session = URLSession(configuration: .ephemeral)
+            MessageRoutes.register(
+                on: router, db: conn,
+                client: GmailClient(session: session),
+                tokens: GmailTokenService(
+                    db: conn,
+                    oauth: GoogleOAuthClient(
+                        clientID: "t", clientSecret: "s",
+                        redirectURI: "http://127.0.0.1:9/cb", session: session
+                    ),
+                    logger: Self.logger
+                ),
+                logger: Self.logger,
+                makeProvider: { _ in provider }
+            )
+            let app = Application(router: router)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let uri = "/api/messages/b5/body?accountId=\(account.id.uuidString)"
+            try await app.test(.router) { client in
+                var bodies: [MessageBody] = []
+                for _ in 0..<2 {
+                    try await client.execute(uri: uri, method: .get) { response in
+                        XCTAssertEqual(response.status, .ok)
+                        bodies.append(
+                            try decoder.decode(MessageBody.self, from: Data(buffer: response.body))
+                        )
+                    }
+                }
+                let first = try XCTUnwrap(bodies.first)
+                let second = try XCTUnwrap(bodies.last)
+                XCTAssertEqual(
+                    second.to, ["alice@example.com", "bob@example.com"],
+                    "a store hit must keep To: so reply-all still works"
+                )
+                XCTAssertEqual(second.cc, ["carol@example.com"])
+                XCTAssertEqual(
+                    second.text, first.text,
+                    "the second open is served from the store"
+                )
+                let fetches = await provider.fetchCount
+                XCTAssertEqual(
+                    fetches, 1,
+                    "the second GET must not reach the provider"
+                )
+            }
+        }
+    }
+
+    /// Provider double that always answers with the same recipients.
+    private actor RecipientBodyProvider: MailProvider {
+        nonisolated let kind: MailProviderKind = .qq
+        private(set) var fetchCount = 0
+
+        func capabilities() async -> MailCapabilities {
+            MailCapabilities(archiveFolder: true, idle: true, move: true, serverSnippet: true)
+        }
+
+        func pullChanges(after cursor: MailSyncState, waitUpTo: Duration) async throws -> MailChangeSet {
+            MailChangeSet(upserts: [], resetRequired: false, cursor: cursor)
+        }
+
+        func fetchBody(remoteId: String) async throws -> FetchedBody {
+            fetchCount += 1
+            return FetchedBody(
+                text: "stored text", html: nil, attachments: [], hasMore: false,
+                to: ["alice@example.com", "bob@example.com"],
+                cc: ["carol@example.com"]
+            )
+        }
+
+        func fetchAttachment(remoteId: String, attachmentId: String) async throws -> FetchedAttachmentBytes {
+            throw AttachmentError.notFound
+        }
+
+        func fetchRawMessage(remoteId: String) async throws -> Data { Data() }
+
+        func fetchRawHeaderValues(remoteId: String) async throws -> [String: String] { [:] }
+
+        func setRead(remoteId: String, isRead: Bool) async throws {}
+
+        func archive(remoteId: String) async throws {}
+
+        func unarchive(remoteId: String) async throws {}
+
+        func send(_ outbound: OutboundMessage) async throws -> String? { nil }
+
+        func probe() async throws {}
     }
 
     func test_headerDelete_cascadesBody() async throws {

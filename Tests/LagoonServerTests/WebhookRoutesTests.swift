@@ -121,7 +121,7 @@ final class WebhookRoutesTests: XCTestCase {
             let engine = SyncEngine(
                 db: conn,
                 logger: Logger(label: "webhook-engine-tests"),
-                makeProvider: { account in providers[account.id] },
+                makeProvider: { account, _ in providers[account.id] },
                 sleep: { _ in },
                 makeDB: { try await TestDatabase.requireConnection() }
             )

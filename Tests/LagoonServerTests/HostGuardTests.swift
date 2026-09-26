@@ -32,10 +32,14 @@ final class HostGuardTests: XCTestCase {
     // MARK: - Middleware
 
     private func makeApp(
+        allowedNames: Set<String> = LoopbackHost.allowedNames,
         host: @escaping @Sendable (Request) -> String? = { $0.head.authority }
     ) -> Application<RouterResponder<BasicRequestContext>> {
         let router = Router()
-        router.add(middleware: LoopbackHostMiddleware<BasicRequestContext>(host: host))
+        router.add(middleware: LoopbackHostMiddleware<BasicRequestContext>(
+            allowedNames: allowedNames,
+            host: host
+        ))
         router.get("healthz") { _, _ in Response(status: .ok) }
         return Application(router: router)
     }
@@ -91,6 +95,55 @@ final class HostGuardTests: XCTestCase {
         try await app.test(.router) { client in
             try await client.execute(uri: "/healthz", method: .get) { response in
                 XCTAssertEqual(response.status, .ok)
+            }
+        }
+    }
+
+    /// The advertised "bind your LAN address + LAGOON_API_TOKEN" posture: the
+    /// guard must serve the address the server actually bound. With the
+    /// loopback-only default this was a 403 to every LAN client, which is how
+    /// a live port ends up answering forbidden-host to everyone.
+    func test_tokenizedLanBindAuthority_isServed() async throws {
+        let cfg = ServerConfig(
+            host: "192.168.1.50",
+            port: 8080,
+            googleClientID: "",
+            googleClientSecret: "",
+            googleRedirectURI: "http://192.168.1.50:8080/oauth/gmail/callback"
+        )
+        let app = makeApp(
+            allowedNames: cfg.allowedHostNames(apiToken: "secret"),
+            host: { _ in "192.168.1.50:8080" }
+        )
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/healthz", method: .get) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+    }
+
+    /// Widening the allow-list must not reopen the DNS-rebinding path: a
+    /// hostile name is still rejected with the same envelope.
+    func test_tokenizedLanBind_stillRejectsForeignHostNames() async throws {
+        let cfg = ServerConfig(
+            host: "192.168.1.50",
+            port: 8080,
+            googleClientID: "",
+            googleClientSecret: "",
+            googleRedirectURI: ""
+        )
+        for hostile in ["evil.com", "evil.com:8080", "127.0.0.1.evil.com", "192.168.1.51"] {
+            let app = makeApp(
+                allowedNames: cfg.allowedHostNames(apiToken: "secret"),
+                host: { _ in hostile }
+            )
+            try await app.test(.router) { client in
+                try await client.execute(uri: "/healthz", method: .get) { response in
+                    XCTAssertEqual(
+                        response.status, .forbidden,
+                        "host \(hostile) must stay rejected even with a token"
+                    )
+                }
             }
         }
     }

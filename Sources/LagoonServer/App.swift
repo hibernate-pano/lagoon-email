@@ -24,19 +24,18 @@ struct LagoonServerMain {
         // The Host-header check stays on regardless (DNS rebinding).
         let apiToken = ProcessInfo.processInfo.environment["LAGOON_API_TOKEN"]
             .flatMap { $0.isEmpty ? nil : $0 }
-        if !cfg.isLoopback, apiToken == nil {
-            die("""
-                refusing to start: LAGOON_SERVER_HOST=\(cfg.host) is not a loopback address.
-                Lagoon has NO API authentication without LAGOON_API_TOKEN; binding a non-loopback
-                interface would expose the API to the network. Either bind loopback
-                (127.0.0.1, ::1, localhost) or set LAGOON_API_TOKEN and configure the same
-                token on the client.
-                """)
-        }
+        if let refusal = cfg.startupRefusal(apiToken: apiToken) { die(refusal) }
         if !cfg.isLoopback {
             logger.warning("binding non-loopback with API token auth", metadata: [
                 "host": .string(cfg.host),
             ])
+            if cfg.isWildcardBind {
+                logger.warning("""
+                    wildcard bind names no single address, so the Host guard still only \
+                    accepts loopback names: LAN clients will get 403 forbidden-host. \
+                    Bind the concrete LAN address (LAGOON_SERVER_HOST=192.168.x.x) to serve them.
+                    """)
+            }
         }
 
         // Tokens are AES-GCM encrypted with LAGOON_TOKEN_KEY. Fail closed at
@@ -124,12 +123,15 @@ struct LagoonServerMain {
         let syncEngine = SyncEngine(
             db: db,
             logger: logger,
-            makeProvider: { account in
+            makeProvider: { account, loopDB in
                 MailProviderFactory.make(
                     account: account,
                     client: gmailClient,
                     tokens: tokens,
-                    db: db,
+                    // The loop's own connection: a provider that reads
+                    // credentials from the DB must not query on the shared
+                    // `db` while the loop's queries are in flight.
+                    db: loopDB,
                     logger: logger
                 )
             },
@@ -163,8 +165,13 @@ struct LagoonServerMain {
         let router = Router()
         // A loopback bind alone is not a security boundary: DNS rebinding can
         // point any browser on this machine at 127.0.0.1 and read synced mail.
-        // Reject requests whose Host is not loopback (Networking/HostGuard.swift).
-        router.add(middleware: LoopbackHostMiddleware())
+        // Reject requests whose Host is not allowed (Networking/HostGuard.swift).
+        // With an API token set the allow-list also covers the configured bind
+        // address, so a LAN client on that address is served instead of being
+        // rejected 403 by a guard that never learned about the token.
+        router.add(middleware: LoopbackHostMiddleware(
+            allowedNames: cfg.allowedHostNames(apiToken: apiToken)
+        ))
         router.add(middleware: APIAuthMiddleware(token: apiToken))
         HealthRoutes.register(on: router)
         OAuthRoutes.register(

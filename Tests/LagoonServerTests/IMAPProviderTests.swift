@@ -417,6 +417,58 @@ final class IMAPProviderTests: XCTestCase {
         }
     }
 
+    /// Finding 4: a round that harvested new sent Message-IDs but saw no new
+    /// inbox mail must still be returned, so the engine records the reply
+    /// signal and persists the sent cursor. Otherwise the pull keeps looping
+    /// on the same (unchanged) `cursor`, re-scanning the same 200-message Sent
+    /// backfill every time and never advancing.
+    func test_pullChanges_returnsSentOnlyRoundInsteadOfRescanningSent() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let transport = ScriptedTransport()
+            let (provider, _) = try makeProvider(transport: transport)
+            await scriptHandshake(transport)
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+                (name: "Archive", attribute: "\\Archive"),
+                (name: "Sent", attribute: "\\Sent"),
+            ])
+            // Inbox round: no new mail at all (cursor already past everything).
+            await scriptSelect(transport, number: 5, uidValidity: 42, uidNext: 901)
+            await transport.enqueue("A0006 OK FETCH completed")
+            await transport.enqueue(#"* 1 FETCH (UID 900 FLAGS (\Seen))"#)
+            await transport.enqueue("A0007 OK FETCH completed")
+            // Sent scan: one brand-new reply. Nothing else is scripted — a
+            // second round would hit `closed` and fail the test.
+            await scriptSelect(transport, number: 8, exists: 1, uidValidity: 7, uidNext: 52)
+            await scriptHeaderFetch(transport, sequence: 1, uid: 50, flags: "\\Seen", headers: [
+                ("From", "user@qq.com"),
+                ("Subject", "Re: Q3 plan"),
+                ("Message-ID", "<reply50@qq.com>"),
+                ("In-Reply-To", "<m900@qq.com>"),
+            ])
+            await transport.enqueue("A0009 OK FETCH completed")
+
+            // A budget below the poll interval would make the old code sleep
+            // and re-round; the sent harvest must end the pull on its own.
+            let change = try await provider.pullChanges(
+                after: MailSyncState(uidValidity: 42, lastUid: 900),
+                waitUpTo: .milliseconds(1)
+            )
+
+            XCTAssertTrue(change.upserts.isEmpty, "no new inbox mail in this round")
+            XCTAssertEqual(
+                change.repliedMessageIds, ["<m900@qq.com>"],
+                "a sent-only round must not discard the reply signal"
+            )
+            XCTAssertEqual(change.cursor.sentLastUid, 50)
+            let lines = await wire(transport)
+            XCTAssertEqual(
+                lines.filter { $0.contains("SELECT \"Sent\"") }.count, 1,
+                "the Sent window must be scanned once, not re-harvested every round"
+            )
+        }
+    }
+
     func test_pullChanges_secondRound_fetchesAfterLastUid() async throws {
         try await TokenKeyFixture.withKeyAsync(Self.key) {
             let transport = ScriptedTransport()

@@ -623,6 +623,151 @@ final class GmailProviderTests: XCTestCase {
             }
         }
     }
+
+    /// The sent harvest alone must not pin the poller open (the hot-loop
+    /// bug): a SENT message is in the 50-message window forever, so a
+    /// re-reported reply signal would make every `pullChanges` return before
+    /// its 30s sleep. First pull reports the signal; the second pull sees the
+    /// same window and must come back empty after exactly one list round.
+    func test_sentHarvest_alone_doesNotHotLoopAndReportsOnce() async throws {
+        let oauthUser = "provider-\(UUID().uuidString)"
+        let access = "access-\(UUID().uuidString)"
+        let refresh = "rt-\(UUID().uuidString)"
+        let sent = "sent-\(UUID().uuidString)"
+        let other = "msg-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(
+                    account,
+                    accessToken: access,
+                    refreshToken: refresh,
+                    expiresAt: Date().addingTimeInterval(3600),
+                    db: conn
+                )
+                let provider = makeProvider(account: account, db: conn)
+                // The SENT message enters `lastSeen` on the first pull, so the
+                // second pull's *only* possible change is a re-reported
+                // reply signal.
+                installStub(
+                    tokenBody: tokenBody(accessToken: access),
+                    listBody: Self.listBody(ids: [sent, other]),
+                    metadata: [
+                        sent: Self.metadataBody(
+                            remoteId: sent,
+                            from: "me@example.com",
+                            subject: "Re: lunch",
+                            unread: false,
+                            listUnsubscribe: false,
+                            messageId: "<reply@example.com>",
+                            inReplyTo: "<orig@example.com>",
+                            labels: ["SENT"]
+                        ),
+                        other: Self.metadataBody(
+                            remoteId: other,
+                            from: "alice@example.com",
+                            subject: "lunch",
+                            unread: false,
+                            listUnsubscribe: false
+                        ),
+                    ]
+                )
+
+                let first = try await pull(provider)
+                XCTAssertEqual(first.upserts.count, 2)
+                XCTAssertEqual(first.repliedMessageIds, ["<orig@example.com>"])
+
+                let second = try await pull(provider)
+                XCTAssertTrue(
+                    second.repliedMessageIds.isEmpty,
+                    "the same sent Message-ID must not be reported twice"
+                )
+                XCTAssertTrue(second.upserts.isEmpty, "nothing new in the window")
+                XCTAssertEqual(
+                    listRequests(accessTokens: ["Bearer \(access)"]).count, 2,
+                    "two pulls, one list round each: the sent harvest must not hot-poll"
+                )
+            }
+        }
+    }
+
+    /// Same guarantee one level up, asserted on what `AccountSyncLoop`
+    /// actually persists (`sync.applied`-equivalent evidence, not health
+    /// alone): the loop settles to `.ok`, the sent reply is recorded once, and
+    /// the second round costs one list round — no self-retriggering rounds.
+    func test_syncLoop_staysPacedWhenOnlyTheSentHarvestIsNew() async throws {
+        let oauthUser = "provider-\(UUID().uuidString)"
+        let access = "access-\(UUID().uuidString)"
+        let refresh = "rt-\(UUID().uuidString)"
+        let sent = "sent-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(
+                    account,
+                    accessToken: access,
+                    refreshToken: refresh,
+                    expiresAt: Date().addingTimeInterval(3600),
+                    db: conn
+                )
+                installStub(
+                    tokenBody: tokenBody(accessToken: access),
+                    listBody: Self.listBody(ids: [sent]),
+                    metadata: [
+                        sent: Self.metadataBody(
+                            remoteId: sent,
+                            from: "me@example.com",
+                            subject: "Re: lunch",
+                            unread: false,
+                            listUnsubscribe: false,
+                            messageId: "<reply@example.com>",
+                            inReplyTo: "<orig@example.com>",
+                            labels: ["SENT"]
+                        )
+                    ]
+                )
+
+                // One long-lived provider for both rounds (the loop caches it),
+                // as `SyncEngine` does in production.
+                let provider = makeProvider(account: account, db: conn)
+                let loop = AccountSyncLoop(
+                    account: account,
+                    db: conn,
+                    logger: Logger(label: "gmail-provider-tests"),
+                    makeProvider: { _ in provider },
+                    sleep: { _ in }
+                )
+
+                await loop.round(waitBudget: .milliseconds(1))
+                let afterFirst = try await AccountStore.find(byId: account.id, db: conn)
+                XCTAssertEqual(afterFirst?.syncHealth.status, .ok)
+                let replies = try await AIActionStore.repliedRemoteIds(
+                    accountId: account.id, db: conn
+                )
+                XCTAssertEqual(replies, ["<orig@example.com>"])
+
+                await loop.round(waitBudget: .milliseconds(1))
+                let afterSecond = try await AccountStore.find(byId: account.id, db: conn)
+                XCTAssertEqual(
+                    afterSecond?.syncHealth.status, .ok,
+                    "an empty round must still settle to ok, not flap to degraded"
+                )
+                let repliesAfterSecond = try await AIActionStore.repliedRemoteIds(
+                    accountId: account.id, db: conn
+                )
+                XCTAssertEqual(
+                    repliesAfterSecond, replies,
+                    "the sent harvest must not record a new signal every round"
+                )
+                XCTAssertEqual(
+                    listRequests(accessTokens: ["Bearer \(access)"]).count, 2,
+                    "two rounds, one list round each"
+                )
+            }
+        }
+    }
 }
 
 /// Async form of `XCTAssertThrowsError` (its autoclosure cannot await).
