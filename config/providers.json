@@ -9,9 +9,9 @@
       "priority": 1,
       "capabilities": ["summary", "classify", "action_item", "bundle_reason", "draft"],
       "chatPath": "/chat/completions",
-      "//": "Set rates so LAGOON_BUDGET_USD_PER_MONTH can enforce a real cap.",
-      "costPer1kPromptUsd": null,
-      "costPer1kCompletionUsd": null
+      "//": "MiniMax M3 list price ¥4.2/¥16.8 per M tokens ≈ $0.60/$2.40 per M, rounded up. Conservative so the monthly cap never under-charges (promo is about half).",
+      "costPer1kPromptUsd": 0.0006,
+      "costPer1kCompletionUsd": 0.0024
     }
   ],
   "routing": {

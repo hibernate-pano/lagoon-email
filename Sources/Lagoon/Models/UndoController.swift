@@ -21,10 +21,12 @@ public struct UndoToast: View {
                         .font(.callout)
                         .foregroundStyle(.white)
                     Spacer(minLength: 8)
-                    Button(l10n.undo) {
-                        Task { await controller.undo() }
+                    if item.undoable {
+                        Button(l10n.undo) {
+                            Task { await controller.undo() }
+                        }
+                        .foregroundStyle(.white)
                     }
-                    .foregroundStyle(.white)
                     Button {
                         controller.dismiss()
                     } label: {
@@ -50,10 +52,16 @@ public struct UndoItem: Equatable {
     public let id: Int64
     public let message: String
     public let systemImage: String
-    public init(id: Int64, message: String, systemImage: String) {
+    /// Terminal actions (unsubscribe, send) have no inverse on the server
+    /// (`ActionsRoutes.NotUndoable`), so their toast must not offer Undo —
+    /// a button that always errors teaches the user to ignore the toast.
+    public let undoable: Bool
+
+    public init(id: Int64, message: String, systemImage: String, undoable: Bool = true) {
         self.id = id
         self.message = message
         self.systemImage = systemImage
+        self.undoable = undoable
     }
 }
 

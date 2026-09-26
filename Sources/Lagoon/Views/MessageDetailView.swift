@@ -932,7 +932,10 @@ struct MessageDetailView: View {
             undo.show(UndoItem(
                 id: response.actionId,
                 message: msg,
-                systemImage: "minus.circle"
+                systemImage: "minus.circle",
+                // Unsubscribe is terminal server-side (`NotUndoable`); the
+                // toast confirms, it must not offer a button that always fails.
+                undoable: false
             ))
         } catch {
             if let code = (error as? APIError)?.serverErrorCode {

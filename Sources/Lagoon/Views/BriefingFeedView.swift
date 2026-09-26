@@ -288,6 +288,14 @@ struct BriefingFeedView: View {
                                             Task { await autoArchiveSender(item) }
                                         }
                                         .disabled(!canArchive)
+                                        // 一键退订 lives with the noise rows:
+                                        // messages carrying List-Unsubscribe
+                                        // land in this group, and making the
+                                        // user open the mail first defeats
+                                        // "one-click". Terminal on the server.
+                                        Button(l10n.unsubscribe, role: .destructive) {
+                                            Task { await unsubscribeFrom(item) }
+                                        }
                                     }
                                 }
                             }
@@ -657,6 +665,38 @@ struct BriefingFeedView: View {
             return
         }
         await archiveAndUndo(byId: item.message.remoteId)
+    }
+
+
+
+    /// One-click unsubscribe (一键退订) from the feed. The server resolves the
+    /// List-Unsubscribe header / stored links / body scan, fires the request
+    /// behind its SSRF guard, and archives the message on success — so the
+    /// row leaves the feed the same way an archive row does. Terminal: the
+    /// toast confirms without offering Undo.
+    private func unsubscribeFrom(_ item: BriefingItem) async {
+        guard let accountId = accounts.accountId else { return }
+        do {
+            let response = try await api.unsubscribeMessage(
+                remoteId: item.message.remoteId,
+                accountId: accountId
+            )
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) {
+                items.removeAll { $0.message.remoteId == item.message.remoteId }
+            }
+            undo.show(UndoItem(
+                id: response.actionId,
+                message: "\(l10n.unsubscribed) · \(response.publisher)",
+                systemImage: "minus.circle",
+                undoable: false
+            ))
+        } catch {
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.unsubscribeFailedTitle,
+                detail: error.lagoonUIMessage
+            )
+        }
     }
 
 
