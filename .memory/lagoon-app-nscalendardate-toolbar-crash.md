@@ -47,4 +47,12 @@ lagoon.language / lagoon.grouping）——竞态而非必现。与 9/24 的两�
 - v2.1.1 新增的 @AppStorage（lagoon.grouping/unreadOnly）只在切换时写一次 defaults，
   与常驻轮询相比不是主要输入源，别错怪。
 
+**处置（2026-09-27，v2.1.2 c291931，founder 拍板"顺畅体验第一"）。** 详情页动作整体
+移出窗口工具栏，改为阅读视图内 `safeAreaInset(top)` 常驻动作条（动作/快捷键/⋯菜单
+原样保留，Archive & Next 升级 borderedProminent）。push/pop 详情对窗口 toolbar 零
+增删 → `_insertNewItem` 路径永不触达，竞态入口移除。连带收益：v2.0.7 的 surfaceVisible
+门控（防隐藏面 toolbar 泄漏）连同参数一起删除——没有项可泄漏了。剩余 toolbar 项只有
+RootView 常驻那组，数量恒定不增删。若 OS 崩溃仍再现于其他 toolbar 更新路径，下一步
+是给 Apple 提 Feedback（栈已留档）。
+
 **Related.** [[macos-swiftui-toolbar-overflow-hides-controls]] — 同一层的另一个静默问题族。

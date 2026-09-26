@@ -86,6 +86,10 @@ struct SearchSheet: View {
                         },
                         onAdvanceTo: { next in
                             path = next.map { [$0] } ?? []
+                        },
+                        onDelete: { id in
+                            results.removeAll { $0.remoteId == id }
+                            path = []
                         }
                     )
                     // Same reset contract as the BriefingFeed/MessageList

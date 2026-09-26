@@ -13,6 +13,8 @@ struct MessageDetailView: View {
     let initialGroup: BriefingGroup?
     /// Optional sibling list for j/k navigation and auto-advance on archive.
     var siblings: [String]? = nil
+    /// Called after a successful delete so the host can drop the row and pop.
+    var onDelete: ((String) -> Void)? = nil
     /// Called after a successful archive/undo so the list row can disappear/return.
     var onArchived: ((String, Bool) -> Void)? = nil  // (remoteId, isArchived)
     var onReadStateChange: (String, Bool) -> Void = { _, _ in }
@@ -102,6 +104,7 @@ struct MessageDetailView: View {
         siblings: [String]? = nil,
         onArchived: ((String, Bool) -> Void)? = nil,
         onAdvanceTo: ((String?) -> Void)? = nil,
+        onDelete: ((String) -> Void)? = nil,
         onReadStateChange: @escaping (String, Bool) -> Void = { _, _ in },
         onPinnedChanged: @escaping (Bool) -> Void = { _ in }
     ) {
@@ -113,6 +116,7 @@ struct MessageDetailView: View {
         self.siblings = siblings
         self.onArchived = onArchived
         self.onAdvanceTo = onAdvanceTo
+        self.onDelete = onDelete
         self.onReadStateChange = onReadStateChange
         self.onPinnedChanged = onPinnedChanged
         _isRead = State(initialValue: header?.isRead ?? false)
@@ -339,6 +343,9 @@ struct MessageDetailView: View {
             Button(l10n.overrideGroup) { showOverrideMenu = true }
             Button(l10n.unsubscribe, role: .destructive) { Task { await unsubscribe() } }
                 .disabled(header == nil)
+            // 删除也是可逆的（移入服务器废纸篓，⌘Z 恢复），但它是用户心智里
+            // 最"重"的动词，所以给 destructive 着色并放在 ⋯ 菜单末尾。
+            Button(l10n.deleteContext, role: .destructive) { Task { await deleteMessage() } }
 
             Divider()
 
@@ -957,6 +964,25 @@ struct MessageDetailView: View {
                 detail: l10n.archiveFailedDetail,
                 actionLabel: l10n.retry,
                 action: { [self] in await self.archiveAndAdvance() }
+            )
+        }
+    }
+
+    /// 删除：移入服务器废纸篓。可撤销（restore），所以 toast 保留 Undo 按钮。
+    private func deleteMessage() async {
+        do {
+            let response = try await api.deleteMessage(remoteId: remoteId, accountId: accountId)
+            undo.show(UndoItem(
+                id: response.actionId,
+                message: l10n.deleted,
+                systemImage: "trash"
+            ))
+            onDelete?(remoteId)
+        } catch {
+            actionBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.deleteFailedTitle,
+                detail: error.lagoonUIMessage
             )
         }
     }

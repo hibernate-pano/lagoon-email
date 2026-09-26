@@ -75,6 +75,8 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     /// reconnect (spec §4.3).
     private var archiveResolved = false
     private var archiveName: String?
+    private var trashResolved = false
+    private var trashName: String?
     private var sentResolved = false
     private var sentName: String?
     private var cachedCapabilities: MailCapabilities?
@@ -692,6 +694,50 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             sentResolved = true
         }
         return archiveName
+    }
+
+    /// Resolve the Trash role once per provider: SPECIAL-USE `\Trash` or a
+    /// well-known name. Unlike the archive role there is NO create fallback —
+    /// inventing a "Trash" folder on a server that has none would fake the
+    /// delete semantics; the route answers 409 delete-unavailable instead.
+    private func resolveTrashFolder(client: IMAPClient) async throws -> String? {
+        if trashResolved { return trashName }
+        let mailboxes = try await client.listMailboxes()
+        if let special = mailboxes.first(where: { mailbox in
+            mailbox.attributes.contains { $0.caseInsensitiveCompare("\\Trash") == .orderedSame }
+        }) {
+            trashName = special.name
+        } else if let named = mailboxes.first(where: { mailbox in
+            ["trash", "deleted", "deleted messages", "deleted items", "已删除", "已删除邮件"]
+                .contains(mailbox.name.lowercased())
+        }) {
+            trashName = named.name
+        }
+        trashResolved = true
+        return trashName
+    }
+
+    public func trash(remoteId: String) async throws {
+        try await withClient { client in
+            guard let folder = try await resolveTrashFolder(client: client) else {
+                throw MailError.trashUnavailable
+            }
+            try await selectInbox(client: client, force: false)
+            let uid = try await resolveUID(remoteId, client: client)
+            try await move(client: client, uid: uid, to: folder)
+        }
+    }
+
+    public func restoreFromTrash(remoteId: String) async throws {
+        try await withClient { client in
+            guard let folder = try await resolveTrashFolder(client: client) else {
+                throw MailError.trashUnavailable
+            }
+            selected = try await client.select(folder)
+            let trashedUID = try await resolveUID(remoteId, client: client)
+            try await move(client: client, uid: trashedUID, to: Self.inboxName)
+            selected = nil
+        }
     }
 
     private static func isSentMailbox(_ mailbox: IMAPMailbox) -> Bool {

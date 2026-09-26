@@ -739,7 +739,7 @@ public enum MessageRoutes {
             return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
         case .messageGone:
             return RouteJSON.error(.gone, "message-gone")
-        case .unreachable, .protocolError, .archiveUnavailable:
+        case .unreachable, .protocolError, .archiveUnavailable, .trashUnavailable:
             return RouteJSON.error(.badGateway, "smtp-send-failed")
         }
     }
@@ -933,6 +933,8 @@ public enum MessageRoutes {
             return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
         case .archiveUnavailable:
             return RouteJSON.error(.conflict, "archive-unavailable")
+        case .trashUnavailable:
+            return RouteJSON.error(.conflict, "delete-unavailable")
         case .unreachable, .protocolError:
             return RouteJSON.error(.badGateway, "provider-unreachable")
         }

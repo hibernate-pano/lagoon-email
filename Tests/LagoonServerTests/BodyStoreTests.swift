@@ -221,6 +221,8 @@ final class BodyStoreTests: XCTestCase {
         func archive(remoteId: String) async throws {}
 
         func unarchive(remoteId: String) async throws {}
+        func trash(remoteId: String) async throws {}
+        func restoreFromTrash(remoteId: String) async throws {}
 
         func send(_ outbound: OutboundMessage) async throws -> String? { nil }
 
@@ -328,6 +330,8 @@ final class BodyStoreTests: XCTestCase {
         func archive(remoteId: String) async throws {}
 
         func unarchive(remoteId: String) async throws {}
+        func trash(remoteId: String) async throws {}
+        func restoreFromTrash(remoteId: String) async throws {}
 
         func send(_ outbound: OutboundMessage) async throws -> String? { nil }
 

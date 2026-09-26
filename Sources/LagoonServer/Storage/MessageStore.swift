@@ -98,14 +98,35 @@ public enum MessageStore {
         ]).get()
     }
 
-    /// Newest unarchived headers, optionally narrowed to one sender
-    /// (发件人归集). `sender` is an exact `from_address` match — the caller
-    /// passes the address the user clicked, never user-typed SQL. Bound as
-    /// `$3`; `nil` keeps the unfiltered list.
+    /// 聚合匹配臂：`sender` 精确匹配发件人地址；`keyword` 对主题做大小写
+    /// 不敏感的包含匹配（值经 LIKE 特殊字符转义后绑定，SQL 分支均为静态字面量）。
+    public enum StackMatch: Sendable {
+        case sender(String)
+        case keyword(String)
+    }
+
+    /// Escape LIKE metacharacters so a user keyword like `100%` or `a_b`
+    /// matches literally. The `%…%` wrapping happens after escaping.
+    static func likePattern(containing value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+        return "%\(escaped)%"
+    }
+
+    /// Newest headers for the All-Messages surface and its lenses.
+    /// - `archived = true` serves the 档案柜 (已归档 built-in stack); the
+    ///   default lists the live inbox (is_archived FALSE).
+    /// - `stackMatch` narrows to one 聚合规则.
+    /// Deleted rows never appear in either view — they live in the server's
+    /// Trash folder and are reachable only through undo/restore.
     public static func recent(
         forAccount accountId: UUID,
         limit: Int,
         sender: String? = nil,
+        archived: Bool = false,
+        stackMatch: StackMatch? = nil,
         db: PostgresConnection
     ) async throws -> [MessageHeader] {
         var sql = """
@@ -113,20 +134,32 @@ public enum MessageStore {
                    NULLIF(from_name, '') AS from_name,
                    NULLIF(subject, '') AS subject,
                    NULLIF(snippet, '') AS snippet,
-                   received_at, is_read, is_archived,
+                   received_at, is_read, is_archived, is_deleted,
                    message_id_header, in_reply_to, references_header
             FROM message_headers
-            WHERE account_id = $1 AND is_archived = FALSE
+            WHERE account_id = $1 AND is_deleted = FALSE AND is_archived =
         """
+        sql += archived ? " TRUE" : " FALSE"
         var params: [PostgresData] = [PostgresData(uuid: accountId)]
-        // Placeholder numbers must match the positional bind list: with a
-        // sender, $2 is the address and the limit becomes $3.
-        if sender != nil {
-            sql += " AND from_address = $2"
-            params.append(PostgresData(string: sender!))
+        var nextParam = 2
+        switch stackMatch {
+        case .sender(let address):
+            sql += "\n            AND from_address = $\(nextParam)"
+            params.append(PostgresData(string: address))
+            nextParam += 1
+        case .keyword(let value):
+            sql += "\n            AND subject ILIKE $\(nextParam) ESCAPE '\\'"
+            params.append(PostgresData(string: likePattern(containing: value)))
+            nextParam += 1
+        case nil:
+            break
         }
-        sql += "\n            ORDER BY received_at DESC\n            LIMIT "
-        sql += sender == nil ? "$2" : "$3"
+        if sender != nil {
+            sql += "\n            AND from_address = $\(nextParam)"
+            params.append(PostgresData(string: sender!))
+            nextParam += 1
+        }
+        sql += "\n            ORDER BY received_at DESC\n            LIMIT $\(nextParam)"
         params.append(PostgresData(int: limit))
         let rows = try await db.query(sql, params).get()
         return try rows.map { try Self.decode($0) }
@@ -144,7 +177,7 @@ public enum MessageStore {
                    NULLIF(from_name, '') AS from_name,
                    NULLIF(subject, '') AS subject,
                    NULLIF(snippet, '') AS snippet,
-                   received_at, is_read, is_archived,
+                   received_at, is_read, is_archived, is_deleted,
                    message_id_header, in_reply_to, references_header
             FROM message_headers
             WHERE account_id = $1 AND remote_id = $2
@@ -167,6 +200,9 @@ public enum MessageStore {
     /// Remove non-archived rows that no longer exist in the provider's inbox.
     /// Archived rows are retained because they represent messages Lagoon moved
     /// out of the inbox intentionally and may still need local history/undo.
+    /// **Deleted rows are retained for the same reason** — they sit in the
+    /// server's Trash and `is_deleted` must survive reconcile or the undo
+    /// would restore a row that no longer exists.
     public static func reconcileInbox(
         accountId: UUID,
         keeping remoteIds: Set<String>,
@@ -176,7 +212,7 @@ public enum MessageStore {
             """
             SELECT remote_id
             FROM message_headers
-            WHERE account_id = $1 AND is_archived = FALSE
+            WHERE account_id = $1 AND is_archived = FALSE AND is_deleted = FALSE
             """,
             [PostgresData(uuid: accountId)]
         ).get()
@@ -292,11 +328,29 @@ public enum MessageStore {
     ) async throws -> Int {
         let sql = """
             SELECT COUNT(*) FROM message_headers
-            WHERE account_id = $1 AND is_archived = FALSE AND is_read = FALSE
+            WHERE account_id = $1 AND is_archived = FALSE AND is_deleted = FALSE AND is_read = FALSE
         """
         let result = try await db.query(sql, [PostgresData(uuid: accountId)]).get()
         guard let row = result.rows.first else { return 0 }
         return try row.makeRandomAccess()["count"].decode(Int.self)
+    }
+
+    /// 删除/恢复的本地旗标。远端先动（route 负责 trash/restore），这里只
+    /// 记账；`is_archived` 不动——从废纸篓恢复的邮件回到它原来所在的面。
+    public static func setDeleted(
+        remoteId: String,
+        accountId: UUID,
+        deleted: Bool,
+        db: PostgresConnection
+    ) async throws {
+        let sql = """
+            UPDATE message_headers SET is_deleted = $3 WHERE remote_id = $1 AND account_id = $2
+        """
+        try await db.query(sql, [
+            PostgresData(string: remoteId),
+            PostgresData(uuid: accountId),
+            PostgresData(bool: deleted),
+        ]).get()
     }
 
     public static func decode(_ row: PostgresNIO.PostgresRow) throws -> MessageHeader {
@@ -312,6 +366,7 @@ public enum MessageStore {
         let receivedAt: Date = try r["received_at"].decode(Date.self)
         let isRead: Bool = try r["is_read"].decode(Bool.self)
         let isArchived: Bool = try r["is_archived"].decode(Bool.self)
+        let isDeleted: Bool = (try? r["is_deleted"].decode(Bool.self)) ?? false
         let messageIdHeader: String? = (try? r["message_id_header"].decode(String.self)).flatMap { $0.isEmpty ? nil : $0 }
         let inReplyTo: String? = (try? r["in_reply_to"].decode(String.self)).flatMap { $0.isEmpty ? nil : $0 }
         let references: String? = (try? r["references_header"].decode(String.self)).flatMap { $0.isEmpty ? nil : $0 }
@@ -327,6 +382,7 @@ public enum MessageStore {
             receivedAt: receivedAt,
             isRead: isRead,
             isArchived: isArchived,
+            isDeleted: isDeleted,
             messageIdHeader: messageIdHeader,
             inReplyTo: inReplyTo,
             references: references

@@ -49,6 +49,26 @@ public enum ActionsRoutes {
             )
         }
 
+        // POST /api/messages/{remoteId}/delete?accountId=
+        // 删除 = 移入服务器废纸篓（provider.trash），绝不硬抹除。本地只翻
+        // `is_deleted` 旗标：邮件离开所有列表/未读数/搜索，撤销即 restore。
+        router.post("api/messages/:remoteId/delete") { request, context -> Response in
+            return await deleteHandler(
+                request: request, context: context, db: db,
+                makeProvider: makeProvider, logger: logger
+            )
+        }
+
+        // POST /api/archive-bulk?accountId=  {remoteIds: [...]}
+        // 清扫（Sweep）: remote-first archive per id, one audit row each so
+        // undo stays per-message. Per-item results — partial success is
+        // reported honestly, never thrown away.
+        router.post("api/archive-bulk") { request, _ -> Response in
+            return await archiveBulkHandler(
+                request: request, db: db, makeProvider: makeProvider, logger: logger
+            )
+        }
+
         // POST /api/messages/{remoteId}/unsubscribe
         // Reads the List-Unsubscribe header through the provider, fires an HTTP
         // POST/GET to the endpoint, then records + marks read locally. Returns
@@ -163,6 +183,147 @@ public enum ActionsRoutes {
             remote: true,
             actionId: action.id
         ))
+    }
+
+    // MARK: - Unsubscribe
+
+    /// 删除：远端先移入废纸篓，本地再翻旗标。与归档同一套审计/撤销。
+    private static func deleteHandler(
+        request: Request, context: BasicRequestContext, db: PostgresConnection,
+        makeProvider: MailProviderFactory.Builder, logger: Logger
+    ) async -> Response {
+        guard let accountId = RouteParams.accountId(from: request) else {
+            return RouteJSON.error(.badRequest, "malformed-accountId")
+        }
+        guard let remoteId = RouteParams.remoteId(from: context) else {
+            return RouteJSON.error(.badRequest, "malformed-remoteId")
+        }
+        let account: Account
+        do {
+            guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                return RouteJSON.error(.notFound, "unknown-account")
+            }
+            account = found
+        } catch {
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+        guard let provider = makeProvider(account) else {
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        }
+        do {
+            try await provider.trash(remoteId: remoteId)
+        } catch let error as MailError {
+            return MessageRoutes.providerError(error, logger: logger, remoteId: remoteId)
+        } catch {
+            logger.warning("delete.remoteFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "label": .string(MessageRoutes.providerLabel(error)),
+            ])
+            return RouteJSON.error(.badGateway, "provider-unreachable")
+        }
+        let action: AIAction
+        do {
+            action = try await db.withTransaction(logger: logger) { transaction in
+                try await MessageStore.setDeleted(
+                    remoteId: remoteId, accountId: accountId, deleted: true, db: transaction
+                )
+                return try await AIActionStore.record(
+                    accountId: accountId,
+                    kind: .delete,
+                    payload: [
+                        "remoteId": remoteId,
+                        "remoteWrite": "true",
+                    ],
+                    db: transaction
+                )
+            }
+        } catch {
+            // A local failure must not leave a remote-only move behind.
+            do { try await provider.restoreFromTrash(remoteId: remoteId) } catch {
+                logger.error("delete.compensationFailed", metadata: [
+                    "remoteId": .string(remoteId),
+                    "err": .string("\(error)"),
+                ])
+            }
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+        return RouteJSON.response(ArchiveResponse(
+            ok: true,
+            remoteId: remoteId,
+            remote: true,
+            actionId: action.id
+        ))
+    }
+
+    /// 清扫: archive every requested id remote-first. Cap 500 so a runaway
+    /// client cannot one-shot the provider's rate budget; per-item errors are
+    /// reported, not thrown — a sweep that half-succeeded must say so.
+    private static func archiveBulkHandler(
+        request: Request, db: PostgresConnection,
+        makeProvider: MailProviderFactory.Builder, logger: Logger
+    ) async -> Response {
+        guard let accountId = RouteParams.accountId(from: request) else {
+            return RouteJSON.error(.badRequest, "malformed-accountId")
+        }
+        let body: Data
+        do { body = try await collectBody(request) } catch {
+            return RouteJSON.error(.badRequest, "missing-body")
+        }
+        struct Req: Decodable { let remoteIds: [String] }
+        let req: Req
+        do { req = try JSONDecoder().decode(Req.self, from: body) } catch {
+            return RouteJSON.error(.badRequest, "invalid-body")
+        }
+        let ids = Array(req.remoteIds.prefix(500))
+        guard !ids.isEmpty else {
+            return RouteJSON.error(.badRequest, "empty-remoteIds")
+        }
+        let account: Account
+        do {
+            guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                return RouteJSON.error(.notFound, "unknown-account")
+            }
+            account = found
+        } catch {
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+        guard let provider = makeProvider(account) else {
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        }
+        guard account.capabilities.archiveFolder else {
+            return RouteJSON.error(.conflict, "archive-unavailable")
+        }
+
+        var items: [ArchiveBulkItem] = []
+        for remoteId in ids {
+            do {
+                try await provider.archive(remoteId: remoteId)
+                let action = try await AIActionStore.record(
+                    accountId: accountId,
+                    kind: .archive,
+                    payload: ["remoteId": remoteId, "remoteWrite": "true"],
+                    db: db
+                )
+                try await db.query(
+                    "UPDATE message_headers SET is_archived = TRUE WHERE remote_id = $1 AND account_id = $2",
+                    [PostgresData(string: remoteId), PostgresData(uuid: accountId)]
+                ).get()
+                items.append(ArchiveBulkItem(remoteId: remoteId, ok: true, actionId: action.id))
+            } catch let error as MailError {
+                // Same label the per-message route would return; logged there,
+                // reported here — a sweep that half-succeeded says so.
+                logger.warning("provider.requestFailed", metadata: [
+                    "remoteId": .string(remoteId),
+                    "label": .string(error.logLabel),
+                ])
+                items.append(ArchiveBulkItem(
+                    remoteId: remoteId, ok: false, errorCode: error.logLabel
+                ))
+            } catch {
+                items.append(ArchiveBulkItem(remoteId: remoteId, ok: false, errorCode: "internal-error"))
+            }
+        }
+        return RouteJSON.response(ArchiveBulkResponse(items: items))
     }
 
     // MARK: - Unsubscribe
@@ -623,6 +784,17 @@ public enum ActionsRoutes {
             try await AIActionStore.insertOverride(
                 accountId: account.id, remoteId: remoteId,
                 fromGroup: to, toGroup: from, db: db
+            )
+        case .delete:
+            // 从废纸篓移回 INBOX——远端先动，再翻回本地旗标。
+            guard let provider = makeProvider(account) else {
+                throw MailError.notConfigured("provider missing during undo")
+            }
+            if action.payload["remoteWrite"] == "true" {
+                try await provider.restoreFromTrash(remoteId: remoteId)
+            }
+            try await MessageStore.setDeleted(
+                remoteId: remoteId, accountId: account.id, deleted: false, db: db
             )
         case .unsubscribe, .draftCreate, .send, .undo:
             // Terminal: we can't take back an unsubscribe, an undraft, or a

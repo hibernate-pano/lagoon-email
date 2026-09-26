@@ -140,6 +140,7 @@ struct ActionHistorySheet: View {
         case .draftCreate: "text.bubble"
         case .send: "paperplane"
         case .undo: "arrow.uturn.backward"
+        case .delete: "trash"
         }
     }
 }

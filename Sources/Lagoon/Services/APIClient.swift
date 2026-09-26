@@ -130,17 +130,28 @@ public final class APIClient: Sendable {
     }
 
     /// `sender` narrows to one exact `from_address` (发件人归集); nil keeps
-    /// the unfiltered recent list.
-    public func fetchMessages(accountId: UUID, limit: Int = 50, sender: String? = nil) async throws -> SyncResponse {
+    /// the unfiltered recent list. `archived = true` serves the 档案柜;
+    /// `stackId` narrows to one user-defined 聚合规则.
+    public func fetchMessages(
+        accountId: UUID,
+        limit: Int = 50,
+        sender: String? = nil,
+        archived: Bool = false,
+        stackId: UUID? = nil
+    ) async throws -> SyncResponse {
         guard var c = URLComponents(url: baseURL.appendingPathComponent("api/messages"), resolvingAgainstBaseURL: false) else {
             throw APIError.invalidURL(baseURL.absoluteString + "/api/messages")
         }
         var items: [URLQueryItem] = [
             .init(name: "accountId", value: accountId.uuidString),
-            .init(name: "limit", value: String(limit))
+            .init(name: "limit", value: String(limit)),
+            .init(name: "archived", value: archived ? "true" : "false")
         ]
         if let sender {
             items.append(.init(name: "sender", value: sender))
+        }
+        if let stackId {
+            items.append(.init(name: "stackId", value: stackId.uuidString))
         }
         c.queryItems = items
         guard let url = c.url else {
@@ -352,6 +363,79 @@ public final class APIClient: Sendable {
         request.timeoutInterval = APITimeout.fast.seconds
         let (data, _) = try await send(request, timeout: .fast)
         return try Self.decode(UnsubscribeResponse.self, from: data)
+    }
+
+    /// POST /api/messages/{remoteId}/delete?accountId= — 删除 = 移入服务器
+    /// 废纸篓；响应形状与归档一致（{ok, remoteId, remote, actionId}）。
+    public func deleteMessage(remoteId: String, accountId: UUID) async throws -> ArchiveResponse {
+        let url = try makeURL(path: ["api", "messages", remoteId, "delete"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(ArchiveResponse.self, from: data)
+    }
+
+    /// POST /api/archive-bulk?accountId= — 清扫：远端逐封归档，逐项回报。
+    public func archiveBulk(remoteIds: [String], accountId: UUID) async throws -> ArchiveBulkResponse {
+        let url = try makeURL(path: ["api", "archive-bulk"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = APITimeout.slow.seconds
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(ArchiveBulkRequest(remoteIds: remoteIds))
+        let (data, _) = try await send(request, timeout: .slow)
+        return try Self.decode(ArchiveBulkResponse.self, from: data)
+    }
+
+    // MARK: - 聚合规则 (Stacks)
+
+    public func fetchStacks(accountId: UUID) async throws -> StackRuleListResponse {
+        let url = try makeURL(path: ["api", "stacks"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(StackRuleListResponse.self, from: data)
+    }
+
+    public func createStack(_ req: StackCreateRequest, accountId: UUID) async throws -> StackCreateResponse {
+        let url = try makeURL(path: ["api", "stacks"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = APITimeout.fast.seconds
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(req)
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(StackCreateResponse.self, from: data)
+    }
+
+    public func deleteStack(id: UUID, accountId: UUID) async throws {
+        let url = try makeURL(path: ["api", "stacks", id.uuidString], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.timeoutInterval = APITimeout.fast.seconds
+        _ = try await send(request, timeout: .fast)
+    }
+
+    /// GET /api/auto-archive/suggestions?accountId= — 归档历史驱动的白名单推荐。
+    public func fetchAutoArchiveSuggestions(accountId: UUID) async throws -> AutoArchiveSuggestionsResponse {
+        let url = try makeURL(path: ["api", "auto-archive", "suggestions"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(AutoArchiveSuggestionsResponse.self, from: data)
     }
 
     /// POST /api/messages/{remoteId}/classify {fromGroup,toGroup}.

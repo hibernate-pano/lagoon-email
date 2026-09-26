@@ -931,6 +931,8 @@ actor SlowProbeProvider: MailProvider {
     func setRead(remoteId: String, isRead: Bool) async throws { throw Self.unsupported }
     func archive(remoteId: String) async throws { throw Self.unsupported }
     func unarchive(remoteId: String) async throws { throw Self.unsupported }
+    func trash(remoteId: String) async throws { throw Self.unsupported }
+    func restoreFromTrash(remoteId: String) async throws { throw Self.unsupported }
     func send(_ outbound: OutboundMessage) async throws -> String? { throw Self.unsupported }
     func probe() async throws { throw Self.unsupported }
 

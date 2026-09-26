@@ -9,6 +9,7 @@ struct AutoArchiveRulesSheet: View {
     @Environment(\.l10n) private var l10n
     @Environment(\.dismiss) private var dismiss
     @State private var rules: [AutoArchiveRule] = []
+    @State private var suggestions: [AutoArchiveSuggestion] = []
     @State private var isLoading = true
     @State private var errorBanner: ErrorBanner?
     private let api = APIClient()
@@ -35,7 +36,7 @@ struct AutoArchiveRulesSheet: View {
                 .foregroundStyle(.secondary)
                 .padding()
         }
-        .frame(width: 420, height: 320)
+        .frame(width: 460, height: 400)
         .task { await refresh() }
     }
 
@@ -43,25 +44,61 @@ struct AutoArchiveRulesSheet: View {
     private var content: some View {
         if isLoading {
             ProgressView().padding()
-        } else if rules.isEmpty {
-            Text(l10n.autoArchiveRulesEmpty)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .padding()
         } else {
-            List(rules) { rule in
-                HStack {
-                    Text(rule.senderAddress)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .help(rule.senderAddress)
-                    Spacer()
-                    Button(role: .destructive) {
-                        Task { await delete(rule) }
-                    } label: {
-                        Label(l10n.deleteRule, systemImage: "trash")
+            List {
+                if !suggestions.isEmpty {
+                    Section {
+                        ForEach(suggestions) { suggestion in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(suggestion.fromName ?? suggestion.sender)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Text(l10n.suggestionHint(suggestion.archiveCount))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button(l10n.suggestionCreate) {
+                                    Task { await accept(suggestion) }
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+                    } header: {
+                        Text(l10n.suggestionsHeader)
+                            .font(.caption)
+                            .bold()
+                            .foregroundStyle(.secondary)
                     }
-                    .labelStyle(.titleOnly)
+                }
+                Section {
+                    if rules.isEmpty {
+                        Text(l10n.autoArchiveRulesEmpty)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(rules) { rule in
+                        HStack {
+                            Text(rule.senderAddress)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(rule.senderAddress)
+                            Spacer()
+                            Button(role: .destructive) {
+                                Task { await delete(rule) }
+                            } label: {
+                                Label(l10n.deleteRule, systemImage: "trash")
+                            }
+                            .labelStyle(.titleOnly)
+                        }
+                    }
+                } header: {
+                    Text(l10n.autoArchiveRulesTitle)
+                        .font(.caption)
+                        .bold()
+                        .foregroundStyle(.secondary)
                 }
             }
             .listStyle(.inset)
@@ -80,7 +117,23 @@ struct AutoArchiveRulesSheet: View {
         } catch {
             errorBanner = ErrorBanner(severity: .error, title: error.lagoonUIMessage)
         }
+        // Suggestions are best-effort: an empty history just means no rows.
+        if let accountId = accounts.accountId {
+            suggestions = (try? await api.fetchAutoArchiveSuggestions(accountId: accountId))?.suggestions ?? []
+        }
         isLoading = false
+    }
+
+    /// 接受推荐 = 走既有的规则创建路由（幂等），从推荐区消失。
+    private func accept(_ suggestion: AutoArchiveSuggestion) async {
+        guard let accountId = accounts.accountId else { return }
+        do {
+            _ = try await api.addAutoArchiveRule(senderAddress: suggestion.sender, accountId: accountId)
+            suggestions.removeAll { $0.sender == suggestion.sender }
+            await refresh()
+        } catch {
+            errorBanner = ErrorBanner(severity: .error, title: error.lagoonUIMessage)
+        }
     }
 
     private func delete(_ rule: AutoArchiveRule) async {

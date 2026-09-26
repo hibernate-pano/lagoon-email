@@ -32,14 +32,51 @@ public enum AIActionKind: String, Codable, Sendable, CaseIterable {
     case draftCreate = "draft_create"
     case send
     case undo
+    /// Moved to the server's Trash; undo restores it to the INBOX.
+    case delete
 
     public var isUndoable: Bool {
         switch self {
-        case .archive, .markRead, .pin, .unpin, .classifyOverride:
+        case .archive, .markRead, .pin, .unpin, .classifyOverride, .delete:
             true
         case .unsubscribe, .draftCreate, .send, .undo:
             false
         }
+    }
+}
+
+/// 一条用户自定义聚合（归集规则）。命中的邮件自动归入该聚合：
+/// `sender` 精确匹配 `from_address`；`keyword` 对主题做大小写不敏感的
+/// 包含匹配。求值发生在读取时，未来的邮件无需登记即自动归入。
+public struct StackRule: Codable, Sendable, Identifiable, Equatable {
+    public enum Kind: String, Codable, Sendable, CaseIterable {
+        case sender
+        case keyword
+
+        public var displayName: String {
+            switch self {
+            case .sender: return "发件人"
+            case .keyword: return "关键词"
+            }
+        }
+    }
+
+    public let id: UUID
+    public let accountId: UUID
+    public let name: String
+    public let kind: Kind
+    /// Match value: an exact address (sender) or a subject substring (keyword).
+    public let value: String
+    public let createdAt: Date
+
+    public init(id: UUID, accountId: UUID, name: String, kind: Kind,
+                value: String, createdAt: Date) {
+        self.id = id
+        self.accountId = accountId
+        self.name = name
+        self.kind = kind
+        self.value = value
+        self.createdAt = createdAt
     }
 }
 

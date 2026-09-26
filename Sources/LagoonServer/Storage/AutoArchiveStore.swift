@@ -112,6 +112,47 @@ public enum AutoArchiveStore {
         return true
     }
 
+    /// 规则推荐：近 30 天被归档次数达到阈值、且还没有规则覆盖的发件人。
+    /// 数据来自本地行（is_archived），不依赖 ai_actions payload 的历史形状。
+    public static func suggestions(
+        accountId: UUID,
+        minCount: Int = 5,
+        limit: Int = 5,
+        db: PostgresConnection
+    ) async throws -> [AutoArchiveSuggestion] {
+        let sql = """
+            SELECT m.from_address AS sender,
+                   MAX(NULLIF(m.from_name, '')) AS from_name,
+                   COUNT(*) AS archive_count
+            FROM message_headers m
+            WHERE m.account_id = $1
+              AND m.is_archived = TRUE
+              AND m.is_deleted = FALSE
+              AND m.received_at >= now() - interval '30 days'
+              AND NOT EXISTS (
+                  SELECT 1 FROM auto_archive_rules r
+                  WHERE r.account_id = m.account_id AND r.sender_address = m.from_address
+              )
+            GROUP BY m.from_address
+            HAVING COUNT(*) >= $2
+            ORDER BY archive_count DESC, sender ASC
+            LIMIT $3
+        """
+        let rows = try await db.query(sql, [
+            PostgresData(uuid: accountId),
+            PostgresData(int: minCount),
+            PostgresData(int: limit),
+        ]).get()
+        return try rows.map { row in
+            let r = row.makeRandomAccess()
+            return AutoArchiveSuggestion(
+                sender: try r["sender"].decode(String.self),
+                fromName: (try? r["from_name"].decode(String.self)).flatMap { $0.isEmpty ? nil : $0 },
+                archiveCount: try r["archive_count"].decode(Int.self)
+            )
+        }
+    }
+
     // MARK: - Decoding
 
     private static func decode(_ row: PostgresNIO.PostgresRow) throws -> AutoArchiveRule {

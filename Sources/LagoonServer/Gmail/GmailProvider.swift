@@ -337,6 +337,18 @@ public actor GmailProvider: MailProvider {
         }
     }
 
+    public func trash(remoteId: String) async throws {
+        try await perform { token in
+            try await self.client.trashMessage(accessToken: token, remoteId: remoteId)
+        }
+    }
+
+    public func restoreFromTrash(remoteId: String) async throws {
+        try await perform { token in
+            try await self.client.untrashMessage(accessToken: token, remoteId: remoteId)
+        }
+    }
+
     /// Same wire format as the IMAP path: one `MIMEBuilder` message, uploaded
     /// through the Gmail `raw` endpoint. Gmail threads on the References chain
     /// in the message itself, so no threadId is needed.

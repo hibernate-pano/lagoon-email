@@ -108,6 +108,8 @@ final class UnsubscribeRouteTests: XCTestCase {
         func setRead(remoteId: String, isRead: Bool) async throws {}
         func archive(remoteId: String) async throws {}
         func unarchive(remoteId: String) async throws {}
+        func trash(remoteId: String) async throws {}
+        func restoreFromTrash(remoteId: String) async throws {}
         func send(_ outbound: OutboundMessage) async throws -> String? { nil }
         func probe() async throws {}
     }

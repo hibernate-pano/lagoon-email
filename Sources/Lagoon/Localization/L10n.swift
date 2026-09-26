@@ -451,6 +451,7 @@ public struct L10n: Sendable, Equatable {
         case .draftCreate: pick("生成草稿", "Generated drafts")
         case .send: pick("发送邮件", "Sent message")
         case .undo: pick("撤销操作", "Undid an action")
+        case .delete: pick("删除邮件", "Deleted message")
         }
     }
     public var archived: String { pick("已归档", "Archived") }
@@ -473,6 +474,53 @@ public struct L10n: Sendable, Equatable {
     public var groupingHelp: String { pick("按会话、发件人或日期归集", "Group by conversation, sender, or date") }
     public var unreadOnly: String { pick("仅未读", "Unread") }
     public var unreadOnlyHelp: String { pick("只显示未读邮件", "Show unread messages only") }
+
+    // MARK: 删除
+    public var deleteContext: String { pick("删除", "Delete") }
+    public var deleted: String { pick("已移入废纸篓", "Moved to Trash") }
+    public var deleteFailedTitle: String { pick("删除未完成", "Delete didn't complete") }
+
+    // MARK: 聚合（用户自定义归集规则）
+    public var aggregateMenu: String { pick("聚合…", "Group into…") }
+    public var aggregateBySender: String { pick("按此发件人聚合", "By this sender") }
+    public var aggregateByKeyword: String { pick("按主题关键词聚合…", "By subject keyword…") }
+    public var stackListTitle: String { pick("聚合规则", "Groups") }
+    public var stackNew: String { pick("新建聚合", "New") }
+    public var stackArchivedRow: String { pick("已归档（档案柜）", "Archived (cabinet)") }
+    public var stackBuiltInHeader: String { pick("内置", "Built-in") }
+    public var stackEmpty: String { pick("还没有聚合规则。右键任意邮件即可创建。", "No groups yet. Right-click any message to create one.") }
+    public var stackRulesHeader: String { pick("自定义聚合", "Your groups") }
+    public var stackDeleteRule: String { pick("删除此聚合", "Delete this group") }
+    public func stackKindLabel(_ kind: String) -> String { pick("按\(kind)", "By \(kind)") }
+    public var stackEditorTitle: String { pick("新建聚合", "New group") }
+    public var stackRuleKind: String { pick("匹配方式", "Match on") }
+    public var stackRuleValue: String { pick("匹配内容", "Match value") }
+    public var stackRuleName: String { pick("聚合名称", "Group name") }
+    public var stackKindSender: String { pick("发件人", "Sender") }
+    public var stackKindKeyword: String { pick("关键词", "Keyword") }
+    public var stackCreate: String { pick("创建", "Create") }
+    public func stackCreated(_ name: String) -> String {
+        pick("聚合「\(name)」已创建，未来邮件自动归入", "Group “\(name)” created — future mail lands here automatically")
+    }
+    public var keywordHint: String { pick("标题包含该词的邮件（不分大小写）都会进入此聚合", "Mail whose subject contains this word joins the group") }
+    public var senderHint: String { pick("来自该地址的全部邮件都会进入此聚合", "All mail from this address joins the group") }
+
+    // MARK: 清扫
+    public var sweepTitle: String { pick("归档全部", "Archive all") }
+    public var sweepHelp: String { pick("把此聚合命中的邮件整批移入档案柜", "Archive every message this group matches") }
+    public func sweepDone(_ count: Int) -> String {
+        pick("已归档 \(count) 封", "Archived \(count) messages")
+    }
+    public func sweepPartial(_ ok: Int, _ failed: Int) -> String {
+        pick("\(ok) 封成功，\(failed) 封失败", "\(ok) archived, \(failed) failed")
+    }
+
+    // MARK: 白名单规则推荐
+    public var suggestionsHeader: String { pick("推荐（基于近 30 天归档历史）", "Suggested (from 30-day archive history)") }
+    public var suggestionCreate: String { pick("创建规则", "Create rule") }
+    public func suggestionHint(_ count: Int) -> String {
+        pick("30 天内你手动归档了 \(count) 封", "You archived \(count) messages in 30 days")
+    }
     public var pinning: String { pick("正在置顶…", "Pinning…") }
     public var draftVariants: String { pick("AI 草稿（3 个版本）", "AI drafts (3 variants)") }
     public var pushToGmailDrafts: String { pick("保存到 Gmail 草稿", "Save to Gmail drafts") }

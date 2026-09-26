@@ -513,6 +513,11 @@ struct BriefingFeedView: View {
 
                 onAdvanceTo: { next in path = next.map { [$0] } ?? [] },
 
+                onDelete: { id in
+                    items.removeAll { $0.message.remoteId == id }
+                    path = []
+                },
+
                 onReadStateChange: { id, isRead in
 
                     setRead(remoteId: id, isRead: isRead)

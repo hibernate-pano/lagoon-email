@@ -36,6 +36,26 @@ public enum AutoArchiveRoutes {
             }
         }
 
+        // GET /api/auto-archive/suggestions?accountId= → archive-history-driven
+        // whitelist proposals (senders the user keeps archiving by hand).
+        router.get("api/auto-archive/suggestions") { request, _ -> Response in
+            guard let accountId = RouteParams.accountId(from: request) else {
+                return RouteJSON.error(.badRequest, "malformed-accountId")
+            }
+            do {
+                let suggestions = try await AutoArchiveStore.suggestions(
+                    accountId: accountId, db: db
+                )
+                return RouteJSON.response(AutoArchiveSuggestionsResponse(suggestions: suggestions))
+            } catch {
+                logger.error("auto-archive.suggestionsFailed", metadata: [
+                    "accountId": .string(accountId.uuidString),
+                    "err": .string("\(error)"),
+                ])
+                return RouteJSON.error(.internalServerError, "internal-error")
+            }
+        }
+
         router.post("api/auto-archive") { request, _ -> Response in
             guard let accountId = RouteParams.accountId(from: request) else {
                 return RouteJSON.error(.badRequest, "malformed-accountId")

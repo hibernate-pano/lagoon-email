@@ -160,6 +160,7 @@ public enum MailError: Error, Equatable {
     case protocolError(String)
     case messageGone
     case archiveUnavailable
+    case trashUnavailable
     case notConfigured(String)
 
     /// Stable, log-safe label (never interpolate payloads into user-facing text).
@@ -170,6 +171,7 @@ public enum MailError: Error, Equatable {
         case .protocolError: return "protocol-error"
         case .messageGone: return "message-gone"
         case .archiveUnavailable: return "archive-unavailable"
+        case .trashUnavailable: return "trash-unavailable"
         case .notConfigured: return "not-configured"
         }
     }
@@ -216,6 +218,14 @@ public protocol MailProvider: Sendable {
     func setRead(remoteId: String, isRead: Bool) async throws
     func archive(remoteId: String) async throws
     func unarchive(remoteId: String) async throws
+
+    /// Move the message to the server's Trash folder (删除 = 移入废纸篓,
+    /// never a hard expunge). Throws `MailError.trashUnavailable` when the
+    /// account exposes no trash folder.
+    func trash(remoteId: String) async throws
+
+    /// Move the message back from Trash to the INBOX (delete 的撤销).
+    func restoreFromTrash(remoteId: String) async throws
 
     /// Returns the provider-assigned Message-ID when it reports one.
     func send(_ outbound: OutboundMessage) async throws -> String?

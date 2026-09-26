@@ -354,12 +354,13 @@ public enum SearchRoutes {
                    NULLIF(m.from_name, '') as from_name,
                    NULLIF(m.subject, '') as subject,
                    NULLIF(m.snippet, '') as snippet,
-                   m.received_at, m.is_read, m.is_archived,
+                   m.received_at, m.is_read, m.is_archived, m.is_deleted,
                    m.message_id_header, m.in_reply_to, m.references_header
             FROM message_headers m
             LEFT JOIN message_bodies b
               ON b.account_id = m.account_id AND b.remote_id = m.remote_id
             WHERE m.account_id = $1
+              AND m.is_deleted = FALSE
               AND (m.subject ILIKE $2 ESCAPE '\\' OR m.snippet ILIKE $2 ESCAPE '\\'
                    OR m.from_name ILIKE $2 ESCAPE '\\' OR m.from_address ILIKE $2 ESCAPE '\\'
                    OR b.body_text ILIKE $2 ESCAPE '\\'

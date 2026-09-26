@@ -19,6 +19,9 @@ struct MessageListView: View {
     @State private var expandedThreads: Set<String> = []
     /// Non-nil presents the sender's full mail history (发件人归集).
     @State private var senderFocus: SenderFocus?
+    /// 聚合规则面板 + 右键创建入口。
+    @State private var showStackList = false
+    @State private var stackEditor: StackEditorRequest?
     /// 归集维度: conversations (thread + affinity), per-sender, or flat.
     /// Persisted — the lens the user picked should survive relaunch.
     @AppStorage("lagoon.grouping") private var groupingRaw = GroupingMode.conversation.rawValue
@@ -78,6 +81,12 @@ struct MessageListView: View {
                         Label(l10n.unreadOnly, systemImage: unreadOnly ? "envelope.badge.fill" : "envelope.badge")
                     }
                     .help(l10n.unreadOnlyHelp)
+                    Button {
+                        showStackList = true
+                    } label: {
+                        Label(l10n.stackListTitle, systemImage: "rectangle.stack")
+                    }
+                    .help(l10n.stackListTitle)
                     if isLoading {
                         ProgressView().controlSize(.small)
                     }
@@ -110,7 +119,10 @@ struct MessageListView: View {
                                                 message: conversation.newest,
                                                 onArchive: { Task { await archive(conversation.newest) } },
                                                 onToggleRead: { Task { await toggleRead(conversation.newest) } },
-                                                onShowSender: { senderFocus = SenderFocus(from: conversation.newest) }
+                                                onShowSender: { senderFocus = SenderFocus(from: conversation.newest) },
+                                                onAggregateSender: { openAggregateEditor(kind: .sender, for: conversation.newest) },
+                                                onAggregateKeyword: { openAggregateEditor(kind: .keyword, for: conversation.newest) },
+                                                onDelete: { Task { await delete(conversation.newest) } }
                                             ))
                                     }
                                 }
@@ -139,6 +151,18 @@ struct MessageListView: View {
                             )
                         }
                     }
+                    .sheet(isPresented: $showStackList) {
+                        StackListSheet()
+                    }
+                    .sheet(item: $stackEditor) { request in
+                        StackRuleEditorSheet(
+                            initialKind: request.kind,
+                            prefilledValue: request.value,
+                            prefilledName: request.name
+                        ) { _ in
+                            Task { await refresh() }
+                        }
+                    }
                 } else if !isLoading && errorBanner == nil {
                     Text(l10n.noMessagesYet)
                         .foregroundStyle(.secondary)
@@ -159,6 +183,16 @@ struct MessageListView: View {
             }
             .keyboardShortcut("[", modifiers: .command)
             .help(l10n.backHelp)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+            .focusable(false)
+            .accessibilityHidden(true)
+            // ⌘⌫ deletes the selected row(s) (moves to the server's Trash),
+            // mirroring ⌫ = archive.
+            Button(l10n.deleteContext) {
+                deleteSelected()
+            }
+            .keyboardShortcut(.delete, modifiers: .command)
             .frame(width: 0, height: 0)
             .opacity(0)
             .focusable(false)
@@ -201,6 +235,10 @@ struct MessageListView: View {
                 },
                 onAdvanceTo: { next in
                     path = next.map { [$0] } ?? []
+                },
+                onDelete: { id in
+                    messages.removeAll { $0.remoteId == id }
+                    path = []
                 },
                 onReadStateChange: { remoteId, isRead in
                     setRead(remoteId: remoteId, isRead: isRead)
@@ -404,7 +442,10 @@ struct MessageListView: View {
                 message: newest,
                 onArchive: { Task { await archive(newest) } },
                 onToggleRead: { Task { await toggleRead(newest) } },
-                onShowSender: { senderFocus = SenderFocus(from: newest) }
+                onShowSender: { senderFocus = SenderFocus(from: newest) },
+                onAggregateSender: { openAggregateEditor(kind: .sender, for: newest) },
+                onAggregateKeyword: { openAggregateEditor(kind: .keyword, for: newest) },
+                onDelete: { Task { await delete(newest) } }
             ))
             if isExpanded {
                 ForEach(conversation.messages) { m in
@@ -413,7 +454,10 @@ struct MessageListView: View {
                             message: m,
                             onArchive: { Task { await archive(m) } },
                             onToggleRead: { Task { await toggleRead(m) } },
-                            onShowSender: { senderFocus = SenderFocus(from: m) }
+                            onShowSender: { senderFocus = SenderFocus(from: m) },
+                            onAggregateSender: { openAggregateEditor(kind: .sender, for: m) },
+                            onAggregateKeyword: { openAggregateEditor(kind: .keyword, for: m) },
+                            onDelete: { Task { await delete(m) } }
                         ))
                         .padding(.leading, 14)
                 }
@@ -474,17 +518,66 @@ struct MessageListView: View {
         // MessageDetailView. We surface a banner instead.
         throw APIError.badStatus(code: 409, bodySnippet: "archive-unavailable")
     }
+
+    /// 删除 = 移入服务器废纸篓（provider.trash），可 ⌘Z 撤销（restore）。
+    /// 本地行为与归档一致：行立刻离开列表。
+    private func delete(_ m: MessageHeader) async {
+        do {
+            let response = try await api.deleteMessage(remoteId: m.remoteId, accountId: m.accountId)
+            withAnimation(.snappy) {
+                messages.removeAll { $0.remoteId == m.remoteId }
+            }
+            ErrorCenter.shared.report(.init(
+                severity: .info,
+                title: l10n.deleted,
+                autoDismissAfter: .seconds(6)
+            ))
+            _ = response
+        } catch {
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.deleteFailedTitle,
+                detail: error.lagoonUIMessage
+            )
+        }
+    }
+
+    /// ⌘⌫ — delete the selected row(s), mirroring ⌫ = archive.
+    private func deleteSelected() {
+        let ids = selection.isEmpty ? Set(messages.prefix(1).map(\.remoteId)) : selection
+        let targets = messages.filter { ids.contains($0.remoteId) }
+        selection.removeAll()
+        for m in targets {
+            Task { await delete(m) }
+        }
+    }
+
+    /// 聚合入口：sender 规则直接预填发件人；keyword 规则带主题建议词，
+    /// 用户在编辑器里确认/修改后才落库。
+    private func openAggregateEditor(kind: StackRule.Kind, for m: MessageHeader) {
+        if kind == .sender {
+            stackEditor = StackEditorRequest(
+                kind: .sender, value: m.fromAddress, name: m.fromName ?? m.fromAddress
+            )
+        } else {
+            let suggestion = SubjectNormalizer.suggestKeyword(in: m.subject) ?? ""
+            stackEditor = StackEditorRequest(kind: .keyword, value: suggestion, name: suggestion)
+        }
+    }
 }
 
 // MARK: - Row chrome
 
 /// Tag + triage gestures shared by every tappable row (single message or
-/// expanded thread member). Also the 发件人归集 entry point.
+/// expanded thread member). Also the 发件人归集 and 聚合 entry points.
 private struct RowChrome: ViewModifier {
     let message: MessageHeader
     let onArchive: () -> Void
     let onToggleRead: () -> Void
     let onShowSender: () -> Void
+    let onAggregateSender: () -> Void
+    let onAggregateKeyword: () -> Void
+    let onDelete: () -> Void
     @Environment(\.l10n) private var l10n
 
     func body(content: Content) -> some View {
@@ -511,7 +604,15 @@ private struct RowChrome: ViewModifier {
                 Button(message.isRead ? l10n.markAsUnread : l10n.markAsRead) { onToggleRead() }
                 Button(l10n.archived) { onArchive() }
                 Divider()
+                // 聚合: seed a persistent rule from this row — one tap for the
+                // sender rule, the editor for a subject keyword.
+                Menu(l10n.aggregateMenu) {
+                    Button(l10n.aggregateBySender) { onAggregateSender() }
+                    Button(l10n.aggregateByKeyword) { onAggregateKeyword() }
+                }
                 Button(l10n.senderMailContext) { onShowSender() }
+                Divider()
+                Button(l10n.deleteContext, role: .destructive) { onDelete() }
             }
     }
 }
@@ -568,23 +669,3 @@ extension Date {
     }
 }
 
-extension MessageHeader {
-    /// Tap-to-toggle-read creates a copy with the read flag flipped. The
-    /// stored struct is `Sendable` and value-typed, so this is the
-    /// standard "copy with a field change" idiom.
-    fileprivate func withRead(_ isRead: Bool) -> MessageHeader {
-        MessageHeader(
-            id: id,
-            accountId: accountId,
-            remoteId: remoteId,
-            threadId: threadId,
-            fromAddress: fromAddress,
-            fromName: fromName,
-            subject: subject,
-            snippet: snippet,
-            receivedAt: receivedAt,
-            isRead: isRead,
-            isArchived: isArchived
-        )
-    }
-}

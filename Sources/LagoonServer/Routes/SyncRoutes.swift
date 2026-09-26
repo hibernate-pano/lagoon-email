@@ -25,8 +25,21 @@ public enum SyncRoutes {
             // parameter in the store (spec §6.6 rule 1/2).
             let sender = req.uri.queryParameters["sender"].map(String.init)
                 .flatMap { $0.isEmpty ? nil : $0 }
+            // 档案柜: ?archived=true lists what is_archived holds. 聚合:
+            // ?stackId=<uuid> narrows to one user-defined rule.
+            let archived = req.uri.queryParameters["archived"] == "true"
+            let stackMatch: MessageStore.StackMatch?
+            if let raw = req.uri.queryParameters["stackId"].map(String.init), let ruleId = UUID(uuidString: raw) {
+                guard let rule = try await StackStore.listStackRule(id: ruleId, accountId: uuid, db: db) else {
+                    return Response(status: .notFound, body: .init(byteBuffer: ByteBuffer(string: "unknown-stack")))
+                }
+                stackMatch = rule.kind == .sender ? .sender(rule.value) : .keyword(rule.value)
+            } else {
+                stackMatch = nil
+            }
             let msgs = try await MessageStore.recent(
-                forAccount: uuid, limit: limit, sender: sender, db: db
+                forAccount: uuid, limit: limit, sender: sender,
+                archived: archived, stackMatch: stackMatch, db: db
             )
             let unread = try await MessageStore.unreadCount(forAccount: uuid, db: db)
             let cursor = SyncCursor(accountId: uuid, lastFetchedAt: Date(), totalUnread: unread)

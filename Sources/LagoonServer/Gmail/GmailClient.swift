@@ -204,6 +204,31 @@ public final class GmailClient: Sendable {
         try Self.assertOK(resp, data)
     }
 
+    /// `messages.trash` — the standard delete-with-recovery path; Gmail
+    /// keeps the message in Trash for 30 days before expunging.
+    public func trashMessage(accessToken: String, remoteId: String) async throws {
+        var c = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")!
+        c.path += "/\(Self.percentEncodePath(remoteId))/trash"
+        var req = URLRequest(url: c.url!)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        try OutboundGuard.validate(req.url!)
+        let (data, resp) = try await session.outboundData(for: req)
+        try Self.assertOK(resp, data)
+    }
+
+    /// `messages.untrash` — the delete undo.
+    public func untrashMessage(accessToken: String, remoteId: String) async throws {
+        var c = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")!
+        c.path += "/\(Self.percentEncodePath(remoteId))/untrash"
+        var req = URLRequest(url: c.url!)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        try OutboundGuard.validate(req.url!)
+        let (data, resp) = try await session.outboundData(for: req)
+        try Self.assertOK(resp, data)
+    }
+
     /// `users.drafts.create` with `threadId` — places a reply draft in the
     /// same thread. Requires `gmail.compose` scope; 403 without it.
     public func createDraft(

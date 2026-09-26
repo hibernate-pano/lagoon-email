@@ -24,9 +24,12 @@ actor StubMailProvider: MailProvider {
     private(set) var lastCursor: MailSyncState?
     private(set) var sendCalls: [OutboundMessage] = []
     private(set) var archiveCalls: [String] = []
+    private(set) var trashCalls: [String] = []
     /// When set, every archive throws this — drives the whitelist autopilot's
     /// remote-first failure paths (spec 2026-09-19 §3).
     private var archiveFailure: MailError?
+    /// Same knob for the trash path (delete route tests).
+    private var trashFailure: MailError?
 
     init(
         kind: MailProviderKind = .qq,
@@ -88,9 +91,18 @@ actor StubMailProvider: MailProvider {
         if let archiveFailure { throw archiveFailure }
     }
     func unarchive(remoteId: String) async throws {}
+    func trash(remoteId: String) async throws {
+        trashCalls.append(remoteId)
+        if let trashFailure { throw trashFailure }
+    }
+    func restoreFromTrash(remoteId: String) async throws {}
     /// Actor-isolated knob for scripted archive failures.
     func setArchiveFailure(_ error: MailError?) {
         archiveFailure = error
+    }
+    /// Actor-isolated knobs for scripted trash failures + observation.
+    func setTrashFailure(_ error: MailError?) {
+        trashFailure = error
     }
 
     func send(_ outbound: OutboundMessage) async throws -> String? {

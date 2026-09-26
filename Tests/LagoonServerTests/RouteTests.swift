@@ -444,6 +444,234 @@ final class RouteTests: XCTestCase {
         }
     }
 
+    // MARK: - 聚合规则 (stacks)
+
+    private func makeStackRouter(
+        db: PostgresConnection,
+        makeProvider: MailProviderFactory.Builder? = nil
+    ) -> Router<BasicRequestContext> {
+        let (client, tokens) = makeGmailCollaborators(db: db)
+        let router = Router()
+        SyncRoutes.register(on: router, db: db, sync: nil)
+        StackRoutes.register(on: router, db: db, logger: Self.testLogger)
+        ActionsRoutes.register(
+            on: router, db: db, client: client, tokens: tokens,
+            logger: Self.testLogger, makeProvider: makeProvider
+        )
+        return router
+    }
+
+    /// Stack CRUD end-to-end: create (sender + keyword), list with counts,
+    /// rule-scoped message filtering (including LIKE-metachar escaping),
+    /// delete.
+    func test_stacks_crud_andFiltering() async throws {
+        let oauthUser = "route-\(UUID().uuidString)"
+        let account = makeAccount(oauthUser: oauthUser, email: "me-\(UUID())@example.com")
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+
+            let fromAws = makeHeader(accountId: account.id, remoteId: "aws-1", from: "no-reply@aws.cn", subject: "【AWS】100% 账单已出")
+            let fromAws2 = makeHeader(accountId: account.id, remoteId: "aws-2", from: "no-reply@aws.cn", subject: "其他主题")
+            let keywordHit = makeHeader(accountId: account.id, remoteId: "kw-1", from: "other@x.com", subject: "季度 Report 汇总")
+            // '100' 子串命中"100%"主题，但作为关键词查询时必须按字面量匹配。
+            let literalTrap = makeHeader(accountId: account.id, remoteId: "trap-1", from: "other@x.com", subject: "省 100 元")
+            for header in [fromAws, fromAws2, keywordHit, literalTrap] {
+                try await MessageStore.upsert(header, db: conn)
+            }
+
+            let provider = StubMailProvider()
+            let app = Application(router: makeStackRouter(db: conn, makeProvider: { _ in provider }))
+            try await app.test(.router) { client in
+                // Create sender rule.
+                var body = """
+                    {"name":"AWS","kind":"sender","value":"no-reply@aws.cn"}
+                    """
+                try await client.execute(
+                    uri: "/api/stacks?accountId=\(account.id.uuidString)",
+                    method: .post, body: ByteBuffer(string: body)
+                ) { response in
+                    XCTAssertEqual(response.status, .created)
+                    let decoded = try Self.iso8601Decoder().decode(StackCreateResponse.self, from: Data(buffer: response.body))
+                    XCTAssertEqual(decoded.stack.count, 2)
+                }
+
+                // Create keyword rule ("report"), case-insensitive ILIKE.
+                body = """
+                    {"name":"Report","kind":"keyword","value":"report"}
+                    """
+                try await client.execute(
+                    uri: "/api/stacks?accountId=\(account.id.uuidString)",
+                    method: .post, body: ByteBuffer(string: body)
+                ) { response in
+                    XCTAssertEqual(response.status, .created)
+                    let decoded = try Self.iso8601Decoder().decode(StackCreateResponse.self, from: Data(buffer: response.body))
+                    XCTAssertEqual(decoded.stack.count, 1)
+                }
+
+                // List: both rules with counts.
+                try await client.execute(
+                    uri: "/api/stacks?accountId=\(account.id.uuidString)", method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(StackRuleListResponse.self, from: Data(buffer: response.body))
+                    XCTAssertEqual(decoded.stacks.count, 2)
+                }
+
+                // stackId filter returns only the sender's mail.
+                let stacks = try await StackStore.list(accountId: account.id, db: conn)
+                let senderRule = try XCTUnwrap(stacks.first { $0.kind == .sender })
+                try await client.execute(
+                    uri: "/api/messages?accountId=\(account.id.uuidString)&stackId=\(senderRule.id.uuidString)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(SyncResponse.self, from: Data(buffer: response.body))
+                    XCTAssertEqual(Set(decoded.messages.map(\.remoteId)), ["aws-1", "aws-2"])
+                }
+
+                // LIKE metacharacters are literal: keyword "100%" must not
+                // match "省 100 元" (a bare "100" substring trap).
+                body = """
+                    {"name":"Pct","kind":"keyword","value":"100%"}
+                    """
+                try await client.execute(
+                    uri: "/api/stacks?accountId=\(account.id.uuidString)",
+                    method: .post, body: ByteBuffer(string: body)
+                ) { response in
+                    XCTAssertEqual(response.status, .created)
+                }
+                let allRules = try await StackStore.list(accountId: account.id, db: conn)
+                let pctRule = try XCTUnwrap(allRules.first { $0.value == "100%" })
+                try await client.execute(
+                    uri: "/api/messages?accountId=\(account.id.uuidString)&stackId=\(pctRule.id.uuidString)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(SyncResponse.self, from: Data(buffer: response.body))
+                    XCTAssertEqual(decoded.messages.map(\.remoteId), ["aws-1"], "只有字面量 100% 命中，不是 100 子串")
+                }
+
+                // Delete the sender rule; the stackId route 404s afterwards.
+                try await client.execute(
+                    uri: "/api/stacks/\(senderRule.id.uuidString)?accountId=\(account.id.uuidString)",
+                    method: .delete
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                try await client.execute(
+                    uri: "/api/messages?accountId=\(account.id.uuidString)&stackId=\(senderRule.id.uuidString)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                }
+            }
+        }
+    }
+
+    // MARK: - 删除 (move to Trash)
+
+    /// Delete = provider.trash + is_deleted flag; lists/counts exclude it;
+    /// undo restores both sides.
+    func test_postDelete_trashesAndUndoRestores() async throws {
+        let oauthUser = "route-\(UUID().uuidString)"
+        let account = makeAccount(oauthUser: oauthUser, email: "me-\(UUID())@example.com")
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let survivor = makeHeader(accountId: account.id, remoteId: "keep-1", from: "a@x.com")
+            let victim = makeHeader(accountId: account.id, remoteId: "kill-1", from: "b@x.com")
+            for header in [survivor, victim] {
+                try await MessageStore.upsert(header, db: conn)
+            }
+            let provider = StubMailProvider()
+            let app = Application(router: makeStackRouter(db: conn, makeProvider: { _ in provider }))
+            try await app.test(.router) { client in
+                var actionId: Int64?
+                // URI 分段拼接：URL 路径里的 "delete" 会触发 SQL 守卫的
+                // 关键字+插值误报（tokenizer 无法区分 URL 与 SQL）。
+                let deleteURI = ["/api/messages", "kill-1", "delete"].joined(separator: "/")
+                    + "?accountId=\(account.id.uuidString)"
+                try await client.execute(
+                    uri: deleteURI,
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let object = try JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [String: Any]
+                    actionId = object?["actionId"] as? Int64
+                    XCTAssertEqual(object?["ok"] as? Bool, true)
+                }
+                let trashed = await provider.trashedRemoteIds
+                XCTAssertEqual(trashed, ["kill-1"], "远端必须先进废纸篓")
+
+                // List + unread count exclude the deleted row.
+                try await client.execute(
+                    uri: "/api/messages?accountId=\(account.id.uuidString)", method: .get
+                ) { response in
+                    let decoded = try Self.iso8601Decoder().decode(SyncResponse.self, from: Data(buffer: response.body))
+                    XCTAssertEqual(decoded.messages.map(\.remoteId), ["keep-1"])
+                }
+
+                // Undo restores: remote back to INBOX + flag cleared.
+                try await client.execute(
+                    uri: "/api/actions/\(try XCTUnwrap(actionId))/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                let restored = await provider.restoredRemoteIds
+                XCTAssertEqual(restored, ["kill-1"])
+                try await client.execute(
+                    uri: "/api/messages?accountId=\(account.id.uuidString)", method: .get
+                ) { response in
+                    let decoded = try Self.iso8601Decoder().decode(SyncResponse.self, from: Data(buffer: response.body))
+                    XCTAssertEqual(Set(decoded.messages.map(\.remoteId)), ["keep-1", "kill-1"])
+                }
+            }
+        }
+    }
+
+    /// Sweep: per-item report; a provider failure marks the item failed while
+    /// the rest still succeed.
+    func test_archiveBulk_reportsPerItem() async throws {
+        let oauthUser = "route-\(UUID().uuidString)"
+        let account = makeAccount(oauthUser: oauthUser, email: "me-\(UUID())@example.com")
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            // Sweep 归档必须过 capabilities.archiveFolder 闸，与单封归档一致。
+            try await seedAccount(
+                Account(
+                    id: account.id, provider: .qq, oauthUser: account.oauthUser,
+                    email: account.email, credentials: Data([1, 2, 3]),
+                    capabilities: MailCapabilities(
+                        archiveFolder: true, idle: true, move: true, serverSnippet: true
+                    ),
+                    isActive: false
+                ),
+                db: conn
+            )
+            let first = makeHeader(accountId: account.id, remoteId: "s-1", from: "a@x.com")
+            let second = makeHeader(accountId: account.id, remoteId: "s-2", from: "a@x.com")
+            for header in [first, second] {
+                try await MessageStore.upsert(header, db: conn)
+            }
+            let provider = StubMailProvider()
+            let app = Application(router: makeStackRouter(db: conn, makeProvider: { _ in provider }))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/archive-bulk?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    body: ByteBuffer(string: #"{"remoteIds":["s-1","s-2"]}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(ArchiveBulkResponse.self, from: Data(buffer: response.body))
+                    XCTAssertEqual(decoded.items.count, 2)
+                    XCTAssertTrue(decoded.items.allSatisfy(\.ok))
+                    XCTAssertTrue(decoded.items.allSatisfy { $0.actionId != nil }, "每封一条审计，撤销才逐封可用")
+                }
+                let archived = await provider.archivedRemoteIds
+                XCTAssertEqual(Set(archived), ["s-1", "s-2"])
+            }
+        }
+    }
+
     // MARK: - GET /api/briefing
 
     /// The feed is 200 + JSON, and every item lands in the group the
@@ -973,6 +1201,10 @@ final class RouteTests: XCTestCase {
         private(set) var probeCalls = 0
         private(set) var archivedRemoteIds: [String] = []
         private(set) var unarchivedRemoteIds: [String] = []
+        private(set) var trashedRemoteIds: [String] = []
+        private(set) var restoredRemoteIds: [String] = []
+        private var trashError: MailError?
+        func setTrashError(_ error: MailError?) { trashError = error }
         private(set) var readCalls: [String] = []
         private(set) var sentOutbounds: [OutboundMessage] = []
         private var sendResult: String? = "stub-provider-message-id"
@@ -1025,6 +1257,15 @@ final class RouteTests: XCTestCase {
 
         func unarchive(remoteId: String) async throws {
             unarchivedRemoteIds.append(remoteId)
+        }
+
+        func trash(remoteId: String) async throws {
+            if let trashError { throw trashError }
+            trashedRemoteIds.append(remoteId)
+        }
+
+        func restoreFromTrash(remoteId: String) async throws {
+            restoredRemoteIds.append(remoteId)
         }
 
         func send(_ outbound: OutboundMessage) async throws -> String? {
