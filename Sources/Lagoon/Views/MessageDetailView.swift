@@ -13,6 +13,13 @@ struct MessageDetailView: View {
     let initialGroup: BriefingGroup?
     /// Optional sibling list for j/k navigation and auto-advance on archive.
     var siblings: [String]? = nil
+    /// Whether the hosting surface is the visible one. RootView keeps both
+    /// surfaces resident in a ZStack (state survives ⌘0 switches); toolbar
+    /// items are window-level and sail past the surface's disabled/hidden
+    /// modifiers, so a detail pushed on the hidden surface would still plant
+    /// its reply/archive/⋯ buttons in the top-right — duplicating the
+    /// visible surface's set. False ⇒ this detail emits no toolbar items.
+    var surfaceVisible: Bool = true
     /// Called after a successful archive/undo so the list row can disappear/return.
     var onArchived: ((String, Bool) -> Void)? = nil  // (remoteId, isArchived)
     var onReadStateChange: (String, Bool) -> Void = { _, _ in }
@@ -98,6 +105,7 @@ struct MessageDetailView: View {
         initiallyPinned: Bool,
         initialGroup: BriefingGroup? = nil,
         siblings: [String]? = nil,
+        surfaceVisible: Bool = true,
         onArchived: ((String, Bool) -> Void)? = nil,
         onAdvanceTo: ((String?) -> Void)? = nil,
         onReadStateChange: @escaping (String, Bool) -> Void = { _, _ in },
@@ -109,6 +117,7 @@ struct MessageDetailView: View {
         self.initiallyPinned = initiallyPinned
         self.initialGroup = initialGroup
         self.siblings = siblings
+        self.surfaceVisible = surfaceVisible
         self.onArchived = onArchived
         self.onAdvanceTo = onAdvanceTo
         self.onReadStateChange = onReadStateChange
@@ -149,7 +158,15 @@ struct MessageDetailView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .navigationTitle(subjectText)
-        .toolbar { toolbarContent }
+        // Toolbar items are window-level on macOS: they bypass the hosting
+        // surface's disabled/hidden modifiers (RootView keeps BOTH surfaces
+        // resident in a ZStack), so a detail pushed on the hidden surface
+        // would still plant its reply/archive/⋯ cluster in the top-right,
+        // duplicating the visible side. Emit nothing while hidden — the
+        // detail itself stays mounted, so state still survives ⌘0.
+        .toolbar {
+            if surfaceVisible { toolbarContent }
+        }
         .noticeBanner($actionBanner)
         .noticeBanner($pinBanner)
         .onAppear {
