@@ -19,6 +19,31 @@ struct MessageListView: View {
     @State private var expandedThreads: Set<String> = []
     /// Non-nil presents the sender's full mail history (发件人归集).
     @State private var senderFocus: SenderFocus?
+    /// 归集维度: conversations (thread + affinity), per-sender, or flat.
+    /// Persisted — the lens the user picked should survive relaunch.
+    @AppStorage("lagoon.grouping") private var groupingRaw = GroupingMode.conversation.rawValue
+    @AppStorage("lagoon.unreadOnly") private var unreadOnly = false
+
+    enum GroupingMode: String, CaseIterable {
+        case conversation
+        case sender
+        case date
+
+        var mode: ConversationGrouper.Mode {
+            self == .sender ? .sender : .thread
+        }
+    }
+
+    private var groupingMode: GroupingMode {
+        get { GroupingMode(rawValue: groupingRaw) ?? .conversation }
+        nonmutating set { groupingRaw = newValue.rawValue }
+    }
+
+    /// `$`-prefix binding needs a property wrapper; a computed property
+    /// provides its own explicit Binding instead.
+    private var groupingBinding: Binding<GroupingMode> {
+        Binding(get: { groupingMode }, set: { groupingMode = $0 })
+    }
     /// False when another surface is showing (RootView keeps both alive).
     /// The poll loop sleeps instead of refreshing — keep-alive costs no
     /// traffic. Hidden shortcuts are disabled by the parent.
@@ -38,7 +63,21 @@ struct MessageListView: View {
                 HStack(spacing: 8) {
                     Text(l10n.allMessages)
                         .font(.headline)
+                    Picker(l10n.groupingLabel, selection: groupingBinding) {
+                        Text(l10n.groupingConversation).tag(GroupingMode.conversation)
+                        Text(l10n.groupingSender).tag(GroupingMode.sender)
+                        Text(l10n.groupingDate).tag(GroupingMode.date)
+                    }
+                    .pickerStyle(.segmented)
+                    .fixedSize()
+                    .help(l10n.groupingHelp)
                     Spacer()
+                    Button {
+                        unreadOnly.toggle()
+                    } label: {
+                        Label(l10n.unreadOnly, systemImage: unreadOnly ? "envelope.badge.fill" : "envelope.badge")
+                    }
+                    .help(l10n.unreadOnlyHelp)
                     if isLoading {
                         ProgressView().controlSize(.small)
                     }
@@ -275,15 +314,34 @@ struct MessageListView: View {
         var id: DateBucket { bucket }
     }
 
-    /// Threads first (by `thread_id`, newest member per thread), then each
-    /// thread lands in the date bucket of its newest message — so a thread
-    /// spanning midnight stays one row instead of splitting in two.
+    /// Rows the current lens shows: the unread-only filter is the first cut.
+    private var displayMessages: [MessageHeader] {
+        unreadOnly ? messages.filter { !$0.isRead } : messages
+    }
+
+    /// Threads first (by `thread_id` + same-sender/same-subject affinity, or
+    /// pure per-sender, per the lens), then each thread lands in the date
+    /// bucket of its newest message — so a thread spanning midnight stays
+    /// one row instead of splitting in two. The `.date` lens flattens to
+    /// singleton rows (the count==1 row path renders them exactly as before).
     private var groupedSections: [ConversationSection] {
-        let conversations = ConversationGrouper.group(messages)
-        let groups = Dictionary(grouping: conversations) { $0.newest.receivedAt.dateBucket }
-        return DateBucket.allCases.compactMap { bucket in
-            guard let items = groups[bucket], !items.isEmpty else { return nil }
-            return ConversationSection(bucket: bucket, conversations: items)
+        switch groupingMode {
+        case .date:
+            let groups = Dictionary(grouping: displayMessages) { $0.receivedAt.dateBucket }
+            return DateBucket.allCases.compactMap { bucket in
+                guard let items = groups[bucket], !items.isEmpty else { return nil }
+                let conversations = items
+                    .sorted { $0.receivedAt > $1.receivedAt }
+                    .map { Conversation(threadId: $0.remoteId, messages: [$0]) }
+                return ConversationSection(bucket: bucket, conversations: conversations)
+            }
+        case .conversation, .sender:
+            let conversations = ConversationGrouper.group(displayMessages, mode: groupingMode.mode)
+            let groups = Dictionary(grouping: conversations) { $0.newest.receivedAt.dateBucket }
+            return DateBucket.allCases.compactMap { bucket in
+                guard let items = groups[bucket], !items.isEmpty else { return nil }
+                return ConversationSection(bucket: bucket, conversations: items)
+            }
         }
     }
 

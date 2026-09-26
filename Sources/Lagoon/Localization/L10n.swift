@@ -466,6 +466,13 @@ public struct L10n: Sendable, Equatable {
     public var senderMailEmpty: String { pick("没有来自此发件人的邮件", "No mail from this sender") }
     public var loadFailed: String { pick("加载失败", "Couldn't load") }
     public var close: String { pick("关闭", "Close") }
+    public var groupingLabel: String { pick("归集", "Grouping") }
+    public var groupingConversation: String { pick("会话", "Threads") }
+    public var groupingSender: String { pick("发件人", "Sender") }
+    public var groupingDate: String { pick("平铺", "Flat") }
+    public var groupingHelp: String { pick("按会话、发件人或日期归集", "Group by conversation, sender, or date") }
+    public var unreadOnly: String { pick("仅未读", "Unread") }
+    public var unreadOnlyHelp: String { pick("只显示未读邮件", "Show unread messages only") }
     public var pinning: String { pick("正在置顶…", "Pinning…") }
     public var draftVariants: String { pick("AI 草稿（3 个版本）", "AI drafts (3 variants)") }
     public var pushToGmailDrafts: String { pick("保存到 Gmail 草稿", "Save to Gmail drafts") }
