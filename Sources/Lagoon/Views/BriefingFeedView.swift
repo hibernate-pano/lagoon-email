@@ -505,12 +505,6 @@ struct BriefingFeedView: View {
 
                 siblings: siblings,
 
-                // The feed can be the hidden side of RootView's ZStack while
-                // this detail stays mounted; its toolbar items must not leak
-                // into the window toolbar (they would duplicate the visible
-                // surface's cluster).
-                surfaceVisible: isVisible,
-
                 onArchived: { id, isArchived in
 
                     handleArchived(id: id, isArchived: isArchived)

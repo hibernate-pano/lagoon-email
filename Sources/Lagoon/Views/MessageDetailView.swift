@@ -13,13 +13,6 @@ struct MessageDetailView: View {
     let initialGroup: BriefingGroup?
     /// Optional sibling list for j/k navigation and auto-advance on archive.
     var siblings: [String]? = nil
-    /// Whether the hosting surface is the visible one. RootView keeps both
-    /// surfaces resident in a ZStack (state survives ⌘0 switches); toolbar
-    /// items are window-level and sail past the surface's disabled/hidden
-    /// modifiers, so a detail pushed on the hidden surface would still plant
-    /// its reply/archive/⋯ buttons in the top-right — duplicating the
-    /// visible surface's set. False ⇒ this detail emits no toolbar items.
-    var surfaceVisible: Bool = true
     /// Called after a successful archive/undo so the list row can disappear/return.
     var onArchived: ((String, Bool) -> Void)? = nil  // (remoteId, isArchived)
     var onReadStateChange: (String, Bool) -> Void = { _, _ in }
@@ -107,7 +100,6 @@ struct MessageDetailView: View {
         initiallyPinned: Bool,
         initialGroup: BriefingGroup? = nil,
         siblings: [String]? = nil,
-        surfaceVisible: Bool = true,
         onArchived: ((String, Bool) -> Void)? = nil,
         onAdvanceTo: ((String?) -> Void)? = nil,
         onReadStateChange: @escaping (String, Bool) -> Void = { _, _ in },
@@ -119,7 +111,6 @@ struct MessageDetailView: View {
         self.initiallyPinned = initiallyPinned
         self.initialGroup = initialGroup
         self.siblings = siblings
-        self.surfaceVisible = surfaceVisible
         self.onArchived = onArchived
         self.onAdvanceTo = onAdvanceTo
         self.onReadStateChange = onReadStateChange
@@ -160,14 +151,14 @@ struct MessageDetailView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .navigationTitle(subjectText)
-        // Toolbar items are window-level on macOS: they bypass the hosting
-        // surface's disabled/hidden modifiers (RootView keeps BOTH surfaces
-        // resident in a ZStack), so a detail pushed on the hidden surface
-        // would still plant its reply/archive/⋯ cluster in the top-right,
-        // duplicating the visible side. Emit nothing while hidden — the
-        // detail itself stays mounted, so state still survives ⌘0.
-        .toolbar {
-            if surfaceVisible { toolbarContent }
+        // The action bar lives IN the reading view, pinned above the scroll:
+        // push/pop no longer touches the window toolbar (the macOS 27 beta
+        // ToolbarBridge race lives in toolbar item INSERT — see actionBar).
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
+                actionBar
+                Divider()
+            }
         }
         .noticeBanner($actionBanner)
         .noticeBanner($pinBanner)
@@ -245,20 +236,18 @@ struct MessageDetailView: View {
         }
     }
 
-    @ToolbarContentBuilder
-    private var toolbarContent: some ToolbarContent {
-        // Three sections, left-to-right, each visually separated so a power
-        // user can park their mouse on the right cluster (Archive & Next) and
-        // not lose the thread when the toolbar overflows on narrow windows.
-        //
-        //   [Pin]  |  [Reply · ReplyAll · Forward]  |  [Archive & Next]  [⋯]
-        //
-        // Summarize, Generate Drafts, Download .eml, Mark Read, Override and
-        // Unsubscribe all move into the ⋯ menu — they remain keyboard-
-        // accessible via ⌘D / ⇧⌘D but no longer compete for toolbar space.
-        // Less common actions stop costing pixels in the always-visible strip.
-
-        ToolbarItem(placement: .navigation) {
+    /// 阅读视图内常驻动作条（pinned above the scroll, always reachable）。
+    /// 动作不再挂窗口工具栏：toolbar 项在 push/pop 详情页时的插入/移除触发
+    /// macOS 27 beta 的 ToolbarBridge NSCalendarDate 崩溃（.memory
+    /// lagoon-app-nscalendardate-toolbar-crash，三次全在此路径）——打开/
+    /// 关闭邮件对窗口工具栏零改动后，竞态入口被移除。
+    ///
+    /// Layout mirrors the old toolbar:
+    ///   [Pin]  |  [Reply · ReplyAll · Forward]  ····  [Archive & Next] [⋯]
+    /// Summarize, Generate Drafts, Download .eml, Mark Read, Override and
+    /// Unsubscribe stay in the ⋯ menu with their ⌘ shortcuts.
+    private var actionBar: some View {
+        HStack(spacing: 10) {
             Button { Task { await togglePin() } } label: {
                 if isPinBusy {
                     HStack(spacing: 6) {
@@ -269,21 +258,25 @@ struct MessageDetailView: View {
                     Label(isPinned ? l10n.unpin : l10n.pin, systemImage: isPinned ? "pin.slash" : "pin")
                 }
             }
+            .buttonStyle(.borderless)
             .disabled(isPinBusy)
             .help(isPinned ? l10n.unpinHelp : l10n.pinHelp)
             .keyboardShortcut("p", modifiers: .command)
-        }
 
-        ToolbarItemGroup(placement: .primaryAction) {
+            Divider()
+                .frame(height: 16)
+
             Button { composerMode = .reply; showComposer = true } label: {
                 Label(l10n.reply, systemImage: "arrowshape.turn.up.left")
             }
+            .buttonStyle(.borderless)
             .help(l10n.replyHelp)
             .keyboardShortcut("r", modifiers: .command)
 
             Button { composerMode = .replyAll; showComposer = true } label: {
                 Label(l10n.replyAll, systemImage: "arrowshape.turn.up.left.2")
             }
+            .buttonStyle(.borderless)
             .keyboardShortcut("r", modifiers: [.command, .shift])
             .disabled(messageBody == nil)
             .help(l10n.replyAllHelp)
@@ -291,63 +284,71 @@ struct MessageDetailView: View {
             Button { composerMode = .forward; showComposer = true } label: {
                 Label(l10n.forward, systemImage: "arrowshape.turn.up.right")
             }
+            .buttonStyle(.borderless)
             .keyboardShortcut("f", modifiers: [.command, .shift])
             .disabled(messageBody == nil)
             .help(l10n.forwardHelp)
-        }
 
-        ToolbarItem(placement: .primaryAction) {
-            // Archive & Next is the rightmost (primary) action: when the
-            // toolbar overflows, this is the last button to disappear.
+            Spacer()
+
+            // The primary verb, visually promoted: it is the one gesture the
+            // whole triage loop exists for.
             Button { Task { await archiveAndAdvance() } } label: {
                 Label(l10n.archiveAndNext, systemImage: "tray.and.arrow.down")
             }
+            .buttonStyle(.borderedProminent)
             .keyboardShortcut("e", modifiers: .command)
             .disabled(!canArchive)
             .help(canArchive ? l10n.shortcutArchiveNext : l10n.archiveUnavailable)
+
+            moreActionsMenu
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
 
-        ToolbarItem(placement: .primaryAction) {
-            // The overflow menu gathers Summarize / Drafts / Download /
-            // Mark Read / Override / Unsubscribe. Each keeps its keyboard
-            // shortcut so a power user never has to open it.
-            Menu {
-                Button { Task { await loadSummary() } } label: {
-                    if summaryState == .loading {
-                        Label(l10n.summarizing, systemImage: "sparkles")
-                    } else {
-                        Label(l10n.summarize, systemImage: "sparkles")
-                    }
+    /// The overflow menu gathers Summarize / Drafts / Download /
+    /// Mark Read / Override / Unsubscribe. Each keeps its keyboard
+    /// shortcut so a power user never has to open it.
+    private var moreActionsMenu: some View {
+        Menu {
+            Button { Task { await loadSummary() } } label: {
+                if summaryState == .loading {
+                    Label(l10n.summarizing, systemImage: "sparkles")
+                } else {
+                    Label(l10n.summarize, systemImage: "sparkles")
                 }
-                .disabled(summaryState == .loading)
-                .keyboardShortcut("d", modifiers: .command)
-
-                Button { Task { await generateDrafts() } } label: {
-                    if draftState == .loading {
-                        Label(l10n.generatingDrafts, systemImage: "text.bubble")
-                    } else {
-                        Label(l10n.draftVariants, systemImage: "text.bubble")
-                    }
-                }
-                .disabled(draftState == .loading)
-                .keyboardShortcut("d", modifiers: [.command, .shift])
-
-                Divider()
-
-                Button(l10n.markRead) { Task { await markReadOnce(force: true) } }
-                    .disabled(isRead)
-                Button(l10n.overrideGroup) { showOverrideMenu = true }
-                Button(l10n.unsubscribe, role: .destructive) { Task { await unsubscribe() } }
-                    .disabled(header == nil)
-
-                Divider()
-
-                Button(l10n.downloadEml) { Task { await downloadRawEml() } }
-                    .help(l10n.downloadEmlHelp)
-            } label: {
-                Label(l10n.moreActions, systemImage: "ellipsis.circle")
             }
+            .disabled(summaryState == .loading)
+            .keyboardShortcut("d", modifiers: .command)
+
+            Button { Task { await generateDrafts() } } label: {
+                if draftState == .loading {
+                    Label(l10n.generatingDrafts, systemImage: "text.bubble")
+                } else {
+                    Label(l10n.draftVariants, systemImage: "text.bubble")
+                }
+            }
+            .disabled(draftState == .loading)
+            .keyboardShortcut("d", modifiers: [.command, .shift])
+
+            Divider()
+
+            Button(l10n.markRead) { Task { await markReadOnce(force: true) } }
+                .disabled(isRead)
+            Button(l10n.overrideGroup) { showOverrideMenu = true }
+            Button(l10n.unsubscribe, role: .destructive) { Task { await unsubscribe() } }
+                .disabled(header == nil)
+
+            Divider()
+
+            Button(l10n.downloadEml) { Task { await downloadRawEml() } }
+                .help(l10n.downloadEmlHelp)
+        } label: {
+            Label(l10n.moreActions, systemImage: "ellipsis.circle")
         }
+        .buttonStyle(.borderless)
+        .accessibilityLabel(l10n.moreActions)
     }
 
     // MARK: - Sections

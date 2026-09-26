@@ -196,10 +196,6 @@ struct MessageListView: View {
                 // still loads / toggles it via the server.
                 initiallyPinned: false,
                 siblings: messages.map(\.remoteId),
-                // Hidden side of RootView's ZStack: keep the detail mounted
-                // but emit no window toolbar items (they would duplicate the
-                // visible surface's cluster).
-                surfaceVisible: isVisible,
                 onArchived: { id, _ in
                     messages.removeAll { $0.remoteId == id }
                 },

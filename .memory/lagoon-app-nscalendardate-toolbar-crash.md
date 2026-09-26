@@ -35,4 +35,16 @@ ObjC 异常未捕获 → AppKit `_crashOnException` → abort。触发点是 `pr
 - 若复发：降低 toolbar 内容 churn（RootView 账号菜单 label 随轮询刷新变化）或提 Feedback；
   steno 的"启动一次性清状态"仅在磁盘确有 toolbar 键时才有意义。
 
+**复发记录（2026-09-27 00:01，第三次）。** v2.1.1 二进制（23:59 启动，2 分 17 秒后崩），
+触发路径 = 点击邮件 → 详情 push 插入 toolbar 项 → `AppKitToolbarStrategy.updateToolbar()`
+→ NSCalendarDate decode 抛异常。偏好域复查仍无 toolbar 键（只有 window frame /
+lagoon.language / lagoon.grouping）——竞态而非必现。与 9/24 的两次同栈。要点：
+- 崩溃点在 AppKit 的 `_insertNewItem`（插入新项），不是既有项的内容更新——**push/pop
+  详情页的"插入/移除 5 项"是最大的开彩票动作**。
+- 彻底规避 = 详情动作条移出窗口工具栏（in-view action bar，零 churn）；折中 = 项常驻
+  只切 enabled（但与 surfaceVisible 防重复门控冲突，隐藏面会露出灰按钮）。均为 UX 决策，
+  待 founder 拍板，不要擅自重构。
+- v2.1.1 新增的 @AppStorage（lagoon.grouping/unreadOnly）只在切换时写一次 defaults，
+  与常驻轮询相比不是主要输入源，别错怪。
+
 **Related.** [[macos-swiftui-toolbar-overflow-hides-controls]] — 同一层的另一个静默问题族。
