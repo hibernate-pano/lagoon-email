@@ -21,7 +21,13 @@ public enum SyncRoutes {
                 )
             }
             let limit = max(1, min(Int(req.uri.queryParameters["limit"] ?? "50") ?? 50, 200))
-            let msgs = try await MessageStore.recent(forAccount: uuid, limit: limit, db: db)
+            // Optional 发件人归集 filter: exact from_address, bound as a
+            // parameter in the store (spec §6.6 rule 1/2).
+            let sender = req.uri.queryParameters["sender"].map(String.init)
+                .flatMap { $0.isEmpty ? nil : $0 }
+            let msgs = try await MessageStore.recent(
+                forAccount: uuid, limit: limit, sender: sender, db: db
+            )
             let unread = try await MessageStore.unreadCount(forAccount: uuid, db: db)
             let cursor = SyncCursor(accountId: uuid, lastFetchedAt: Date(), totalUnread: unread)
             let payload = SyncResponse(cursor: cursor, messages: msgs)

@@ -457,6 +457,15 @@ public struct L10n: Sendable, Equatable {
     public var archivedLocallyOnly: String { pick("归档未完成", "Archive did not complete") }
     public var unsubscribed: String { pick("已退订", "Unsubscribed") }
     public var unsubscribe: String { pick("退订", "Unsubscribe") }
+    // MARK: 会话归集 / 发件人归集
+    public func threadCount(_ count: Int) -> String { pick("\(count) 封", "\(count) messages") }
+    public func threadRowLabel(_ count: Int) -> String {
+        pick("会话，\(count) 封邮件，点按展开", "Conversation, \(count) messages; press to expand")
+    }
+    public var senderMailContext: String { pick("来自此发件人的邮件…", "Mail from this sender…") }
+    public var senderMailEmpty: String { pick("没有来自此发件人的邮件", "No mail from this sender") }
+    public var loadFailed: String { pick("加载失败", "Couldn't load") }
+    public var close: String { pick("关闭", "Close") }
     public var pinning: String { pick("正在置顶…", "Pinning…") }
     public var draftVariants: String { pick("AI 草稿（3 个版本）", "AI drafts (3 variants)") }
     public var pushToGmailDrafts: String { pick("保存到 Gmail 草稿", "Save to Gmail drafts") }

@@ -98,12 +98,17 @@ public enum MessageStore {
         ]).get()
     }
 
+    /// Newest unarchived headers, optionally narrowed to one sender
+    /// (发件人归集). `sender` is an exact `from_address` match — the caller
+    /// passes the address the user clicked, never user-typed SQL. Bound as
+    /// `$3`; `nil` keeps the unfiltered list.
     public static func recent(
         forAccount accountId: UUID,
         limit: Int,
+        sender: String? = nil,
         db: PostgresConnection
     ) async throws -> [MessageHeader] {
-        let sql = """
+        var sql = """
             SELECT id, account_id, remote_id, thread_id, from_address,
                    NULLIF(from_name, '') AS from_name,
                    NULLIF(subject, '') AS subject,
@@ -112,13 +117,18 @@ public enum MessageStore {
                    message_id_header, in_reply_to, references_header
             FROM message_headers
             WHERE account_id = $1 AND is_archived = FALSE
-            ORDER BY received_at DESC
-            LIMIT $2
         """
-        let rows = try await db.query(sql, [
-            PostgresData(uuid: accountId),
-            PostgresData(int: limit)
-        ]).get()
+        var params: [PostgresData] = [PostgresData(uuid: accountId)]
+        // Placeholder numbers must match the positional bind list: with a
+        // sender, $2 is the address and the limit becomes $3.
+        if sender != nil {
+            sql += " AND from_address = $2"
+            params.append(PostgresData(string: sender!))
+        }
+        sql += "\n            ORDER BY received_at DESC\n            LIMIT "
+        sql += sender == nil ? "$2" : "$3"
+        params.append(PostgresData(int: limit))
+        let rows = try await db.query(sql, params).get()
         return try rows.map { try Self.decode($0) }
     }
 

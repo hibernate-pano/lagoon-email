@@ -2,9 +2,11 @@ import SwiftUI
 import LagoonKit
 
 /// Raw conversation list (spec §7.1) - the secondary surface reachable from
-/// the Briefing Feed. Each row drills into the message body. Messages are
-/// grouped by `DateBucket` (Today / Yesterday / This week / ... / Earlier)
-/// so a 400-message inbox scans in seconds.
+/// the Briefing Feed. Rows are conversations (会话归集, grouped by the
+/// server's `thread_id`): a thread collapses to one count-badged row that
+/// expands in place. Conversations are grouped by `DateBucket` (Today /
+/// Yesterday / This week / ... / Earlier) so a 400-message inbox scans in
+/// seconds; the row context menu opens the sender's full history.
 struct MessageListView: View {
     @EnvironmentObject var accounts: AccountStore
     @State private var messages: [MessageHeader] = []
@@ -12,6 +14,11 @@ struct MessageListView: View {
     @State private var errorBanner: ErrorBanner?
     @State private var path: [String] = []
     @State private var selection: Set<String> = []
+    /// Thread rows the user expanded (会话归集). Collapsed by default so a
+    /// 400-message inbox still scans as one row per conversation.
+    @State private var expandedThreads: Set<String> = []
+    /// Non-nil presents the sender's full mail history (发件人归集).
+    @State private var senderFocus: SenderFocus?
     /// False when another surface is showing (RootView keeps both alive).
     /// The poll loop sleeps instead of refreshing — keep-alive costs no
     /// traffic. Hidden shortcuts are disabled by the parent.
@@ -55,37 +62,18 @@ struct MessageListView: View {
                     List(selection: $selection) {
                         ForEach(groupedSections, id: \.bucket) { section in
                             Section {
-                                ForEach(section.messages) { m in
-                                    messageRow(m)
-                                        .tag(m.remoteId)
-                                        .swipeActions(edge: .trailing) {
-                                            // Trailing swipe = archive (Mail.app convention).
-                                            Button(role: .destructive) {
-                                                Task { await archive(m) }
-                                            } label: {
-                                                Label(l10n.archived, systemImage: "tray.and.arrow.down")
-                                            }
-                                        }
-                                        .swipeActions(edge: .leading) {
-                                            // Leading swipe = toggle read. Single
-                                            // gesture, no destructive styling so
-                                            // the row snaps back without warning.
-                                            Button {
-                                                Task { await toggleRead(m) }
-                                            } label: {
-                                                Label(
-                                                    m.isRead ? l10n.markAsUnread : l10n.markAsRead,
-                                                    systemImage: m.isRead ? "envelope.badge" : "envelope.open"
-                                                )
-                                            }
-                                            .tint(.blue)
-                                        }
-                                        .contextMenu {
-                                            Button(m.isRead ? l10n.markAsUnread : l10n.markAsRead) {
-                                                Task { await toggleRead(m) }
-                                            }
-                                            Button(l10n.archived) { Task { await archive(m) } }
-                                        }
+                                ForEach(section.conversations) { conversation in
+                                    if conversation.messages.count > 1 {
+                                        conversationRow(conversation)
+                                    } else {
+                                        messageRow(conversation.newest)
+                                            .modifier(RowChrome(
+                                                message: conversation.newest,
+                                                onArchive: { Task { await archive(conversation.newest) } },
+                                                onToggleRead: { Task { await toggleRead(conversation.newest) } },
+                                                onShowSender: { senderFocus = SenderFocus(from: conversation.newest) }
+                                            ))
+                                    }
                                 }
                             } header: {
                                 Text(l10n.label(for: section.bucket))
@@ -102,6 +90,15 @@ struct MessageListView: View {
                     // name for it.
                     .onDeleteCommand {
                         archiveSelected()
+                    }
+                    .sheet(item: $senderFocus) { focus in
+                        if let accountId = accounts.accountId {
+                            SenderSheet(
+                                accountId: accountId,
+                                senderAddress: focus.address,
+                                senderName: focus.name
+                            )
+                        }
                     }
                 } else if !isLoading && errorBanner == nil {
                     Text(l10n.noMessagesYet)
@@ -270,23 +267,103 @@ struct MessageListView: View {
         }
     }
 
-    // MARK: - Date grouping
+    // MARK: - Conversation grouping (会话归集)
 
-    private struct DateSection: Identifiable {
+    private struct ConversationSection: Identifiable {
         let bucket: DateBucket
-        let messages: [MessageHeader]
+        let conversations: [Conversation]
         var id: DateBucket { bucket }
     }
 
-    private var groupedSections: [DateSection] {
-        let groups = Dictionary(grouping: messages) { $0.receivedAt.dateBucket }
-        // Render buckets in chronological order (newest first).
+    /// Threads first (by `thread_id`, newest member per thread), then each
+    /// thread lands in the date bucket of its newest message — so a thread
+    /// spanning midnight stays one row instead of splitting in two.
+    private var groupedSections: [ConversationSection] {
+        let conversations = ConversationGrouper.group(messages)
+        let groups = Dictionary(grouping: conversations) { $0.newest.receivedAt.dateBucket }
         return DateBucket.allCases.compactMap { bucket in
-            guard let bucketMessages = groups[bucket], !bucketMessages.isEmpty else { return nil }
-            return DateSection(
-                bucket: bucket,
-                messages: bucketMessages.sorted { $0.receivedAt > $1.receivedAt }
-            )
+            guard let items = groups[bucket], !items.isEmpty else { return nil }
+            return ConversationSection(bucket: bucket, conversations: items)
+        }
+    }
+
+    /// Collapsed thread: one row per conversation with a count badge and
+    /// disclosure chevron; tapping expands the member rows in place. Verbs
+    /// on the collapsed row act on the newest message only — per-message
+    /// actions live on the expanded members, so nothing bulk-fires unseen.
+    private func conversationRow(_ conversation: Conversation) -> some View {
+        let newest = conversation.newest
+        let isExpanded = expandedThreads.contains(conversation.threadId)
+        return VStack(spacing: 0) {
+            Button {
+                if isExpanded {
+                    expandedThreads.remove(conversation.threadId)
+                } else {
+                    expandedThreads.insert(conversation.threadId)
+                }
+            } label: {
+                HStack(alignment: .top, spacing: 8) {
+                    if conversation.hasUnread {
+                        Circle()
+                            .fill(.tint)
+                            .frame(width: 7, height: 7)
+                            .padding(.top, 7)
+                            .accessibilityLabel(l10n.unreadDotLabel)
+                    } else {
+                        Color.clear.frame(width: 7, height: 7)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(newest.subject ?? l10n.noSubject)
+                                .font(.body)
+                                .bold(conversation.hasUnread)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(l10n.threadCount(conversation.messages.count))
+                                .font(.caption2)
+                                .bold()
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1)
+                                .background(.quaternary, in: Capsule())
+                            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(newest.fromName ?? newest.fromAddress)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        if !isExpanded, let snippet = newest.snippet {
+                            Text(snippet)
+                                .font(.caption2)
+                                .lineLimit(2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(l10n.threadRowLabel(conversation.messages.count))
+            .modifier(RowChrome(
+                message: newest,
+                onArchive: { Task { await archive(newest) } },
+                onToggleRead: { Task { await toggleRead(newest) } },
+                onShowSender: { senderFocus = SenderFocus(from: newest) }
+            ))
+            if isExpanded {
+                ForEach(conversation.messages) { m in
+                    messageRow(m)
+                        .modifier(RowChrome(
+                            message: m,
+                            onArchive: { Task { await archive(m) } },
+                            onToggleRead: { Task { await toggleRead(m) } },
+                            onShowSender: { senderFocus = SenderFocus(from: m) }
+                        ))
+                        .padding(.leading, 14)
+                }
+            }
         }
     }
 
@@ -343,6 +420,57 @@ struct MessageListView: View {
         // MessageDetailView. We surface a banner instead.
         throw APIError.badStatus(code: 409, bodySnippet: "archive-unavailable")
     }
+}
+
+// MARK: - Row chrome
+
+/// Tag + triage gestures shared by every tappable row (single message or
+/// expanded thread member). Also the 发件人归集 entry point.
+private struct RowChrome: ViewModifier {
+    let message: MessageHeader
+    let onArchive: () -> Void
+    let onToggleRead: () -> Void
+    let onShowSender: () -> Void
+    @Environment(\.l10n) private var l10n
+
+    func body(content: Content) -> some View {
+        content
+            .tag(message.remoteId)
+            .swipeActions(edge: .trailing) {
+                // Trailing swipe = archive (Mail.app convention).
+                Button(role: .destructive) { onArchive() } label: {
+                    Label(l10n.archived, systemImage: "tray.and.arrow.down")
+                }
+            }
+            .swipeActions(edge: .leading) {
+                // Leading swipe = toggle read. Single gesture, no destructive
+                // styling so the row snaps back without warning.
+                Button { onToggleRead() } label: {
+                    Label(
+                        message.isRead ? l10n.markAsUnread : l10n.markAsRead,
+                        systemImage: message.isRead ? "envelope.badge" : "envelope.open"
+                    )
+                }
+                .tint(.blue)
+            }
+            .contextMenu {
+                Button(message.isRead ? l10n.markAsUnread : l10n.markAsRead) { onToggleRead() }
+                Button(l10n.archived) { onArchive() }
+                Divider()
+                Button(l10n.senderMailContext) { onShowSender() }
+            }
+    }
+}
+
+/// Identifiable wrapper so `.sheet(item:)` can present the sender view.
+private struct SenderFocus: Identifiable {
+    let address: String
+    let name: String?
+    init(from m: MessageHeader) {
+        address = m.fromAddress
+        name = m.fromName
+    }
+    var id: String { address }
 }
 
 // MARK: - DateBucket

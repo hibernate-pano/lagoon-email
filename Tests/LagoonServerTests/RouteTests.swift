@@ -365,6 +365,85 @@ final class RouteTests: XCTestCase {
         return []
     }
 
+    // MARK: - GET /api/messages (发件人归集)
+
+    /// The `sender` query narrows to one exact `from_address`; injection-shaped
+    /// values are bound as a literal (empty result, never parsed as SQL); an
+    /// unknown sender is an empty 200, not an error.
+    func test_getMessages_senderFilter_returnsOnlyThatSender() async throws {
+        let oauthUser = "route-\(UUID().uuidString)"
+        let account = makeAccount(oauthUser: oauthUser, email: "me-\(UUID().uuidString)@example.com")
+
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+
+            let fromAlice = makeHeader(accountId: account.id, remoteId: "a1-\(UUID())", from: "alice@example.com")
+            let fromBob = makeHeader(accountId: account.id, remoteId: "b1-\(UUID())", from: "bob@example.com")
+            for header in [fromAlice, fromBob] {
+                try await MessageStore.upsert(header, db: conn)
+            }
+
+            let router = Router()
+            SyncRoutes.register(on: router, db: conn, sync: nil)
+            let app = Application(router: router)
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages?accountId=\(account.id.uuidString)&sender=alice%40example.com",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        SyncResponse.self,
+                        from: Data(buffer: response.body)
+                    )
+                    XCTAssertEqual(decoded.messages.map(\.remoteId), [fromAlice.remoteId])
+                }
+
+                // No sender param keeps the unfiltered recent list.
+                try await client.execute(
+                    uri: "/api/messages?accountId=\(account.id.uuidString)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        SyncResponse.self,
+                        from: Data(buffer: response.body)
+                    )
+                    XCTAssertEqual(
+                        Set(decoded.messages.map(\.remoteId)),
+                        [fromAlice.remoteId, fromBob.remoteId]
+                    )
+                }
+
+                // Unknown sender: empty 200.
+                try await client.execute(
+                    uri: "/api/messages?accountId=\(account.id.uuidString)&sender=nobody%40example.com",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        SyncResponse.self,
+                        from: Data(buffer: response.body)
+                    )
+                    XCTAssertTrue(decoded.messages.isEmpty)
+                }
+
+                // Injection-shaped value is a literal address, not SQL.
+                try await client.execute(
+                    uri: "/api/messages?accountId=\(account.id.uuidString)&sender=%27%20OR%201%3D1%20--",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        SyncResponse.self,
+                        from: Data(buffer: response.body)
+                    )
+                    XCTAssertTrue(decoded.messages.isEmpty, "injection-shaped sender must be a literal, not SQL")
+                }
+            }
+        }
+    }
+
     // MARK: - GET /api/briefing
 
     /// The feed is 200 + JSON, and every item lands in the group the

@@ -59,6 +59,8 @@ struct MessageDetailView: View {
     @State private var showOverrideMenu = false
 
     @State private var showComposer = false
+    /// 发件人归集 sheet: the sender's full received-mail history.
+    @State private var showSenderSheet = false
     /// Which composer variant the toolbar button opened. `.reply` keeps
     /// the pre-M1.7 single-recipient path; `.replyAll` adds the other
     /// To/Cc addresses minus self; `.forward` opens the new-message
@@ -190,6 +192,13 @@ struct MessageDetailView: View {
                     onPick: handleDraftPick
                 )
             }
+        }
+        .sheet(isPresented: $showSenderSheet) {
+            SenderSheet(
+                accountId: accountId,
+                senderAddress: senderEmail,
+                senderName: senderName
+            )
         }
         .sheet(isPresented: $showComposer) {
             switch composerMode {
@@ -388,7 +397,18 @@ struct MessageDetailView: View {
                 }
                 VStack(alignment: .leading, spacing: 6) {
                     Text(subjectText).font(.title2).bold().textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                    Text(fromDisplay).font(.callout).textSelection(.enabled)
+                    HStack(spacing: 8) {
+                        Text(fromDisplay).font(.callout).textSelection(.enabled)
+                        // 发件人归集: every received mail from this address.
+                        if !senderEmail.isEmpty {
+                            Button { showSenderSheet = true } label: {
+                                Label(l10n.senderMailContext, systemImage: "person.crop.circle")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.link)
+                            .help(l10n.senderMailContext)
+                        }
+                    }
                     if let toDisplay { Text(l10n.recipient(toDisplay)).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
                     if let ccDisplay { Text("\(l10n.replyCc): \(ccDisplay)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
                     if let receivedAt {

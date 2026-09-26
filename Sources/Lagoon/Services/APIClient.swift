@@ -129,14 +129,20 @@ public final class APIClient: Sendable {
         baseURL.appendingPathComponent("oauth/gmail/start")
     }
 
-    public func fetchMessages(accountId: UUID, limit: Int = 50) async throws -> SyncResponse {
+    /// `sender` narrows to one exact `from_address` (发件人归集); nil keeps
+    /// the unfiltered recent list.
+    public func fetchMessages(accountId: UUID, limit: Int = 50, sender: String? = nil) async throws -> SyncResponse {
         guard var c = URLComponents(url: baseURL.appendingPathComponent("api/messages"), resolvingAgainstBaseURL: false) else {
             throw APIError.invalidURL(baseURL.absoluteString + "/api/messages")
         }
-        c.queryItems = [
+        var items: [URLQueryItem] = [
             .init(name: "accountId", value: accountId.uuidString),
             .init(name: "limit", value: String(limit))
         ]
+        if let sender {
+            items.append(.init(name: "sender", value: sender))
+        }
+        c.queryItems = items
         guard let url = c.url else {
             throw APIError.invalidURL(baseURL.absoluteString + "/api/messages")
         }
