@@ -13,7 +13,7 @@ struct ActionHistorySheet: View {
     @State private var errorBanner: ErrorBanner?
     @State private var undoingId: Int64?
 
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     var body: some View {
         VStack(spacing: 0) {

@@ -7,7 +7,7 @@ struct UsageSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var report: UsageReport?
     @State private var errorBanner: ErrorBanner?
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {

@@ -26,21 +26,28 @@ public enum MailProviderFactory {
 
     /// The production `Builder`. Bound once per route so handlers share the
     /// same collaborators.
+    ///
+    /// Returns the builder plus the handle that lets a caller give an account
+    /// back: a deleted mailbox must not keep a provider (and its live IMAP
+    /// session) in the pool until the process exits.
     public static func factory(
         db: LagoonDB,
         logger: Logger
-    ) -> Builder {
+    ) -> (builder: Builder, release: @Sendable (UUID) async -> Void) {
         // Route traffic gets its own reusable provider per account. The sync
         // engine already owns a separate long-lived provider; sharing that one
         // would put IDLE and on-demand body/action commands on the same IMAP
         // connection. Caching here avoids a fresh QQ login for every message
         // open or action while keeping the two workloads isolated.
         let pool = MailProviderPool()
-        return { account in
-            PooledMailProvider(account: account, pool: pool) { _ in
-                make(account: account, db: db, logger: logger)
-            }
-        }
+        return (
+            builder: { account in
+                PooledMailProvider(account: account, pool: pool) { _ in
+                    make(account: account, db: db, logger: logger)
+                }
+            },
+            release: { id in await pool.release(id) }
+        )
     }
 }
 
@@ -60,7 +67,7 @@ actor MailProviderPool {
     func provider(
         for account: Account,
         build: @Sendable (Account) -> (any MailProvider)?
-    ) -> (any MailProvider)? {
+    ) async -> (any MailProvider)? {
         if let entry = entries[account.id],
            entry.providerKind == account.provider,
            entry.email == account.email,
@@ -68,13 +75,25 @@ actor MailProviderPool {
             return entry.provider
         }
         guard let provider = build(account) else { return nil }
+        // Re-authentication reuses the account id, so this branch replaces a
+        // provider that may still hold a live IMAP session. Hand it back
+        // before it is dropped — dropping a reference is not closing it.
+        let replaced = entries[account.id]?.provider
         entries[account.id] = Entry(
             provider: provider,
             providerKind: account.provider,
             email: account.email,
             credentials: account.credentials
         )
+        await replaced?.shutdown()
         return provider
+    }
+
+    /// Give an account's provider back: a deleted mailbox must not keep a live
+    /// IMAP session in the pool until the process exits.
+    func release(_ id: UUID) async {
+        let entry = entries.removeValue(forKey: id)
+        await entry?.provider.shutdown()
     }
 }
 
@@ -188,6 +207,12 @@ actor PooledMailProvider: MailProvider, ArchiveFolderResolving {
             throw MailError.notConfigured("provider unavailable")
         }
         try await provider.probe()
+    }
+
+    /// Releasing a route-side provider means releasing the pool's entry for
+    /// this account: the next call builds a fresh one, with a fresh session.
+    func shutdown() async {
+        await pool.release(account.id)
     }
 
     func archiveFolder() async -> String? {

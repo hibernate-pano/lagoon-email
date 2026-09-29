@@ -62,20 +62,6 @@ public enum AutoArchiveStore {
         }
     }
 
-    public static func find(
-        id: Int64,
-        accountId: UUID,
-        db: LagoonDB
-    ) async throws -> AutoArchiveRule? {
-        return try db.read { db in
-            try Row.fetchOne(
-                db,
-                sql: "SELECT id, account_id, sender_address, created_at FROM auto_archive_rules WHERE id = ? AND account_id = ?",
-                arguments: [id, accountId]
-            ).map(decode)
-        }
-    }
-
     public static func delete(
         id: Int64,
         accountId: UUID,

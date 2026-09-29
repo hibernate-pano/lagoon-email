@@ -18,7 +18,11 @@ struct ShortcutsSheet: View {
         let description: String
     }
 
-    private var entries: [Entry] {
+    /// Internal rather than private so `CommandPaletteFilterTests` can pin
+    /// the list's content. A hand-curated cheatsheet rots silently: nothing
+    /// in the compiler notices a dropped row or a key that only exists in
+    /// one language.
+    var entries: [Entry] {
         [
             // Navigation
             Entry(id: "back", keys: "⌘[", description: l10n.backHelp),

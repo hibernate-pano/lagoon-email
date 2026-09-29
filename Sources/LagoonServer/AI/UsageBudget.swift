@@ -144,7 +144,7 @@ public actor UsageBudget: BudgetPolicy {
     }
 
     private static func summary(db: LagoonDB, yearMonth: String) async throws -> MonthSummary {
-        let row = try await db.read { db in
+        let row = try db.read { db in
             try Row.fetchOne(
                 db,
                 sql: "SELECT COALESCE(SUM(cost_micro_usd), 0) AS total, COUNT(*) AS calls FROM usage_log WHERE year_month = ?",
@@ -176,7 +176,7 @@ public actor UsageBudget: BudgetPolicy {
                 prompt_tokens, completion_tokens, cost_micro_usd
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """
-        try await db.write {
+        try db.write {
             try $0.execute(sql: sql, arguments: [
                 yearMonth,
                 accountEmail,

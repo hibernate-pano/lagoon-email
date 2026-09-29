@@ -66,6 +66,13 @@ public enum UnsubscribeScanner {
     /// that merely sits near one. Relative URLs and foreign schemes are
     /// dropped; HTML entities in hrefs are decoded (`&amp;` is ubiquitous).
     public static func bodyLinks(in html: String) -> [String] {
+        scoredBodyLinks(in: html).map(\.url)
+    }
+
+    /// As `bodyLinks`, but keeping each candidate's score so callers that
+    /// need to reason about *how good* a candidate is (rather than just which
+    /// came first) are not forced to re-parse the HTML.
+    static func scoredBodyLinks(in html: String) -> [(url: String, score: Int)] {
         var scored: [(url: String, score: Int, order: Int)] = []
         // mailto: anchors are a fallback, never a first choice — they are
         // ranked after every http(s) candidate (see the merge at the end).
@@ -123,15 +130,17 @@ public enum UnsubscribeScanner {
             lhs.score != rhs.score ? lhs.score > rhs.score : lhs.order < rhs.order
         }
         var seen = Set<String>()
-        var out: [String] = []
+        var out: [(url: String, score: Int)] = []
         for item in ranked where !seen.contains(item.url) && out.count < 10 {
             seen.insert(item.url)
-            out.append(item.url)
+            out.append((item.url, item.score))
         }
         for item in mailtos.sorted(by: { $0.order < $1.order })
         where !seen.contains(item.url) && out.count < 10 {
             seen.insert(item.url)
-            out.append(item.url)
+            // Ranked below every http(s) candidate, and below the floor of
+            // every scored link too: a mailto is never auto-followed.
+            out.append((item.url, 0))
         }
         return out
     }
@@ -139,17 +148,27 @@ public enum UnsubscribeScanner {
     // MARK: - Landing-page confirm link
 
     /// The one URL an unsubscribe landing page itself offers for the actual
-    /// confirmation. hrefs carrying confirm-shaped tokens win ("the button
-    /// the user would have clicked"); otherwise the scanner's best candidate.
-    /// Drives the single automatic confirmation hop in `classifyAndConfirm`.
+    /// confirmation. Drives the single automatic confirmation hop in
+    /// `classifyAndConfirm`.
+    ///
+    /// A confirm-shaped token in the href breaks ties, but **only within the
+    /// top score tier**. The previous version scanned the entire list for
+    /// such a token, which made the ranking attacker-controllable: a footer
+    /// link to `https://attacker.example/unsubscribe-confirm` scored below
+    /// the real button yet still jumped ahead of it, and the attacker's page
+    /// is then what decides whether Lagoon reports success. Restricting the
+    /// preference to the top tier keeps the case it was written for — a
+    /// landing page whose "Manage preferences" link and "Confirm unsubscribe"
+    /// button score alike — while a generic footer decoy can no longer win.
     public static func confirmLink(in html: String) -> String? {
-        let links = bodyLinks(in: html)
-        let preferred = links.first { link in
-            let lower = link.lowercased()
-            return ["confirm", "one-click", "oneclick", "optout", "opt-out", "unsubscribe"]
-                .contains { lower.contains($0) }
+        let candidates = scoredBodyLinks(in: html)
+        guard let top = candidates.first?.score else { return nil }
+        let confirmTokens = ["confirm", "one-click", "oneclick", "optout", "opt-out"]
+        let preferred = candidates.first { candidate in
+            candidate.score == top
+                && confirmTokens.contains { candidate.url.lowercased().contains($0) }
         }
-        return preferred ?? links.first
+        return (preferred ?? candidates.first)?.url
     }
 
     // MARK: - Safety (SSRF guard)

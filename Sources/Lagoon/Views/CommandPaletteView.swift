@@ -44,7 +44,11 @@ struct CommandPaletteView: View {
     /// All commands the palette exposes. Ordered roughly by frequency of
     /// use so a single Return invokes the most likely target before the
     /// user types anything.
-    private var allCommands: [Command] {
+    ///
+    /// Internal rather than private so `CommandPaletteFilterTests` can pin
+    /// the list: a command dropped or duplicated by accident is invisible
+    /// in the compiler and merely "feels less useful" to the user.
+    var allCommands: [Command] {
         [
             Command(id: "new-message", title: l10n.newMessage, shortcut: "⌘N", systemImage: "square.and.pencil", action: { run(onNewMessage) }),
             Command(id: "search", title: l10n.search, shortcut: "⌘F", systemImage: "magnifyingglass", action: { run(onSearch) }),

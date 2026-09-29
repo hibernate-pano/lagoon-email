@@ -40,18 +40,17 @@ final class SoundEffectsTests: XCTestCase {
     }
 
     /// `send` / `archive` / `syncRecovered` must all be callable without
-    /// crashing when sound is enabled. With no audio hardware in CI the
-    /// NSSound returns nil and the call silently no-ops — but we want to
-    /// know the entry points exist and don't trap.
-    func test_playEntryPoints_existAndDoNotCrash() {
-        // Enable and disable both run without exceptions in the test runner.
-        SoundEffects.isEnabled = true
-        SoundEffects.send()
-        SoundEffects.archive()
-        SoundEffects.syncRecovered()
-        SoundEffects.isEnabled = false
-        SoundEffects.send()
-        SoundEffects.archive()
-        SoundEffects.syncRecovered()
+    /// crashing in both preference states. With no audio hardware in CI the
+    /// NSSound returns nil and the call silently no-ops — so what this pins
+    /// down is that the entry points exist, are reachable, and re-read the
+    /// gate on every call rather than caching it at load time.
+    func test_playEntryPoints_areCallableInBothPreferenceStates() {
+        for enabled in [true, false] {
+            SoundEffects.isEnabled = enabled
+            XCTAssertEqual(SoundEffects.isEnabled, enabled)
+            XCTAssertNoThrow(SoundEffects.send())
+            XCTAssertNoThrow(SoundEffects.archive())
+            XCTAssertNoThrow(SoundEffects.syncRecovered())
+        }
     }
 }

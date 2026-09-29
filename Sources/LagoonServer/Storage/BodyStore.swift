@@ -9,6 +9,15 @@ import LagoonKit
 /// The route reads here first and only hits the provider on a miss, which
 /// makes re-opens free and offline-adjacent (whatever was opened once is
 /// served without network).
+/// Raised when a body is written for a message that has no header row. The
+/// `message_bodies` foreign key requires one, and SQLite's own answer to a
+/// missing parent row (`SQLITE_CONSTRAINT_FOREIGNKEY`) reads like a disk
+/// fault in a log line — which is how a permanently-un-cacheable body was
+/// reported as an intermittent persist failure for months.
+public enum BodyStoreError: Error {
+    case headerMissing
+}
+
 public enum BodyStore {
     public static func get(
         accountId: UUID,
@@ -54,6 +63,9 @@ public enum BodyStore {
 
     /// Insert or replace. The header row must exist (foreign key); callers
     /// fetch the header first, so a missing header means the message is gone.
+    /// That case is reported as `BodyStoreError.headerMissing` rather than
+    /// letting the INSERT fail on the constraint, so the caller can tell
+    /// "not cacheable, and not because of us" from a real write failure.
     public static func put(
         accountId: UUID,
         remoteId: String,
@@ -74,8 +86,14 @@ public enum BodyStore {
                 cc_addresses = EXCLUDED.cc_addresses,
                 fetched_at = strftime('%Y-%m-%d %H:%M:%f','now')
         """
-        try db.write {
-            try $0.execute(sql: sql, arguments: [
+        try db.write { raw in
+            let headerExists = try Bool.fetchOne(
+                raw,
+                sql: "SELECT EXISTS(SELECT 1 FROM message_headers WHERE account_id = ? AND remote_id = ?)",
+                arguments: [accountId, remoteId]
+            ) ?? false
+            guard headerExists else { throw BodyStoreError.headerMissing }
+            try raw.execute(sql: sql, arguments: [
                 accountId,
                 remoteId,
                 body.text,

@@ -142,12 +142,31 @@ public struct OutboundMessage: Sendable {
         self.isReply = isReply
     }
 
-    /// Split a comma-separated `To:` string back into addresses. Used by
-    /// the route when it needs the recipient count for validation.
+    /// Split a comma-separated `To:` string back into addresses.
     public var recipientAddresses: [String] {
         to.split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+    }
+
+    /// The envelope recipient list: every `To` address plus every `Cc`, one
+    /// forward-path per entry. RFC 5321 §4.1.1.3 gives `RCPT TO` exactly one
+    /// address, so a reply-all cannot travel as a single comma-joined command
+    /// — and without the Cc set here, every Cc recipient is silently never
+    /// delivered to. Duplicates are dropped case-insensitively, because the
+    /// same person can appear in both lists under different capitalisation.
+    public var envelopeRecipients: [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for raw in recipientAddresses + cc {
+            // The route accepts a bracketed address, which a forward-path
+            // must not carry twice.
+            let address = raw.trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+            let key = address.lowercased()
+            guard !address.isEmpty, seen.insert(key).inserted else { continue }
+            result.append(address)
+        }
+        return result
     }
 }
 
@@ -231,6 +250,16 @@ public protocol MailProvider: Sendable {
 
     /// Connectivity + credential check used by the connect flow.
     func probe() async throws
+
+    /// Release what the provider holds between calls — above all an open IMAP
+    /// session, which QQ counts against a per-account limit. The engine and
+    /// the route pool call this before dropping their last reference; a
+    /// provider that holds nothing does nothing.
+    func shutdown() async
+}
+
+public extension MailProvider {
+    func shutdown() async {}
 }
 
 /// Provider-internal body shape (M1.6). `attachments[i].data` is the

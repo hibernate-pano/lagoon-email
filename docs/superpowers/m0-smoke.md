@@ -1,5 +1,7 @@
 # M0 Smoke Notes
 
+> **状态：已归档（superseded）。当前架构见 [README](../../README.md) 与 [使用说明](../使用说明.md)。**
+
 Date: 2026-09-09
 Executor: AI co-founder (autonomous), macOS 26 / Xcode 26.6 / Swift 6.3 / OrbStack Docker
 

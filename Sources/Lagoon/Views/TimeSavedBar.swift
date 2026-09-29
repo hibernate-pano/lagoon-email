@@ -8,6 +8,8 @@ import LagoonKit
 struct TimeSavedBar: View {
     @EnvironmentObject private var accounts: AccountStore
     @Environment(\.l10n) private var l10n
+    /// Backgrounded windows idle instead of polling — see `sleepForPoll`.
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var store = TimeSavedStore()
     @State private var showWeek = false
 
@@ -22,13 +24,14 @@ struct TimeSavedBar: View {
                 store.clear()
                 return
             }
+            // Immediate first pass: this bar is the only thing on screen
+            // telling the user what the day cost, so it must not wait out a
+            // full interval before its first number appears.
+            await store.refresh(accountId: accountId)
             while !Task.isCancelled {
+                guard await sleepForPoll(TimeSavedStore.refreshInterval) else { return }
+                guard shouldPoll(isVisible: true, scenePhase: scenePhase) else { continue }
                 await store.refresh(accountId: accountId)
-                do {
-                    try await Task.sleep(for: TimeSavedStore.refreshInterval)
-                } catch {
-                    return
-                }
             }
         }
     }

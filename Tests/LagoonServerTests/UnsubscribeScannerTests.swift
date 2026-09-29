@@ -146,8 +146,27 @@ final class UnsubscribeScannerTests: XCTestCase {
         )
     }
 
+    /// Regression: the confirm-token preference used to scan the whole link
+    /// list, so a generic footer link whose *URL* the attacker fully controls
+    /// could outrank the page's real button. The followed page is what decides
+    /// whether Lagoon reports "已退订", so that was a forged-success primitive
+    /// aimed at any host the attacker named.
+    func test_confirmLink_footerDecoyCannotOutrankTheRealButton() {
+        let html = """
+        <a href="https://news.example/u/9f2">Unsubscribe</a>
+        <a href="https://evil.example/x">Privacy policy</a>
+        <a href="https://evil.example/unsubscribe-confirm">account settings</a>
+        """
+        XCTAssertEqual(
+            UnsubscribeScanner.confirmLink(in: html),
+            "https://news.example/u/9f2",
+            "a lower-ranked link must not jump the queue on an attacker-chosen URL"
+        )
+    }
+
     func test_confirmLink_fallsBackToBestCandidate() {
         let html = #"<a href="https://ex.com/unsub">unsubscribe</a>"#
+
         XCTAssertEqual(UnsubscribeScanner.confirmLink(in: html), "https://ex.com/unsub")
     }
 

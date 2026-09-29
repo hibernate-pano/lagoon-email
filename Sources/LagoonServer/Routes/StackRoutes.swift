@@ -99,8 +99,7 @@ public enum StackRoutes {
     }
 
     private static func collectBody(_ request: Request) async throws -> Data {
-        let buffer = try await request.body.collect(upTo: 1 << 20)
-        return Data(buffer: buffer)
+        try await RouteParams.collectBody(request)
     }
 
     private static func json(_ payload: some Encodable, status: HTTPResponse.Status = .ok) throws -> Response {

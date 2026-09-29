@@ -1,5 +1,7 @@
 # Lagoon · 国内邮箱接入设计（IMAP / QQ 邮箱 v1）
 
+> **状态：已归档（superseded）。当前架构见 [README](../../../README.md) 与 [使用说明](../../使用说明.md)。**
+
 > 日期：2026-09-11 · 状态：Approved（设计已逐节确认）· 前置文档：`2026-09-09-lagoon-email-design.md`
 >
 > 上游 spec §6.4 已预留 “IMAP fallback. IDLE where supported, polling (60s adaptive) otherwise”，

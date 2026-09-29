@@ -215,4 +215,160 @@ final class SMTPClientTests: XCTestCase {
         let unterminated = SMTPClient.dotStuffedForData(Data("last line".utf8))
         XCTAssertEqual(String(decoding: unterminated, as: UTF8.self), "last line\r\n.\r\n")
     }
+
+    // MARK: - Envelope recipients
+
+    /// Every `RCPT TO` lines on the wire, one command per line.
+    private func rcptCommands(_ transport: ScriptedTransport) async -> [String] {
+        await wire(transport)
+            .components(separatedBy: "\r\n")
+            .filter { $0.hasPrefix("RCPT TO:") }
+    }
+
+    /// A reply-all to three `To` plus two `Cc`. RFC 5321 §4.1.1.3 allows one
+    /// forward-path per `RCPT TO`, so a single `RCPT TO:<a, b, c>` is a
+    /// protocol violation and — because the Cc addresses appear nowhere else
+    /// in the envelope — the Cc recipients are never delivered to at all.
+    func test_send_replyAll_emitsOneRcptPerEnvelopeRecipient() async throws {
+        let transport = ScriptedTransport()
+        await transport.enqueue("220 smtp.qq.com ESMTP ready")
+        await transport.enqueue("250 smtp.qq.com")
+        await transport.enqueue("235 Authentication successful")
+        // MAIL FROM, then one 250 per recipient.
+        for _ in 0..<6 { await transport.enqueue("250 OK") }
+        await transport.enqueue("354 End data with <CR><LF>.<CR><LF>")
+        await transport.enqueue("250 OK: queued")
+        await transport.enqueue("221 Bye")
+
+        let messageId = try await makeClient(transport).send(
+            OutboundMessage(
+                fromEmail: "me@qq.com",
+                fromName: nil,
+                to: "alice@example.com, bob@example.com, carol@example.com",
+                cc: ["dave@example.com", "erin@example.com"],
+                subject: "Re: Lunch?",
+                body: "See you all at noon.",
+                inReplyTo: "<original@qq.com>",
+                references: "<original@qq.com>"
+            ),
+            host: "smtp.qq.com", port: 465,
+            username: "me@qq.com", authCode: "abcd1234abcd1234"
+        )
+
+        let commands = await rcptCommands(transport)
+        XCTAssertEqual(commands, [
+            "RCPT TO:<alice@example.com>",
+            "RCPT TO:<bob@example.com>",
+            "RCPT TO:<carol@example.com>",
+            "RCPT TO:<dave@example.com>",
+            "RCPT TO:<erin@example.com>",
+        ])
+
+        // The headers still name everyone, and DATA only follows the envelope.
+        let transcript = await wire(transport)
+        XCTAssertTrue(transcript.contains("Cc: <dave@example.com>, <erin@example.com>"), transcript)
+        guard let dataIndex = transcript.range(of: "\r\nDATA\r\n") else {
+            return XCTFail("no DATA command:\n\(transcript)")
+        }
+        let envelope = transcript[..<dataIndex.lowerBound]
+        XCTAssertTrue(envelope.contains("MAIL FROM:<me@qq.com>"), transcript)
+        XCTAssertNotNil(messageId)
+    }
+
+    /// The same person can sit in `To` and `Cc` under different capitalisation.
+    /// One `RCPT TO` is enough; a duplicate is a second copy of the mail.
+    func test_envelopeRecipients_mergesCcAndDropsCaseInsensitiveDuplicates() {
+        let outbound = OutboundMessage(
+            fromEmail: "me@qq.com",
+            fromName: nil,
+            to: "Alice@example.com, <bob@example.com>",
+            cc: ["alice@EXAMPLE.com", "dave@example.com", "dave@example.com"],
+            subject: "s",
+            body: "b",
+            inReplyTo: nil,
+            references: nil
+        )
+        XCTAssertEqual(outbound.envelopeRecipients, [
+            "Alice@example.com", "bob@example.com", "dave@example.com",
+        ])
+    }
+
+    /// One mailbox rejected (5xx) must not cancel delivery to the others —
+    /// that is what a per-recipient rejection means, and a `Cc` set can always
+    /// contain an address the server refuses.
+    func test_send_oneRecipientRejected_deliversToTheRest() async throws {
+        let transport = ScriptedTransport()
+        await transport.enqueue("220 smtp.qq.com ESMTP ready")
+        await transport.enqueue("250 smtp.qq.com")
+        await transport.enqueue("235 Authentication successful")
+        await transport.enqueue("250 OK")        // MAIL FROM
+        await transport.enqueue("250 OK")        // alice
+        await transport.enqueue("550 no such user")  // bob
+        await transport.enqueue("250 OK")        // carol
+        await transport.enqueue("354 End data with <CR><LF>.<CR><LF>")
+        await transport.enqueue("250 OK: queued")
+        await transport.enqueue("221 Bye")
+
+        _ = try await makeClient(transport).send(
+            OutboundMessage(
+                fromEmail: "me@qq.com",
+                fromName: nil,
+                to: "alice@example.com, bob@example.com, carol@example.com",
+                subject: "s",
+                body: "b",
+                inReplyTo: nil,
+                references: nil
+            ),
+            host: "smtp.qq.com", port: 465,
+            username: "me@qq.com", authCode: "abcd1234abcd1234"
+        )
+
+        let commands = await rcptCommands(transport)
+        XCTAssertEqual(commands, [
+            "RCPT TO:<alice@example.com>",
+            "RCPT TO:<bob@example.com>",
+            "RCPT TO:<carol@example.com>",
+        ])
+        let transcript = await wire(transport)
+        XCTAssertTrue(transcript.contains("\r\nDATA\r\n"), "DATA must follow the envelope")
+        XCTAssertEqual(transcript.components(separatedBy: "EHLO").count - 1, 1, "no retry expected")
+    }
+
+    /// Rejected by everyone: the caller must see a failure, not a silent
+    /// no-op. 5xx is terminal, so there is no second attempt.
+    func test_send_everyRecipientRejected_throwsProtocolErrorAndDoesNotRetry() async throws {
+        let transport = ScriptedTransport()
+        await transport.enqueue("220 smtp.qq.com ESMTP ready")
+        await transport.enqueue("250 smtp.qq.com")
+        await transport.enqueue("235 Authentication successful")
+        await transport.enqueue("250 OK")
+        await transport.enqueue("553 mailbox unavailable")
+        await transport.enqueue("553 mailbox unavailable")
+        // A retry would need a second 220; its absence also proves no retry.
+
+        do {
+            _ = try await makeClient(transport).send(
+                OutboundMessage(
+                    fromEmail: "me@qq.com",
+                    fromName: nil,
+                    to: "alice@example.com, bob@example.com",
+                    subject: "s",
+                    body: "b",
+                    inReplyTo: nil,
+                    references: nil
+                ),
+                host: "smtp.qq.com", port: 465,
+                username: "me@qq.com", authCode: "abcd1234abcd1234"
+            )
+            XCTFail("expected MailError.protocolError")
+        } catch MailError.protocolError(let label) {
+            XCTAssertTrue(label.contains("553"), label)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        let transcript = await wire(transport)
+        XCTAssertFalse(transcript.contains("\r\nDATA\r\n"), transcript)
+        XCTAssertEqual(transcript.components(separatedBy: "EHLO").count - 1, 1, transcript)
+    }
 }

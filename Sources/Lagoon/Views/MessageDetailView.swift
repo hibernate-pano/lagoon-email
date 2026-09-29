@@ -68,7 +68,7 @@ struct MessageDetailView: View {
     @EnvironmentObject private var accounts: AccountStore
     @EnvironmentObject private var undo: UndoController
     @EnvironmentObject private var directory: DirectoryStore
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     private enum SummaryState: Equatable {
         case idle
@@ -998,15 +998,14 @@ struct MessageDetailView: View {
         } catch {
             if let code = (error as? APIError)?.serverErrorCode {
                 if code == "unsubscribe-manual-required" {
+                    // No action: "open the original email" needs a
+                    // `messageWebLink` the server does not emit yet, and a
+                    // button that does nothing is worse than copy that just
+                    // tells the user what to do by hand.
                     actionBanner = ErrorBanner(
                         severity: .error,
                         title: l10n.unsubscribeFailedTitle,
-                        detail: l10n.unsubscribeManualRequired,
-                        actionLabel: l10n.openOriginal,
-                        // `openOriginalMail()` is main-actor isolated and
-                        // the banner action is a plain async closure; this
-                        // is an error under the Swift 6 language mode.
-                        action: { @MainActor [self] in self.openOriginalMail() }
+                        detail: l10n.unsubscribeManualRequired
                     )
                 } else if code == "unsubscribe-page-required" {
                     // Not a failure: a publisher that wants a web
@@ -1020,9 +1019,7 @@ struct MessageDetailView: View {
                     actionBanner = ErrorBanner(
                         severity: .info,
                         title: l10n.unsubscribe,
-                        detail: l10n.unsubscribePageRequired,
-                        actionLabel: l10n.openOriginal,
-                        action: { @MainActor [self] in self.openOriginalMail() }
+                        detail: l10n.unsubscribePageRequired
                     )
                 } else if code == "unsubscribe-unavailable" {
                     actionBanner = ErrorBanner(
@@ -1049,13 +1046,6 @@ struct MessageDetailView: View {
                 )
             }
         }
-    }
-
-    private func openOriginalMail() {
-        // No-op stub: the original-message URL would come from the message
-        // header. Wiring this requires a `MessageHeader.messageWebLink`
-        // the server doesn't yet emit. Spec §6.2 keeps the affordance so
-        // the user can find the path; the action itself is a follow-up.
     }
 
     private func overrideClassification(to group: BriefingGroup) {

@@ -1,7 +1,8 @@
 import Foundation
 import Logging
 
-/// One SMTP delivery: implicit TLS (465), `AUTH PLAIN`, one recipient.
+/// One SMTP delivery: implicit TLS (465), `AUTH PLAIN`, one `RCPT TO` per
+/// envelope recipient.
 ///
 /// The spec's retry rule is encoded in `Phase`: anything that fails *before*
 /// the DATA payload is on the wire may be retried once (a second full session);
@@ -124,7 +125,7 @@ public actor SMTPClient {
         try await command("AUTH PLAIN \(credentials)", expecting: 235, phase: .auth)
 
         try await command("MAIL FROM:<\(outbound.fromEmail)>", expecting: 250, phase: .preData)
-        try await command("RCPT TO:<\(outbound.to)>", expecting: 250, phase: .preData)
+        try await acceptRecipients(outbound.envelopeRecipients)
         try await command("DATA", expecting: 354, phase: .preData)
 
         try await perform(phase: .postData) {
@@ -139,6 +140,44 @@ public actor SMTPClient {
             try await self.transport.write(Data("\(line)\r\n".utf8))
         }
         try await expect(code, phase: phase)
+    }
+
+    /// RFC 5321 §4.1.1.3: `RCPT TO` carries exactly one forward-path, so a
+    /// reply-all is one command per envelope recipient. A 5xx rejects that one
+    /// mailbox and the message still goes to everyone the server accepted —
+    /// that is what the sender asked for, and aborting would deliver nothing.
+    /// A 4xx is a verdict on the session, not on the address, so it aborts and
+    /// lets the normal retry rule run. Delivering to nobody is a failure.
+    private func acceptRecipients(_ addresses: [String]) async throws {
+        // No envelope recipient means there is nothing to deliver to. Both
+        // routes validate that a recipient exists, so reaching this is a
+        // programming error rather than a mailbox verdict — 550 is the code
+        // that maps to the same terminal, non-retryable failure.
+        guard !addresses.isEmpty else { throw Self.failure(code: 550, phase: .preData) }
+
+        var accepted = 0
+        var lastRejection: Int?
+        for address in addresses {
+            try await perform(phase: .preData) {
+                try await self.transport.write(Data("RCPT TO:<\(address)>\r\n".utf8))
+            }
+            let code = try await readReply(phase: .preData)
+            if code == 250 {
+                accepted += 1
+                continue
+            }
+            logger.warning("smtp.recipientRejected", metadata: [
+                "code": .string("\(code)"),
+                "label": .string(Self.failure(code: code, phase: .preData).error.logLabel),
+            ])
+            if (400...499).contains(code) { throw Self.failure(code: code, phase: .preData) }
+            lastRejection = code
+        }
+        guard accepted > 0 else {
+            // Nobody accepted: the sender asked for a delivery that cannot
+            // happen, which is a failure and not a silent no-op.
+            throw Self.failure(code: lastRejection ?? 550, phase: .preData)
+        }
     }
 
     /// Reads one (possibly multi-line) reply and checks its status code.

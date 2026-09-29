@@ -11,24 +11,47 @@ public enum MessageStore {
     /// `List-Unsubscribe` header on the metadata response; it feeds the
     /// heuristic briefing classifier. Defaults to false so existing call sites
     /// (and tests) are unaffected.
+    ///
+    /// The `ON CONFLICT` clause is a *merge*, never a blind overwrite, and is
+    /// deliberately asymmetric per column:
+    /// - `is_read` / `list_unsubscribe` are monotonic OR: read state is locally
+    ///   authoritative, so a remote flag clear never un-reads a message here.
+    ///   The one deliberate exception is the undo route, which clears the
+    ///   column with a direct UPDATE — that is what undoing a mark-read means.
+    ///   A sync round that fetched headers before that UPDATE and upserts after
+    ///   it writes the old TRUE back, but for that one round only: the next
+    ///   fetch sees the cleared remote flag and OR-ing FALSE leaves it FALSE.
+    /// - `subject` / `snippet` keep the stored value when the incoming row has
+    ///   none. `readStateFlips` re-delivers headers without a snippet, and a
+    ///   plain `EXCLUDED.snippet` would blank the preview of every message the
+    ///   user opens.
+    /// - `unsubscribe_links` is replaced by the value computed above, which
+    ///   already contains the previously stored links.
     public static func upsert(
         _ m: MessageHeader,
         listUnsubscribe: Bool = false,
         unsubscribeLinks: [String] = [],
         db: LagoonDB
     ) async throws {
-        let linksJSON = try Self.linksJSON(unsubscribeLinks)
         try db.write { db in
-            // The Postgres upsert merged `existing || new` with first
-            // occurrence wins in SQL. SQLite has no array type, so the merge
-            // happens here inside the write transaction: read what's stored,
-            // merge, write. Repeated syncs cannot grow the array.
+            // SQLite has no array type, so the "existing || new, first
+            // occurrence wins" merge the Postgres upsert used to do happens
+            // here, inside the write transaction: read what is stored,
+            // merge, write. Repeated syncs cannot grow or shrink the array.
+            //
+            // This matters because the two callers supply disjoint halves of
+            // the candidate set: the sync round only ever sees the
+            // `List-Unsubscribe` header, while the body-scraped links are
+            // merged in later by `mergeUnsubscribeLinks`. Writing the raw
+            // input here would wipe them on the very next sync round.
             let existing = try Row.fetchOne(
                 db,
                 sql: "SELECT unsubscribe_links FROM message_headers WHERE account_id = ? AND remote_id = ?",
                 arguments: [m.accountId, m.remoteId]
             ).flatMap { $0.decodedLinks() } ?? []
-            let merged = try Self.linksJSON(Self.mergeLinks(existing + unsubscribeLinks))
+            let links = existing.isEmpty
+                ? try Self.linksJSON(unsubscribeLinks)
+                : try Self.linksJSON(Self.mergeLinks(existing + unsubscribeLinks))
             let sql = """
                 INSERT INTO message_headers (
                     id, account_id, remote_id, thread_id,
@@ -44,8 +67,8 @@ public enum MessageStore {
                     ?, strftime('%Y-%m-%d %H:%M:%f','now')
                 )
                 ON CONFLICT (account_id, remote_id) DO UPDATE SET
-                    subject = EXCLUDED.subject,
-                    snippet = EXCLUDED.snippet,
+                    subject = CASE WHEN EXCLUDED.subject = '' THEN message_headers.subject ELSE EXCLUDED.subject END,
+                    snippet = CASE WHEN EXCLUDED.snippet = '' THEN message_headers.snippet ELSE EXCLUDED.snippet END,
                     is_read = message_headers.is_read OR EXCLUDED.is_read,
                     list_unsubscribe = message_headers.list_unsubscribe OR EXCLUDED.list_unsubscribe,
                     message_id_header = COALESCE(EXCLUDED.message_id_header, message_headers.message_id_header),
@@ -59,7 +82,7 @@ public enum MessageStore {
                 m.fromAddress, m.fromName ?? "", m.subject ?? "", m.snippet ?? "",
                 m.receivedAt, m.isRead, m.isArchived, listUnsubscribe,
                 m.messageIdHeader, m.inReplyTo, m.references,
-                linksJSON
+                links
             ])
         }
     }
@@ -87,6 +110,23 @@ public enum MessageStore {
                 sql: "UPDATE message_headers SET unsubscribe_links = ? WHERE remote_id = ? AND account_id = ?",
                 arguments: [merged, remoteId, accountId]
             )
+        }
+    }
+
+    /// The unsubscribe candidates harvested so far: the `List-Unsubscribe`
+    /// header links seen by the sync round, plus anything later scraped out
+    /// of the message body. Empty when the row is unknown.
+    public static func unsubscribeLinks(
+        remoteId: String,
+        accountId: UUID,
+        db: LagoonDB
+    ) async throws -> [String] {
+        try db.read { db in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT unsubscribe_links FROM message_headers WHERE account_id = ? AND remote_id = ?",
+                arguments: [accountId, remoteId]
+            )?.decodedLinks() ?? []
         }
     }
 
@@ -123,6 +163,10 @@ public enum MessageStore {
     /// - `stackMatch` narrows to one 聚合规则.
     /// Deleted rows never appear in either view — they live in the server's
     /// Trash folder and are reachable only through undo/restore.
+    ///
+    /// The pin join is what lets the client render pin state: pins live in
+    /// their own table, so a plain `message_headers` read leaves the client
+    /// with no way to tell a pinned mail from an unpinned one.
     public static func recent(
         forAccount accountId: UUID,
         limit: Int,
@@ -132,32 +176,36 @@ public enum MessageStore {
         db: LagoonDB
     ) async throws -> [MessageHeader] {
         var sql = """
-            SELECT id, account_id, remote_id, thread_id, from_address,
-                   NULLIF(from_name, '') AS from_name,
-                   NULLIF(subject, '') AS subject,
-                   NULLIF(snippet, '') AS snippet,
-                   received_at, is_read, is_archived, is_deleted,
-                   message_id_header, in_reply_to, references_header
-            FROM message_headers
-            WHERE account_id = ? AND is_deleted = FALSE AND is_archived =
+            SELECT h.id, h.account_id, h.remote_id, h.thread_id, h.from_address,
+                   NULLIF(h.from_name, '') AS from_name,
+                   NULLIF(h.subject, '') AS subject,
+                   NULLIF(h.snippet, '') AS snippet,
+                   h.received_at, h.is_read, h.is_archived, h.is_deleted,
+                   h.message_id_header, h.in_reply_to, h.references_header,
+                   (message_pins.account_id IS NOT NULL) AS is_pinned
+            FROM message_headers h
+            LEFT JOIN message_pins
+                   ON message_pins.account_id = h.account_id
+                  AND message_pins.remote_id = h.remote_id
+            WHERE h.account_id = ? AND h.is_deleted = FALSE AND h.is_archived =
         """
         sql += archived ? " TRUE" : " FALSE"
         var arguments: [DatabaseValueConvertible?] = [accountId]
         switch stackMatch {
         case .sender(let address):
-            sql += "\n            AND from_address = ?"
+            sql += "\n            AND h.from_address = ?"
             arguments.append(address)
         case .keyword(let value):
-            sql += "\n            AND subject LIKE ? ESCAPE '\\'"
+            sql += "\n            AND h.subject LIKE ? ESCAPE '\\'"
             arguments.append(likePattern(containing: value))
         case nil:
             break
         }
         if sender != nil {
-            sql += "\n            AND from_address = ?"
+            sql += "\n            AND h.from_address = ?"
             arguments.append(sender)
         }
-        sql += "\n            ORDER BY received_at DESC\n            LIMIT ?"
+        sql += "\n            ORDER BY h.received_at DESC\n            LIMIT ?"
         arguments.append(limit)
         return try db.read { db in
             try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
@@ -365,7 +413,11 @@ public enum MessageStore {
     }
 
     public static func decode(_ row: Row) throws -> MessageHeader {
-        MessageHeader(
+        // `is_pinned` only exists on queries that join `message_pins`
+        // (`recent`); `find` does not, and GRDB answers nil for a missing
+        // column, so a default is correct rather than a cast that throws.
+        let isPinned: Bool? = row["is_pinned"]
+        return MessageHeader(
             id: row["id"],
             accountId: row["account_id"],
             remoteId: row["remote_id"],
@@ -378,6 +430,7 @@ public enum MessageStore {
             isRead: row["is_read"],
             isArchived: row["is_archived"],
             isDeleted: row["is_deleted"],
+            isPinned: isPinned ?? false,
             messageIdHeader: row.optionalText("message_id_header"),
             inReplyTo: row.optionalText("in_reply_to"),
             references: row.optionalText("references_header")

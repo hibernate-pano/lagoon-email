@@ -31,7 +31,7 @@ struct ComposerSheet: View {
     /// Stable across retries; changes only when the composer is created anew.
     @State private var requestId = UUID().uuidString.lowercased()
     private let draftKey: String
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     /// The `To:` line split into an array for the reply-all override.
     /// A plain reply passes a single-element array (the same address the

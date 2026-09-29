@@ -16,6 +16,11 @@ public struct MessageHeader: Codable, Equatable, Sendable, Identifiable {
     /// leaves every list, the unread count and search; the message itself
     /// lives in the server's Trash folder until restore or server-side expiry.
     public let isDeleted: Bool
+    /// True when the user pinned this mail. Pins live in their own server
+    /// table, so every list route has to join them in — without this the
+    /// client had no way to know, and the detail view's pin button showed
+    /// "置顶" for a mail that was already pinned.
+    public let isPinned: Bool
     /// RFC5322 Message-ID / In-Reply-To / References, captured so replies can
     /// thread correctly (IMAP has no threads API).
     public let messageIdHeader: String?
@@ -35,6 +40,7 @@ public struct MessageHeader: Codable, Equatable, Sendable, Identifiable {
         isRead: Bool,
         isArchived: Bool,
         isDeleted: Bool = false,
+        isPinned: Bool = false,
         messageIdHeader: String? = nil,
         inReplyTo: String? = nil,
         references: String? = nil
@@ -51,6 +57,7 @@ public struct MessageHeader: Codable, Equatable, Sendable, Identifiable {
         self.isRead = isRead
         self.isArchived = isArchived
         self.isDeleted = isDeleted
+        self.isPinned = isPinned
         self.messageIdHeader = messageIdHeader
         self.inReplyTo = inReplyTo
         self.references = references
@@ -61,7 +68,7 @@ public struct MessageHeader: Codable, Equatable, Sendable, Identifiable {
     private enum CodingKeys: String, CodingKey {
         case id, accountId, remoteId, threadId
         case fromAddress, fromName, subject, snippet, receivedAt
-        case isRead, isArchived, isDeleted
+        case isRead, isArchived, isDeleted, isPinned
         case messageIdHeader, inReplyTo, references
     }
 
@@ -79,6 +86,7 @@ public struct MessageHeader: Codable, Equatable, Sendable, Identifiable {
         isRead = try c.decode(Bool.self, forKey: .isRead)
         isArchived = try c.decode(Bool.self, forKey: .isArchived)
         isDeleted = try c.decodeIfPresent(Bool.self, forKey: .isDeleted) ?? false
+        isPinned = try c.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
         messageIdHeader = try c.decodeIfPresent(String.self, forKey: .messageIdHeader)
         inReplyTo = try c.decodeIfPresent(String.self, forKey: .inReplyTo)
         references = try c.decodeIfPresent(String.self, forKey: .references)
@@ -89,6 +97,7 @@ public struct MessageHeader: Codable, Equatable, Sendable, Identifiable {
             id: id, accountId: accountId, remoteId: remoteId, threadId: threadId,
             fromAddress: fromAddress, fromName: fromName, subject: subject, snippet: snippet,
             receivedAt: receivedAt, isRead: read, isArchived: isArchived, isDeleted: isDeleted,
+            isPinned: isPinned,
             messageIdHeader: messageIdHeader, inReplyTo: inReplyTo, references: references
         )
     }

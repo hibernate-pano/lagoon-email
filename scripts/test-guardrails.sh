@@ -140,6 +140,74 @@ expect_env_forbidden ".env.production"
 expect_env_allowed   ".env.example"
 expect_env_allowed   "docs/.env.example"
 
+# A guardrail that cannot fail is worse than no guardrail: it reads like
+# coverage while checking nothing. The silent-catch lint's first version was
+# a line-based grep that reported success over 47 `catch {` occurrences
+# without examining one, so it ships with a fixture that proves it fires.
+# The fixture is scanned by the shipped parser (a copy of the real script
+# with only its input glob swapped), not by a second implementation.
+echo "== silent-catch lint fires (scripts/lint-no-silent-catch.sh) =="
+
+silent_fixture="$(mktemp -d)"
+lint_copy="$(mktemp)"
+cleanup_fixtures() { rm -rf "$silent_fixture" "$lint_copy"; }
+trap cleanup_fixtures EXIT
+
+cat > "$silent_fixture/Fixture.swift" <<'FIXTURE'
+struct F {
+    func swallowed() {
+        do { try a() } catch {
+        }
+    }
+    func swallowedWithComment() {
+        do { try a() } catch {
+            // best effort
+        }
+    }
+    func handledInline() {
+        do { try a() } catch { return }
+    }
+    func handled() {
+        do { try a() } catch {
+            banner = .init()
+        }
+    }
+    // The single-line empty catch is the shape spec §6.5 actually names, and
+    // the parser used to pass it: `$tail` starts at `catch`, so the enclosing
+    // `}` in `} catch { }` left the net depth at -1 rather than 0 and the
+    // "body ends on this line" branch never ran. These three pin it.
+    func swallowedInline() { do { try a() } catch { } }
+    func swallowedInlineComment() { do { try a() } catch { /* best effort */ } }
+    func handledInlineAssign() { do { try a() } catch { banner = nil } }
+}
+FIXTURE
+
+sed "s#Sources/Lagoon/Views/\*\.swift#${silent_fixture}/*.swift#" \
+    scripts/lint-no-silent-catch.sh > "$lint_copy"
+lint_out="$(bash "$lint_copy" 2>&1 || true)"
+
+expect_flagged() {
+  if printf '%s' "$lint_out" | grep -q "Fixture.swift:$1"; then
+    ok "silent catch reported at fixture line $1"
+  else
+    bad "silent catch NOT reported at fixture line $1"
+  fi
+}
+expect_not_flagged() {
+  if printf '%s' "$lint_out" | grep -q "Fixture.swift:$1"; then
+    bad "fixture line $1 wrongly reported as a silent catch"
+  else
+    ok "fixture line $1 correctly not reported"
+  fi
+}
+expect_flagged 3
+expect_flagged 7
+expect_not_flagged 10
+expect_not_flagged 13
+expect_flagged 23
+expect_flagged 24
+expect_not_flagged 25
+
 echo
 echo "guardrail self-test: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

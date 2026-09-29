@@ -445,6 +445,29 @@ final class SyncEngineTests: XCTestCase {
         }
     }
 
+    /// A failing round drops the provider — and dropping it is not closing it.
+    /// The session stays authenticated on the server until its own idle
+    /// timeout, and QQ caps concurrent IMAP sessions per account, so a mailbox
+    /// that fails and retries must not stack one session per attempt.
+    func test_failingRound_handsTheProviderSessionBack() async throws {
+        let oauthUser = "sync-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(account, db: conn)
+
+                let provider = StubMailProvider.failing(.unreachable("stub"))
+                let loop = makeLoop(db: conn, account: account, provider: provider)
+
+                await loop.round()
+
+                let closed = await provider.shutdownCount
+                XCTAssertEqual(closed, 1, "a dropped provider must be shut down, not abandoned")
+            }
+        }
+    }
+
     /// (e) a successful round clears the failure counter, so the next failure
     /// starts backing off from 1s again rather than from where it left off.
     func test_success_resetsTheBackoffCounter() async throws {
@@ -666,8 +689,9 @@ final class SyncEngineTests: XCTestCase {
                 // Keyed by account id: a multi-active engine (other tests run
                 // in parallel against the same DB) syncs every stored row, so
                 // an unknown account gets an empty-script stub, never this one.
+                let handedOut = ProviderHandle()
                 let probes: [UUID: @Sendable () -> SlowProbeProvider] = [
-                    account.id: { SlowProbeProvider(probe: probe) }
+                    account.id: { handedOut.record(SlowProbeProvider(probe: probe)) }
                 ]
                 let engine = SyncEngine(
                     db: conn,
@@ -733,6 +757,16 @@ final class SyncEngineTests: XCTestCase {
                 XCTAssertNil(
                     loop,
                     "stop() must tear the loop down, not leave it running"
+                )
+                // The name of this test claims it; assert it. A loop dropped
+                // with its provider still holding an IMAP session spends one
+                // of the account's session slots until the server's own idle
+                // timeout.
+                let provider = handedOut.last()
+                let closed = await provider?.shutdowns ?? 0
+                XCTAssertGreaterThan(
+                    closed, 0,
+                    "stop() must hand the connection back, not just drop the loop"
                 )
             }
         }
@@ -884,10 +918,16 @@ actor SlowProbeProvider: MailProvider {
 
     private let probe: OverlapProbe
     private let hold: Duration
+    private(set) var shutdowns = 0
 
     init(probe: OverlapProbe, hold: Duration = .milliseconds(120)) {
         self.probe = probe
         self.hold = hold
+    }
+
+    /// The engine must hand the session back before dropping the provider.
+    func shutdown() async {
+        shutdowns += 1
     }
 
     func capabilities() async -> MailCapabilities {
@@ -923,6 +963,25 @@ actor SlowProbeProvider: MailProvider {
     func probe() async throws { throw Self.unsupported }
 
     private static let unsupported = MailError.notConfigured("probe provider")
+}
+
+/// Keeps the provider the engine built so a test can assert on what happened
+/// to it after the engine let go.
+final class ProviderHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var providers: [SlowProbeProvider] = []
+
+    func record(_ provider: SlowProbeProvider) -> SlowProbeProvider {
+        lock.lock()
+        providers.append(provider)
+        lock.unlock()
+        return provider
+    }
+
+    func last() -> SlowProbeProvider? {
+        lock.lock(); defer { lock.unlock() }
+        return providers.last
+    }
 }
 
 /// Counts how many times the engine's provider factory fired (SQLite shares

@@ -22,8 +22,8 @@ Lagoon.app（one process）
 
 Docs: [startup runbook (zh)](docs/启动说明.md) ·
 [user guide (zh)](docs/使用说明.md) ·
-[v2 final design spec](docs/superpowers/specs/2026-09-23-v2-inbox-os-final-design.md) ·
-[original product spec](docs/superpowers/specs/2026-09-09-lagoon-email-design.md)
+[archived: v2 design spec (superseded)](docs/superpowers/specs/2026-09-23-v2-inbox-os-final-design.md) ·
+[archived: original product spec (superseded)](docs/superpowers/specs/2026-09-09-lagoon-email-design.md)
 
 ## Accounts
 

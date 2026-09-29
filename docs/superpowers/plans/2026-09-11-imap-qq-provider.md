@@ -1,5 +1,7 @@
 # Lagoon IMAP / QQ 邮箱接入 Implementation Plan（M1.5）
 
+> **状态：已归档（superseded）。当前架构见 [README](../../../README.md) 与 [使用说明](../../使用说明.md)。**
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让 Lagoon 在国内网络直连 QQ 邮箱完成完整闭环（接入 → 同步 → 阅读 → Briefing → AI 摘要 → SMTP 回复 → 归档/撤销），Gmail 路径保留且行为不变。

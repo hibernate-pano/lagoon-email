@@ -9,6 +9,9 @@ import LagoonKit
 /// seconds; the row context menu opens the sender's full history.
 struct MessageListView: View {
     @EnvironmentObject var accounts: AccountStore
+    /// Injected by RootView, which also hosts the toast — so an undo raised
+    /// on either surface is visible from this one.
+    @EnvironmentObject private var undo: UndoController
     @State private var messages: [MessageHeader] = []
     @State private var isLoading = false
     @State private var errorBanner: ErrorBanner?
@@ -26,6 +29,10 @@ struct MessageListView: View {
     /// Persisted — the lens the user picked should survive relaunch.
     @AppStorage("lagoon.grouping") private var groupingRaw = GroupingMode.conversation.rawValue
     @AppStorage("lagoon.unreadOnly") private var unreadOnly = false
+    /// Guards the two things a local list mutation can break: a slow poll
+    /// that started before the user archived a row writing the server's
+    /// pre-archive snapshot back, and a refresh raised mid-poll vanishing.
+    @State private var refreshGate = RefreshGate()
 
     enum GroupingMode: String, CaseIterable {
         case conversation
@@ -51,14 +58,21 @@ struct MessageListView: View {
     /// The poll loop sleeps instead of refreshing — keep-alive costs no
     /// traffic. Hidden shortcuts are disabled by the parent.
     var isVisible: Bool = true
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     /// Switches back to the Briefing Feed from the toolbar button.
     var onShowBriefing: () -> Void = {}
 
     private static let refreshInterval: Duration = .seconds(30)
+    /// While the list is empty (fresh connect, backfill still landing) poll
+    /// at this cadence for up to `maxFastEmptyTicks` ticks, then fall back to
+    /// the 30s tracker so a genuinely empty mailbox doesn't hammer the API.
+    private static let emptyPollInterval: Duration = .seconds(3)
+    private static let maxFastEmptyTicks = 20
 
     @Environment(\.l10n) private var l10n
+    /// Backgrounded windows idle instead of polling — see `sleepForPoll`.
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -97,12 +111,17 @@ struct MessageListView: View {
                     }
                     .keyboardShortcut("0", modifiers: .command)
                     .help(l10n.backToBriefingHelp)
-                    Button(l10n.refresh) {
-                        Task { await refresh() }
+                    // ⌘R is "refresh" on the list and "reply" on the open
+                    // message, and the detail view is a push inside this
+                    // same stack — so both bindings are live at once and
+                    // the wrong one wins. Attach the shortcut only at the
+                    // root, the same shape ⌘0 and ⌘[ already use.
+                    if path.isEmpty {
+                        refreshControl
+                            .keyboardShortcut("r", modifiers: .command)
+                    } else {
+                        refreshControl
                     }
-                    .disabled(isLoading)
-                    .keyboardShortcut("r", modifiers: .command)
-                    .help(l10n.shortcutRefresh)
                 }
                 .padding()
 
@@ -151,9 +170,6 @@ struct MessageListView: View {
                             )
                         }
                     }
-                    .sheet(isPresented: $showStackList) {
-                        StackListSheet()
-                    }
                     .sheet(item: $stackEditor) { request in
                         StackRuleEditorSheet(
                             initialKind: request.kind,
@@ -168,6 +184,16 @@ struct MessageListView: View {
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+            }
+            // 聚合规则 is reachable from the toolbar button, which is
+            // outside the `!messages.isEmpty` branch — so the sheet has to
+            // live outside it too. It used to hang off the `List`, where an
+            // empty inbox meant the button did nothing at all and the
+            // feature was unreachable. The two sheets below it stay put:
+            // every one of their setters is a row action, and a row cannot
+            // exist without a list.
+            .sheet(isPresented: $showStackList) {
+                StackListSheet()
             }
             .navigationDestination(for: String.self) { remoteId in
                 destination(for: remoteId)
@@ -203,16 +229,26 @@ struct MessageListView: View {
         // so an invisible surface must sleep instead of polling.
         .task {
             await refresh()
+            var emptyTicks = 0
             while !Task.isCancelled {
-                do {
-                    try await Task.sleep(for: Self.refreshInterval)
-                } catch {
-                    return
-                }
-                if isVisible {
+                let fast = messages.isEmpty && emptyTicks < Self.maxFastEmptyTicks
+                emptyTicks = messages.isEmpty ? emptyTicks + 1 : 0
+                guard await sleepForPoll(
+                    fast ? Self.emptyPollInterval : Self.refreshInterval
+                ) else { return }
+                if shouldPoll(isVisible: isVisible, scenePhase: scenePhase) {
                     await refresh()
                 }
             }
+        }
+        // ⌘Z (raised on either surface — the toast lives in RootView) restores
+        // the row server-side. Without these the list would sit on its stale
+        // snapshot until the next 30s tick.
+        .onReceive(NotificationCenter.default.publisher(for: .lagoonDidUndo)) { _ in
+            Task { await refresh() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .lagoonDidChangeData)) { _ in
+            Task { await refresh() }
         }
     }
 
@@ -226,18 +262,18 @@ struct MessageListView: View {
                 remoteId: remoteId,
                 accountId: accountId,
                 header: header,
-                // We don't render pin state in the raw list; the detail
-                // still loads / toggles it via the server.
-                initiallyPinned: false,
+                // The list row knows its own pin state, so the detail view
+                // starts on the truth. It used to be hardcoded false, which
+                // showed "置顶" for a mail that was already pinned and made
+                // the first tap a no-op (pinned=true over an existing pin).
+                initiallyPinned: header?.isPinned ?? false,
                 siblings: messages.map(\.remoteId),
-                onArchived: { id, _ in
-                    messages.removeAll { $0.remoteId == id }
-                },
+                onArchived: { id, _ in dropRow(id) },
                 onAdvanceTo: { next in
                     path = next.map { [$0] } ?? []
                 },
                 onDelete: { id in
-                    messages.removeAll { $0.remoteId == id }
+                    dropRow(id)
                     path = []
                 },
                 onReadStateChange: { remoteId, isRead in
@@ -257,36 +293,73 @@ struct MessageListView: View {
         }
     }
 
+    /// The one way a row leaves the list. Retiring the in-flight poll is
+    /// not optional here: a poll that captured the list before the archive
+    /// lands afterwards and writes the row straight back — and because the
+    /// detail view auto-advances, the user is then looking at the next
+    /// mail while the archived one reappears behind them.
+    private func dropRow(_ remoteId: String) {
+        refreshGate.invalidate()
+        messages.removeAll { $0.remoteId == remoteId }
+    }
+
+    private var refreshControl: some View {
+        Button(l10n.refresh) {
+            Task { await refresh() }
+        }
+        .disabled(isLoading)
+        .help(l10n.shortcutRefresh)
+    }
+
     private func setRead(remoteId: String, isRead: Bool) {
         guard let index = messages.firstIndex(where: { $0.remoteId == remoteId }) else { return }
-        let message = messages[index]
-        messages[index] = MessageHeader(
-            id: message.id,
-            accountId: message.accountId,
-            remoteId: message.remoteId,
-            threadId: message.threadId,
-            fromAddress: message.fromAddress,
-            fromName: message.fromName,
-            subject: message.subject,
-            snippet: message.snippet,
-            receivedAt: message.receivedAt,
-            isRead: isRead,
-            isArchived: message.isArchived
-        )
+        invalidatePendingRefresh()
+        // `MessageHeader.withRead` copies every other field. The
+        // hand-rolled constructor this replaced silently dropped
+        // `isPinned` (and the RFC threading headers), so clearing the unread
+        // dot on a pinned mail un-pinned it locally.
+        messages[index] = messages[index].withRead(isRead)
     }
 
     // MARK: - Sync
 
+    /// Retire any poll already in flight. Called by every local mutation of
+    /// `messages` (archive, delete, mark-read) so a response captured before
+    /// that mutation cannot write the pre-mutation snapshot back over it.
+    private func invalidatePendingRefresh() {
+        refreshGate.invalidate()
+    }
+
     private func refresh() async {
         guard let id = accounts.accountId else { return }
-        guard !isLoading else { return }
+        // `claim` is nil while a refresh is in flight. It used to be a bare
+        // `guard !isLoading else { return }`, which silently discarded the
+        // request: a ⌘Z landing mid-poll left the user looking at a snapshot
+        // taken before the undo until the next 30s tick. The gate remembers
+        // it instead and `finish()` tells us to run again.
+        guard let generation = refreshGate.claim() else { return }
         isLoading = true
+        // `defer`, not a trailing assignment: the two generation guards below
+        // return early, and without this a single superseded response would
+        // pin `isLoading` true for the life of the view — every later refresh
+        // blocked by the guard above, the refresh button stuck disabled.
+        defer {
+            isLoading = false
+            if refreshGate.finish() {
+                Task { await refresh() }
+            }
+        }
         errorBanner = nil
         do {
             let resp = try await api.fetchMessages(accountId: id)
+            // A newer refresh started while this one was in flight; its
+            // payload is at least as fresh, so committing this one would
+            // resurrect rows the user has since archived or deleted.
+            guard generation == refreshGate.generation else { return }
             messages = resp.messages
             accounts.setLastSync(resp)
         } catch {
+            guard generation == refreshGate.generation else { return }
             errorBanner = ErrorBanner(
                 severity: .error,
                 title: l10n.syncFailed + error.lagoonUIMessage,
@@ -294,7 +367,6 @@ struct MessageListView: View {
                 action: { [self] in await self.refresh() }
             )
         }
-        isLoading = false
     }
 
     // MARK: - Row
@@ -468,11 +540,31 @@ struct MessageListView: View {
     // MARK: - Actions
 
     private func archive(_ m: MessageHeader) async {
+        // Any local mutation retires the in-flight poll. Without this the
+        // generation counter only ever guards refresh-vs-refresh — which
+        // `guard !isLoading` already serialises — so the real race stayed
+        // open: a poll that captured the list *before* this archive lands
+        // afterwards and writes the row straight back.
+        invalidatePendingRefresh()
         do {
-            _ = try await api.archiveMessage(remoteId: m.remoteId, accountId: m.accountId)
-            messages.removeAll { $0.remoteId == m.remoteId }
-        } catch APIError.badStatus(_, _) where (try? archiveUnavailable()) == nil {
-            // server answered 409 — the account can't archive; banner set below
+            let response = try await api.archiveMessage(remoteId: m.remoteId, accountId: m.accountId)
+            withAnimation(.snappy) {
+                messages.removeAll { $0.remoteId == m.remoteId }
+            }
+            SoundEffects.archive()
+            undo.show(UndoItem(
+                id: response.actionId,
+                message: l10n.archived,
+                systemImage: "tray.and.arrow.down"
+            ))
+        } catch APIError.badStatus(let code, _) where code == 409 {
+            // The account negotiated no archive-capable folder, so the
+            // server refuses every archive. Retrying cannot help — say so
+            // instead of filing a generic failure.
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.archiveUnavailable
+            )
         } catch {
             errorBanner = ErrorBanner(
                 severity: .error,
@@ -497,42 +589,42 @@ struct MessageListView: View {
         }
     }
 
+    /// Mark a message read. One-way on purpose: the server's read route
+    /// hardcodes `isRead: true` and records no inverse action, so a
+    /// "mark unread" flip would be reverted by the next poll with nothing
+    /// the user could undo. The Unread verb is absent from the row menu
+    /// for the same reason — see `RowChrome`.
     private func toggleRead(_ m: MessageHeader) async {
-        // Optimistic toggle: flip the local state immediately, then write
-        // through. If the server fails, revert.
-        let original = m.isRead
+        // Optimistic flip so the dot clears before the round trip; reverted
+        // if the server refuses. A no-op for an already-read row.
+        guard !m.isRead else { return }
+        invalidatePendingRefresh()
         if let index = messages.firstIndex(where: { $0.remoteId == m.remoteId }) {
-            messages[index] = m.withRead(!original)
+            messages[index] = m.withRead(true)
         }
         do {
             try await api.markRead(remoteId: m.remoteId, accountId: m.accountId)
         } catch {
             if let index = messages.firstIndex(where: { $0.remoteId == m.remoteId }) {
-                messages[index] = m.withRead(original)
+                messages[index] = m.withRead(false)
             }
         }
     }
 
-    private func archiveUnavailable() throws -> Void {
-        // Discriminates the 409 path; the real mapping lives in
-        // MessageDetailView. We surface a banner instead.
-        throw APIError.badStatus(code: 409, bodySnippet: "archive-unavailable")
-    }
-
     /// 删除 = 移入服务器废纸篓（provider.trash），可 ⌘Z 撤销（restore）。
-    /// 本地行为与归档一致：行立刻离开列表。
+    /// 本地行为与归档一致：行立刻离开列表，toast 承接撤销入口。
     private func delete(_ m: MessageHeader) async {
+        invalidatePendingRefresh()
         do {
             let response = try await api.deleteMessage(remoteId: m.remoteId, accountId: m.accountId)
             withAnimation(.snappy) {
                 messages.removeAll { $0.remoteId == m.remoteId }
             }
-            ErrorCenter.shared.report(.init(
-                severity: .info,
-                title: l10n.deleted,
-                autoDismissAfter: .seconds(6)
+            undo.show(UndoItem(
+                id: response.actionId,
+                message: l10n.deleted,
+                systemImage: "trash"
             ))
-            _ = response
         } catch {
             errorBanner = ErrorBanner(
                 severity: .error,
@@ -568,6 +660,24 @@ struct MessageListView: View {
 
 // MARK: - Row chrome
 
+/// Whether a list row may offer the read verb at all.
+///
+/// Read state is one-way on the wire — the server's read route only ever
+/// sets `isRead: true` — and `toggleRead` returns immediately on an
+/// already-read row. Rendering the control anyway left something that
+/// looked live and did nothing: no request, no state change, and the only
+/// visual difference (the unread dot, the bold subject) not moving.
+/// `MessageDetailView` greys the same verb out (`.disabled(isRead)`); a
+/// row drops it instead, which also means the leading swipe disappears
+/// when there is nothing for it to do.
+///
+/// Free function rather than a member of the (private) `RowChrome`: the
+/// policy is the part worth pinning, and it is reachable from the
+/// modifier, from the tests, and from anywhere else a row is drawn.
+func offersReadVerb(_ message: MessageHeader) -> Bool {
+    !message.isRead
+}
+
 /// Tag + triage gestures shared by every tappable row (single message or
 /// expanded thread member). Also the 发件人归集 and 聚合 entry points.
 private struct RowChrome: ViewModifier {
@@ -580,7 +690,25 @@ private struct RowChrome: ViewModifier {
     let onDelete: () -> Void
     @Environment(\.l10n) private var l10n
 
+    @ViewBuilder
     func body(content: Content) -> some View {
+        if offersReadVerb(message) {
+            chrome(content)
+                .swipeActions(edge: .leading) {
+                    // Leading swipe = mark read. Single gesture, no
+                    // destructive styling so the row snaps back without
+                    // warning.
+                    Button { onToggleRead() } label: {
+                        Label(l10n.markAsRead, systemImage: "envelope.open")
+                    }
+                    .tint(.blue)
+                }
+        } else {
+            chrome(content)
+        }
+    }
+
+    private func chrome(_ content: Content) -> some View {
         content
             .tag(message.remoteId)
             .swipeActions(edge: .trailing) {
@@ -589,19 +717,10 @@ private struct RowChrome: ViewModifier {
                     Label(l10n.archived, systemImage: "tray.and.arrow.down")
                 }
             }
-            .swipeActions(edge: .leading) {
-                // Leading swipe = toggle read. Single gesture, no destructive
-                // styling so the row snaps back without warning.
-                Button { onToggleRead() } label: {
-                    Label(
-                        message.isRead ? l10n.markAsUnread : l10n.markAsRead,
-                        systemImage: message.isRead ? "envelope.badge" : "envelope.open"
-                    )
-                }
-                .tint(.blue)
-            }
             .contextMenu {
-                Button(message.isRead ? l10n.markAsUnread : l10n.markAsRead) { onToggleRead() }
+                if offersReadVerb(message) {
+                    Button(l10n.markAsRead) { onToggleRead() }
+                }
                 Button(l10n.archived) { onArchive() }
                 Divider()
                 // 聚合: seed a persistent rule from this row — one tap for the

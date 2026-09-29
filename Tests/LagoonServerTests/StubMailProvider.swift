@@ -42,6 +42,12 @@ actor StubMailProvider: MailProvider {
         self.persistentFailure = persistentFailure
     }
 
+    private(set) var shutdownCount = 0
+
+    func shutdown() async {
+        shutdownCount += 1
+    }
+
     func capabilities() async -> MailCapabilities {
         MailCapabilities(archiveFolder: true, idle: true, move: true, serverSnippet: false)
     }

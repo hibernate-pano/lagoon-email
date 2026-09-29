@@ -67,6 +67,15 @@ public enum BriefingRoutes {
                 return RouteJSON.error(.internalServerError, "internal-error")
             }
 
+            // The grouping reasons are shown to the user, so the classifier
+            // has to write them in the language they are reading. The
+            // sibling routes (/summary, /draft) already read this header;
+            // passing nil here made the briefing the one place where the
+            // model's language and the UI's could disagree.
+            let language = RouteParams.preferredLanguage(
+                fromHeader: request.headers[.acceptLanguage]
+            )
+
             let heuristics = HeuristicBriefingClassifier(
                 signals: .init(
                     pinnedRemoteIds: pinned,
@@ -92,7 +101,7 @@ public enum BriefingRoutes {
                             let fresh = try await classifier.classify(
                                 pending,
                                 accountEmail: account.email,
-                                language: nil
+                                language: language
                             )
                             await cache.store(fresh, for: pending)
                             for (remoteId, group) in fresh { overrides[remoteId] = group }
@@ -109,7 +118,7 @@ public enum BriefingRoutes {
                                 let fresh = try await classifier.classify(
                                     pending,
                                     accountEmail: account.email,
-                                    language: nil
+                                    language: language
                                 )
                                 await cache.store(fresh, for: pending)
                             } catch {

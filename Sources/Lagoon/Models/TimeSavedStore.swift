@@ -21,7 +21,11 @@ public final class TimeSavedStore: ObservableObject {
     }
 
     public func refresh(accountId: UUID) async {
-        report = try? await api.fetchTimeSaved(accountId: accountId)
+        // Assign only on success. Overwriting with nil on a failed poll would
+        // make the status bar vanish for a transient network blip — the
+        // opposite of what the doc comment promises.
+        guard let latest = try? await api.fetchTimeSaved(accountId: accountId) else { return }
+        report = latest
     }
 
     public func clear() {

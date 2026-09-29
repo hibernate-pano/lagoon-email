@@ -17,6 +17,13 @@ public enum ProviderHTTP {
            let parsed = URL(string: raw.trimmingCharacters(in: .whitespaces)),
            let host = parsed.host,
            let port = parsed.port {
+            // Both key families are required and both are deprecated.
+            // `kCFNetworkProxies*` is the documented NSURLSession spelling;
+            // the `kCFStreamPropertyHTTPSProxy*` pair is what actually takes
+            // effect for https:// on Apple platforms, and dropping it
+            // silently sends LLM traffic straight past the user's proxy
+            // (Clash here). Kept on purpose — see scripts/warn-gate.sh,
+            // which allowlists exactly these two.
             cfg.connectionProxyDictionary = [
                 kCFNetworkProxiesHTTPEnable as String: true,
                 kCFNetworkProxiesHTTPProxy as String: host,

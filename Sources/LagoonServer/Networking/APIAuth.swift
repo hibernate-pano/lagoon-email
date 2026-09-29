@@ -1,6 +1,7 @@
 import Foundation
 import Hummingbird
 import NIOCore
+import Crypto
 
 /// Per-install bearer token for `/api/*` (V2 A5).
 ///
@@ -21,11 +22,6 @@ public struct APIAuthMiddleware<Context: RequestContext>: RouterMiddleware {
     public init(token: String? = nil) {
         let trimmed = token?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.token = (trimmed?.isEmpty == false) ? trimmed : nil
-    }
-
-    /// Production convenience: reads the environment.
-    public static func fromEnvironment() -> Self {
-        Self(token: ProcessInfo.processInfo.environment["LAGOON_API_TOKEN"])
     }
 
     public func handle(
@@ -50,13 +46,16 @@ public struct APIAuthMiddleware<Context: RequestContext>: RouterMiddleware {
     }
 
     /// Constant-time string comparison so the 401 timing does not oracle the
-    /// token prefix. Pure function, unit-tested below via the middleware.
+    /// token. Comparing digests rather than the strings themselves is what
+    /// makes it constant-time: a `count` check on the raw bytes returns
+    /// early, which leaks the token's *length* — and the presented value's,
+    /// since the header and the token are both attacker-influenced.
     static func timingSafeEqual(_ lhs: String?, _ rhs: String) -> Bool {
         guard let lhs else { return false }
-        let x = Array(lhs.utf8), y = Array(rhs.utf8)
-        guard x.count == y.count else { return false }
+        let a = SHA256.hash(data: Data(lhs.utf8))
+        let b = SHA256.hash(data: Data(rhs.utf8))
         var diff = 0
-        for (a, b) in zip(x, y) { diff |= Int(a ^ b) }
+        for (x, y) in zip(a, b) { diff |= Int(x ^ y) }
         return diff == 0
     }
 }

@@ -797,4 +797,154 @@ final class APIClientTests: XCTestCase {
         XCTAssertFalse(report.today.isEmpty)
         XCTAssertTrue(report.today.byDay.isEmpty)
     }
+
+    // MARK: - Bearer token on every outgoing request
+
+    /// The attachment download bypasses `send` (it needs the raw headers, not
+    /// a status-validated envelope), so it is the one place where adding the
+    /// bearer token is a separate step. It did not do it, and the embedded
+    /// server always has a token (V3), so every attachment download 401'd and
+    /// every HTML `cid:` inline image silently broke.
+    func test_downloadAttachment_sendsBearerToken() async throws {
+        let expected = try installedToken()
+        StubURLProtocol.setHandler { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: [
+                    "Content-Type": "image/png",
+                    "Content-Disposition": #"attachment; filename="logo.png""#,
+                ]
+            )!
+            return (response, Data([0x89, 0x50, 0x4E, 0x47]))
+        }
+
+        let result = try await makeClient().downloadAttachment(
+            accountId: UUID(), remoteId: "remote 1", attachmentId: "att/1"
+        )
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(
+            request.value(forHTTPHeaderField: "Authorization"),
+            "Bearer \(expected)",
+            "the attachment route is behind APIAuthMiddleware; a missing header is a 401"
+        )
+        // The raw-header path must survive the fix: the caller writes the
+        // bytes and names the file from these, not from a decoded envelope.
+        XCTAssertEqual(result.mimeType, "image/png")
+        XCTAssertEqual(result.filename, "logo.png")
+        XCTAssertEqual(result.data, Data([0x89, 0x50, 0x4E, 0x47]))
+    }
+
+    /// The invariant, not one method: every public method that reaches the
+    /// network carries the token. A new method that forgets produces a 401
+    /// that no local test would otherwise catch, so the table below has to
+    /// grow whenever the public surface does.
+    func test_everyPublicMethod_sendsBearerToken() async throws {
+        let expected = try installedToken()
+        // Any 2xx is fine: the assertion is about the request, not the body.
+        StubURLProtocol.setHandler { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            return (response, Data("{}".utf8))
+        }
+        let accountId = UUID()
+        let client = makeClient()
+
+        let calls: [(String, (APIClient) async throws -> Void)] = [
+            ("fetchMessages", { _ = try await $0.fetchMessages(accountId: accountId) }),
+            ("requestSync", { try await $0.requestSync() }),
+            ("fetchAccounts", { _ = try await $0.fetchAccounts() }),
+            ("fetchAIStatus", { _ = try await $0.fetchAIStatus() }),
+            ("downloadAttachment", {
+                _ = try await $0.downloadAttachment(accountId: accountId, remoteId: "r", attachmentId: "a")
+            }),
+            ("downloadRawMessage", { _ = try await $0.downloadRawMessage(accountId: accountId, remoteId: "r") }),
+            ("connectQQ", { _ = try await $0.connectQQ(email: "me@qq.com", authCode: "c") }),
+            ("activateAccount", { try await $0.activateAccount(id: accountId) }),
+            ("deleteAccount", { try await $0.deleteAccount(id: accountId) }),
+            ("fetchBriefing", { _ = try await $0.fetchBriefing(accountId: accountId) }),
+            ("fetchBody", { _ = try await $0.fetchBody(remoteId: "r", accountId: accountId) }),
+            ("archiveMessage", { _ = try await $0.archiveMessage(remoteId: "r", accountId: accountId) }),
+            ("unsubscribeMessage", { _ = try await $0.unsubscribeMessage(remoteId: "r", accountId: accountId) }),
+            ("deleteMessage", { _ = try await $0.deleteMessage(remoteId: "r", accountId: accountId) }),
+            ("archiveBulk", { _ = try await $0.archiveBulk(remoteIds: ["r"], accountId: accountId) }),
+            ("fetchStacks", { _ = try await $0.fetchStacks(accountId: accountId) }),
+            ("createStack", {
+                _ = try await $0.createStack(
+                    StackCreateRequest(name: "a", kind: .sender, value: "a@b.com"), accountId: accountId
+                )
+            }),
+            ("deleteStack", { try await $0.deleteStack(id: accountId, accountId: accountId) }),
+            ("fetchAutoArchiveSuggestions", { _ = try await $0.fetchAutoArchiveSuggestions(accountId: accountId) }),
+            ("overrideClassification", {
+                try await $0.overrideClassification(
+                    remoteId: "r", accountId: accountId, from: nil, to: .needsReply
+                )
+            }),
+            ("fetchActions", { _ = try await $0.fetchActions(accountId: accountId) }),
+            ("undoAction", { try await $0.undoAction(id: 1, accountId: accountId) }),
+            ("sendReply", {
+                _ = try await $0.sendReply(remoteId: "r", accountId: accountId, body: "b", requestId: "i")
+            }),
+            ("sendNewMessage", {
+                _ = try await $0.sendNewMessage(
+                    to: "a@b.com", subject: "s", body: "b", accountId: accountId, requestId: "i"
+                )
+            }),
+            ("generateDrafts", { _ = try await $0.generateDrafts(remoteId: "r", accountId: accountId) }),
+            ("chooseDraft", { _ = try await $0.chooseDraft(draftId: 1, variant: 0) }),
+            ("search", { _ = try await $0.search(query: "q", accountId: accountId) }),
+            ("fetchUsage", { _ = try await $0.fetchUsage() }),
+            ("fetchTimeSaved", { _ = try await $0.fetchTimeSaved(accountId: accountId) }),
+            ("fetchAutoArchiveRules", { _ = try await $0.fetchAutoArchiveRules(accountId: accountId) }),
+            ("addAutoArchiveRule", { _ = try await $0.addAutoArchiveRule(senderAddress: "a@b.com", accountId: accountId) }),
+            ("deleteAutoArchiveRule", { try await $0.deleteAutoArchiveRule(id: 1, accountId: accountId) }),
+            ("markRead", { try await $0.markRead(remoteId: "r", accountId: accountId) }),
+            ("setPinned", { try await $0.setPinned(remoteId: "r", accountId: accountId, pinned: true) }),
+            ("fetchSummary", { _ = try await $0.fetchSummary(remoteId: "r", accountId: accountId) }),
+        ]
+
+        var missing: [String] = []
+        for (name, call) in calls {
+            StubURLProtocol.setHandler { request in
+                let response = HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                return (response, Data("{}".utf8))
+            }
+            _ = try? await call(client)
+            guard let request = StubURLProtocol.capturedRequests.first else {
+                missing.append("\(name) (no request)")
+                continue
+            }
+            if request.value(forHTTPHeaderField: "Authorization") != "Bearer \(expected)" {
+                missing.append(name)
+            }
+        }
+        XCTAssertEqual(missing, [], "these methods reach the network without the bearer token")
+    }
+
+    /// Installs a known token in the same store the app uses, so the
+    /// assertions do not depend on whatever the ambient environment holds.
+    private func installedToken() throws -> String {
+        let token = "test-token-\(UUID().uuidString)"
+        let key = "lagoon.apiToken"
+        let previous = UserDefaults.standard.string(forKey: key)
+        APIClient.storeAPIToken(token)
+        addTeardownBlock {
+            if let previous {
+                UserDefaults.standard.set(previous, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+        // `apiToken` prefers the env var, so a developer running the suite
+        // with LAGOON_API_TOKEN set would otherwise compare against that.
+        return ProcessInfo.processInfo.environment["LAGOON_API_TOKEN"].flatMap {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0
+        } ?? token
+    }
 }

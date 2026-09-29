@@ -11,17 +11,22 @@ import GRDB
 /// constraint is gone — GRDB serializes writes and pools readers, so the
 /// per-loop `makeDB` indirection now returns the same pool.
 ///
-/// Dates are stored as Julian-day REALs, which is both GRDB's default `Date`
-/// codec and what SQLite's `strftime('%Y-%m-%d %H:%M:%f','now')` produces, so SQL-side
-/// expressions like `strftime('%Y-%m-%d %H:%M:%f','now','-30 days')` agree with Swift-side `Date()`.
+/// Dates are stored as TEXT in GRDB's default `Date` format
+/// `"yyyy-MM-dd HH:mm:ss.SSS"` (UTC, `en_US_POSIX` locale), which is also what
+/// SQLite's `strftime('%Y-%m-%d %H:%M:%f','now')` produces, so SQL-side
+/// expressions like `strftime('%Y-%m-%d %H:%M:%f','now','-30 days')` agree
+/// with Swift-side `Date()`. (GRDB 7 offers no alternate encoding strategy
+/// here; a REAL Julian day would not be read back as the same instant.)
 /// Bools are INTEGER 1/0 (SQLite understands `TRUE`/`FALSE` literals since
 /// 3.23, so existing query text keeps them). JSON columns are TEXT holding
 /// `JSONEncoder` output. UUIDs are 16-byte BLOBs (GRDB default).
 public enum LagoonDatabase {
-    /// The single migration for the embedded schema: a fresh SQLite install
-    /// starts here directly. The historical 19 Postgres migrations were
-    /// consolidated — remote mail is re-syncable, so no data migrates.
+    /// The schema migration. A fresh SQLite install starts here directly.
+    /// The historical 19 Postgres migrations were consolidated — remote
+    /// mail is re-syncable, so no data migrates.
     public static let currentVersion = "lagoon-v1"
+    /// Index-only follow-up. See `indexReconciliation`.
+    public static let indexVersion = "lagoon-v2"
 
     public static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
@@ -30,8 +35,44 @@ public enum LagoonDatabase {
             // `-- statement` markers are layout, not parsing.
             try db.execute(sql: Self.schema)
         }
+        migrator.registerMigration(indexVersion) { db in
+            try db.execute(sql: Self.indexReconciliation)
+        }
         return migrator
     }
+
+    /// GRDB records applied migrations by *identifier*, not by content, so
+    /// editing `lagoon-v1`'s body does nothing for a database that already
+    /// ran it — the index changes would have been silently absent from every
+    /// existing install while looking correct in a fresh test database.
+    /// This migration is the reconciliation, and it is written to be safe on
+    /// both paths: `lagoon-v1` already omits the dropped indexes on a fresh
+    /// install, so every statement here is `IF EXISTS` / `IF NOT EXISTS`.
+    ///
+    /// Indexes only — no table or column changes — so this stays cheap and
+    /// cannot lose mail.
+    static let indexReconciliation = """
+        CREATE INDEX IF NOT EXISTS message_headers_account_sender_idx
+            ON message_headers (account_id, from_address, received_at DESC)
+            WHERE is_deleted = FALSE;
+        -- statement
+        CREATE INDEX IF NOT EXISTS message_headers_unread_idx
+            ON message_headers (account_id)
+            WHERE is_deleted = FALSE AND is_archived = FALSE AND is_read = FALSE;
+        -- statement
+        CREATE INDEX IF NOT EXISTS message_headers_list_unsubscribe_idx
+            ON message_headers (account_id) WHERE list_unsubscribe = TRUE;
+        -- statement
+        CREATE INDEX IF NOT EXISTS ai_actions_undo_of_idx
+            ON ai_actions (account_id, json_extract(payload, '$.undoOf'))
+            WHERE kind = 'undo';
+        -- statement
+        DROP INDEX IF EXISTS message_headers_thread_idx;
+        -- statement
+        DROP INDEX IF EXISTS accounts_provider_idx;
+        -- statement
+        DROP INDEX IF EXISTS ai_actions_expires_idx;
+    """
 
     /// Opens (creating if needed) and migrates the database at `path`.
     public static func open(path: String) throws -> DatabasePool {
@@ -75,8 +116,6 @@ public enum LagoonDatabase {
             UNIQUE (provider, oauth_user)
         );
         -- statement
-        CREATE INDEX accounts_provider_idx ON accounts (provider);
-        -- statement
         CREATE TABLE message_headers (
             id                 BLOB PRIMARY KEY,
             account_id         BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -102,11 +141,28 @@ public enum LagoonDatabase {
         CREATE INDEX message_headers_account_received_idx
             ON message_headers (account_id, received_at DESC);
         -- statement
-        CREATE INDEX message_headers_thread_idx
-            ON message_headers (account_id, thread_id);
-        -- statement
         CREATE INDEX message_headers_account_deleted_idx
             ON message_headers (account_id, received_at DESC) WHERE is_deleted = FALSE;
+        -- statement
+        -- Sender lens: MessageStore.recent's `from_address = ?` branch. The
+        -- index is already ordered by received_at DESC, so the ORDER BY needs
+        -- no sort; `is_archived` is not in the predicate because the archived
+        -- view of the same lens reuses this index.
+        CREATE INDEX message_headers_account_sender_idx
+            ON message_headers (account_id, from_address, received_at DESC)
+            WHERE is_deleted = FALSE;
+        -- statement
+        -- Unread count: MessageStore.unreadCount counts exactly these rows, so
+        -- the index holds only unread headers and the count is a pure scan of
+        -- a small tree instead of the whole account.
+        CREATE INDEX message_headers_unread_idx
+            ON message_headers (account_id)
+            WHERE is_deleted = FALSE AND is_archived = FALSE AND is_read = FALSE;
+        -- statement
+        -- Unsubscribe candidates: MessageStore.listUnsubscribeIds. Most mail
+        -- carries no List-Unsubscribe header, so this partial index is small.
+        CREATE INDEX message_headers_list_unsubscribe_idx
+            ON message_headers (account_id) WHERE list_unsubscribe = TRUE;
         -- statement
         CREATE TABLE message_pins (
             account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -141,7 +197,13 @@ public enum LagoonDatabase {
         CREATE INDEX ai_actions_account_created_idx
             ON ai_actions(account_id, created_at DESC);
         -- statement
-        CREATE INDEX ai_actions_expires_idx ON ai_actions(expires_at);
+        -- Undo lookup: AIActionStore.timeSavedEvents runs a correlated
+        -- NOT EXISTS per candidate row over `undo` actions. Without this the
+        -- probe is a scan of every undo row in the account, so the cost is
+        -- quadratic in actions; with it each probe is one index seek.
+        CREATE INDEX ai_actions_undo_of_idx
+            ON ai_actions (account_id, json_extract(payload, '$.undoOf'))
+            WHERE kind = 'undo';
         -- statement
         -- Send idempotency (migration 009): one send per client requestId.
         CREATE UNIQUE INDEX ai_actions_send_request_idx

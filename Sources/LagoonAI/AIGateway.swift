@@ -406,9 +406,7 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
         do {
             let completion = try await provider.complete(capability: capability, system: system, user: user)
             breaker.recordSuccess(provider.name)
-            statusLock.lock()
-            lastSuccessAt = Date()
-            statusLock.unlock()
+            statusLock.withLock { lastSuccessAt = Date() }
             log(capability: capability, provider: provider, completion: completion, outcome: "ok")
             return completion
         } catch {
@@ -423,9 +421,7 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
                 breaker.recordFailure(provider.name)
             case LLMError.insufficientCredit:
                 breaker.recordFailure(provider.name)
-                statusLock.lock()
-                lastCreditExhaustedAt = Date()
-                statusLock.unlock()
+                statusLock.withLock { lastCreditExhaustedAt = Date() }
             default:
                 break
             }
@@ -557,5 +553,21 @@ final class CircuitBreaker: @unchecked Sendable {
             state.openUntil = now.addingTimeInterval(cooldown)
         }
         states[provider] = state
+    }
+}
+
+
+extension NSLock {
+    /// Scoped lock/unlock for a *synchronous* body. `NSLock.lock()` is
+    /// `@available(*, noasync)`: calling it directly from an `async` function
+    /// is a hard error in the Swift 6 language mode, and even before that it
+    /// can block a cooperative-pool thread. Funnelling the pair through one
+    /// non-async function keeps the critical section explicit and lets the
+    /// compiler check the call sites.
+    @inline(__always)
+    func withLock<R>(_ body: () throws -> R) rethrows -> R {
+        lock()
+        defer { unlock() }
+        return try body()
     }
 }

@@ -36,7 +36,7 @@ struct StackListSheet: View {
     @State private var editor: StackEditorRequest?
     @State private var openStack: StackSummary?
     @State private var showArchived = false
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     var body: some View {
         NavigationStack {
@@ -146,11 +146,13 @@ struct StackListSheet: View {
         do {
             let response = try await api.fetchStacks(accountId: accountId)
             stacks = response.stacks
+            // The archived row's badge. `/api/messages?archived=true` returns
+            // no total, and `cursor.totalUnread` is unread-specific, so the
+            // only number available is the size of the window we asked for —
+            // this reads 0 or 1, not the real count. Fixing it needs a server
+            // total; see the report rather than fudging the number here.
             let archived = try await api.fetchMessages(accountId: accountId, limit: 1, archived: true)
-            archivedCount = archived.cursor.totalUnread == 0 ? archived.messages.count : archived.cursor.totalUnread
-            // totalUnread is unread-specific; the archived count needs its own
-            // source — the cursor is not it. Use the fetched window count.
-            archivedCount = archived.messages.count < 200 ? archived.messages.count : 200
+            archivedCount = archived.messages.count
         } catch {
             errorBanner = ErrorBanner(severity: .error, title: l10n.loadFailed, detail: error.lagoonUIMessage)
         }
@@ -184,7 +186,7 @@ struct StackMailSheet: View {
     @State private var isSweeping = false
     @State private var errorBanner: ErrorBanner?
     @State private var path: [String] = []
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     private var title: String {
         switch source {
@@ -257,7 +259,7 @@ struct StackMailSheet: View {
                     remoteId: remoteId,
                     accountId: accountId,
                     header: messages.first { $0.remoteId == remoteId },
-                    initiallyPinned: false,
+                    initiallyPinned: messages.first { $0.remoteId == remoteId }?.isPinned ?? false,
                     siblings: messages.map(\.remoteId),
                     onArchived: { id, _ in
                         messages.removeAll { $0.remoteId == id }
@@ -339,7 +341,7 @@ struct StackRuleEditorSheet: View {
     @State private var name: String
     @State private var isCreating = false
     @State private var errorBanner: ErrorBanner?
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     init(
         initialKind: StackRule.Kind,

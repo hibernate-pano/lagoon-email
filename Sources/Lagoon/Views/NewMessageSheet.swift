@@ -20,7 +20,7 @@ struct NewMessageSheet: View {
     @State private var error: String?
     @State private var requestId = UUID().uuidString.lowercased()
     private let draftKey: String
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     /// - Parameters:
     ///   - prefillTo: Recipient to seed the To field with. Empty for a

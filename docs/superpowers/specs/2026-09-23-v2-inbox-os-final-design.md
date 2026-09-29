@@ -1,5 +1,7 @@
 # V2 Final：AI Inbox OS 终态设计（清零版）
 
+> **状态：已归档（superseded）。当前架构见 [README](../../../README.md) 与 [使用说明](../../使用说明.md)。**
+
 **Date:** 2026-09-23
 **Status:** Approved（创始人确认：忽略历史债务与迁移兼容，允许重复造轮子）
 **Audience:** Solo founder + AI co-founder

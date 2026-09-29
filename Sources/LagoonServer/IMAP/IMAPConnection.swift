@@ -11,6 +11,11 @@ import Logging
 public actor IMAPConnection {
     public static let connectTimeout: Duration = .seconds(10)
     public static let defaultReadTimeout: Duration = .seconds(30)
+    /// Ceiling on the bytes a single response may declare across its literals.
+    /// Generous next to a real message (a 25 MB attachment cap exists
+    /// downstream) but finite, so a hostile or broken server cannot talk us
+    /// into an unbounded allocation.
+    static let maxLiteralBytes = 32 * 1024 * 1024
 
     private let transport: any StreamTransport
     private let logger: Logger
@@ -170,7 +175,23 @@ public actor IMAPConnection {
         let transport = self.transport
         var line = try await withReadTimeout(timeout) { try await transport.readLine() }
         var literal: Data?
+        var literalBytes = 0
         while let length = IMAPResponseParser.literalLength(in: line) {
+            // The length is whatever the server printed, and `readExactly`
+            // buffers until it has that many bytes. Without a ceiling here a
+            // single `{4000000000}` turns a hostile or broken server into an
+            // unbounded allocation. The read timeout bounds the *caller*, not
+            // the transport's read pump, so it does not bound this.
+            //
+            // The comparison is written as a subtraction rather than
+            // `literalBytes += length` first: the running total is accumulated
+            // across markers, and a second hostile marker would overflow the
+            // add and trap before the guard ever ran — the very thing the
+            // cap exists to prevent.
+            guard length <= Self.maxLiteralBytes - literalBytes else {
+                throw MailError.protocolError("literal exceeds \(Self.maxLiteralBytes) bytes")
+            }
+            literalBytes += length
             let chunk = try await withReadTimeout(timeout) { try await transport.readExactly(length) }
             if literal == nil {
                 literal = chunk

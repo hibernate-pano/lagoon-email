@@ -1,5 +1,7 @@
 # M1.5 Smoke Notes — QQ 邮箱（IMAP/SMTP）接入
 
+> **状态：已归档（superseded）。当前架构见 [README](../../README.md) 与 [使用说明](../使用说明.md)。**
+
 Date: 2026-09-11 · reliability update: 2026-09-13
 Executor: AI co-founder (autonomous), macOS 26 / Xcode 26.6 / Swift 6.3 / OrbStack Docker
 

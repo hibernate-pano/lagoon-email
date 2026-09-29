@@ -18,14 +18,24 @@ struct BriefingFeedView: View {
     @State private var path: [String] = []
     @State private var scrollProxy: ScrollViewProxy?
     @State private var selectedMessageId: String? = nil
+    /// Stamped by every `refresh()` so a slow poll that started before the
+    /// user archived a row cannot write the server's pre-archive snapshot
+    /// back over the removal. Only the newest generation may commit.
+    @State private var refreshGate = RefreshGate()
     /// False when another surface is showing (RootView keeps both alive).
     /// The poll loop sleeps instead of refreshing, and hidden shortcuts
     /// are disabled by the parent — keep-alive without traffic or hotkeys.
     var isVisible: Bool = true
 
-    private let api = APIClient()
+    private let api = APIClient.shared
     private static let refreshInterval: Duration = .seconds(30)
+    /// Fast cadence while the feed is empty (fresh connect, backfill still
+    /// landing), bounded like the list view's fast poll.
+    private static let emptyPollInterval: Duration = .seconds(3)
+    private static let maxFastEmptyTicks = 20
     @Environment(\.l10n) private var l10n
+    /// Backgrounded windows idle instead of polling — see `sleepForPoll`.
+    @Environment(\.scenePhase) private var scenePhase
 
     /// Same gate as the detail toolbar. Unknown (directory not loaded yet, or a
     /// version-skewed row) reads as allowed: the server is the authority and
@@ -163,11 +173,16 @@ struct BriefingFeedView: View {
     }
 
     private func poll() async {
+        var emptyTicks = 0
         while !Task.isCancelled {
-            do { try await Task.sleep(for: Self.refreshInterval) } catch { return }
+            let fast = items.isEmpty && emptyTicks < Self.maxFastEmptyTicks
+            emptyTicks = items.isEmpty ? emptyTicks + 1 : 0
+            guard await sleepForPoll(
+                fast ? Self.emptyPollInterval : Self.refreshInterval
+            ) else { return }
             // Never reorder the feed underneath an open message. The next
             // refresh happens when the user returns to the feed.
-            if isVisible, path.isEmpty {
+            if path.isEmpty, shouldPoll(isVisible: isVisible, scenePhase: scenePhase) {
                 await refresh()
             }
         }
@@ -196,23 +211,36 @@ struct BriefingFeedView: View {
             }
             .keyboardShortcut("0", modifiers: .command)
             .help(l10n.showRawListHelp)
-            Button {
-                Task { await refresh() }
-            } label: {
-                if isLoading {
-                    HStack(spacing: 4) {
-                        ProgressView().controlSize(.small)
-                        Text(l10n.refresh)
-                    }
-                } else {
-                    Label(l10n.refresh, systemImage: "arrow.clockwise")
-                }
+            // ⌘R is "refresh" on the feed and "reply" on the open message,
+            // and the detail view is a push inside this same stack — so
+            // both bindings are live at once and the wrong one wins.
+            // Attach the shortcut only at the root, the same shape ⌘0 and
+            // ⌘[ already use.
+            if path.isEmpty {
+                refreshControl
+                    .keyboardShortcut("r", modifiers: .command)
+            } else {
+                refreshControl
             }
-            .disabled(isLoading)
-            .keyboardShortcut("r", modifiers: .command)
-            .help(l10n.shortcutRefresh)
         }
         .padding()
+    }
+
+    private var refreshControl: some View {
+        Button {
+            Task { await refresh() }
+        } label: {
+            if isLoading {
+                HStack(spacing: 4) {
+                    ProgressView().controlSize(.small)
+                    Text(l10n.refresh)
+                }
+            } else {
+                Label(l10n.refresh, systemImage: "arrow.clockwise")
+            }
+        }
+        .disabled(isLoading)
+        .help(l10n.shortcutRefresh)
     }
 
     // MARK: - Content
@@ -514,7 +542,7 @@ struct BriefingFeedView: View {
                 onAdvanceTo: { next in path = next.map { [$0] } ?? [] },
 
                 onDelete: { id in
-                    items.removeAll { $0.message.remoteId == id }
+                    dropItem(id)
                     path = []
                 },
 
@@ -572,7 +600,11 @@ struct BriefingFeedView: View {
 
         items[index] = BriefingItem(
 
-            message: withUpdatedRead(item.message, isRead: isRead),
+            // `MessageHeader.withRead` copies every other field. The
+            // hand-rolled constructor this replaced silently dropped
+            // `isPinned` (and the RFC threading headers), so flipping the
+            // read dot on a pinned mail un-pinned it locally.
+            message: item.message.withRead(isRead),
 
             group: item.group, reasonCode: item.reasonCode
 
@@ -582,27 +614,20 @@ struct BriefingFeedView: View {
 
 
 
-    private func withUpdatedRead(_ m: MessageHeader, isRead: Bool) -> MessageHeader {
+    /// The one way a row leaves the feed. Retiring the in-flight poll is
+    /// not optional here: a poll that captured the feed before the archive
+    /// lands afterwards and writes the row straight back.
+    private func dropItem(_ remoteId: String) {
 
-        MessageHeader(
+        refreshGate.invalidate()
 
-            id: m.id, accountId: m.accountId, remoteId: m.remoteId, threadId: m.threadId,
-
-            fromAddress: m.fromAddress, fromName: m.fromName,
-
-            subject: m.subject, snippet: m.snippet,
-
-            receivedAt: m.receivedAt, isRead: isRead, isArchived: m.isArchived
-
-        )
+        items.removeAll { $0.message.remoteId == remoteId }
 
     }
 
-
-
     private func handleArchived(id: String, isArchived: Bool) {
 
-        items.removeAll { $0.message.remoteId == id }
+        dropItem(id)
 
     }
 
@@ -681,6 +706,7 @@ struct BriefingFeedView: View {
     /// toast confirms without offering Undo.
     private func unsubscribeFrom(_ item: BriefingItem) async {
         guard let accountId = accounts.accountId else { return }
+        invalidatePendingRefresh()
         do {
             let response = try await api.unsubscribeMessage(
                 remoteId: item.message.remoteId,
@@ -707,7 +733,7 @@ struct BriefingFeedView: View {
 
 
     private func archiveAndUndo(byId remoteId: String) async {
-
+        invalidatePendingRefresh()
         guard canArchive else {
             errorBanner = ErrorBanner(
                 severity: .error,
@@ -757,21 +783,51 @@ struct BriefingFeedView: View {
 
 
 
+    /// Retire any poll already in flight. Called by every local mutation of
+    /// `items` (archive, unsubscribe, mark-all-read) so a response captured
+    /// before that mutation cannot write the pre-mutation snapshot back over
+    /// it — the row would visibly reappear.
+    private func invalidatePendingRefresh() {
+        refreshGate.invalidate()
+    }
+
     private func refresh() async {
 
         guard let accountId = accounts.accountId else { return }
 
-        guard !isLoading else { return }
+        // `claim` is nil while a refresh is in flight. It used to be a bare
+        // `guard !isLoading else { return }`, which silently discarded the
+        // request: a ⌘Z landing mid-poll left the user looking at a snapshot
+        // taken before the undo until the next 30s tick. The gate remembers
+        // it instead and `finish()` tells us to run again.
+        guard let generation = refreshGate.claim() else { return }
 
         isLoading = true
+
+        // `defer`, not a trailing assignment: the two generation guards below
+        // return early, and without this a single superseded response would
+        // pin `isLoading` true for the life of the view — every later refresh
+        // blocked by the guard above, the refresh button stuck disabled.
+        defer {
+            isLoading = false
+            if refreshGate.finish() {
+                Task { await refresh() }
+            }
+        }
 
         do {
 
             let response = try await api.fetchBriefing(accountId: accountId)
 
+            // A newer refresh started while this one was in flight; its
+            // payload is at least as fresh, so committing this one would
+            // resurrect rows the user has since archived or unsubscribed.
+            guard generation == refreshGate.generation else { return }
+
             items = response.items
             errorBanner = nil
         } catch {
+            guard generation == refreshGate.generation else { return }
             // Spec §6.2: a `.timedOut` from the briefing endpoint (LLM
             // classification can be slow) gets its own copy; everything
             // else falls into the generic retry banner.
@@ -793,9 +849,6 @@ struct BriefingFeedView: View {
                 )
             }
         }
-
-        isLoading = false
-
     }
 
     /// Mark every message in the current briefing as read. Runs the per-row
@@ -805,6 +858,7 @@ struct BriefingFeedView: View {
     /// confirms; the first error surfaces in `errorBanner` and the next
     /// refresh pulls the server's view of truth back.
     private func markAllRead() async {
+        invalidatePendingRefresh()
         guard let accountId = accounts.accountId else { return }
         guard !isMarkingAllRead, !items.isEmpty else { return }
         let unread = items.filter { !$0.message.isRead }
@@ -915,20 +969,3 @@ extension BriefingItem {
     }
 }
 
-extension MessageHeader {
-    fileprivate func withRead(_ isRead: Bool) -> MessageHeader {
-        MessageHeader(
-            id: id,
-            accountId: accountId,
-            remoteId: remoteId,
-            threadId: threadId,
-            fromAddress: fromAddress,
-            fromName: fromName,
-            subject: subject,
-            snippet: snippet,
-            receivedAt: receivedAt,
-            isRead: isRead,
-            isArchived: isArchived
-        )
-    }
-}

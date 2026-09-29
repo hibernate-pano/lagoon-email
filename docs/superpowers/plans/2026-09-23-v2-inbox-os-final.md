@@ -1,5 +1,7 @@
 # V2 Final Implementation Plan（终态重建路线）
 
+> **状态：已归档（superseded）。当前架构见 [README](../../../README.md) 与 [使用说明](../../使用说明.md)。**
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 按终态 SPEC 重建 Lagoon：多活跃并发同步 + Sent/全文索引 + 事件驱动 + API 鉴权 + 单漏斗 UI + AI 动作闭环。允许删约束、允许重复造轮子，不做迁移兼容。

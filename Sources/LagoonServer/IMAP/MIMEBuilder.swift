@@ -40,14 +40,14 @@ public enum MIMEBuilder {
         if !outbound.cc.isEmpty {
             lines.append("Cc: \(addressList(outbound.cc.joined(separator: ", ")))")
         }
-        lines.append("Subject: \(subject)")
+        lines.append("Subject: \(headerSafe(subject))")
         lines.append("Date: \(Self.dateHeader())")
         lines.append("Message-ID: \(messageId)")
         if includeThreading, let inReplyTo = outbound.inReplyTo, !inReplyTo.isEmpty {
-            lines.append("In-Reply-To: \(inReplyTo)")
+            lines.append("In-Reply-To: \(headerSafe(inReplyTo))")
         }
         if includeThreading, let references = outbound.references, !references.isEmpty {
-            lines.append("References: \(references)")
+            lines.append("References: \(headerSafe(references))")
         }
         lines.append("MIME-Version: 1.0")
         lines.append("Content-Type: text/plain; charset=UTF-8")
@@ -83,24 +83,39 @@ public enum MIMEBuilder {
 
     /// `"Name" <addr>` with RFC 2047 for a non-ASCII name, else `<addr>`.
     private static func address(_ email: String, name: String?) -> String {
-        guard let name, !name.isEmpty else { return "<\(email)>" }
+        let address = headerSafe(email)
+        guard let name = name.map(headerSafe), !name.isEmpty else { return "<\(address)>" }
         guard name.allSatisfy(\.isASCII) else {
-            return "=?UTF-8?B?\(Data(name.utf8).base64EncodedString())?= <\(email)>"
+            return "=?UTF-8?B?\(Data(name.utf8).base64EncodedString())?= <\(address)>"
         }
-        return "\"\(name)\" <\(email)>"
+        return "\"\(name)\" <\(address)>"
     }
 
     /// Comma-separated address list → the bracketed form the headers use.
     /// Already-bracketed input passes through unchanged (a caller that
     /// received `Name <a@b>` from a header keeps it verbatim).
     private static func addressList(_ raw: String) -> String {
-        raw.split(separator: ",")
+        headerSafe(raw).split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .map { value in
                 value.contains("<") ? value : "<\(value)>"
             }
             .joined(separator: ", ")
+    }
+
+    /// Every value interpolated above is remote-controlled on at least one
+    /// path: a reply's subject, Message-ID and References are copied out of
+    /// the message being answered, and RFC 2047 decoding there can turn
+    /// `=0D=0A` back into the CRLF that ends a header line. RFC 5322 §2.2.3
+    /// admits no CR, LF or NUL in a field value, so they are dropped here —
+    /// the one place every header of every outgoing message is assembled.
+    /// Folding instead would be wrong: RFC 5322 folds with SP/TAB only, so a
+    /// bare CRLF has to disappear rather than become a legal-looking wrap.
+    private static func headerSafe(_ value: String) -> String {
+        String(value.unicodeScalars.filter { scalar in
+            scalar.value != 0x0A && scalar.value != 0x0D && scalar.value != 0x00
+        })
     }
 
     private static func base64Lines(_ data: Data) -> String {

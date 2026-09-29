@@ -1,6 +1,7 @@
 import Foundation
 
-/// Per-account sync cursor, persisted as `accounts.sync_state` (JSONB).
+/// Per-account sync cursor, persisted as `accounts.sync_state` (TEXT holding
+/// `JSONEncoder` output).
 ///
 /// IMAP uses `uidValidity`/`lastUid`. `archiveFolder` records the resolved
 /// remote archive mailbox name. The `sent*` triple tracks the Sent folder scan

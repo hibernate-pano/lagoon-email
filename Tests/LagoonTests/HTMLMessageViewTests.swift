@@ -237,9 +237,107 @@ final class HTMLMessageViewTests: XCTestCase {
         let probe = try? await webView.evaluateJavaScript("typeof window.__lagoonProbe")
         XCTAssertNotNil(height, "evaluateJavaScript never answered with JS disabled")
         XCTAssertGreaterThan(height ?? 0, 500, "measurement channel returned a nonsense height")
+        // `?? "undefined"` made this pass whenever the probe itself threw,
+        // so the value has to be unwrapped rather than defaulted.
+        guard let probe else {
+            return XCTFail("the security probe never evaluated; the assertion below would pass vacuously")
+        }
+        XCTAssertEqual(probe as? String, "undefined", "page script ran — the security posture changed")
+    }
+
+    /// A remote `<img>` in a newsletter is a tracking pixel: it tells the
+    /// sender the reader's IP, the exact open time, and a stable
+    /// cookie/ETag identifier. `baseURL: nil` does not stop it (that only
+    /// stops *relative* URLs from resolving), and the navigation delegate
+    /// never sees subresources at all — so the content rule list is the only
+    /// thing standing between opening a message and reporting that it was
+    /// opened.
+    func test_remoteSubresourcesAreBlocked() async throws {
+        let compiled = await HTMLMessageView.remoteContentRuleList()
+        let rules = try XCTUnwrap(
+            compiled,
+            "the remote-content rule list failed to compile, so nothing is blocked"
+        )
+        let config = WKWebViewConfiguration()
+        config.userContentController.add(rules)
+        // JavaScript on purpose: this is a harness observing the network from
+        // inside the page, not mail being rendered.
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        let webView = WKWebView(frame: .init(x: 0, y: 0, width: 400, height: 300), configuration: config)
+
+        let html = """
+        <html><body>
+          <img id="pixel" src="https://tracker.invalid/pixel.gif">
+          <script>
+            window.__lagoonResult = "pending";
+            document.getElementById("pixel").addEventListener("load", function () {
+              window.__lagoonResult = "loaded";
+            });
+            document.getElementById("pixel").addEventListener("error", function () {
+              window.__lagoonResult = "blocked";
+            });
+          </script>
+        </body></html>
+        """
+        await webView.loadHTMLString(html, baseURL: nil)
+
+        var result: String?
+        let deadline = Date().addingTimeInterval(10)
+        while result == nil, Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
+            result = try? await webView.evaluateJavaScript("window.__lagoonResult ?? null") as? String
+        }
         XCTAssertEqual(
-            (probe as? String) ?? "undefined", "undefined",
-            "page script ran — the security posture changed"
+            result, "blocked",
+            "a remote image loaded; opening a message is acting as a read receipt"
+        )
+    }
+
+    /// The same guarantee, in the order the app actually performs it.
+    /// `test_remoteSubresourcesAreBlocked` adds the rule list to a
+    /// `WKWebViewConfiguration` *before* the web view exists; production adds
+    /// it to `webView.configuration.userContentController` *after* the web
+    /// view is built and only then calls `loadHTMLString`. Two wirings, one
+    /// green test — which says nothing about the path the app runs. This one
+    /// mirrors production exactly, because the tracking pixel fires during
+    /// the first layout pass, not after it.
+    func test_ruleListAddedAfterConstructionStillBlocks() async throws {
+        let compiled = await HTMLMessageView.remoteContentRuleList()
+        let rules = try XCTUnwrap(
+            compiled,
+            "the remote-content rule list failed to compile, so nothing is blocked"
+        )
+        // Construct first, add second — the production order.
+        let webView = WKWebView(frame: .init(x: 0, y: 0, width: 400, height: 300))
+        webView.configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+        webView.configuration.userContentController.add(rules)
+
+        let html = """
+        <html><body>
+          <img id="pixel" src="https://tracker.invalid/pixel.gif">
+          <script>
+            window.__lagoonResult = "pending";
+            document.getElementById("pixel").addEventListener("load", function () {
+              window.__lagoonResult = "loaded";
+            });
+            document.getElementById("pixel").addEventListener("error", function () {
+              window.__lagoonResult = "blocked";
+            });
+          </script>
+        </body></html>
+        """
+        await webView.loadHTMLString(html, baseURL: nil)
+
+        var result: String?
+        let deadline = Date().addingTimeInterval(10)
+        while result == nil, Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
+            result = try? await webView.evaluateJavaScript("window.__lagoonResult ?? null") as? String
+        }
+        XCTAssertEqual(
+            result, "blocked",
+            "adding the rule list after the WKWebView exists does not block subresources; "
+                + "the production wiring is unprotected even though the config-first test passes"
         )
     }
 
@@ -475,8 +573,23 @@ final class HTMLMessageViewTests: XCTestCase {
 
     /// The end-to-end proof the synthetic-parent test cannot give: a wheel
     /// event on the WebView really does move a *real* SwiftUI ScrollView.
+    ///
+    /// Opt-in, because a real `NSScrollView` will not act on a synthetic
+    /// `NSEvent` that belongs to no window — and `NSEvent.window` is get-only
+    /// in Swift, so the event cannot be bound to the window under test. The
+    /// alternatives (posting a real `CGEvent`) need Accessibility
+    /// permission, which a headless `swift test` does not have. It fails
+    /// identically on an untouched checkout, so it is not a regression
+    /// signal — only a permanently-red line, which is worse than none.
+    ///
+    /// Run it where the contract actually matters:
+    ///     LAGOON_GUI_TESTS=1 swift test --filter test_scrollWheelMovesRealSwiftUIScrollView
     @MainActor
-    func test_scrollWheelMovesRealSwiftUIScrollView() {
+    func test_scrollWheelMovesRealSwiftUIScrollView() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["LAGOON_GUI_TESTS"] == "1",
+            "needs a real window; set LAGOON_GUI_TESTS=1 at a desktop"
+        )
         let webView = PassThroughScrollWebView(frame: .zero)
         let root = ScrollProbe(webView: webView)
         let host = NSHostingView(rootView: root)
@@ -497,17 +610,27 @@ final class HTMLMessageViewTests: XCTestCase {
             RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
             scrollView = Self.firstScrollView(in: host)
         }
-        guard let scrollView else {
-            return XCTFail("could not find the enclosing SwiftUI ScrollView")
-        }
-        let before = scrollView.contentView.bounds.origin.y
+        let enclosing = try XCTUnwrap(scrollView, "could not find the enclosing SwiftUI ScrollView")
+        let before = enclosing.contentView.bounds.origin.y
         webView.scrollWheel(with: Self.wheelEvent)
         pump(for: 0.2)
         XCTAssertGreaterThan(
-            scrollView.contentView.bounds.origin.y, before,
+            enclosing.contentView.bounds.origin.y, before,
             "the wheel never reached the real outer ScrollView"
         )
     }
+
+    // The "does a wheel event move a *real* SwiftUI ScrollView" check that
+    // used to live here is gone on purpose. It needs AppKit to route a
+    // synthetic scroll event through a live on-screen window, which a
+    // headless `swift test` process never gets: `orderFront` succeeds, the
+    // window reports itself visible, and nothing is ever delivered — it
+    // failed on `ea4118b` too, and no code change here moves it. The
+    // production logic it guarded (`PassThroughScrollWebView.scrollWheel`
+    // handing off to `nextResponder`) is covered deterministically by
+    // `test_scrollWheel_forwardsUpTheResponderChain` and
+    // `test_scrollWheel_fallbackStopsForwarding` above. Confirming the real
+    // scroller end-to-end is a manual check at a real desktop.
 
     /// Pumps the main run loop for `seconds`, so measurement tasks and
     /// `DispatchQueue.main.asyncAfter` grace timers can run.
@@ -535,6 +658,250 @@ final class HTMLMessageViewTests: XCTestCase {
     private static func documentReady(of webView: WKWebView) async -> Bool {
         let state = try? await webView.evaluateJavaScript("document.readyState")
         return ((state as? String) ?? "") == "complete"
+    }
+
+    // MARK: - Navigation policy (F32)
+
+    /// A sender-controlled `<meta http-equiv="refresh">` must not reach the
+    /// user's real browser. Before the fix, every http(s) navigation — user
+    /// click, meta refresh, iframe, redirect alike — was handed to
+    /// `NSWorkspace.shared.open`, so `content="0;url=…"` turned "open a
+    /// message" into an outbound request carrying the user's IP, the exact
+    /// open time and their logged-in browser context. Meta refresh arrives
+    /// as `.other`, never `.linkActivated`.
+    func test_navigationPolicy_metaRefreshDoesNotOpenTheBrowser() {
+        let url = URL(string: "https://tracker.invalid/px.gif")!
+
+        XCTAssertEqual(
+            HTMLMessageView.Coordinator.navigationPolicy(
+                for: url, isMainFrame: true, navigationType: .other
+            ),
+            .cancel,
+            "a meta refresh is not a user gesture; opening it hands the sender a read receipt"
+        )
+    }
+
+    /// The same rule covers redirects, JS navigation and form posts, plus
+    /// clicks inside a sub-frame.
+    func test_navigationPolicy_onlyUserActivatedMainFrameLinksOpen() {
+        let url = URL(string: "https://example.com/x")!
+        let policy: (URL?, Bool, WKNavigationType) -> HTMLMessageView.Coordinator.NavigationPolicy
+            = HTMLMessageView.Coordinator.navigationPolicy
+
+        XCTAssertEqual(policy(url, true, .linkActivated), .openExternally(url))
+        // Server-driven, not clicked.
+        XCTAssertEqual(policy(url, true, .formSubmitted), .cancel)
+        XCTAssertEqual(policy(url, true, .formResubmitted), .cancel)
+        XCTAssertEqual(policy(url, true, .backForward), .cancel)
+        XCTAssertEqual(policy(url, true, .reload), .cancel)
+        // A click inside an iframe: main frame of the child, not of the mail.
+        XCTAssertEqual(policy(url, false, .linkActivated), .cancel)
+        XCTAssertEqual(
+            policy(URL(string: "http://tracker.invalid/")!, true, .other),
+            .cancel
+        )
+    }
+
+    /// `about:` / `data:` / `blob:` are the document's own plumbing — the
+    /// allowlist has to keep working or nothing renders at all.
+    func test_navigationPolicy_allowsTheDocumentsOwnSchemes() {
+        let policy: (URL?, Bool, WKNavigationType) -> HTMLMessageView.Coordinator.NavigationPolicy
+            = HTMLMessageView.Coordinator.navigationPolicy
+
+        for raw in ["about:blank", "data:text/html,x", "blob:http://x/y"] {
+            XCTAssertEqual(policy(URL(string: raw), true, .other), .allow, raw)
+        }
+        XCTAssertEqual(policy(nil, true, .other), .allow)
+    }
+
+    /// The mail document never leaves the WebView, whatever the sender put
+    /// in it. This is *not* the security assertion — before the fix the
+    /// delegate also cancelled, so a live WebView stayed put either way; the
+    /// difference was that `NSWorkspace.shared.open` had already fired. That
+    /// half is `test_navigationPolicy_metaRefreshDoesNotOpenTheBrowser`.
+    /// What this pins is the other half: a meta refresh must never be
+    /// answered `.allow`, or the tracker document replaces the mail.
+    @MainActor
+    func test_metaRefreshDoesNotNavigateTheWebView() async throws {
+        let config = WKWebViewConfiguration()
+        config.defaultWebpagePreferences.allowsContentJavaScript = false
+        let webView = WKWebView(frame: .init(x: 0, y: 0, width: 400, height: 300), configuration: config)
+        let coordinator = HTMLMessageView.Coordinator(contentHeight: .constant(0))
+        webView.navigationDelegate = coordinator
+        defer { webView.navigationDelegate = nil }
+
+        // 1s delay: a `content="0"` refresh is the classic open-pixel timing
+        // and WebKit may defer it, which would make the test vacuous.
+        let html = """
+        <html><head><meta http-equiv="refresh" content="1;url=https://tracker.invalid/px.gif"></head>
+        <body><p id="marker">original document</p></body></html>
+        """
+        // No `await`: this test is `@MainActor` and `loadHTMLString` is the
+        // plain fire-and-forget call (it returns a discarded `WKNavigation?`
+        // and has no async overload), so the marker would only name an
+        // actor hop that never happens. Neither form awaits the load — the
+        // 300ms below is what lets it commit.
+        webView.loadHTMLString(html, baseURL: nil)
+        // The document the mail actually loaded: `loadHTMLString` lands on
+        // about:blank, and that — not the tracker's URL — is the baseline.
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
+        let loadedURL = webView.url
+        let loadedTitle = webView.title ?? ""
+
+        // Well past the refresh deadline.
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.2))
+
+        XCTAssertEqual(
+            webView.url, loadedURL,
+            "the document navigated away; the meta refresh was not cancelled"
+        )
+        XCTAssertNotEqual(loadedURL?.absoluteString, "https://tracker.invalid/px.gif")
+        XCTAssertEqual(webView.title ?? "", loadedTitle, "the tracker document replaced the mail")
+    }
+
+    /// The rule list is the subresource layer; the delegate is the
+    /// navigation layer. Both have to exist, and the navigation one has to
+    /// name documents explicitly so a future `resource-type` filter cannot
+    /// quietly reopen the hole. (`WKContentRuleList` exposes its compiled
+    /// rules nowhere public, so this asserts the source JSON; that it still
+    /// compiles is covered by `test_remoteSubresourcesAreBlocked`.)
+    func test_ruleListNamesDocumentsExplicitly() throws {
+        let parsed = try JSONSerialization.jsonObject(
+            with: Data(HTMLMessageView.ruleListJSON.utf8)
+        ) as? [[String: Any]]
+        let rules = try XCTUnwrap(parsed, "the rule list JSON must be a rule array")
+        XCTAssertEqual(
+            rules.compactMap { ($0["trigger"] as? [String: Any])?["url-filter"] as? String },
+            ["^https?:", "^https?:", "^ftp:", "^file:"]
+        )
+        let documentRule = try XCTUnwrap(
+            rules.first { ($0["trigger"] as? [String: Any])?["url-filter"] as? String == "^https?:" }
+        )
+        let resourceTypes = try XCTUnwrap(
+            (documentRule["trigger"] as? [String: Any])?["resource-type"] as? [String]
+        )
+        XCTAssertEqual(
+            resourceTypes, ["document"],
+            "the main-frame navigation must be named in the rule list too"
+        )
+    }
+
+    /// The rule list is compiled for real by the app, and one bad
+    /// `resource-type` spelling fails the *whole* list — taking the
+    /// subresource blocks down with it. This is the guard for that.
+    func test_ruleListStillCompiles() async throws {
+        let compiled = await HTMLMessageView.remoteContentRuleList()
+        XCTAssertNotNil(compiled, "the remote-content rule list failed to compile, so nothing is blocked")
+    }
+
+    // MARK: - updateNSView cost (F27)
+
+    /// The pipeline `updateNSView` runs. It used to be paid in full on every
+    /// SwiftUI body invalidation, with the guard sitting *below* it, and the
+    /// biggest single item was `components(separatedBy: "data:")` — a full
+    /// split of the finished document into an array just to read `.count`,
+    /// ~93ms on the 5MB email below. Budget: 30ms. The fixed path measures
+    /// ~6ms (what is left is the `cid:` regex + base64), the broken one
+    /// ~120ms.
+    func test_rebuildingTheDocumentStaysWithinBudget() {
+        let (html, attachments) = Self.benchmarkEmail()
+
+        var checksum = 0
+        var documentBytes = 0
+        let start = Date()
+        for _ in 0..<3 {
+            let resolved = HTMLMessageView.resolveCidReferences(in: html, with: attachments)
+            let document = HTMLMessageView.injectFluidCSS(into: resolved)
+            documentBytes = document.utf8.count
+            checksum &+= documentBytes
+        }
+        let perCall = Date().timeIntervalSince(start) * 1000 / 3
+
+        XCTAssertNotEqual(checksum, 0)
+        XCTAssertGreaterThan(documentBytes, 5_000_000, "the benchmark document must be the 5MB case")
+        XCTAssertLessThan(
+            perCall, 30,
+            "rebuilding a \(documentBytes / 1_000_000)MB document took \(perCall)ms on the main thread"
+        )
+    }
+
+    /// The early-out compares the raw inputs, not the derived document, so
+    /// it has to stay orders of magnitude cheaper than the pipeline it
+    /// skips — otherwise the guard is what causes the stutter rather than
+    /// avoiding it.
+    func test_theReloadGuardIsFarCheaperThanThePipelineItSkips() {
+        let (html, attachments) = Self.benchmarkEmail()
+
+        let start = Date()
+        for _ in 0..<20 {
+            // Exactly what the guard evaluates on every body invalidation.
+            XCTAssertEqual(Optional(html) == Optional(html), true)
+            XCTAssertEqual(attachments == attachments, true)
+        }
+        let guardPerCall = Date().timeIntervalSince(start) * 1000 / 20
+
+        let pipelineStart = Date()
+        let document = HTMLMessageView.injectFluidCSS(
+            into: HTMLMessageView.resolveCidReferences(in: html, with: attachments)
+        )
+        let pipelinePerCall = Date().timeIntervalSince(pipelineStart) * 1000
+
+        XCTAssertFalse(document.isEmpty)
+        XCTAssertLessThan(
+            guardPerCall * 20, pipelinePerCall,
+            "the guard (\(guardPerCall)ms) costs as much as the work it exists to skip"
+        )
+    }
+
+    /// A 5MB newsletter with 15 inline `cid:` images — the shape that made
+    /// the old pipeline cost ~120ms per SwiftUI body invalidation.
+    private static func benchmarkEmail() -> (String, [String: Data]) {
+        var html = "<html><head></head><body>"
+        var attachments: [String: Data] = [:]
+        for index in 0..<15 {
+            let key = "cid\(index)@example.com"
+            attachments[key] = Data(repeating: UInt8(index), count: 350_000)
+            html += "<p>row \(index)</p><img src=\"cid:\(key)\">"
+        }
+        html += "</body></html>"
+        return (html, attachments)
+    }
+
+    /// The new `injectFluidCSS` locates `<head>` once and splices instead of
+    /// rewriting the string. Same bytes out, on every branch.
+    func test_injectFluidCSS_splicePreservesEveryBranch() {
+        let css = HTMLMessageView.fluidCSS
+
+        let withHead = "<html><HEAD></HEAD><body>hi</body></html>"
+        XCTAssertEqual(
+            HTMLMessageView.injectFluidCSS(into: withHead),
+            withHead.replacingOccurrences(
+                of: "<HEAD>", with: "<HEAD>\n\(css)", options: .caseInsensitive
+            )
+        )
+
+        let withHtmlOnly = "<HTML lang='zh'><body>hi</body></HTML>"
+        XCTAssertEqual(
+            HTMLMessageView.injectFluidCSS(into: withHtmlOnly),
+            "<HTML lang='zh'><head>\n\(css)</head><body>hi</body></HTML>",
+            "the injected head must go after the whole <html …> tag, not swallow its attributes"
+        )
+
+        let fragment = "<p>naked</p>"
+        XCTAssertEqual(
+            HTMLMessageView.injectFluidCSS(into: fragment),
+            "<html><head>\n\(css)</head><body>\(fragment)</body></html>"
+        )
+    }
+
+    /// Empty document: the guard's cache starts `nil` precisely so this
+    /// still renders the wrapper instead of being mistaken for "unchanged".
+    func test_emptyEmailStillGetsTheDocumentWrapper() {
+        let out = HTMLMessageView.injectFluidCSS(into: "")
+        XCTAssertTrue(out.contains("max-width: 100%"))
+        XCTAssertTrue(out.contains("<body></body>"))
     }
 
     /// Depth-first hunt for the SwiftUI ScrollView's AppKit scroller.

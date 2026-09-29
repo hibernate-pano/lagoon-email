@@ -15,12 +15,19 @@ public struct IMAPMailbox: Equatable, Sendable {
 
 /// The state `SELECT` pins down. `uidValidity` identifies the UID space: when
 /// it changes, every stored UID is meaningless and the caller must reset.
+///
+/// RFC 3501 §2.3.1.1 makes a message's identity the triple (mailbox name,
+/// UIDVALIDITY, UID): two folders may legitimately report the same
+/// UIDVALIDITY while numbering their mail independently, so `mailbox` is part
+/// of the identity, not decoration.
 public struct IMAPSelected: Equatable, Sendable {
+    public var mailbox: String
     public var exists: Int
     public var uidValidity: Int64
     public var uidNext: Int64
 
-    public init(exists: Int, uidValidity: Int64, uidNext: Int64) {
+    public init(mailbox: String, exists: Int, uidValidity: Int64, uidNext: Int64) {
+        self.mailbox = mailbox
         self.exists = exists
         self.uidValidity = uidValidity
         self.uidNext = uidNext
@@ -41,19 +48,6 @@ public struct IMAPFetchedHeader: Equatable, Sendable {
         self.flags = flags
         self.internalDate = internalDate
         self.rawHeaders = rawHeaders
-    }
-}
-
-/// A best-effort snippet: the raw first `octets` bytes of the whole message,
-/// headers included, still in whatever transfer encoding the message uses (the
-/// provider decodes it and drops it when it cannot tell what the bytes mean).
-public struct IMAPFetchedText: Equatable, Sendable {
-    public var uid: Int64
-    public var snippet: Data?
-
-    public init(uid: Int64, snippet: Data?) {
-        self.uid = uid
-        self.snippet = snippet
     }
 }
 
@@ -122,7 +116,13 @@ public actor IMAPClient {
 
         do {
             _ = try await connection.execute("AUTHENTICATE PLAIN \(payload)")
-        } catch {
+        } catch let error as MailError {
+            // An explicit credential rejection is already the server's final
+            // verdict. Retrying it over LOGIN would spend a second failed
+            // attempt on exactly the rate-limited or locked accounts that
+            // must not be hammered — QQ folds "wrong code / account abnormal
+            // / service not open / frequency limited / busy" into one message.
+            if case .authFailed = error { throw error }
             logger.debug(
                 "imap.auth.saslFallback",
                 metadata: ["reason": .string(Self.reasonLabel(error))]
@@ -137,6 +137,12 @@ public actor IMAPClient {
                 if case .protocolError("tagged NO") = error { throw MailError.authFailed }
                 throw error
             }
+        } catch {
+            logger.debug(
+                "imap.auth.saslFallback",
+                metadata: ["reason": .string(Self.reasonLabel(error))]
+            )
+            _ = try await connection.execute("LOGIN \(quotedUser) \(quotedSecret)")
         }
         // Credentials are never logged; only the failure category above.
         cachedCapabilities = nil
@@ -172,7 +178,7 @@ public actor IMAPClient {
         let quoted = try Self.quoted(mailbox)
         let responses = try await connection.execute("\(Self.selectVerb) \(quoted)")
 
-        var selected = IMAPSelected(exists: 0, uidValidity: 0, uidNext: 0)
+        var selected = IMAPSelected(mailbox: mailbox, exists: 0, uidValidity: 0, uidNext: 0)
         for response in responses {
             guard case .untagged = response.kind else { continue }
             if response.atoms.count >= 3,
@@ -186,6 +192,14 @@ public actor IMAPClient {
             if let value = Self.number(after: "UIDNEXT", in: response.raw) {
                 selected.uidNext = value
             }
+        }
+        if selected.uidValidity == 0 {
+            // RFC 3501 §2.3.1.1 requires the UIDVALIDITY response code. A
+            // server that omits it leaves every cache keyed on it unable to
+            // tell one rebuild from the next — worth a line in the log.
+            logger.warning("imap.uidValidityMissing", metadata: [
+                "mailbox": .string(mailbox),
+            ])
         }
         return selected
     }
@@ -203,9 +217,10 @@ public actor IMAPClient {
         return Self.parseHeaders(responses)
     }
 
-    /// The same header block for one known UID — how a read-state flip is
-    /// refreshed without re-scanning the mailbox (the store overwrites
-    /// `subject` on conflict, so a flip must carry the real headers).
+    /// The same header block for one known UID. The store protects every
+    /// column a re-fetch could carry except `is_read` (monotonic OR), so this
+    /// single-UID form is for callers that need one message's headers, not for
+    /// bulk work — `fetchHeaders(uids:)` is that.
     public func fetchHeader(
         uid: Int64,
         fields: [String] = IMAPClient.defaultHeaderFields
@@ -215,6 +230,26 @@ public actor IMAPClient {
             "UID FETCH \(uid) (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (\(fieldList))])"
         )
         return Self.parseHeaders(responses)
+    }
+
+    /// The same header block for a known set of UIDs, in commands of at most
+    /// `uidsPerCommand`. The session is strictly serial and one round trip is
+    /// paid per command, so a bulk read (a batch of read-state flips) must not
+    /// ask for one message at a time.
+    public func fetchHeaders(
+        uids: [Int64],
+        fields: [String] = IMAPClient.defaultHeaderFields
+    ) async throws -> [IMAPFetchedHeader] {
+        let fieldList = fields.joined(separator: " ")
+        var headers: [IMAPFetchedHeader] = []
+        for chunk in uids.chunked(into: Self.uidsPerCommand) {
+            let set = chunk.map(String.init).joined(separator: ",")
+            let responses = try await connection.execute(
+                "UID FETCH \(set) (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (\(fieldList))])"
+            )
+            headers.append(contentsOf: Self.parseHeaders(responses))
+        }
+        return headers
     }
 
     /// Flag rescan over a bounded UID window (spec §3.2 step 3) — how the
@@ -264,29 +299,27 @@ public actor IMAPClient {
         return []
     }
 
-    /// How many bytes of a message the list-preview fetch asks for.
-    ///
-    /// This is a *byte* count, not a round-trip count: every message is still
-    /// fetched with exactly one `UID FETCH`, and the number of round trips is
-    /// independent of the window size. On a real 189-message QQ mailbox the
-    /// pull took 26–30 s with both a 256 B and a 32768 B window, i.e. the cost
-    /// is dominated by round-trip latency, so widening the window is nearly
-    /// free in wall-clock terms.
+    /// How many bytes of a message the list-preview fetch asks for. This is a
+    /// *byte* count and has nothing to do with the round-trip count, which is
+    /// `ceil(window / uidsPerCommand)` — see `uidsPerCommand`.
     ///
     /// 32768 is deliberately large. `BODY.PEEK[]<0.N>` starts at byte 0, the
     /// RFC 2822 header block, and a real newsletter's `Received` / `DKIM` /
     /// `ARC` headers alone can run to several KB. A window that ends inside
     /// those headers leaves `splitHeadAndBody` without its blank separator, so
     /// `plainText` returns "" and the list shows no preview: measured against
-    /// the same mailbox, 256 B produced previews for 13/189 messages and
-    /// 4096 B for 67/189, while 32768 B reached 178/189 (94%) with zero
-    /// raw-base64 leaks and zero two-character snippets — both of those were
-    /// just artifacts of the window clipping the top-level `content-type`
-    /// header, not independent decoding bugs.
+    /// the same 189-message mailbox, 256 B produced previews for 13/189
+    /// messages and 4096 B for 67/189, while 32768 B reached 178/189 (94%)
+    /// with zero raw-base64 leaks and zero two-character snippets — both of
+    /// those were just artifacts of the window clipping the top-level
+    /// `content-type` header, not independent decoding bugs.
     ///
     /// The price is at most ~32 KB more per message — a one-off ~16 MB while
-    /// backfilling 500 messages — and, per the measurement above, no extra
-    /// round trips.
+    /// backfilling 500 messages. That is bytes on one already-open connection,
+    /// not extra round trips: one command answers for up to
+    /// `uidsPerCommand` messages, and the literal cap in `IMAPConnection`
+    /// applies per response, so a batched FETCH is still bounded at 32 KB per
+    /// message rather than per command.
     ///
     /// A cheaper fetch would be a small header slice plus the body:
     /// `UID FETCH uid (UID BODY.PEEK[HEADER.FIELDS (CONTENT-TYPE
@@ -296,24 +329,52 @@ public actor IMAPClient {
     /// be concatenated. Fix that framing first; until then keep
     /// `BODY.PEEK[]<0.N>`.
     public static let snippetOctets = 32768
+    /// UIDs per batched preview FETCH. The strictly serial session pays one
+    /// round trip per command, so a 500-message backfill is 5 commands here
+    /// (not one), against 500 for a per-message fetch. The line stays a few
+    /// KB; a server that refuses an over-long line costs one skipped chunk.
+    static let uidsPerCommand = 100
 
-    /// First `octets` bytes of the message — headers included so the MIME
-    /// decoder can tell what the body is — still transfer-encoded.
-    public func fetchTextSnippet(
-        uid: Int64,
+    /// Text-prefix bytes for the given UIDs, keyed by UID: the first `octets`
+    /// bytes of each message — headers included so the MIME decoder can tell
+    /// what the body is — still transfer-encoded.
+    ///
+    /// One command per ≤`uidsPerCommand` UIDs instead of one command per
+    /// message: on the strictly serial session a backfill of N messages would
+    /// otherwise pay N round trips just for previews. The prefix carries the
+    /// RFC 822 headers on purpose — the snippet extractor needs the MIME
+    /// metadata to decode transfer-encoded bodies.
+    public func fetchTextSnippets(
+        uids: [Int64],
         octets: Int = IMAPClient.snippetOctets
-    ) async throws -> [IMAPFetchedText] {
-        let responses = try await connection.execute(
-            "UID FETCH \(uid) (UID BODY.PEEK[]<0.\(octets)>)"
-        )
-
-        var snippets: [IMAPFetchedText] = []
-        for response in responses {
-            guard case .untagged = response.kind,
-                  let literal = response.literal,
-                  let items = IMAPResponseParser.parenthesized(response.raw),
-                  let fetchedUid = Self.numberValue(after: "UID", in: items) else { continue }
-            snippets.append(IMAPFetchedText(uid: fetchedUid, snippet: literal))
+    ) async throws -> [Int64: Data] {
+        var snippets: [Int64: Data] = [:]
+        for chunk in uids.chunked(into: Self.uidsPerCommand) {
+            let set = chunk.map(String.init).joined(separator: ",")
+            do {
+                let responses = try await connection.execute(
+                    "UID FETCH \(set) (UID BODY.PEEK[]<0.\(octets)>)"
+                )
+                for response in responses {
+                    guard case .untagged = response.kind,
+                          let literal = response.literal,
+                          let items = IMAPResponseParser.parenthesized(response.raw),
+                          let fetchedUid = Self.numberValue(after: "UID", in: items) else { continue }
+                    snippets[fetchedUid] = literal
+                }
+            } catch where Self.isMessageVerdict(error) {
+                // A refused chunk costs its own previews, not the ones already
+                // collected: the cursor is about to move past these messages,
+                // so dropping the whole window here would blank every preview
+                // in it for good. The session is still aligned (a tagged
+                // completion terminates the command's responses), so the next
+                // chunk may go out. A transport failure is deliberately not
+                // caught here — it travels on and tears the session down.
+                logger.debug("imap.snippetChunkSkipped", metadata: [
+                    "label": .string((error as? MailError)?.logLabel ?? "\(type(of: error))"),
+                    "uids": .string("\(chunk.count)"),
+                ])
+            }
         }
         return snippets
     }
@@ -379,7 +440,34 @@ public actor IMAPClient {
         await connection.close()
     }
 
+    /// Close without the LOGOUT courtesy round trip. Used when the session is
+    /// already presumed dead: `execute` would otherwise block for the full
+    /// read timeout waiting for a reply that is never coming, and every
+    /// abandoned session would hold its socket — and the transport's read pump,
+    /// which retains the transport — for that whole window.
+    public func disconnect() async {
+        cachedCapabilities = nil
+        await connection.close()
+    }
+
     // MARK: - Wire helpers
+
+    /// Whether `error` is the server's verdict about the command (or about the
+    /// mail it addressed) rather than about the socket. RFC 3501 §7.1 puts
+    /// every untagged response of a command *before* that command's tagged
+    /// completion, so a tagged NO/BAD consumes the whole response set: nothing
+    /// is left on the wire and the next command still sees its own tag. A
+    /// transport failure is the opposite — the socket is gone, and the caller
+    /// must stop issuing commands on it.
+    static func isMessageVerdict(_ error: Error) -> Bool {
+        guard let mail = error as? MailError else { return false }
+        switch mail {
+        case .protocolError, .messageGone, .archiveUnavailable, .trashUnavailable:
+            return true
+        case .authFailed, .unreachable, .notConfigured:
+            return false
+        }
+    }
 
     /// RFC 3501 quoted-string. Control characters are refused rather than
     /// escaped: a value that can end the line can also inject a command.
@@ -545,5 +633,23 @@ public actor IMAPClient {
     /// AUTHENTICATE carries credentials.
     private static func reasonLabel(_ error: Error) -> String {
         (error as? MailError)?.logLabel ?? "transport"
+    }
+}
+
+/// Fixed-size chunks, last one possibly smaller.
+extension Sequence {
+    func chunked(into size: Int) -> [[Element]] {
+        precondition(size > 0, "chunk size must be positive")
+        var chunks: [[Element]] = []
+        var current: [Element] = []
+        for element in self {
+            current.append(element)
+            if current.count == size {
+                chunks.append(current)
+                current = []
+            }
+        }
+        if !current.isEmpty { chunks.append(current) }
+        return chunks
     }
 }

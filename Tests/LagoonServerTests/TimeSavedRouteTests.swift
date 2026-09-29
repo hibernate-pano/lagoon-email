@@ -64,7 +64,7 @@ final class TimeSavedRouteTests: XCTestCase {
         try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
             try await AccountStore.upsert(account, credentials: Data([1, 2, 3]), db: conn)
 
-            let archivedA = try await AIActionStore.record(
+            _ = try await AIActionStore.record(
                 accountId: account.id, kind: .archive,
                 payload: ["remoteId": "a-\(UUID())"], db: conn
             )

@@ -7,6 +7,8 @@ import LagoonKit
 /// sheet. Surfaces global shortcuts and a usage indicator.
 struct RootView: View {
     @EnvironmentObject private var accounts: AccountStore
+    /// Backgrounded windows idle instead of polling — see `sleepForPoll`.
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var directory = DirectoryStore()
     @StateObject private var errorCenter = ErrorCenter.shared
     @StateObject private var undo = UndoController()
@@ -29,10 +31,16 @@ struct RootView: View {
     /// `directory.refresh()` so a fresh poll is allowed to re-surface the
     /// banner if the underlying state is still bad.
     @State private var syncHealthDismissed = false
+    /// Same contract for the load-error banner: the poll that fills
+    /// `directory.loadError` is the only thing that can clear it, and the ✕
+    /// has to work without waiting 30s for that poll.
+    @State private var loadErrorDismissed = false
+    /// …and for the AI-status banner, whose source is polled the same way.
+    @State private var aiStatusDismissed = false
     /// The health state at the moment of the last `directory.refresh()`;
     /// any transition into `.ok` fires a transient "Sync recovered" banner.
     @State private var lastObservedHealth: SyncHealth.Status?
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     enum Surface: String, CaseIterable, Identifiable {
         case briefing
@@ -192,14 +200,20 @@ struct RootView: View {
         // The directory is the account list + health source; poll it while the
         // window is open (the server writes health from its sync loop).
         .task {
+            // Immediate first pass. The directory is the only source of the
+            // account list, sync health, AI status and load error, so sleeping
+            // before the first refresh would leave the whole window empty for
+            // 30s on every launch.
+            await directory.refresh()
             while !Task.isCancelled {
+                guard await sleepForPoll(DirectoryStore.refreshInterval) else { return }
+                guard shouldPoll(isVisible: true, scenePhase: scenePhase) else { continue }
                 await directory.refresh()
+                // A dismissal only lasts until the next poll: if the
+                // underlying state is still bad, the banner comes back.
                 syncHealthDismissed = false
-                do {
-                    try await Task.sleep(for: DirectoryStore.refreshInterval)
-                } catch {
-                    return
-                }
+                loadErrorDismissed = false
+                aiStatusDismissed = false
             }
         }
         .onChange(of: directory.active?.syncHealth.status) { old, new in
@@ -268,31 +282,48 @@ struct RootView: View {
 
     // MARK: - Priority banner chain
 
-    /// First non-nil `ErrorBanner` wins. Six local sources (`undoError`,
-    /// sync health, load error) plus the global `errorCenter.banner` race
-    /// against each other; this keeps the highest-priority local banner
-    /// visible above the global one.
+    /// First non-nil `ErrorBanner` wins. Four local sources (`undoError`,
+    /// sync health, AI status, load error) race against each other; this
+    /// keeps the highest-priority local banner visible above the global one.
+    ///
+    /// The global `errorCenter.banner` is deliberately absent: it is already
+    /// rendered by the `.noticeBanner($errorCenter.banner)` modifier on the
+    /// same stack, so returning it here drew the same banner twice.
     private var priorityBanner: ErrorBanner? {
         if let banner = undoErrorBanner { return banner }
         if let banner = syncHealthBanner { return banner }
         if let banner = aiStatusBanner { return banner }
-        if let banner = loadErrorBanner { return banner }
-        return errorCenter.banner
+        return loadErrorBanner
     }
 
     private func dismissPriorityBanner(_ banner: ErrorBanner) {
-        // The undo and sync-health sources own their own dismissal. The
-        // global one dismisses through ErrorCenter. The load-error banner
-        // is recomputed on the next directory poll, so dismissing is
-        // implicitly "until next poll".
-        if banner.id == undoErrorBanner?.id {
+        // `ErrorBanner` mints a fresh `UUID` in its own initializer, so every
+        // re-read of a source below returns a *different* instance and `id`
+        // can never match the one the body rendered. The title is the stable
+        // identity: it is the server error text for undo/load and the copy
+        // for sync health, so an unchanged title means the same banner.
+        //
+        // The global `errorCenter.banner` is absent by design — the
+        // `.noticeBanner` modifier owns its own ✕. A banner that matches no
+        // source here was drawn by that modifier, so there is nothing to
+        // dismiss.
+        //
+        // Every branch is a polled source, so dismissing is implicitly "until
+        // the next poll". The AI branch was missing entirely, which made the
+        // ✕ a dead control: it renders with no `actionLabel`, so on the
+        // circuit-open banner that ✕ was the *only* thing to click, and
+        // `directory.aiStatus` keeps its last value when a poll fails, so it
+        // never went away on its own either.
+        if undoErrorBanner?.title == banner.title {
             undo.clearError()
-        } else if banner.id == syncHealthBanner?.id {
+        } else if syncHealthBanner?.title == banner.title {
             syncHealthDismissed = true
-        } else if banner.id == loadErrorBanner?.id {
-            syncHealthDismissed = true
-        } else {
-            errorCenter.dismiss()
+        } else if aiStatusBanner?.title == banner.title {
+            aiStatusDismissed = true
+        } else if loadErrorBanner?.title == banner.title {
+            // This used to set `syncHealthDismissed`, which silenced the
+            // *sync-health* banner and left the load error on screen.
+            loadErrorDismissed = true
         }
     }
 
@@ -310,8 +341,8 @@ struct RootView: View {
         // Mirror what the old RootView did: only show if the directory
         // poll actually failed. `directory.loadError` is set/cleared by
         // `DirectoryStore.refresh()` so a successful poll also clears this
-        // banner for free.
-        guard let lastError = directory.loadError else { return nil }
+        // banner for free; the ✕ clears it without waiting for that poll.
+        guard !loadErrorDismissed, let lastError = directory.loadError else { return nil }
         return ErrorBanner(
             severity: .error,
             title: lastError,
@@ -359,6 +390,7 @@ struct RootView: View {
     /// circuit-open recovers on its own. Retry re-polls the status; the
     /// credit flag itself clears on the next successful AI call after top-up.
     private var aiStatusBanner: ErrorBanner? {
+        guard !aiStatusDismissed else { return nil }
         guard let status = directory.aiStatus, status.configured else { return nil }
         if status.creditExhausted {
             return ErrorBanner(

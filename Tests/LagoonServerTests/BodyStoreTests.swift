@@ -235,6 +235,51 @@ final class BodyStoreTests: XCTestCase {
         }
     }
 
+    /// A body for a message with no `message_headers` row — the client opened
+    /// one the sync loop never listed, or has since reconciled away. The
+    /// `message_bodies` foreign key makes that write-through impossible, and
+    /// the failure used to escape as SQLite's `SQLITE_CONSTRAINT_FOREIGNKEY`
+    /// under the generic `body.persistFailed` label, i.e. an intermittent disk
+    /// fault rather than "this mail has no local row". The cause is now named,
+    /// and the read the user asked for still succeeds.
+    func test_bodyRoute_withoutHeaderRow_servesBodyAndNamesTheMissingHeader() async throws {
+        let account = makeAccount()
+        try await TestDatabase.withConnection(cleanup: cleanup(account)) { conn in
+            try await seed(account, db: conn)
+            // Deliberately no MessageStore.upsert: the header row is the thing
+            // under test.
+            let provider = RecipientBodyProvider()
+            let router = Router<BasicRequestContext>()
+            MessageRoutes.register(
+                on: router, db: conn,
+                logger: Self.logger, makeProvider: { _ in provider }
+            )
+            let app = Application(router: router)
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/no-header/body?accountId=\(account.id.uuidString)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertTrue(String(buffer: response.body).contains("stored text"))
+                }
+            }
+
+            let thrown = await XCTAssertThrowsErrorAsync {
+                try await BodyStore.put(
+                    accountId: account.id, remoteId: "no-header",
+                    body: body(text: "x"), db: conn
+                )
+            }
+            XCTAssertTrue(
+                thrown is BodyStoreError,
+                "a missing parent row must be reported as BodyStoreError, not as an SQLite constraint fault (got \(String(describing: thrown)))"
+            )
+            let stored = try await BodyStore.get(accountId: account.id, remoteId: "no-header", db: conn)
+            XCTAssertNil(stored, "a body with no header row must not be written")
+        }
+    }
+
     /// The body route serves the stored parse on the second GET even when the
     /// provider is gone — the write-through lock.
     func test_bodyRoute_servesStoredParseWhenProviderGone() async throws {

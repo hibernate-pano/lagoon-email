@@ -130,6 +130,14 @@ public final class APIClient: Sendable {
         }
     }
 
+    /// The app-wide client. A `private let api = APIClient()` stored on a
+    /// `View` re-runs its default initializer every time the parent
+    /// re-renders the struct, so each render built a fresh `URLSession` —
+    /// and a session that is immediately discarded strands its connections
+    /// instead of draining them. Views must read this instead; the
+    /// `init(baseURL:session:)` seam above stays for tests.
+    public static let shared = APIClient()
+
     /// `sender` narrows to one exact `from_address` (发件人归集); nil keeps
     /// the unfiltered recent list. `archived = true` serves the 档案柜;
     /// `stackId` narrows to one user-defined 聚合规则.
@@ -213,8 +221,10 @@ public final class APIClient: Sendable {
         request.timeoutInterval = APITimeout.interactive.seconds
         // The attachment endpoint streams bytes — the `send` helper validates
         // 2xx and throws on non-2xx, but we want the raw Data and headers
-        // back here, so bypass validation and handle non-2xx directly.
-        let (data, resp) = try await session.data(for: request)
+        // back here, so bypass validation and handle non-2xx directly. The
+        // bearer token still has to be stamped: this route lives behind the
+        // same auth middleware as everything else under /api/.
+        let (data, resp) = try await session.data(for: Self.authenticated(request))
         guard let http = resp as? HTTPURLResponse else {
             throw APIError.invalidResponse
         }
@@ -754,10 +764,7 @@ public final class APIClient: Sendable {
     /// to the retry layer. Callers therefore receive the validated
     /// (Data, URLResponse) and skip their own `validate(...)` call.
     private func send(_ request: URLRequest, timeout: APITimeout) async throws -> (Data, URLResponse) {
-        var request = request
-        if let token = Self.apiToken, !token.isEmpty {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        let request = Self.authenticated(request)
         let attempt: () async throws -> (Data, URLResponse) = {
             let (data, resp) = try await self.session.data(for: request)
             try Self.validate(resp, data: data)
@@ -769,6 +776,23 @@ public final class APIClient: Sendable {
             guard timeout == .fast, Self.shouldAutoRetry(error) else { throw error }
             return try await attempt()
         }
+    }
+
+    /// Stamps the per-install bearer token on a request.
+    ///
+    /// Every path that reaches the network goes through here, and it is a
+    /// separate function precisely so that stays true: `send` covers the
+    /// ~30 methods that use it, and `downloadAttachment` — which has to skip
+    /// `send`'s status validation to keep the raw headers — uses this one.
+    /// When the attachment download carried no token, every attachment
+    /// 401'd in the shipping app (the embedded server always has a token)
+    /// and HTML `cid:` inline images silently broke.
+    static func authenticated(_ request: URLRequest) -> URLRequest {
+        var request = request
+        if let token = apiToken, !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return request
     }
 
     private static func shouldAutoRetry(_ error: Error) -> Bool {

@@ -40,11 +40,6 @@ public enum AccessTokenCipher {
         return text
     }
 
-    /// Validate the configured key without touching any data. Called at startup.
-    public static func validateKey() throws {
-        _ = try loadKey()
-    }
-
     private static func loadKey() throws -> SymmetricKey {
         if let keyProvider {
             return try keyProvider()

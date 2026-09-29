@@ -102,7 +102,7 @@ public enum MessageRoutes {
         makeProvider: MailProviderFactory.Builder? = nil
     ) {
         let makeProvider = makeProvider
-            ?? MailProviderFactory.factory(db: db, logger: logger)
+            ?? MailProviderFactory.factory(db: db, logger: logger).builder
 
         // GET /api/messages/{remoteId}/body?accountId=<uuid>
         // 200 MessageBody | 400 malformed | 404 unknown | 410 message-gone
@@ -210,6 +210,11 @@ public enum MessageRoutes {
                 account: account,
                 remoteId: remoteId,
                 provider: provider,
+                // Best-effort: an unsynced row just falls back to a generic
+                // name. One local read, no second round trip to the server.
+                subject: try? await MessageStore.find(
+                    remoteId: remoteId, accountId: account.id, db: db
+                )?.subject,
                 logger: logger
             )
         }
@@ -784,11 +789,20 @@ public enum MessageRoutes {
         do {
             let fetched = try await provider.fetchBody(remoteId: remoteId)
             // Best-effort persist: a store failure must not fail the read
-            // the user is looking at.
+            // the user is looking at. "No header row" is not a store failure
+            // — `message_bodies` has a foreign key into `message_headers`, and
+            // the client can open a message the sync loop never listed (or has
+            // since reconciled away). Such a body is simply not cacheable, and
+            // saying so keeps the real write faults readable in the log.
             do {
                 try await BodyStore.put(
                     accountId: account.id, remoteId: remoteId, body: fetched, db: db
                 )
+            } catch BodyStoreError.headerMissing {
+                logger.info("body.persistSkipped", metadata: [
+                    "remoteId": .string(remoteId),
+                    "reason": .string("no-header-row"),
+                ])
             } catch {
                 logger.warning("body.persistFailed", metadata: [
                     "remoteId": .string(remoteId),
@@ -847,10 +861,16 @@ public enum MessageRoutes {
                 .replacingOccurrences(of: "\r", with: "")
                 .replacingOccurrences(of: "\n", with: "")
             if let safeName, !safeName.isEmpty {
+                // RFC 6266: `filename` is what a client that does not
+                // understand `filename*` shows, so it carries the name
+                // itself; `filename*` carries the same name percent-encoded
+                // exactly once. Putting the encoded form in both made the
+                // save dialog offer `%E6%8A%A5…` as the file name.
                 let encoded = safeName.addingPercentEncoding(
                     withAllowedCharacters: .urlPathAllowed
                 ) ?? safeName
-                response.headers[.contentDisposition] = "attachment; filename=\"\(encoded)\"; filename*=UTF-8''\(encoded)"
+                response.headers[.contentDisposition] =
+                    "attachment; filename=\"\(safeName)\"; filename*=UTF-8''\(encoded)"
             } else {
                 response.headers[.contentDisposition] = "attachment"
             }
@@ -885,18 +905,15 @@ public enum MessageRoutes {
         account: Account,
         remoteId: String,
         provider: any MailProvider,
+        subject: String?,
         logger: Logger
     ) async -> Response {
         do {
             let raw = try await provider.fetchRawMessage(remoteId: remoteId)
             var response = Response(status: .ok)
             response.headers[.contentType] = "message/rfc822"
-            let subject = "?";
-            let safeName = subject
-                .replacingOccurrences(of: "\"", with: "")
-                .replacingOccurrences(of: "\r", with: "")
-                .replacingOccurrences(of: "\n", with: "")
-            response.headers[.contentDisposition] = "attachment; filename=\"\(safeName).eml\""
+            response.headers[.contentDisposition] =
+                "attachment; filename=\"\(rawMessageFilename(subject: subject))\""
             response.headers[.contentLength] = String(raw.count)
             response.body = .init(byteBuffer: ByteBuffer(bytes: raw))
             return response
@@ -909,6 +926,25 @@ public enum MessageRoutes {
             ])
             return RouteJSON.error(.badGateway, "provider-unreachable")
         }
+    }
+
+    /// Download name for the raw message. The subject is attacker-supplied
+    /// text going straight into a `Content-Disposition` header, so quotes and
+    /// CR/LF are stripped rather than escaped — a header split here would let
+    /// a message name its own response headers. Falls back to a neutral name
+    /// when the row is unsynced or the subject is empty.
+    static func rawMessageFilename(subject: String?) -> String {
+        let cleaned = (subject ?? "")
+            .replacingOccurrences(of: "\"", with: "")
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // `/` and `\` would turn the name into a path the user did not choose.
+        let safe = cleaned
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: "\\", with: "-")
+        let capped = String(safe.prefix(80))
+        return capped.isEmpty ? "message.eml" : "\(capped).eml"
     }
 
     /// Map a provider failure onto the route-level status. Only the stable
@@ -944,7 +980,14 @@ public enum MessageRoutes {
 }
 
 private extension String {
+    /// Judged on UTF-8 bytes, not on `Character`s. Swift treats CRLF as a
+    /// single extended grapheme cluster, so `contains("\r")` and
+    /// `contains("\n")` are both false for `"\r\n"` — the exact sequence a
+    /// header injection is made of, and the only one these two checks were
+    /// there to catch. Bare CR and bare LF are single clusters and were caught
+    /// by accident.
     var containsHeaderInjection: Bool {
-        contains("\r") || contains("\n") || contains("\0")
+        let bytes = utf8
+        return bytes.contains(0x0D) || bytes.contains(0x0A) || bytes.contains(0x00)
     }
 }

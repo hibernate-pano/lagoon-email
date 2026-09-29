@@ -18,7 +18,7 @@ public enum DraftRoutes {
         makeProvider: MailProviderFactory.Builder? = nil
     ) {
         let makeProvider = makeProvider
-            ?? MailProviderFactory.factory(db: db, logger: logger)
+            ?? MailProviderFactory.factory(db: db, logger: logger).builder
 
         router.post("api/messages/:remoteId/draft") { request, context -> Response in
             return await generateHandler(
@@ -166,7 +166,7 @@ public enum DraftRoutes {
         }
 
         do {
-            try await db.write {
+            try db.write {
                 try $0.execute(
                     sql: "UPDATE draft_replies SET chosen_variant = ? WHERE id = ?",
                     arguments: [req.variant, draftId]
@@ -204,7 +204,7 @@ public enum DraftRoutes {
     }
 
     private static func findDraft(id: Int64, db: LagoonDB) async throws -> DraftReply? {
-        return try await db.read { db in
+        return try db.read { db in
             try Row.fetchOne(
                 db,
                 sql: "SELECT id, account_id, remote_id, variants, chosen_variant, created_at FROM draft_replies WHERE id = ?",
@@ -233,11 +233,7 @@ public enum DraftRoutes {
     }
 
     private static func collectBody(_ request: Request) async throws -> Data {
-        var bytes: [UInt8] = []
-        for try await chunk in request.body {
-            bytes.append(contentsOf: Array(buffer: chunk))
-        }
-        return Data(bytes)
+        try await RouteParams.collectBody(request)
     }
 
     private static func errorResponse(
@@ -321,7 +317,7 @@ public enum SearchRoutes {
             arguments.append(since)
         }
         sql += "\n            ORDER BY m.received_at DESC\n            LIMIT 100"
-        return try await db.read { db in
+        return try db.read { db in
             try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
                 .map { try MessageStore.decode($0) }
         }

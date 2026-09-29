@@ -27,11 +27,18 @@ actor ScriptedTransport: StreamTransport {
 
     private var script: [Event]
     private let closeAfterScript: Bool
+    /// One-shot error for the next read the script cannot serve, cleared
+    /// afterwards. Models a socket that fails once and then works again, so
+    /// the reconnect that follows the failure can be scripted.
+    private var pendingReadFailure: Error?
 
     private(set) var writes: [Data] = []
     private(set) var connectedHost: String?
     private(set) var connectedPort: Int?
-    private var isClosed = false
+    private(set) var isClosed = false
+    /// How many times the client closed this transport — the only externally
+    /// visible proof that a session was actually torn down.
+    private(set) var closeCount = 0
 
     init(closeAfterScript: Bool = true) {
         self.script = []
@@ -48,6 +55,11 @@ actor ScriptedTransport: StreamTransport {
 
     func enqueueLiteral(_ data: Data) {
         script.append(.literal(data))
+    }
+
+    /// Make the next unserved read fail with `error`, once.
+    func failNextRead(with error: Error) {
+        pendingReadFailure = error
     }
 
     // MARK: - StreamTransport
@@ -105,6 +117,7 @@ actor ScriptedTransport: StreamTransport {
 
     func close() async {
         isClosed = true
+        closeCount += 1
     }
 
     /// Blocks until the script head can be delivered, the transport is closed,
@@ -112,6 +125,10 @@ actor ScriptedTransport: StreamTransport {
     /// Polling keeps this double free of continuation bookkeeping while staying
     /// cancellation-safe.
     private func waitForMore() async throws {
+        if let failure = pendingReadFailure {
+            pendingReadFailure = nil
+            throw failure
+        }
         while true {
             if isHeadDeliverable { return }
             if isClosed { throw StreamTransportError.closed }

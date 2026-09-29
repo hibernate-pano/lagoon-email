@@ -159,6 +159,37 @@ final class NIOSSLStreamTransportConcurrencyTests: XCTestCase {
         let line = try await transport.readLine()
         XCTAssertEqual(line, "PARTIALTAIL")
     }
+
+    /// A transport that is simply dropped — rebuilt in place, an account
+    /// deleted, a connect that failed — must not keep the socket. The read
+    /// pump spends its life parked inside `next()`, so while the pump held the
+    /// transport the TLS session and its file descriptor stayed alive until
+    /// the process exited, and QQ counts every one of those against the
+    /// per-account session limit.
+    func test_droppedTransport_hangsUpTheSocket() async throws {
+        let server = try await ScriptedTLSServer(script: [
+            (.milliseconds(0), "HELLO\r\n"),
+        ])
+        defer { Task { await server.shutdown() } }
+
+        try await connectAndDrop(server: server)
+
+        for _ in 0..<100 {
+            if server.closedChildren > 0 { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let closed = server.closedChildren
+        XCTAssertEqual(closed, 1, "the dropped transport must close its connection")
+    }
+
+    /// Connect, read one line, then return — so the transport is released
+    /// with its read pump parked and without anyone calling `close()`.
+    private func connectAndDrop(server: ScriptedTLSServer) async throws {
+        let transport = server.makeClientTransport()
+        try await transport.connect(host: "localhost", port: server.port)
+        let hello = try await transport.readLine()
+        XCTAssertEqual(hello, "HELLO")
+    }
 }
 
 // MARK: - Scripted TLS server
@@ -198,6 +229,9 @@ private final class ScriptedTLSServer: @unchecked Sendable {
         listener = channel
         port = Int(listener.localAddress!.port!)
     }
+
+    /// Child connections the client has hung up on.
+    var closedChildren: Int { self.tracker.closedChildren }
 
     func makeClientTransport() -> NIOSSLStreamTransport {
         NIOSSLStreamTransport(allowedPorts: [port], trustRoots: .certificates(certificates))
@@ -243,6 +277,18 @@ private final class ScriptedTLSServer: @unchecked Sendable {
 private final class ChildTracker: @unchecked Sendable {
     private let lock = NSLock()
     private var channels: [Channel] = []
+    /// Connections the client hung up on — the only proof, from the server's
+    /// side, that a dropped transport really returned its socket.
+    private var hangsUp = 0
+
+    var closedChildren: Int {
+        lock.lock(); defer { lock.unlock() }
+        return hangsUp
+    }
+
+    func recordHangUp() {
+        lock.lock(); hangsUp += 1; lock.unlock()
+    }
 
     func add(_ channel: Channel) {
         lock.lock(); channels.append(channel); lock.unlock()
@@ -275,7 +321,9 @@ private final class ScriptHandler: ChannelInboundHandler, @unchecked Sendable {
     }
 
     func channelActive(context: ChannelHandlerContext) {
+        let tracker = self.tracker
         tracker.add(context.channel)
+        context.channel.closeFuture.whenComplete { _ in tracker.recordHangUp() }
         let channel = context.channel
         let script = self.script
         Task {

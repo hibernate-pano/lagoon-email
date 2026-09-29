@@ -4,12 +4,12 @@ import XCTest
 import Hummingbird
 import HummingbirdTesting
 import NIOCore
-import PostgresNIO
 @testable import LagoonServer
 @testable import LagoonKit
 
-/// End-to-end route tests. The /// `GET /api/accounts` and M1 `/api/briefing` + `/api/messages/*` tests use a
-/// guarded test-DB connection injected into the router.
+/// End-to-end route tests. `GET /api/accounts` and the M1 `/api/briefing` +
+/// `/api/messages/*` tests run against a per-test hermetic SQLite store
+/// (TestDatabase.withConnection), which is injected into the router.
 final class RouteTests: XCTestCase {
     override func tearDown() {
         URLProtocolStub.reset()
@@ -17,12 +17,11 @@ final class RouteTests: XCTestCase {
     }
     func test_getAccounts_emptyTestDatabase_returnsEmptyJSONArray() async throws {
         try await TestDatabase.withConnection { conn in
-            // The shared lagoon_test DB is only empty if prior tests cleaned up
-            // after themselves; if not, skip rather than weaken the assertion.
+            // A fresh temp-file store per test: the account table starts
+            // empty by construction, so the empty-array assertion below
+            // can be asserted outright rather than skipped.
             let existing = try await AccountStore.all(db: conn)
-            guard existing.isEmpty else {
-                throw XCTSkip("test DB has \(existing.count) leftover account row(s); empty-array assertion skipped")
-            }
+            XCTAssertTrue(existing.isEmpty)
 
             let router = Router()
             AccountsRoutes.register(
@@ -592,6 +591,143 @@ final class RouteTests: XCTestCase {
         }
     }
 
+    /// The data-loss window of a sweep. `reconcileInbox` deletes every
+    /// `is_archived = FALSE` row the provider no longer lists, and the remote
+    /// MOVE is exactly what makes it stop listing one — so a sweep that moved
+    /// first and flagged second left a window in which the sync loop deleted
+    /// the row, and `message_bodies` with it (ON DELETE CASCADE), for a mail
+    /// the user had just swept. The flag is committed before the remote call
+    /// now, so the row is out of the delete predicate for the whole await.
+    func test_archiveBulk_reconcileDuringRemoteMoveKeepsTheHeaderAndItsBody() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(
+                Account(
+                    id: account.id, provider: .qq, oauthUser: account.oauthUser,
+                    email: account.email, credentials: Data([1, 2, 3]),
+                    capabilities: MailCapabilities(
+                        archiveFolder: true, idle: true, move: true, serverSnippet: true
+                    ),
+                    isActive: false
+                ),
+                db: conn
+            )
+            let remoteId = "sweep-\(UUID().uuidString)"
+            try await MessageStore.upsert(
+                makeHeader(accountId: account.id, remoteId: remoteId, from: "a@x.com"), db: conn
+            )
+            try await BodyStore.put(
+                accountId: account.id, remoteId: remoteId,
+                body: FetchedBody(text: "the only copy", html: nil, attachments: [], hasMore: false),
+                db: conn
+            )
+
+            let gate = RaceGate()
+            let provider = StubMailProvider()
+            await provider.setArchiveGate(gate)
+            let app = Application(router: makeStackRouter(db: conn, makeProvider: { _ in provider }))
+            try await app.test(.router) { client in
+                let sweep = Task {
+                    try await client.execute(
+                        uri: "/api/archive-bulk?accountId=\(account.id.uuidString)",
+                        method: .post,
+                        body: ByteBuffer(string: #"{"remoteIds":["\#(remoteId)"]}"#)
+                    ) { response in
+                        XCTAssertEqual(response.status, .ok)
+                        let decoded = try Self.iso8601Decoder().decode(
+                            ArchiveBulkResponse.self, from: Data(buffer: response.body)
+                        )
+                        XCTAssertEqual(decoded.items.count, 1)
+                        XCTAssertTrue(decoded.items[0].ok)
+                    }
+                }
+                // The provider has taken the mail out of the inbox; the sync
+                // loop's reconcile now runs against a half-finished sweep.
+                await gate.waitForArrival()
+                try await MessageStore.reconcileInbox(
+                    accountId: account.id, keeping: [], db: conn
+                )
+                let header = try await MessageStore.find(
+                    remoteId: remoteId, accountId: account.id, db: conn
+                )
+                XCTAssertNotNil(
+                    header, "a swept mail must not be deleted by the reconcile that follows its move"
+                )
+                let body = try await BodyStore.get(
+                    accountId: account.id, remoteId: remoteId, db: conn
+                )
+                XCTAssertEqual(
+                    body?.text, "the only copy",
+                    "the body cascades with its header — losing the row loses the mail"
+                )
+                await gate.release()
+                try await sweep.value
+            }
+
+            let stored = try await MessageStore.find(
+                remoteId: remoteId, accountId: account.id, db: conn
+            )
+            XCTAssertEqual(stored?.isArchived, true)
+            let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
+            XCTAssertEqual(actions.filter { $0.kind == .archive }.count, 1)
+        }
+    }
+
+    /// A sweep whose remote move fails must not leave the local claim behind:
+    /// the mail is still in the server inbox, so it has to stay in the local
+    /// one too. (The claim is new — the flag used to be written only after the
+    /// move succeeded — so this guards the new ordering, not the old one.)
+    func test_archiveBulk_remoteFailureReleasesTheLocalClaim() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(
+                Account(
+                    id: account.id, provider: .qq, oauthUser: account.oauthUser,
+                    email: account.email, credentials: Data([1, 2, 3]),
+                    capabilities: MailCapabilities(
+                        archiveFolder: true, idle: true, move: true, serverSnippet: true
+                    ),
+                    isActive: false
+                ),
+                db: conn
+            )
+            let remoteId = "sweep-fail-\(UUID().uuidString)"
+            try await MessageStore.upsert(
+                makeHeader(accountId: account.id, remoteId: remoteId, from: "a@x.com"), db: conn
+            )
+            let provider = StubMailProvider()
+            await provider.setArchiveError(.archiveUnavailable)
+            let app = Application(router: makeStackRouter(db: conn, makeProvider: { _ in provider }))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/archive-bulk?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    body: ByteBuffer(string: #"{"remoteIds":["\#(remoteId)"]}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        ArchiveBulkResponse.self, from: Data(buffer: response.body)
+                    )
+                    XCTAssertEqual(decoded.items.count, 1)
+                    XCTAssertFalse(decoded.items[0].ok, "the item reports the remote failure")
+                }
+            }
+            let stored = try await MessageStore.find(
+                remoteId: remoteId, accountId: account.id, db: conn
+            )
+            XCTAssertEqual(
+                stored?.isArchived, false,
+                "the mail never left the server inbox, so it must not vanish locally either"
+            )
+        }
+    }
+
     // MARK: - GET /api/briefing
 
     /// The feed is 200 + JSON, and every item lands in the group the
@@ -1066,6 +1202,12 @@ final class RouteTests: XCTestCase {
         private var sendResult: String? = "stub-provider-message-id"
         private var sendError: MailError?
         private var probeHook: (@Sendable () async -> Void)?
+        /// Parks the provider inside `archive` / `unarchive` so a test can hold
+        /// a request open at the exact point where the remote side has already
+        /// moved and the local side has not committed yet.
+        private var archiveGate: RaceGate?
+        private var unarchiveGate: RaceGate?
+        private var unarchiveCount = 0
 
         init(
             kind: MailProviderKind = .qq,
@@ -1080,6 +1222,8 @@ final class RouteTests: XCTestCase {
         func setProbeError(_ error: MailError?) { probeError = error }
         func setBodyError(_ error: MailError?) { bodyError = error }
         func setArchiveError(_ error: MailError?) { archiveError = error }
+        func setArchiveGate(_ gate: RaceGate?) { archiveGate = gate }
+        func setUnarchiveGate(_ gate: RaceGate?) { unarchiveGate = gate }
 
         func capabilities() async -> MailCapabilities { capabilitiesValue }
 
@@ -1109,10 +1253,15 @@ final class RouteTests: XCTestCase {
         func archive(remoteId: String) async throws {
             if let archiveError { throw archiveError }
             archivedRemoteIds.append(remoteId)
+            if let archiveGate { await archiveGate.hold() }
         }
 
         func unarchive(remoteId: String) async throws {
             unarchivedRemoteIds.append(remoteId)
+            unarchiveCount += 1
+            // Only the first call parks: a second inverse would have to reach
+            // the provider at all for the test to detect it.
+            if let unarchiveGate, unarchiveCount == 1 { await unarchiveGate.hold() }
         }
 
         func trash(remoteId: String) async throws {
@@ -1811,19 +1960,73 @@ final class RouteTests: XCTestCase {
             let provider = StubMailProvider()
             let app = Application(router: makeSendRouter(db: conn, provider: provider))
 
-            try await app.test(.router) { client in
-                try await client.execute(
-                    uri: "/api/compose/send?accountId=\(account.id.uuidString)",
-                    method: .post,
-                    headers: [.contentType: "application/json"],
-                    body: sendBody(#"{"to":"alice@example.com\r\nBcc:evil@example.com","subject":"Hi","body":"Hello"}"#)
-                ) { response in
-                    XCTAssertEqual(response.status, .badRequest)
-                    XCTAssertEqual(try Self.errorCode(from: response.body), "malformed-compose")
+            // The recipient is checked by two independent rules (no whitespace,
+            // exactly one `@`); the subject is checked by the CR/LF guard alone,
+            // which is the only field this can actually get through.
+            for body in [
+                #"{"to":"alice@example.com\r\nBcc:evil@example.com","subject":"Hi","body":"Hello"}"#,
+                #"{"to":"alice@example.com","subject":"Hi\r\nBcc:evil@example.com","body":"Hello"}"#,
+                #"{"to":"alice@example.com","subject":"Hi\nBcc:evil@example.com","body":"Hello"}"#,
+            ] {
+                try await app.test(.router) { client in
+                    try await client.execute(
+                        uri: "/api/compose/send?accountId=\(account.id.uuidString)",
+                        method: .post,
+                        headers: [.contentType: "application/json"],
+                        body: sendBody(body)
+                    ) { response in
+                        XCTAssertEqual(response.status, .badRequest, "body: \(body)")
+                        XCTAssertEqual(try Self.errorCode(from: response.body), "malformed-compose")
+                    }
                 }
             }
             let sent = await provider.sentOutbounds
             XCTAssertTrue(sent.isEmpty)
+        }
+    }
+
+    /// A reply-all hands the provider the whole recipient set: the addresses
+    /// joined into `To` and the Cc list kept separate. SMTP turns both into
+    /// one `RCPT TO` per address, so losing the Cc array here would silently
+    /// drop every Cc recipient from the envelope.
+    func test_postSend_replyAll_passesEveryRecipientToTheProvider() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id,
+                remoteId: "reply-all-\(UUID())",
+                from: "alice@example.com",
+                messageIdHeader: "<orig@example.com>"
+            )
+            try await MessageStore.upsert(message, db: conn)
+
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/send?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: sendBody(
+                        #"{"body":"on my way","to":["alice@example.com","bob@example.com"],"cc":["carol@example.com"]}"#
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+
+            let sent = await provider.sentOutbounds
+            let outbound = try XCTUnwrap(sent.first)
+            XCTAssertEqual(outbound.to, "alice@example.com, bob@example.com")
+            XCTAssertEqual(outbound.cc, ["carol@example.com"])
+            XCTAssertEqual(
+                outbound.envelopeRecipients,
+                ["alice@example.com", "bob@example.com", "carol@example.com"]
+            )
         }
     }
 
@@ -2447,7 +2650,7 @@ final class RouteTests: XCTestCase {
                 payload: ["remoteId": "expired-1", "remoteWrite": "false"],
                 db: conn
             )
-            try await conn.write { db in
+            try conn.write { db in
                 try db.execute(
                     sql: "UPDATE ai_actions SET expires_at = strftime('%Y-%m-%d %H:%M:%f','now','-1 second') WHERE id = ?",
                     arguments: [action.id]
@@ -2463,6 +2666,271 @@ final class RouteTests: XCTestCase {
                 ) { response in
                     XCTAssertEqual(response.status, .gone)
                     XCTAssertEqual(try Self.errorCode(from: response.body), "action-expired")
+                }
+            }
+        }
+    }
+
+    /// The undo button is live for six seconds, and ⌘Z re-fetches history, so
+    /// a double-fire is reachable in the real product. The second undo must
+    /// be refused *and* must not perform the inverse a second time — an
+    /// unarchive that runs twice is not idempotent: the second pass moves a
+    /// message that is no longer in the folder it is looking in.
+    func test_undoIsSingleUse_secondUndoIsRefusedAndDoesNotReapply() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let action = try await AIActionStore.record(
+                accountId: account.id,
+                kind: .archive,
+                payload: ["remoteId": "undo-once-1", "remoteWrite": "false"],
+                db: conn
+            )
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+            let uri = "/api/actions/\(action.id)/undo?accountId=\(account.id.uuidString)"
+
+            try await app.test(.router) { client in
+                try await client.execute(uri: uri, method: .post) { response in
+                    XCTAssertEqual(response.status, .ok, "the first undo must succeed")
+                }
+            }
+            try await app.test(.router) { client in
+                try await client.execute(uri: uri, method: .post) { response in
+                    XCTAssertNotEqual(
+                        response.status, .ok,
+                        "undo must be single-use; replaying it is how a message gets un-archived twice"
+                    )
+                }
+            }
+            let unarchived = await provider.unarchivedRemoteIds
+            XCTAssertLessThanOrEqual(
+                unarchived.filter { $0 == "undo-once-1" }.count, 1,
+                "the remote inverse must not be applied twice"
+            )
+        }
+    }
+
+    /// Single-use undo is only half a guarantee: it is useless if the client
+    /// cannot see that an action is spent. ⌘Z picks the newest `isUndoable`
+    /// row out of this same history, so an undone archive left in the list
+    /// made ⌘Z a dead end — it re-picked the same spent action every time,
+    /// got 409, and never reached the one before it. The action-history sheet
+    /// showed the same dead button.
+    func test_recentHidesUndoneActionsSoCmdZCanReachThePreviousOne() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let older = try await AIActionStore.record(
+                accountId: account.id,
+                kind: .archive,
+                payload: ["remoteId": "chain-older", "remoteWrite": "false"],
+                db: conn
+            )
+            let newer = try await AIActionStore.record(
+                accountId: account.id,
+                kind: .archive,
+                payload: ["remoteId": "chain-newer", "remoteWrite": "false"],
+                db: conn
+            )
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(newer.id)/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+
+            let remaining = try await AIActionStore.recent(accountId: account.id, db: conn)
+            let ids = remaining.map(\.id)
+            XCTAssertFalse(
+                ids.contains(newer.id),
+                "a spent action must not be offered again; ⌘Z would re-pick it forever"
+            )
+            XCTAssertTrue(
+                ids.contains(older.id),
+                "the undo before it must stay reachable, or ⌘Z has nowhere left to go"
+            )
+            // And the next ⌘Z actually lands on it instead of a 409.
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(older.id)/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(
+                        response.status, .ok,
+                        "the second ⌘Z must undo the previous action, not fail on the spent one"
+                    )
+                }
+            }
+        }
+    }
+
+    /// ⌘Z has no in-flight guard in the client, so two undos of one action can
+    /// be in flight together. The "already undone?" read and the undo row used
+    /// to be separate transactions with a full IMAP round trip between them,
+    /// so both requests passed the check and both ran the inverse — the second
+    /// unarchive landing on a message that had already left the folder. The
+    /// claim is now taken in the same transaction as the check.
+    func test_undoIsSingleUse_concurrentUndoesRunTheInverseOnce() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let remoteId = "undo-race-\(UUID().uuidString)"
+            let action = try await AIActionStore.record(
+                accountId: account.id,
+                kind: .archive,
+                payload: ["remoteId": remoteId, "remoteWrite": "true"],
+                db: conn
+            )
+            let gate = RaceGate()
+            let provider = StubMailProvider()
+            await provider.setUnarchiveGate(gate)
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+            let uri = "/api/actions/\(action.id)/undo?accountId=\(account.id.uuidString)"
+
+            try await app.test(.router) { client in
+                await withTaskGroup(of: HTTPResponse.Status?.self) { group in
+                    for _ in 0..<2 {
+                        group.addTask {
+                            try? await client.execute(uri: uri, method: .post) { $0.status }
+                        }
+                    }
+                    // The first undo is inside the provider. The second request
+                    // gets 300ms to run its own single-use check while the first
+                    // is parked — that check is the whole race.
+                    await gate.waitForArrival()
+                    try? await Task.sleep(for: .milliseconds(300))
+                    await gate.release()
+                    var statuses: [HTTPResponse.Status] = []
+                    for await status in group {
+                        if let status { statuses.append(status) }
+                    }
+                    XCTAssertEqual(statuses.count, 2, "both undo requests must answer")
+                    XCTAssertEqual(
+                        statuses.filter { $0 == .ok }.count, 1,
+                        "exactly one concurrent undo may succeed, got \(statuses)"
+                    )
+                    XCTAssertEqual(
+                        statuses.filter { $0 == .conflict }.count, 1,
+                        "the loser must be told the action is already undone, got \(statuses)"
+                    )
+                }
+            }
+            let unarchived = await provider.unarchivedRemoteIds
+            XCTAssertEqual(
+                unarchived.filter { $0 == remoteId }.count, 1,
+                "the remote inverse must not be applied twice"
+            )
+            let undoRows = try await AIActionStore.recent(accountId: account.id, db: conn)
+                .filter { $0.kind == .undo }
+            XCTAssertEqual(undoRows.count, 1, "one undo, one audit row")
+        }
+    }
+
+    /// The claim is taken before the inverse runs, so a failing inverse must
+    /// hand it back: an action that reads as "undone" after a 500 would deny
+    /// the user the undo that never happened.
+    func test_undoInverseFailureReleasesTheSingleUseClaim() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let action = try await AIActionStore.record(
+                accountId: account.id,
+                kind: .unsubscribe,
+                payload: ["remoteId": "undo-fail-\(UUID().uuidString)", "publisher": "example.com"],
+                db: conn
+            )
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+            let uri = "/api/actions/\(action.id)/undo?accountId=\(account.id.uuidString)"
+
+            try await app.test(.router) { client in
+                try await client.execute(uri: uri, method: .post) { response in
+                    XCTAssertEqual(response.status, .badRequest, "unsubscribe is terminal")
+                    XCTAssertEqual(try Self.errorCode(from: response.body), "not-undoable")
+                }
+            }
+            let undoRows = try await AIActionStore.recent(accountId: account.id, db: conn)
+                .filter { $0.kind == .undo }
+            XCTAssertTrue(
+                undoRows.isEmpty,
+                "a refused inverse must not leave the action marked undone"
+            )
+        }
+    }
+
+    /// `accountId` is a client-supplied query parameter on every route, and
+    /// the bearer token is a single per-install token — there is no
+    /// per-account credential to catch a mismatch. So the only thing standing
+    /// between "I have the token" and "I can read and mutate any account in
+    /// the database" is that every query is scoped by the supplied
+    /// `accountId`. Nothing tested that until now.
+    func test_accountIdFromAnotherAccount_cannotUndoOrReachItsActions() async throws {
+        let owner = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "owner-\(UUID().uuidString)@example.com"
+        )
+        let intruder = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "intruder-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: owner.id)) { conn in
+            try await seedAccount(owner, db: conn)
+            try await seedAccount(intruder, db: conn)
+            let secretAction = try await AIActionStore.record(
+                accountId: owner.id,
+                kind: .archive,
+                payload: ["remoteId": "owner-mail-1", "remoteWrite": "false"],
+                db: conn
+            )
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            // Same action id, but scoped to the intruder's account.
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(secretAction.id)/undo?accountId=\(intruder.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertNotEqual(
+                        response.status, .ok,
+                        "another account's action must not be undoable by guessing its id"
+                    )
+                }
+            }
+            let unarchivedAfterIntrusion = await provider.unarchivedRemoteIds
+            XCTAssertTrue(
+                unarchivedAfterIntrusion.isEmpty,
+                "no remote write may happen for a cross-account undo"
+            )
+
+            // And the action list must not leak across the boundary.
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions?accountId=\(intruder.id.uuidString)", method: .get
+                ) { response in
+                    let body = String(buffer: response.body)
+                    XCTAssertFalse(
+                        body.contains("\(secretAction.id)"),
+                        "one account's action ids must not appear in another's list"
+                    )
                 }
             }
         }

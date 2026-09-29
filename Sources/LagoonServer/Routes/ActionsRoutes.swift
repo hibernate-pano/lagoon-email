@@ -34,7 +34,7 @@ public enum ActionsRoutes {
         makeProvider: MailProviderFactory.Builder? = nil
     ) {
         let makeProvider = makeProvider
-            ?? MailProviderFactory.factory(db: db, logger: logger)
+            ?? MailProviderFactory.factory(db: db, logger: logger).builder
 
         // POST /api/messages/{remoteId}/archive?accountId=
         // Moves the message through the account's provider (`MailProvider.archive`).
@@ -58,9 +58,10 @@ public enum ActionsRoutes {
         }
 
         // POST /api/archive-bulk?accountId=  {remoteIds: [...]}
-        // 清扫（Sweep）: remote-first archive per id, one audit row each so
-        // undo stays per-message. Per-item results — partial success is
-        // reported honestly, never thrown away.
+        // 清扫（Sweep）: local flag claimed first so the sync loop's reconcile
+        // cannot delete a row whose remote MOVE is still in flight, then one
+        // audit row per id so undo stays per-message. Per-item results —
+        // partial success is reported honestly, never thrown away.
         router.post("api/archive-bulk") { request, _ -> Response in
             return await archiveBulkHandler(
                 request: request, db: db, makeProvider: makeProvider, logger: logger
@@ -252,8 +253,9 @@ public enum ActionsRoutes {
         ))
     }
 
-    /// 清扫: archive every requested id remote-first. Cap 500 so a runaway
-    /// client cannot one-shot the provider's rate budget; per-item errors are
+    /// 清扫: claim the local flag, archive every requested id, record one
+    /// audit row each so undo stays per-message. Cap 500 so a runaway client
+    /// cannot one-shot the provider's rate budget; per-item errors are
     /// reported, not thrown — a sweep that half-succeeded must say so.
     private static func archiveBulkHandler(
         request: Request, db: LagoonDB,
@@ -294,17 +296,52 @@ public enum ActionsRoutes {
         var items: [ArchiveBulkItem] = []
         for remoteId in ids {
             do {
-                try await provider.archive(remoteId: remoteId)
-                let action = try await AIActionStore.record(
-                    accountId: accountId,
-                    kind: .archive,
-                    payload: ["remoteId": remoteId, "remoteWrite": "true"],
-                    db: db
-                )
-                try db.write {
-                    try $0.execute(
-                        sql: "UPDATE message_headers SET is_archived = TRUE WHERE remote_id = ? AND account_id = ?",
-                        arguments: [remoteId, accountId]
+                // Local placeholder first, remote move second. reconcileInbox
+                // deletes every `is_archived = FALSE` row the provider no longer
+                // lists, and the remote MOVE is exactly what makes it stop
+                // listing it — so a sweep that moved first and flagged second
+                // left a window in which the sync loop deleted the row and its
+                // body (ON DELETE CASCADE) for a mail the user had just swept.
+                // The flag is the claim reconcile respects; commit it before
+                // the await that lets reconcile run.
+                let claimed = try db.write { raw -> Bool in
+                    let wasArchived = try Bool.fetchOne(
+                        raw,
+                        sql: "SELECT is_archived FROM message_headers WHERE account_id = ? AND remote_id = ?",
+                        arguments: [accountId, remoteId]
+                    ) ?? false
+                    try MessageStore.setArchivedSync(
+                        true, remoteId: remoteId, accountId: accountId, db: raw
+                    )
+                    return !wasArchived
+                }
+                do {
+                    try await provider.archive(remoteId: remoteId)
+                } catch {
+                    // The remote never moved, so the placeholder must not
+                    // outlive it — otherwise the mail disappears from the inbox
+                    // view for a move that never happened.
+                    if claimed {
+                        try? db.write {
+                            try MessageStore.setArchivedSync(
+                                false, remoteId: remoteId, accountId: accountId, db: $0
+                            )
+                        }
+                    }
+                    throw error
+                }
+                // The placeholder is already committed; this only re-asserts it
+                // so the audit row and the flag it describes land together,
+                // as they do in the single-message route.
+                let action = try db.write { raw in
+                    try MessageStore.setArchivedSync(
+                        true, remoteId: remoteId, accountId: accountId, db: raw
+                    )
+                    return try AIActionStore.recordSync(
+                        accountId: accountId,
+                        kind: .archive,
+                        payload: ["remoteId": remoteId, "remoteWrite": "true"],
+                        db: raw
                     )
                 }
                 items.append(ArchiveBulkItem(remoteId: remoteId, ok: true, actionId: action.id))
@@ -319,6 +356,14 @@ public enum ActionsRoutes {
                     remoteId: remoteId, ok: false, errorCode: error.logLabel
                 ))
             } catch {
+                // The item is reported as failed either way: the flag claim
+                // could not be written, the provider failed in a way Lagoon
+                // does not model, or the mail is archived on both sides with
+                // no undo entry. None of them can promise a per-message undo.
+                logger.error("archiveBulk.itemFailed", metadata: [
+                    "remoteId": .string(remoteId),
+                    "err": .string("\(error)"),
+                ])
                 items.append(ArchiveBulkItem(remoteId: remoteId, ok: false, errorCode: "internal-error"))
             }
         }
@@ -374,6 +419,12 @@ public enum ActionsRoutes {
         var headerFailureResponse: Response?
         var bodyFailureResponse: Response?
         var oneClickHeader = false
+        /// Whether the chosen target is the URL the sender named in
+        /// `List-Unsubscribe`. RFC 8058 §3 defines the one-click POST against
+        /// exactly that URL; the flag is meaningless for a link scraped out of
+        /// the body, and firing it there would hand an attacker a POST
+        /// primitive aimed wherever the message body points.
+        var targetFromHeader = false
         /// A mailto: was offered by some stage. Accumulated, NOT acted on
         /// immediately: headerLinks/bodyLinks admit the mailto scheme and the
         /// sync-time writers persist it, so bailing out per stage meant a
@@ -391,6 +442,7 @@ public enum ActionsRoutes {
                     // URL in the header (they can differ, and the first URL
                     // may be the one we skipped as unsafe).
                     target = (url, pub)
+                    targetFromHeader = true
                 case .manual:
                     sawMailto = true
                 case nil:
@@ -471,7 +523,13 @@ public enum ActionsRoutes {
 
         let outcome: UnsubHit
         do {
-            outcome = try await hitUnsubscribe(url: unsubscribeURL, oneClick: oneClickHeader)
+            // RFC 8058 §3: the one-click POST is defined against the https
+            // URL named in `List-Unsubscribe`, so it requires both the header
+            // flag and a target that actually came from that header.
+            let mayOneClick = oneClickHeader
+                && targetFromHeader
+                && unsubscribeURL.scheme?.lowercased() == "https"
+            outcome = try await hitUnsubscribe(url: unsubscribeURL, oneClick: mayOneClick)
         } catch {
             logger.warning("unsubscribe.requestFailed", metadata: [
                 "remoteId": .string(remoteId),
@@ -675,16 +733,36 @@ public enum ActionsRoutes {
         } catch {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
-        let action: AIAction
+
+        // Single-use, and the claim is taken before the inverse runs. The
+        // inverse is not idempotent — replaying an archive-undo moves a
+        // message out of a folder it has already left — and the read that
+        // answers "already undone?" used to live in its own read transaction
+        // with a whole IMAP round trip before the undo row was inserted, so
+        // two concurrent undos (⌘Z has no in-flight guard) both passed the
+        // check and both ran the inverse. One write transaction closes that.
+        let claim: UndoClaim
         do {
-            guard let found = try await AIActionStore.find(id: actionId, db: db),
-                  found.accountId == accountId else {
-                return RouteJSON.error(.notFound, "unknown-action")
+            claim = try db.write { raw in
+                guard let action = try AIActionStore.findSync(id: actionId, db: raw),
+                      action.accountId == accountId
+                else { throw UndoRejection.unknownAction }
+                if let expiresAt = action.expiresAt, expiresAt <= Date() {
+                    throw UndoRejection.expired
+                }
+                if try AIActionStore.isUndoneSync(id: actionId, accountId: accountId, db: raw) {
+                    throw UndoRejection.alreadyUndone
+                }
+                let row = try AIActionStore.recordSync(
+                    accountId: accountId,
+                    kind: .undo,
+                    payload: ["undoOf": "\(actionId)"],
+                    db: raw
+                )
+                return UndoClaim(action: action, rowId: row.id)
             }
-            if let expiresAt = found.expiresAt, expiresAt <= Date() {
-                return RouteJSON.error(.gone, "action-expired")
-            }
-            action = found
+        } catch let rejection as UndoRejection {
+            return rejection.response
         } catch {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
@@ -694,34 +772,59 @@ public enum ActionsRoutes {
         // unsubscribe, send, drafting and undo itself are terminal.
         do {
             try await reverse(
-                action: action, account: account,
+                action: claim.action, account: account,
                 makeProvider: makeProvider, db: db, logger: logger
             )
-            do {
-                let _ = try await AIActionStore.record(
-                    accountId: accountId,
-                    kind: .undo,
-                    payload: ["undoOf": "\(actionId)"],
-                    db: db
-                )
-            } catch {
-                // The inverse already completed; failing the response would make
-                // the user retry a successful undo.
-                logger.warning("undo.auditFailed", metadata: [
-                    "actionId": .string("\(actionId)"),
-                    "err": .string("\(error)"),
-                ])
-            }
         } catch let error as NotUndoable {
+            await releaseClaim(claim, actionId: actionId, db: db, logger: logger)
             logger.info("actions.notUndoable", metadata: [
                 "kind": .string(error.kind.rawValue),
                 "actionId": .string("\(actionId)"),
             ])
             return RouteJSON.error(.badRequest, "not-undoable")
         } catch {
+            await releaseClaim(claim, actionId: actionId, db: db, logger: logger)
             return errorResponse(.internalServerError, "undo-failed", logger: logger, error: error)
         }
         return RouteJSON.response(UndoResponse(ok: true, undone: actionId))
+    }
+
+    /// The action being undone plus the id of the undo row that claims it.
+    private struct UndoClaim {
+        let action: AIAction
+        let rowId: Int64
+    }
+
+    /// The inverse threw, so the claim has to go back: an action that still
+    /// reads as "undone" after a failed undo is the one state single-use
+    /// undo must never leave behind. Best-effort — the next attempt hits the
+    /// same stale claim and is refused, which is the safe direction.
+    private static func releaseClaim(
+        _ claim: UndoClaim, actionId: Int64, db: LagoonDB, logger: Logger
+    ) async {
+        do {
+            try await AIActionStore.deleteUndo(id: claim.rowId, db: db)
+        } catch {
+            logger.error("undo.claimReleaseFailed", metadata: [
+                "actionId": .string("\(actionId)"),
+                "err": .string("\(error)"),
+            ])
+        }
+    }
+
+    /// Why the claim was refused, with the status each answer already had.
+    private enum UndoRejection: Error {
+        case unknownAction
+        case expired
+        case alreadyUndone
+
+        var response: Response {
+            switch self {
+            case .unknownAction: return RouteJSON.error(.notFound, "unknown-action")
+            case .expired: return RouteJSON.error(.gone, "action-expired")
+            case .alreadyUndone: return RouteJSON.error(.conflict, "already-undone")
+            }
+        }
     }
 
     private static func reverse(
@@ -822,11 +925,7 @@ public enum ActionsRoutes {
     }
 
     private static func collectBody(_ request: Request) async throws -> Data {
-        var bytes: [UInt8] = []
-        for try await chunk in request.body {
-            bytes.append(contentsOf: Array(buffer: chunk))
-        }
-        return Data(bytes)
+        try await RouteParams.collectBody(request)
     }
 
     /// Pulls the first usable URL out of a `List-Unsubscribe` header. The header
@@ -840,10 +939,16 @@ public enum ActionsRoutes {
     /// mailto: only reports "manual required" when nothing automatable
     /// exists. Unsafe candidates are skipped.
     ///
+    /// Among the safe candidates https beats http. The unsubscribe URL *is*
+    /// the capability — anyone who sees the request can replay it — so
+    /// sending it in cleartext hands the unsubscribe to every network
+    /// observer. Senders do advertise both schemes for the same path.
+    ///
     /// The caller ACCUMULATES `.manual` across stages instead of returning it
     /// on sight — see the handler.
     private static func pickUnsubTarget(links: [String]) async -> UnsubTarget? {
         var manual = false
+        var insecureFallback: (URL, String)?
         for candidate in links {
             let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
             guard let url = URL(string: trimmed),
@@ -854,10 +959,11 @@ public enum ActionsRoutes {
                 continue
             }
             guard scheme == "http" || scheme == "https" else { continue }
-            if await UnsubscribeScanner.isSafe(url: url) {
-                return .http(url, url.host ?? "")
-            }
+            guard await UnsubscribeScanner.isSafe(url: url) else { continue }
+            if scheme == "https" { return .http(url, url.host ?? "") }
+            if insecureFallback == nil { insecureFallback = (url, url.host ?? "") }
         }
+        if let insecureFallback { return .http(insecureFallback.0, insecureFallback.1) }
         return manual ? .manual : nil
     }
 
@@ -866,16 +972,9 @@ public enum ActionsRoutes {
     private static func storedUnsubscribeLinks(
         remoteId: String, accountId: UUID, db: LagoonDB
     ) async -> [String] {
-        // `try?` fully flattens the Row? the closure returns.
-        guard let row = try? db.read({ raw in
-            try Row.fetchOne(
-                raw,
-                sql: "SELECT unsubscribe_links FROM message_headers WHERE remote_id = ? AND account_id = ?",
-                arguments: [remoteId, accountId]
-            )
-        })
-        else { return [] }
-        return row.decodedStringArray("unsubscribe_links")
+        (try? await MessageStore.unsubscribeLinks(
+            remoteId: remoteId, accountId: accountId, db: db
+        )) ?? []
     }
 
     /// Outcome of hitting an unsubscribe endpoint — 2xx alone is NOT success:
@@ -1110,21 +1209,24 @@ public enum ActionsRoutes {
             }
         }
 
+        /// This must match `URLSessionDataDelegate`'s requirement exactly.
+        /// There is no `completionHandler:` variant of this method in the
+        /// protocol: a signature that merely *resembles* it compiles with a
+        /// "nearly matches optional requirement" warning and is then never
+        /// called by URLSession at all, which silently disables the cap.
         func urlSession(
-            _ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data,
-            completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+            _ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data
         ) {
             lock.lock()
             let total = (received[dataTask.taskIdentifier] ?? 0) + data.count
             received[dataTask.taskIdentifier] = total
             lock.unlock()
             if total > maxBodyBytes {
-                // `URLSession.ResponseDisposition` has no "fail" case, so the
-                // cap cancels the task: `data(for:)` throws `.cancelled`,
-                // which the attempt loop reports as `.failed`.
+                // Cancelling is the only way to stop a `data(for:)` read: the
+                // call then throws `.cancelled`, which the attempt loop
+                // reports as `.failed`.
                 dataTask.cancel()
             }
-            completionHandler(.allow)
         }
 
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {

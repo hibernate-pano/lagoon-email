@@ -57,14 +57,16 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     /// — ~2 s on every body fetch, attachment download, markRead, archive
     /// and undo.
     ///
-    /// A UID is stable for the lifetime of a UIDVALIDITY, so the mapping
-    /// is safe to keep. `uidCacheValidity` records which UIDVALIDITY the
-    /// cache was built against; a mismatch (server-side mailbox rebuild)
-    /// drops the whole map. The one expensive scan populates *every*
-    /// mapping it sees, so opening a second message from the same window
-    /// is free.
+    /// A UID is stable for the lifetime of a UIDVALIDITY *within one mailbox*
+    /// (RFC 3501 §2.3.1.1), so the mapping is safe to keep.
+    /// `uidCacheIdentity` records which (mailbox, UIDVALIDITY) it was built
+    /// against; a mismatch — a different folder, or a server-side mailbox
+    /// rebuild — drops the whole map. `IMAPSelected` carries the folder name,
+    /// so the check cannot be skipped by a code path that only remembers the
+    /// number. The one expensive scan populates *every* mapping it sees, so
+    /// opening a second message from the same window is free.
     private var uidByMessageID: [String: Int64] = [:]
-    private var uidCacheValidity: Int64?
+    private var uidCacheIdentity: (mailbox: String, uidValidity: Int64)?
     /// Current INBOX membership, keyed by UID. The first round builds this map
     /// once; later rounds use `UID SEARCH ALL` to detect messages another
     /// client moved or deleted.
@@ -221,10 +223,15 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             let remaining = ContinuousClock.now.duration(to: deadline)
             guard remaining > .zero else { return change }
             if negotiated.contains("IDLE") {
-                // Push: IDLE returns as soon as the mailbox moves, so new mail
-                // is picked up within seconds instead of on the next poll.
+                // Push: IDLE returns as soon as the *selected* mailbox moves,
+                // so new mail is picked up within seconds instead of on the
+                // next poll. The round above ends in `collectSentReplies`,
+                // which SELECTs the Sent folder and clears `selected` — so
+                // without this re-select we would sit in IDLE on Sent and
+                // never learn about an arriving inbox message.
                 try await withClient { client in
-                    try await client.idle(waitUpTo: min(remaining, Self.idleBudget))
+                    _ = try await selectInbox(client: client, force: true)
+                    _ = try await client.idle(waitUpTo: min(remaining, Self.idleBudget))
                 }
             } else {
                 guard remaining >= pollInterval else { return change }
@@ -261,7 +268,11 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             }
 
             var inboxRemoteIds: Set<String>?
-            if reconcilesInbox {
+            // First sync and post-reset rounds skip the membership reconcile:
+            // the store has no rows yet, so there is nothing to subtract from.
+            // The full index builds on the next round instead of delaying the
+            // first paint.
+            if reconcilesInbox, cursor.lastUid != nil {
                 inboxRemoteIds = try await reconcileInboxMembership(
                     client: client,
                     exists: inbox.exists
@@ -283,11 +294,38 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                 ])
             }
 
+            // One batched command per ≤100 UIDs (an empty round issues none).
+            // A per-message snippet fetch here made a first backfill cost one
+            // round trip per message on the strictly serial session — minutes
+            // on a real mailbox, all before a single row reached the client.
+            //
+            // Previews are best-effort: the cursor is about to move past these
+            // messages, so a failure that silently dropped the window would
+            // leave every message in it without a preview, for good.
+            let snippets: [Int64: Data]
+            if fetched.isEmpty {
+                snippets = [:]
+            } else {
+                do {
+                    snippets = try await client.fetchTextSnippets(uids: fetched.map(\.uid))
+                } catch {
+                    // Refused chunks are already tolerated inside
+                    // `fetchTextSnippets`; what arrives here cost us the
+                    // socket, and a session that lost its socket must not keep
+                    // reading — it is rebuilt on the next round.
+                    await dropConnection()
+                    logger.debug("imap.snippetsFailed", metadata: [
+                        "label": .string(Self.label(error)),
+                        "uids": .string("\(fetched.count)"),
+                    ])
+                    snippets = [:]
+                }
+            }
             var upserts: [RemoteHeader] = []
             upserts.reserveCapacity(fetched.count)
             for header in fetched {
                 rememberInboxHeader(header)
-                let remote = remoteHeader(from: header, snippet: await snippetText(client: client, uid: header.uid))
+                let remote = remoteHeader(from: header, snippet: Self.snippetText(from: snippets[header.uid]))
                 upserts.append(remote)
                 reportedRead[header.uid] = remote.isRead
             }
@@ -306,6 +344,17 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             // references from Sent mail. Best-effort — a Sent failure must
             // never fail the inbox round.
             let sent = await collectSentReplies(client: client, cursor: cursor)
+            // A Sent UIDVALIDITY change kills every stored Sent UID, exactly as
+            // an INBOX one does. Carrying the old high-water mark into the next
+            // round would leave `baseUid` past the new folder's UIDNEXT and end
+            // reply detection silently for good — so a rebase keeps only what
+            // this round actually saw, and a failed harvest (nil validity)
+            // keeps the stored value.
+            let sentValidity = sent.validity ?? cursor.sentUidValidity
+            let sentLastUid: Int64? = sent.validity == nil
+                || sent.validity == cursor.sentUidValidity
+                ? (sent.lastUid ?? cursor.sentLastUid)
+                : sent.lastUid
             return MailChangeSet(
                 upserts: upserts,
                 resetRequired: false,
@@ -313,8 +362,8 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                             uidValidity: inbox.uidValidity,
                     lastUid: nextLastUid,
                     archiveFolder: archiveFolder,
-                    sentUidValidity: sent.validity ?? cursor.sentUidValidity,
-                    sentLastUid: sent.lastUid ?? cursor.sentLastUid,
+                    sentUidValidity: sentValidity,
+                    sentLastUid: sentLastUid,
                     sentFolder: sent.folder ?? cursor.sentFolder
                 ),
                 inboxRemoteIds: inboxRemoteIds,
@@ -338,24 +387,39 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             let state = try await client.select(folder)
             selected = nil
             let validity = state.uidValidity
+            // A Sent UIDVALIDITY change means every UID in the stored sent
+            // cursor belongs to a dead identity space. Carrying the old
+            // high-water mark forward is not merely useless: it is larger
+            // than the whole new folder, so every later round would
+            // short-circuit on `baseUid >= uidNext` and cross-client reply
+            // detection would stop silently, with no way back. The INBOX
+            // cursor is reset the same way (`round` above).
+            let rebased = cursor.sentUidValidity != validity
+            let carried: Int64? = rebased ? nil : cursor.sentLastUid
+            if rebased, cursor.sentLastUid != nil {
+                logger.warning("imap.sentUidValidityReset", metadata: [
+                    "account": .string(account.email),
+                    "folder": .string(folder),
+                ])
+            }
             let baseUid: Int64
-            if cursor.sentUidValidity == validity, let last = cursor.sentLastUid {
+            if let last = carried {
                 baseUid = last + 1
             } else {
-                // First scan or Sent UIDVALIDITY change: bounded window, and
-                // a UIDVALIDITY change invalidates the old sent cursor.
+                // First scan or Sent UIDVALIDITY change: bounded window over
+                // the new identity space.
                 baseUid = max(1, state.uidNext - Self.sentBackfillWindow)
             }
             guard state.uidNext > baseUid || state.exists > 0 else {
-                return ([], validity, cursor.sentLastUid, folder)
+                return ([], validity, carried, folder)
             }
             // Steady state with nothing new: skip the FETCH entirely.
-            if cursor.sentLastUid != nil, baseUid >= state.uidNext {
-                return ([], validity, cursor.sentLastUid, folder)
+            if carried != nil, baseUid >= state.uidNext {
+                return ([], validity, carried, folder)
             }
             let headers = try await client.fetchHeaders(fromUid: baseUid)
             var ids = Set<String>()
-            var maxUid = cursor.sentLastUid
+            var maxUid = carried
             for header in headers {
                 maxUid = max(maxUid ?? 0, header.uid)
                 ids.formUnion(Self.threadReferenceIDs(rawHeaders: header.rawHeaders))
@@ -363,6 +427,10 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             return (ids, validity, maxUid, folder)
         } catch {
             // Best-effort by design: Sent sync must never break inbox sync.
+            // A refusal of the Sent commands is a verdict and the session
+            // survives it, but a socket we cannot read is not something the
+            // next command may keep using — drop it and rebuild next round.
+            if !IMAPClient.isMessageVerdict(error) { await dropConnection() }
             logger.debug("imap.sentSkipped", metadata: ["label": .string(Self.label(error))])
             selected = nil
             return ([], nil, nil, nil)
@@ -388,31 +456,26 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         let fromUid = max(1, lastUid - Self.flagRescanWindow + 1)
         let flags = try await client.fetchFlags(fromUid: fromUid, toUid: lastUid)
 
-        var flips: [RemoteHeader] = []
+        var flipped: [Int64] = []
         for entry in flags {
             let isRead = Self.isRead(flags: entry.flags)
             guard let known = reportedRead[entry.uid], known != isRead else { continue }
             reportedRead[entry.uid] = isRead
-            // The store overwrites `subject` on conflict, so a flip must carry
-            // the real headers instead of just the flag.
-            guard let header = try await client.fetchHeader(uid: entry.uid).first else { continue }
-            flips.append(remoteHeader(from: header))
+            flipped.append(entry.uid)
         }
-        return flips
-    }
-
-    /// Best-effort snippet (spec §3.2 step 4): a preview is never worth
-    /// failing a pull over, but a failed command may have desynced the
-    /// session, so the connection is dropped and rebuilt next round.
-    private func snippetText(client: IMAPClient, uid: Int64) async -> String? {
-        do {
-            let fetched = try await client.fetchTextSnippet(uid: uid)
-            return Self.snippetText(from: fetched.first?.snippet)
-        } catch {
-            logger.debug("imap.snippetSkipped", metadata: ["label": .string(Self.label(error))])
-            dropConnection()
-            return nil
-        }
+        guard !flipped.isEmpty else { return [] }
+        // One command per ≤100 flipped UIDs, not one per flip: the session is
+        // serial and `commandLock` is held for the whole scan, so a phone
+        // marking 200 messages read would otherwise stall every other command
+        // behind 200 round trips.
+        //
+        // The headers are needed for the identity the store is keyed on (the
+        // Message-ID behind `remoteId`) and for `from_address`, which the
+        // auto-archive rules match on. The other columns come back unchanged
+        // and the store protects them on conflict anyway — the flip itself
+        // lands through the monotonic `is_read` OR.
+        let headers = try await client.fetchHeaders(uids: flipped)
+        return headers.map { remoteHeader(from: $0) }
     }
 
     // MARK: - Body & headers
@@ -422,7 +485,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         // durable BodyStore (V2 A3) and only calls this on a miss, so a
         // provider-level memory cache would just be a second copy.
         let raw = try await withClient { client in
-            try await selectInbox(client: client, force: false)
+            _ = try await selectInbox(client: client, force: false)
             let uid = try await resolveUID(remoteId, client: client)
             return try await client.fetchFullBody(uid: uid)
         }
@@ -450,7 +513,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
 
     public func fetchAttachment(remoteId: String, attachmentId: String) async throws -> FetchedAttachmentBytes {
         let raw = try await withClient { client in
-            try await selectInbox(client: client, force: false)
+            _ = try await selectInbox(client: client, force: false)
             let uid = try await resolveUID(remoteId, client: client)
             return try await client.fetchFullBody(uid: uid)
         }
@@ -475,7 +538,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
 
     public func fetchRawMessage(remoteId: String) async throws -> Data {
         return try await withClient { client in
-            try await selectInbox(client: client, force: false)
+            _ = try await selectInbox(client: client, force: false)
             let uid = try await resolveUID(remoteId, client: client)
             return try await client.fetchFullBody(uid: uid)
         }
@@ -483,7 +546,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
 
     public func fetchRawHeaderValues(remoteId: String) async throws -> [String: String] {
         return try await withClient { client in
-            try await selectInbox(client: client, force: false)
+            _ = try await selectInbox(client: client, force: false)
             let uid = try await resolveUID(remoteId, client: client)
             guard let header = try await client.fetchHeader(uid: uid).first else {
                 throw MailError.messageGone
@@ -496,7 +559,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
 
     public func setRead(remoteId: String, isRead: Bool) async throws {
         try await withClient { client in
-            try await selectInbox(client: client, force: false)
+            _ = try await selectInbox(client: client, force: false)
             let uid = try await resolveUID(remoteId, client: client)
             try await client.store(
                 uid: uid,
@@ -514,7 +577,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             guard let folder = try await resolveArchiveFolder(client: client) else {
                 throw MailError.archiveUnavailable
             }
-            try await selectInbox(client: client, force: false)
+            _ = try await selectInbox(client: client, force: false)
             let uid = try await resolveUID(remoteId, client: client)
             try await move(client: client, uid: uid, to: folder)
         }
@@ -570,8 +633,16 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     public func probe() async throws {
         try await withClient { client in
             _ = try await resolveArchiveFolder(client: client)
-            try await selectInbox(client: client, force: true)
+            _ = try await selectInbox(client: client, force: true)
         }
+    }
+
+    /// Hand the session back before the caller drops its last reference. A
+    /// dropped `IMAPProvider` cannot do this itself: the read pump under the
+    /// TLS transport keeps the socket authenticated on the server until its own
+    /// idle timeout, and QQ caps concurrent sessions per account.
+    public func shutdown() async {
+        await dropConnection()
     }
 
     // MARK: - Connection lifecycle
@@ -581,17 +652,37 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     /// unless the error is a verdict about the message rather than the socket.
     private func withClient<T>(_ body: (IMAPClient) async throws -> T) async throws -> T {
         await commandLock.lock()
+        // `AsyncMutex.lock()` has no cancellation check, so a caller that was
+        // cancelled while queued still acquires the lock and then trips
+        // `checkCancellation` below. Track whether a command was actually
+        // started: the wire is provably untouched before that point, and
+        // tearing the shared session down for a cancellation that never sent
+        // anything would cost every other caller a full reconnect.
+        var issuedCommand = false
         do {
             try Task.checkCancellation()
             let client = try await connectedClient()
+            issuedCommand = true
             let result = try await body(client)
             await commandLock.unlock()
             return result
         } catch let error as MailError where error == .messageGone {
+            // The verdict is about the message, not the socket, so the session
+            // survives — but the body may have SELECTed away from INBOX on its
+            // way to discovering the message is gone (`unarchive` selects the
+            // Archive folder first). Leaving `selected` set would make the
+            // next `UID STORE` run against the wrong mailbox.
+            selected = nil
             await commandLock.unlock()
             throw error
+        } catch is CancellationError {
+            // Cancelled mid-command: the server may still owe us a tagged
+            // completion, so the session cannot be reused.
+            if issuedCommand { await dropConnection() }
+            await commandLock.unlock()
+            throw CancellationError()
         } catch {
-            dropConnection()
+            await dropConnection()
             await commandLock.unlock()
             throw Self.map(error)
         }
@@ -609,7 +700,16 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             try await client.sendID()
             negotiated = try await client.capability()
         } catch {
-            await client.logout()
+            // A session that already failed on the socket must not then spend
+            // the full read timeout waiting for a LOGOUT reply that is never
+            // coming — that is 30 s holding `commandLock` and a socket nobody
+            // gets back, on top of the sync loop's backoff. Only a server that
+            // is still talking gets the courtesy round trip.
+            if IMAPClient.isMessageVerdict(error) {
+                await client.logout()
+            } else {
+                await client.disconnect()
+            }
             throw Self.map(error)
         }
         self.client = client
@@ -617,12 +717,19 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         return client
     }
 
-    /// Tearing the session down is deliberately local: the socket is already
-    /// presumed dead, and a reconnect builds a fresh transport anyway.
-    private func dropConnection() {
+    /// Tear the session down. The socket is closed rather than abandoned:
+    /// `NIOSSLStreamTransport` keeps its read pump alive in a `Task` that
+    /// captures the transport, so simply dropping the `IMAPClient` reference
+    /// leaks the TLS connection, the NIO channel and the file descriptor. QQ
+    /// caps concurrent IMAP sessions per account, so a few abandoned sockets
+    /// are enough to start getting `NO` — which would leak more of them.
+    private func dropConnection() async {
+        let dead = client
         client = nil
         selected = nil
+        await dead?.disconnect()
     }
+
 
     /// The auth code lives only between the sealed blob and the TLS session.
     private func imapCredentials() async throws -> (username: String, authCode: String) {
@@ -645,7 +752,10 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     }
 
     private func selectInbox(client: IMAPClient, force: Bool) async throws -> IMAPSelected {
-        if !force, let selected { return selected }
+        // The folder name is part of the check: `selected` may name the
+        // Archive or Trash folder after a move, and a UID from one of those
+        // means nothing in INBOX.
+        if !force, let selected, selected.mailbox == Self.inboxName { return selected }
         let state = try await client.select(Self.inboxName)
         selected = state
         return state
@@ -670,10 +780,16 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             do {
                 try await client.createMailbox(Self.defaultArchiveFolderName)
                 archiveName = Self.defaultArchiveFolderName
-            } catch let error as MailError where error != .authFailed {
+            } catch {
+                // A refusal is a verdict about the folder and is remembered.
+                // A dead socket says nothing about whether this server has an
+                // archive folder, and latching "unavailable" from a blip would
+                // turn archiving off for the whole life of this provider — so
+                // that error travels out and the round retries the CREATE.
+                guard IMAPClient.isMessageVerdict(error) else { throw error }
                 logger.warning(
                     "imap.archive.createRefused",
-                    metadata: ["label": .string(error.logLabel)]
+                    metadata: ["label": .string(Self.label(error))]
                 )
                 archiveName = nil
             }
@@ -715,7 +831,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             guard let folder = try await resolveTrashFolder(client: client) else {
                 throw MailError.trashUnavailable
             }
-            try await selectInbox(client: client, force: false)
+            _ = try await selectInbox(client: client, force: false)
             let uid = try await resolveUID(remoteId, client: client)
             try await move(client: client, uid: uid, to: folder)
         }
@@ -859,11 +975,14 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             return uid
         }
         // Cache: the same Message-ID resolves to the same UID for the whole
-        // UIDVALIDITY. Drop the map when the mailbox was rebuilt under us.
+        // lifetime of the selected mailbox's UIDVALIDITY. Drop the map when
+        // the selection moved to another folder or the mailbox was rebuilt.
         if let selected {
-            if uidCacheValidity != selected.uidValidity {
+            let identity = (mailbox: selected.mailbox, uidValidity: selected.uidValidity)
+            if uidCacheIdentity?.mailbox != identity.mailbox
+                || uidCacheIdentity?.uidValidity != identity.uidValidity {
                 uidByMessageID.removeAll(keepingCapacity: true)
-                uidCacheValidity = selected.uidValidity
+                uidCacheIdentity = identity
             }
             if let cached = uidByMessageID[remoteId] {
                 return cached
@@ -950,13 +1069,6 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
         )
         return text.unicodeScalars.allSatisfy { alphabet.contains($0) }
-    }
-
-    private static func uid(from remoteId: String) throws -> Int64 {
-        guard let uid = Int64(remoteId), uid > 0 else {
-            throw MailError.protocolError("invalid remote id")
-        }
-        return uid
     }
 
     /// Wire failures → the provider-neutral surface. Only a stable label is

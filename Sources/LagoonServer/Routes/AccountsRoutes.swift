@@ -20,12 +20,15 @@ public enum AccountsRoutes {
     ///
     /// `makeProvider` is the route's provider seam: production passes
     /// `MailProviderFactory.factory(...)`, tests script a fake.
+    /// `releaseProvider` lets a deleted account give its pooled provider (and
+    /// its live IMAP session) back; production passes the pool's handle.
     public static func register(
         on router: Router<BasicRequestContext>,
         db: LagoonDB,
         logger: Logger,
         sync: SyncEngine? = nil,
-        makeProvider: @escaping MailProviderFactory.Builder
+        makeProvider: @escaping MailProviderFactory.Builder,
+        releaseProvider: (@Sendable (UUID) async -> Void)? = nil
     ) {
         router.get("api/accounts") { _, _ -> Response in
             do {
@@ -271,15 +274,14 @@ public enum AccountsRoutes {
             }
             // Restart against the promoted account, or stop when none remain.
             await sync?.refresh()
+            // The route-side pool holds a provider (and a live IMAP session)
+            // for this account. Nothing will ask for it again.
+            await releaseProvider?(accountId)
             return Response(status: .noContent)
         }
     }
 
     private static func collectBody(_ request: Request) async throws -> Data {
-        var bytes: [UInt8] = []
-        for try await chunk in request.body {
-            bytes.append(contentsOf: Array(buffer: chunk))
-        }
-        return Data(bytes)
+        try await RouteParams.collectBody(request)
     }
 }

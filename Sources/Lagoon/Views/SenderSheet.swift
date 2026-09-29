@@ -17,7 +17,7 @@ struct SenderSheet: View {
     @State private var isLoading = true
     @State private var errorBanner: ErrorBanner?
     @State private var path: [String] = []
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -77,7 +77,7 @@ struct SenderSheet: View {
                     remoteId: remoteId,
                     accountId: accountId,
                     header: messages.first { $0.remoteId == remoteId },
-                    initiallyPinned: false,
+                    initiallyPinned: messages.first { $0.remoteId == remoteId }?.isPinned ?? false,
                     siblings: messages.map(\.remoteId),
                     onArchived: { id, _ in
                         messages.removeAll { $0.remoteId == id }

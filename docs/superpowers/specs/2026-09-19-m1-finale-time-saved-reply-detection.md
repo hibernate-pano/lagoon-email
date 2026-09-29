@@ -1,5 +1,7 @@
 # M1 收官：时间节省量化 + 回复检测 + 白名单自动驾驶
 
+> **状态：已归档（superseded）。当前架构见 [README](../../../README.md) 与 [使用说明](../../使用说明.md)。**
+
 **Date:** 2026-09-19
 **Status:** Approved（Jasper 选定 M1 收官冲刺）
 **Audience:** Solo founder + AI co-founder

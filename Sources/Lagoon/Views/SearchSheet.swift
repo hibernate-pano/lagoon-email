@@ -11,7 +11,7 @@ struct SearchSheet: View {
     @State private var isLoading = false
     @State private var errorBanner: ErrorBanner?
     @State private var path: [String] = []
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     var body: some View {
         // `NavigationLink(value:)` only pushes when a NavigationStack is in
@@ -79,7 +79,7 @@ struct SearchSheet: View {
                         remoteId: remoteId,
                         accountId: accountId,
                         header: results.first { $0.remoteId == remoteId },
-                        initiallyPinned: false,
+                        initiallyPinned: results.first { $0.remoteId == remoteId }?.isPinned ?? false,
                         siblings: results.map(\.remoteId),
                         onArchived: { id, _ in
                             results.removeAll { $0.remoteId == id }

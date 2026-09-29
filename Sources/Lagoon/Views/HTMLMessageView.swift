@@ -96,10 +96,22 @@ final class PassThroughScrollWebView: WKWebView {
 /// **Security:**
 /// - `allowsContentJavaScript = false` — mail should not run JS.
 /// - `loadHTMLString(_:baseURL: nil)` — no origin, so relative URLs cannot
-///   resolve to file:// or any other scheme. `https://` and other
-///   absolute URLs still load if the user happens to click them; with
-///   JavaScript disabled and `WKURLSchemeHandler` not registered, the
-///   practical risk is "an image fails to load" rather than code execution.
+///   resolve to file:// or any other scheme.
+/// - A `WKContentRuleList` blocks every network scheme, so absolute
+///   `https://` subresources — `<img>`, `<link rel=stylesheet>`, CSS
+///   `url()`, `@import`, web fonts — never leave the machine either.
+///   `baseURL: nil` alone is **not** enough: it only stops *relative* URLs
+///   from resolving, and a tracking pixel is an absolute one. Without this
+///   list, merely opening a message told the sender the user's IP, the exact
+///   open time, and a stable cookie/ETag identifier — a read receipt, on the
+///   most privacy-sensitive screen in the app. The previous version of this
+///   comment claimed the opposite ("an image fails to load").
+/// - The navigation delegate opens *nothing* the sender asked for: only a
+///   main-frame link the user activated reaches the default browser, so a
+///   `<meta http-equiv="refresh">` or an `<iframe>` cannot turn "open a
+///   message" into an outbound request in the user's real browser. The rule
+///   list is the subresource layer; this is the navigation layer. Neither
+///   sanitises the HTML, and neither has to: blocking is the guarantee.
 ///
 /// **Inline images:** HTML references `cid:` URIs. The client passes
 /// `attachmentsByCid` (keyed by the raw `Content-ID` value, with `<>`
@@ -131,6 +143,7 @@ struct HTMLMessageView: NSViewRepresentable {
     // contract lives in the subclass, so the teardown hook has to be able
     // to detach the width-change closure without a cast.
     func makeNSView(context: Context) -> PassThroughScrollWebView {
+        Self.primeRemoteContentRuleList()
         let config = WKWebViewConfiguration()
         // M1.6: mail has no legitimate need for JS. Disabling is the only
         // way to neutralize a `<script>` tag or `javascript:` href.
@@ -174,8 +187,19 @@ struct HTMLMessageView: NSViewRepresentable {
     /// we'd need a per-attachment signature) so we accept a reload whenever
     /// the *count* of resolved cid: references grows.
     final class Coordinator: NSObject, WKNavigationDelegate {
-        var html: String = ""
-        var resolvedCidCount: Int = 0
+        /// The inputs the currently-loaded document was built from. SwiftUI
+        /// calls `updateNSView` on every body invalidation, and reloading
+        /// the WebView would blow away selection, scroll position and any
+        /// in-flight image loads — so nothing happens when these still
+        /// match. `nil` until the first load: an empty email must still
+        /// render (and still get the fluid CSS wrapper), so "never loaded"
+        /// cannot be spelled as an empty string.
+        var sourceHTML: String?
+        var sourceAttachments: [String: Data] = [:]
+        /// Set once the remote-content rule list is attached, so it is added
+        /// exactly once per WebView even though `updateNSView` runs on every
+        /// SwiftUI body invalidation.
+        var blocksRemoteContent = false
         private let contentHeight: Binding<CGFloat>
         private var measureTask: Task<Void, Never>?
         private var fallbackTask: Task<Void, Never>?
@@ -325,29 +349,74 @@ struct HTMLMessageView: NSViewRepresentable {
             return true
         }
 
-        /// Open links in the user's default browser instead of navigating
-        /// the WebView. We still allow the *initial* `loadHTMLString` (no
-        /// real `request`, no decision to make) but anything after that
-        /// — clicks, redirects, programmatic navigation — gets handed off
-        /// to `NSWorkspace`.
+        /// Keep the WebView on the document the mail loaded, and hand a
+        /// link the *user* clicked to their default browser.
+        ///
+        /// The previous version sent every `http(s)` navigation to
+        /// `NSWorkspace` on the premise that "any action reaching here is a
+        /// real user gesture" — which `loadHTMLString` not producing a
+        /// navigation action does not imply. A `<meta http-equiv="refresh">`
+        /// or an `<iframe>` is a navigation too, and opening those in the
+        /// user's real browser hands the sender their IP and the exact open
+        /// time from a different, cookie-carrying app. `navigationPolicy`
+        /// below is the rule.
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
-            // The `loadHTMLString(_:baseURL:)` we use in `updateNSView` does
-            // not produce a navigation action — it sets content directly —
-            // so any action reaching here is a real user gesture.
-            if let url = navigationAction.request.url,
-               let scheme = url.scheme?.lowercased(),
-               scheme == "http" || scheme == "https" {
+            // A nil target frame means "new window" (`target="_blank"`), not
+            // "child frame" — treating the two as the same silently breaks
+            // every new-window link, so the main-frame answer is `true` there.
+            let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+            switch Self.navigationPolicy(
+                for: navigationAction.request.url,
+                isMainFrame: isMainFrame,
+                navigationType: navigationAction.navigationType
+            ) {
+            case .openExternally(let url):
                 NSWorkspace.shared.open(url)
                 decisionHandler(.cancel)
-                return
+            case .cancel:
+                decisionHandler(.cancel)
+            case .allow:
+                // About: / data: / blob: etc.: let the WebView handle them
+                // (mostly no-ops).
+                decisionHandler(.allow)
             }
-            // About: / data: / blob: etc.: let the WebView handle them
-            // (mostly no-ops).
-            decisionHandler(.allow)
+        }
+
+        enum NavigationPolicy: Equatable {
+            /// A main-frame link the user activated: hand the URL to the
+            /// default browser.
+            case openExternally(URL)
+            /// A navigation that must not happen and must not open anything
+            /// either — the sender asked for it, the user did not.
+            case cancel
+            /// The document's own schemes; the WebView handles them.
+            case allow
+        }
+
+        /// What a navigation the WebView asked about is allowed to do.
+        ///
+        /// Only a *user-activated* main-frame link leaves the app. That
+        /// single condition is the whole privacy guarantee: `<meta
+        /// http-equiv="refresh">` arrives as `.other` and an `<iframe>`
+        /// arrives either as `.other` or as a sub-frame navigation, so
+        /// neither can turn "open a message" into an outbound request in
+        /// the user's real browser — which is the read receipt this view
+        /// exists to prevent, one layer up from the sub-resource rule
+        /// list. The `http(s)` case stays `.cancel` either way: the WebView
+        /// is not allowed to navigate off the loaded document at all.
+        static func navigationPolicy(
+            for url: URL?,
+            isMainFrame: Bool,
+            navigationType: WKNavigationType
+        ) -> NavigationPolicy {
+            guard let url, let scheme = url.scheme?.lowercased() else { return .allow }
+            guard scheme == "http" || scheme == "https" else { return .allow }
+            guard isMainFrame, navigationType == .linkActivated else { return .cancel }
+            return .openExternally(url)
         }
 
         /// `loadHTMLString` swaps in a fresh document view, so measurement
@@ -400,25 +469,119 @@ struct HTMLMessageView: NSViewRepresentable {
     """
 
     func updateNSView(_ webView: PassThroughScrollWebView, context: Context) {
+        let coordinator = context.coordinator
+        // Bail out BEFORE the pipeline, not after. The guard used to sit
+        // below `resolveCidReferences` + `injectFluidCSS` and a
+        // `components(separatedBy: "data:")` count, so it decided to skip
+        // the reload only after paying for the rebuild: on a 5MB
+        // inline-image email that is ~120ms of string work on the main
+        // thread, thrown away, on every SwiftUI body invalidation.
+        //
+        // The comparison is on the raw inputs — a `String`/`Data` compare is
+        // a memcmp (~0.04ms on the same email) — and it is exact. The cid
+        // count it replaces could not tell "same key, same number of
+        // entries, different bytes" apart, so an inline image swapped under
+        // a reused Content-ID needed the reload far more than the count ever
+        // justified.
+        if coordinator.sourceHTML == Optional(html),
+           coordinator.sourceAttachments == attachmentsByCid {
+            return
+        }
+        coordinator.sourceHTML = html
+        coordinator.sourceAttachments = attachmentsByCid
         let resolved = Self.resolveCidReferences(in: html, with: attachmentsByCid)
         // Inject the fluid CSS into the head — or wrap a minimal head around
         // documents that have no `<head>` at all (rare but legal HTML).
         let withCSS = Self.injectFluidCSS(into: resolved)
-        // Avoid reloading on every SwiftUI body invalidation: the WebView
-        // already holds the rendered page, and reloading blows away
-        // selection, scroll position, and any in-flight image loads.
-        let nextCidCount = withCSS.components(separatedBy: "data:").count - 1
-        if withCSS == context.coordinator.html,
-           nextCidCount == context.coordinator.resolvedCidCount {
-            return
+        if let rules = Self.compiledRuleList, !coordinator.blocksRemoteContent {
+            webView.configuration.userContentController.add(rules)
+            context.coordinator.blocksRemoteContent = true
         }
-        context.coordinator.html = withCSS
-        context.coordinator.resolvedCidCount = nextCidCount
-        webView.loadHTMLString(withCSS, baseURL: nil)
+        if context.coordinator.blocksRemoteContent {
+            webView.loadHTMLString(withCSS, baseURL: nil)
+        } else {
+            // The rule list is still compiling: wait for it before the first
+            // load, because a tracking pixel fires during the first layout
+            // pass, not after. `primeRemoteContentRuleList()` runs at launch,
+            // so this is the first message racing a millisecond-scale compile.
+            //
+            // If the compile genuinely fails there is no second lever — the
+            // only way to block a subresource is a rule list — so the document
+            // loads anyway rather than the user staring at a blank pane. That
+            // is a real (if remote) loss of the guarantee, not a hypothetical:
+            // `test_remoteSubresourcesAreBlocked` fails loudly if it happens.
+            let document = withCSS
+            Task { @MainActor in
+                await Self.ruleListReady()
+                if !context.coordinator.blocksRemoteContent,
+                   let rules = Self.compiledRuleList {
+                    webView.configuration.userContentController.add(rules)
+                    context.coordinator.blocksRemoteContent = true
+                }
+                webView.loadHTMLString(document, baseURL: nil)
+            }
+        }
         // Measurement starts in `didFinish`, not here: until the load
         // commits, `scrollView.documentView` is still the previous
         // document (or the blank first-load one), so an early observation
         // would attach to the wrong view and report a useless height.
+    }
+
+    /// Block the network schemes, leave the document's own alone.
+    ///
+    /// Two `WKContentRuleList` constraints shape this, both of which fail the
+    /// compile with a bare "Rule list compilation failed" and a `nil` result:
+    /// there is no `"allow"` action type, so the allowlist (`data:` for the
+    /// inlined `cid:` attachments, `about:`/`blob:` for the document's own
+    /// base) has to be expressed as a scheme *filter* rather than
+    /// block-all-plus-exceptions; and `url-filter` rejects regex alternation,
+    /// so each scheme needs its own rule rather than `(http|https)`.
+    ///
+    /// A trigger without `"resource-type"` already covers *every* resource
+    /// type, top-level navigations included — the block below says so out
+    /// loud so nobody later "optimises" a `resource-type` filter in and
+    /// quietly reopens the main-frame hole. `document` is the whole
+    /// navigation vocabulary here: the JSON rule list has no separate
+    /// child-document type (that spelling belongs to the Safari
+    /// declarative API, and putting it in fails the *entire* compile,
+    /// taking the subresource blocks down with it — WebKit's compile error
+    /// is a bare "Rule list compilation failed"). The navigation delegate
+    /// cancels the same traffic before this list is ever consulted, so the
+    /// two are independent layers, not one path.
+    static let ruleListJSON = """
+    [{"trigger":{"url-filter":"^https?:","resource-type":["document"]},"action":{"type":"block"}},
+     {"trigger":{"url-filter":"^https?:"},"action":{"type":"block"}},
+     {"trigger":{"url-filter":"^ftp:"},"action":{"type":"block"}},
+     {"trigger":{"url-filter":"^file:"},"action":{"type":"block"}}]
+    """
+    private static let ruleListIdentifier = "lagoon.blockRemoteContent"
+
+    @MainActor private static var compiledRuleList: WKContentRuleList?
+    @MainActor private static var compileTask: Task<Void, Never>?
+
+    /// Start the one-time compile. Called at launch and again from
+    /// `makeNSView`; the second call is a no-op.
+    @MainActor static func primeRemoteContentRuleList() {
+        guard compileTask == nil else { return }
+        compileTask = Task { @MainActor in
+            compiledRuleList = try? await WKContentRuleListStore.default()
+                .compileContentRuleList(
+                    forIdentifier: ruleListIdentifier,
+                    encodedContentRuleList: ruleListJSON
+                )
+        }
+    }
+
+    @MainActor private static func ruleListReady() async {
+        primeRemoteContentRuleList()
+        await compileTask?.value
+    }
+
+    /// Resolves once the rule list is compiled. Exposed so a test can assert
+    /// the guard actually engaged rather than racing it.
+    @MainActor static func remoteContentRuleList() async -> WKContentRuleList? {
+        await ruleListReady()
+        return compiledRuleList
     }
 
     /// Prepends `fluidCSS` to whatever `<head>` (or implicit head) the email
@@ -427,19 +590,22 @@ struct HTMLMessageView: NSViewRepresentable {
     /// fluid overrides on top.
     static func injectFluidCSS(into html: String) -> String {
         let css = fluidCSS
-        if html.range(of: "<head>", options: .caseInsensitive) != nil {
-            return html.replacingOccurrences(
-                of: "<head>",
-                with: "<head>\n\(css)",
-                options: .caseInsensitive
-            )
+        // Locate once, then splice. `replacingOccurrences(options:
+        // .caseInsensitive)` rescans and rebuilds the *whole* string; on a
+        // 5MB inline-image email that alone measured 23ms per call, and it
+        // ran on every SwiftUI body invalidation.
+        if let head = html.range(of: "<head>", options: .caseInsensitive) {
+            return html[html.startIndex..<head.upperBound] + "\n\(css)" + html[head.upperBound...]
         }
-        if html.range(of: "<html", options: .caseInsensitive) != nil {
-            return html.replacingOccurrences(
-                of: "<html",
-                with: "<html><head>\n\(css)</head>",
-                options: .caseInsensitive
-            )
+        if let open = html.range(of: "<html", options: .caseInsensitive),
+           let tagEnd = html.range(of: ">", range: open.lowerBound..<html.endIndex) {
+            // After the whole `<html …>` tag, not after the word: a document
+            // carrying attributes (`<html lang="zh">`) used to swallow them
+            // into the injected `<head>`, and the splice has to land in the
+            // same place the old replacement did.
+            return html[html.startIndex..<tagEnd.upperBound]
+                + "<head>\n\(css)</head>"
+                + html[tagEnd.upperBound...]
         }
         // No <html> / <head> at all: wrap so our CSS still applies. The
         // sender's body text lands inside our wrapper.

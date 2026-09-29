@@ -9,7 +9,7 @@ observable against the real server:
   1. `resolveArchiveFolder` matches folder names against
      {"archive", "归档"} and `resolveTrashFolder` against a similar list.
      QQ Mail's folders carry Chinese names, which RFC 3501 §5.1.3 puts on
-     the wire as modified UTF-7 ("归档" -> "&XfJT0ZAB-"). IMAPResponseParser
+     the wire as modified UTF-7 ("归档" -> "&X1JoYw-"). IMAPResponseParser
      deliberately does not decode anything ("everything else is passed
      through untouched"), so if QQ does send UTF-7, every Chinese name
      arrives mangled and the archive/trash match fails — Lagoon would

@@ -31,6 +31,7 @@ Support/Lagoon.iconset/
 
 # Local agent / tooling scratch (never part of the product)
 .mimosa/
+.memory/
 .pi/
 .v2c/
 .video_agent/

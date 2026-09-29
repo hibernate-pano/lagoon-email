@@ -313,14 +313,53 @@ public enum MIMEParser {
         let contentId = stripAngleBrackets(headers["content-id"] ?? headers["Content-ID"] ?? "")
 
         if mimeType == "message/rfc822" {
+            // A forwarded message arrives in two shapes and only one of them
+            // is body text. `Content-Disposition: attachment` means the whole
+            // `.eml` is the attachment: recursing into it would drop it from
+            // the list entirely and let the forwarded text stand in for the
+            // real body. Inline is the other shape — read the inner part, but
+            // keep the forwarded message itself downloadable.
+            if dispositionRaw.hasPrefix("attachment") {
+                return attachmentResult(
+                    partPath: partPath,
+                    filename: filename,
+                    mimeType: mimeType,
+                    decoded: body,
+                    encoded: body,
+                    encoding: encoding,
+                    decodeBytes: decodeAttachmentBytes,
+                    contentId: contentId,
+                    disposition: .attachment
+                )
+            }
             let (innerHeader, innerBody) = splitHeadAndBody(body)
-            return parsePart(
+            let inner = parsePart(
                 headers: parseHeaderBlock(innerHeader),
                 body: innerBody,
                 depth: depth + 1,
+                // The encapsulated message's own parts are numbered directly
+                // under this part (IMAP treats a `message/rfc822` body as the
+                // part's body), so `BODY[1.1.2]` is the second part *inside*
+                // the forward while `BODY[1.1]` is the forward itself.
                 partPath: partPath,
                 decodeAttachmentBytes: decodeAttachmentBytes
             )
+            var result = ParseResult()
+            // The forwarded text belongs to the body; its HTML does not — the
+            // detail view renders `html` in preference to `text`, so promoting
+            // it would hide the sender's actual message behind the forward.
+            result.text = inner.text
+            result.attachments.append(forwardedAttachment(
+                partPath: partPath,
+                filename: filename,
+                body: body,
+                encoding: encoding,
+                decodeBytes: decodeAttachmentBytes,
+                contentId: contentId
+            ))
+            result.attachments.append(contentsOf: inner.attachments)
+            result.hasMore = inner.hasMore
+            return result
         }
 
         if mimeType.hasPrefix("multipart/") {
@@ -456,29 +495,38 @@ public enum MIMEParser {
         disposition: Attachment.Disposition
     ) -> ParseResult {
         var result = ParseResult()
-        // Decoding the bytes is the expensive step (a 5 MB PDF costs a
-        // few hundred ms of BASE64 work + allocation). When the caller
-        // only needs metadata we skip it and estimate the size from the
-        // encoded length instead.
-        let data: Data
-        let size: Int
-        if decodeBytes {
-            data = decoded
-            size = decoded.count
-        } else {
-            data = Data()
-            size = estimatedSize(encoding: encoding, encoded: encoded)
-        }
         result.attachments.append(ParsedAttachment(
             id: partPath,
             filename: filename,
             mimeType: mimeType,
-            size: size,
+            size: decodeBytes ? decoded.count : estimatedSize(encoding: encoding, encoded: encoded),
             contentId: contentId,
             disposition: disposition,
-            data: data
+            data: decodeBytes ? decoded : Data()
         ))
         return result
+    }
+
+    /// The `.eml` of an inline `message/rfc822` part, downloadable under this
+    /// part's own id. The forwarded bytes are stored verbatim, so the transfer
+    /// encoding of the wrapper is irrelevant and `body` is both forms.
+    private static func forwardedAttachment(
+        partPath: String,
+        filename: String?,
+        body: Data,
+        encoding: String,
+        decodeBytes: Bool,
+        contentId: String?
+    ) -> ParsedAttachment {
+        ParsedAttachment(
+            id: partPath,
+            filename: filename,
+            mimeType: "message/rfc822",
+            size: decodeBytes ? body.count : estimatedSize(encoding: encoding, encoded: body),
+            contentId: contentId,
+            disposition: .inline,
+            data: decodeBytes ? body : Data()
+        )
     }
 
     /// Decoded byte count without paying for the decode. BASE64 is a
@@ -507,17 +555,56 @@ public enum MIMEParser {
 
     /// Filename from `Content-Disposition: attachment; filename=...` or
     /// `Content-Type: ...; name=...`. The two are interchangeable per RFC 2183
-    /// and the spec sample we actually see uses either one.
+    /// and the spec sample we actually see uses either one. RFC 5987's
+    /// `filename*` / `name*` is only consulted when the plain form is absent:
+    /// when a sender supplies both, RFC 6266 §4.3 keeps the plain one.
     private static func parseFilename(headers: [String: String]) -> String? {
         let disposition = headers["content-disposition"] ?? ""
-        if let name = headerParameter(in: disposition, name: "filename") ?? headerParameter(in: disposition, name: "filename*") {
+        if let name = headerParameter(in: disposition, name: "filename") {
             return decodeRFC2047(name)
+        }
+        if let extended = headerParameter(in: disposition, name: "filename*") {
+            return decodeRFC5987(extended)
         }
         let type = headers["content-type"] ?? ""
         if let name = headerParameter(in: type, name: "name") {
             return decodeRFC2047(name)
         }
+        if let extended = headerParameter(in: type, name: "name*") {
+            return decodeRFC5987(extended)
+        }
         return nil
+    }
+
+    /// RFC 5987 extended parameter: `charset'language'percent-encoded-value`.
+    /// The escapes must be resolved here — `decodeRFC2047` returns its input
+    /// untouched for a value with no `=?`, which is exactly what an RFC 5987
+    /// value looks like, so the raw `UTF-8''%E6%8A%A5…` would reach the UI.
+    private static func decodeRFC5987(_ value: String) -> String? {
+        let pieces = value.split(separator: "'", maxSplits: 2, omittingEmptySubsequences: false)
+        guard pieces.count == 3, !pieces[2].isEmpty else { return nil }
+        let charset = String(pieces[0])
+        return decodeCharset(percentDecode(String(pieces[2])), charset: charset.isEmpty ? nil : charset)
+    }
+
+    /// `%XX` → byte. A malformed escape is kept as the literal characters it
+    /// is, so a filename is never silently shortened by a typo in a header.
+    private static func percentDecode(_ value: String) -> Data {
+        let bytes = Array(value.utf8)
+        var output = Data()
+        output.reserveCapacity(bytes.count)
+        var index = 0
+        while index < bytes.count {
+            if bytes[index] == UInt8(ascii: "%"), index + 2 < bytes.count,
+               let high = hexValue(bytes[index + 1]), let low = hexValue(bytes[index + 2]) {
+                output.append(high << 4 | low)
+                index += 3
+                continue
+            }
+            output.append(bytes[index])
+            index += 1
+        }
+        return output
     }
 
     /// `name="value"` / `name=value` / `name*=RFC 2047 encoded` — the value
@@ -568,7 +655,7 @@ public enum MIMEParser {
     ) -> [(headers: [String: String], body: Data)] {
         var parts: [(headers: [String: String], body: Data)] = []
         var normalized = Data("\r\n".utf8)
-        normalized.append(body)
+        normalized.append(crlfFramed(body))
         let delimiter = Data("\r\n--\(boundary)".utf8)
 
         var searchStart = normalized.startIndex
@@ -601,6 +688,31 @@ public enum MIMEParser {
     private static func makePart(_ data: Data) -> (headers: [String: String], body: Data) {
         let (header, body) = splitHeadAndBody(data)
         return (parseHeaderBlock(header), body)
+    }
+
+    /// Inserts the missing CR in front of every LF that is not already part of
+    /// a CRLF. A `--boundary` is only recognized after CRLF, and LF-only line
+    /// endings are accepted everywhere else (see `splitHeadAndBody`), so
+    /// without this an LF-only multipart collapses into a single part and every
+    /// attachment in it is lost into the body text.
+    ///
+    /// Searching for a second `\n--boundary` candidate instead would match one
+    /// byte *inside* every real CRLF delimiter and split each part in two, so
+    /// the body is reframed once here and only one candidate is ever used.
+    private static func crlfFramed(_ body: Data) -> Data {
+        var output = Data()
+        output.reserveCapacity(body.count + 2)
+        var index = body.startIndex
+        while index < body.endIndex {
+            let byte = body[index]
+            if byte == UInt8(ascii: "\n"),
+               index == body.startIndex || body[body.index(before: index)] != UInt8(ascii: "\r") {
+                output.append(UInt8(ascii: "\r"))
+            }
+            output.append(byte)
+            index = body.index(after: index)
+        }
+        return output
     }
 
     /// `text/plain; charset="utf-8"; boundary=x` → (`text/plain`, params).

@@ -173,6 +173,61 @@ final class DomainCodableTests: XCTestCase {
         XCTAssertNil(back.snippet)
     }
 
+    /// Pin state has to survive the wire, or every list entry point opens
+    /// the detail view with the button reading "置顶" on a mail the user
+    /// already pinned.
+    func test_message_header_roundtripsPinState() throws {
+        let message = MessageHeader(
+            id: UUID(),
+            accountId: UUID(),
+            remoteId: "g5",
+            threadId: "t5",
+            fromAddress: "erin@example.com",
+            fromName: "Erin",
+            subject: "Pinned",
+            snippet: "…",
+            receivedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            isRead: true,
+            isArchived: false,
+            isPinned: true
+        )
+
+        let data = try makeEncoder().encode(message)
+        let back = try makeDecoder().decode(MessageHeader.self, from: data)
+
+        XCTAssertTrue(back.isPinned)
+        XCTAssertEqual(back, message)
+    }
+
+    /// `withRead` is the read-state mutation both list views use. It used
+    /// to drop pin state (and the RFC threading headers) on the floor.
+    func test_message_header_withRead_preservesPinState() {
+        let message = MessageHeader(
+            id: UUID(),
+            accountId: UUID(),
+            remoteId: "g6",
+            threadId: "t6",
+            fromAddress: "frank@example.com",
+            fromName: "Frank",
+            subject: "Kept",
+            snippet: "…",
+            receivedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            isRead: false,
+            isArchived: false,
+            isPinned: true,
+            messageIdHeader: "<a@b>",
+            inReplyTo: "<c@d>",
+            references: "<a@b> <c@d>"
+        )
+
+        let read = message.withRead(true)
+
+        XCTAssertTrue(read.isRead)
+        XCTAssertTrue(read.isPinned, "marking read must not un-pin the mail")
+        XCTAssertEqual(read.messageIdHeader, "<a@b>")
+        XCTAssertEqual(read.references, "<a@b> <c@d>")
+    }
+
     func test_connected_account_decodes_server_json() throws {
         // Exact shape of GET /api/accounts (ConnectedAccount.swift contract).
         let json = """

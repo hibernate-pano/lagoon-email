@@ -1,5 +1,7 @@
 # M1.6 · Attachments, HTML, Inline Images
 
+> **状态：已归档（superseded）。当前架构见 [README](../../../README.md) 与 [使用说明](../../使用说明.md)。**
+
 **Date:** 2026-09-17
 **Status:** Draft for review
 **Predecessor:** v0.2.0 (UX feedback discipline, commit `afd9d90`)

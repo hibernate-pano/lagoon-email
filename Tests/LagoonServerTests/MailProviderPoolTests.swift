@@ -59,6 +59,58 @@ final class MailProviderPoolTests: XCTestCase {
         XCTAssertFalse((first as? StubMailProvider) === (second as? StubMailProvider))
         XCTAssertEqual(counter.value, 2)
     }
+
+    /// Re-authentication reuses the account id, so replacing an entry drops a
+    /// provider that may still hold a live IMAP session. QQ caps concurrent
+    /// sessions per account, so the replaced one has to be closed, not dropped.
+    func test_replacedProviderIsShutDownNotJustDropped() async {
+        let pool = MailProviderPool()
+        let id = UUID()
+        func account(blob: String) -> Account {
+            Account(
+                id: id,
+                provider: .qq,
+                oauthUser: "pool@qq.com",
+                email: "pool@qq.com",
+                credentials: Data(blob.utf8)
+            )
+        }
+        let first = StubMailProvider()
+        let second = StubMailProvider()
+
+        _ = await pool.provider(for: account(blob: "v1")) { _ in first }
+        _ = await pool.provider(for: account(blob: "v2")) { _ in second }
+
+        let firstClosed = await first.shutdownCount
+        let secondClosed = await second.shutdownCount
+        XCTAssertEqual(firstClosed, 1, "the replaced provider's session must be released")
+        XCTAssertEqual(secondClosed, 0, "the live provider is not shut down")
+    }
+
+    /// A deleted account is never asked for again, so its pooled provider and
+    /// session must go when the row does.
+    func test_releaseDropsTheEntryAndShutsItDown() async {
+        let pool = MailProviderPool()
+        let id = UUID()
+        let account = Account(
+            id: id,
+            provider: .qq,
+            oauthUser: "pool@qq.com",
+            email: "pool@qq.com",
+            credentials: Data("v1".utf8)
+        )
+        let held = StubMailProvider()
+        _ = await pool.provider(for: account) { _ in held }
+
+        await pool.release(id)
+
+        let heldClosed = await held.shutdownCount
+        XCTAssertEqual(heldClosed, 1)
+        // And the next caller must get a fresh provider, not the released one.
+        let rebuilt = StubMailProvider()
+        let next = await pool.provider(for: account) { _ in rebuilt }
+        XCTAssertTrue((next as? StubMailProvider) === rebuilt)
+    }
 }
 
 private final class BuildCounter: @unchecked Sendable {

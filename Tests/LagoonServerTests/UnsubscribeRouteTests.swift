@@ -698,28 +698,27 @@ final class UnsubscribeRouteTests: XCTestCase {
 
     /// The streaming cap: past `maxBodyBytes` the task is cancelled instead of
     /// letting `data(for:)` buffer an attacker-chosen body whole.
+    ///
+    /// Dispatch goes through the `URLSessionDataDelegate` *existential* on
+    /// purpose. The previous version of this test called the method directly,
+    /// so it passed even though the signature carried a `completionHandler:`
+    /// parameter that no protocol requirement has — URLSession never called it,
+    /// and the cap was dead in production. Only protocol dispatch proves
+    /// conformance.
     func test_redirectGuard_capsStreamedBody() {
         let cap = 1024
-        let guardDelegate = ActionsRoutes.RedirectGuard(maxBodyBytes: cap)
+        let delegate: URLSessionDataDelegate = ActionsRoutes.RedirectGuard(maxBodyBytes: cap)
         let task = ProbeTask()
         let session = URLSession.shared
 
-        var dispositions: [Int] = []
-        func feed(_ bytes: Int) {
-            guardDelegate.urlSession(
-                session, dataTask: task, didReceive: Data(count: bytes)
-            ) { disposition in dispositions.append(disposition.rawValue) }
-        }
-        feed(cap)
-        XCTAssertFalse(task.wasCancelled, "a body at the cap is still allowed")
-        feed(1)
-        XCTAssertTrue(task.wasCancelled, "one byte past the cap must stop the read")
-        XCTAssertEqual(
-            dispositions,
-            [URLSession.ResponseDisposition.allow.rawValue,
-             URLSession.ResponseDisposition.allow.rawValue],
-            "the disposition stays allow; the cap works by cancelling the task"
+        XCTAssertNotNil(
+            delegate.urlSession(_:dataTask:didReceive:),
+            "the guard must satisfy the delegate requirement, or the cap never runs"
         )
+        delegate.urlSession?(session, dataTask: task, didReceive: Data(count: cap))
+        XCTAssertFalse(task.wasCancelled, "a body at the cap is still allowed")
+        delegate.urlSession?(session, dataTask: task, didReceive: Data(count: 1))
+        XCTAssertTrue(task.wasCancelled, "one byte past the cap must stop the read")
     }
 
     /// The blind POST is gone. The old POST-first probe burned the one

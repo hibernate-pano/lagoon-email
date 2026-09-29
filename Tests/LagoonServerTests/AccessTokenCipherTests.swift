@@ -121,18 +121,10 @@ final class AccessTokenCipherTests: XCTestCase {
         }
     }
 
-    func test_validateKey_badAndGood() throws {
-        try TokenKeyFixture.withKey(nil) {
-            XCTAssertThrowsError(try AccessTokenCipher.validateKey())
-        }
-        try TokenKeyFixture.withKey(Data(repeating: 0, count: 16).base64EncodedString()) {
-            XCTAssertThrowsError(try AccessTokenCipher.validateKey())
-        }
-        try TokenKeyFixture.withKey("not base64!!") {
-            XCTAssertThrowsError(try AccessTokenCipher.validateKey())
-        }
-        try TokenKeyFixture.withKey(TokenKeyFixture.freshKey()) {
-            XCTAssertNoThrow(try AccessTokenCipher.validateKey())
-        }
-    }
+    // `test_missingKeyThrowsMissingKey`, `test_badKey16BytesThrowsBadKey` and
+    // `test_nonBase64KeyThrowsBadKey` already pin key validation through the
+    // real `open()` path, which is the only path production takes. A separate
+    // `validateKey()` probe existed solely for this test and was deleted
+    // along with it: an API with no production caller is a promise the code
+    // does not have to keep.
 }

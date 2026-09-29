@@ -139,7 +139,7 @@ final class AutoArchiveTests: XCTestCase {
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
             try await TestDatabase.withConnection(cleanup: Self.engineCleanup(oauthUser: oauthUser)) { conn in
                 try await Self.seedEngineAccount(account, db: conn)
-                try await AutoArchiveStore.create(
+                _ = try await AutoArchiveStore.create(
                     accountId: account.id,
                     senderAddress: "noise@example.com",
                     db: conn
@@ -189,7 +189,7 @@ final class AutoArchiveTests: XCTestCase {
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
             try await TestDatabase.withConnection(cleanup: Self.engineCleanup(oauthUser: oauthUser)) { conn in
                 try await Self.seedEngineAccount(account, db: conn)
-                try await AutoArchiveStore.create(
+                _ = try await AutoArchiveStore.create(
                     accountId: account.id,
                     senderAddress: "noise@example.com",
                     db: conn
@@ -225,7 +225,7 @@ final class AutoArchiveTests: XCTestCase {
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
             try await TestDatabase.withConnection(cleanup: Self.engineCleanup(oauthUser: oauthUser)) { conn in
                 try await Self.seedEngineAccount(account, db: conn)
-                try await AutoArchiveStore.create(
+                _ = try await AutoArchiveStore.create(
                     accountId: account.id,
                     senderAddress: "noise@example.com",
                     db: conn

@@ -196,4 +196,101 @@ final class MIMEBuilderTests: XCTestCase {
         let decoded = Data(base64Encoded: encodedLines.joined())
         XCTAssertEqual(String(decoding: try XCTUnwrap(decoded), as: UTF8.self), body)
     }
+
+    // MARK: - Header injection
+
+    /// Header block lines, in order. A forged header is not a value with a
+    /// newline in it — it is a *line* of its own, which is what the receiving
+    /// client reads.
+    private func headerLines(_ data: Data) throws -> [String] {
+        let text = String(decoding: data, as: UTF8.self)
+        let separator = try XCTUnwrap(text.range(of: "\r\n\r\n"), "missing header/body separator")
+        return String(text[text.startIndex..<separator.lowerBound])
+            .components(separatedBy: "\r\n")
+    }
+
+    /// The values a reply copies out of the message being answered (subject,
+    /// Message-ID, References) are remote-controlled, and RFC 2047 decoding
+    /// upstream can restore a `=0D=0A` pair to a real CRLF. RFC 5322 §2.2.3
+    /// admits neither CR nor LF in a field value, so a subject carrying one
+    /// must not be able to mint a `Bcc:` of its own.
+    func test_reply_subjectWithCRLF_doesNotEmitAForgedHeaderLine() throws {
+        let data = MIMEBuilder.reply(
+            outbound(subject: "Lunch?\r\nBcc: victim@evil.example"),
+            messageId: "<m1@lagoon>"
+        )
+
+        let lines = try headerLines(data)
+        XCTAssertFalse(
+            lines.contains { $0.lowercased().hasPrefix("bcc:") },
+            "forged header emitted:\n\(lines.joined(separator: "\n"))"
+        )
+        let (headers, _) = try parts(data)
+        XCTAssertEqual(headers["bcc"], nil)
+        XCTAssertEqual(headers["subject"], "Re: Lunch?Bcc: victim@evil.example")
+    }
+
+    /// The same for the threading headers, which arrive already decoded and
+    /// are the other two values a reply takes straight from the wire.
+    func test_reply_threadHeadersWithCRLF_doNotEmitForgedHeaderLines() throws {
+        let data = MIMEBuilder.reply(
+            outbound(
+                inReplyTo: "<a@evil.example>\r\nBcc: victim@evil.example",
+                references: "<a@evil.example>\r\nBcc: second@evil.example"
+            ),
+            messageId: "<m1@lagoon>"
+        )
+
+        let lines = try headerLines(data)
+        XCTAssertEqual(lines.filter { $0.lowercased().hasPrefix("bcc:") }.count, 0, lines.joined(separator: "\n"))
+        let (headers, _) = try parts(data)
+        XCTAssertEqual(headers["in-reply-to"], "<a@evil.example>Bcc: victim@evil.example")
+        XCTAssertEqual(headers["references"], "<a@evil.example>Bcc: second@evil.example")
+    }
+
+    /// A bare CR and a NUL end a header the same way a CRLF does; all three
+    /// are equally illegal in a field value.
+    func test_reply_bareCRAndNUL_inSubjectAreRemoved() throws {
+        for injected in ["Hi\rBcc: a@evil.example", "Hi\nBcc: b@evil.example", "Hi\0Bcc: c@evil.example"] {
+            let data = MIMEBuilder.reply(outbound(subject: injected), messageId: "<m1@lagoon>")
+            let lines = try headerLines(data)
+            XCTAssertFalse(
+                lines.contains { $0.lowercased().hasPrefix("bcc:") },
+                "forged header for \(injected.debugDescription):\n\(lines.joined(separator: "\n"))"
+            )
+        }
+    }
+
+    /// The `To:` list is built from the same helper, so a CRLF in a recipient
+    /// must not become a second header either.
+    func test_reply_toWithCRLF_doesNotEmitAForgedHeaderLine() throws {
+        let data = MIMEBuilder.reply(
+            outbound(to: "alice@example.com\r\nBcc: victim@evil.example"),
+            messageId: "<m1@lagoon>"
+        )
+        let lines = try headerLines(data)
+        XCTAssertFalse(
+            lines.contains { $0.lowercased().hasPrefix("bcc:") },
+            lines.joined(separator: "\n")
+        )
+    }
+
+    /// Sanitising must not damage an ordinary message: a legitimate subject,
+    /// threading chain and address list pass through untouched.
+    func test_reply_ordinaryValuesAreUnchanged() throws {
+        let data = MIMEBuilder.reply(
+            outbound(
+                to: "alice@example.com, Bob <bob@example.com>",
+                subject: "Re: 会议纪要",
+                inReplyTo: "<a@qq.com>",
+                references: "<a@qq.com> <b@qq.com>"
+            ),
+            messageId: "<m1@lagoon>"
+        )
+        let (headers, _) = try parts(data)
+        XCTAssertEqual(headers["to"], "<alice@example.com>, Bob <bob@example.com>")
+        XCTAssertEqual(headers["in-reply-to"], "<a@qq.com>")
+        XCTAssertEqual(headers["references"], "<a@qq.com> <b@qq.com>")
+        XCTAssertEqual(decoded(try XCTUnwrap(headers["subject"])), "Re: 会议纪要")
+    }
 }

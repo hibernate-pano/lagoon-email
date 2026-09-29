@@ -153,6 +153,12 @@ public enum AccountStore {
     /// The client's selected mailbox (filter marker). All accounts sync
     /// concurrently; this only decides which mailbox the UI shows.
     public static func active(db: LagoonDB) async throws -> Account? {
+        try activeSync(db: db)
+    }
+
+    /// Sync core. `LagoonDB(transaction:)` makes this join a caller's write
+    /// transaction instead of borrowing a reader — see `reconcileActive`.
+    private static func activeSync(db: LagoonDB) throws -> Account? {
         let sql = accountColumns + "\n            WHERE is_active = TRUE\n            LIMIT 1"
         return try db.read { db in
             try Row.fetchOne(db, sql: sql).map { try Self.decode($0) }
@@ -167,28 +173,38 @@ public enum AccountStore {
         db: LagoonDB
     ) async throws {
         try db.write { db in
-            try db.execute(sql: "UPDATE accounts SET is_active = FALSE WHERE is_active = TRUE")
-            try db.execute(
-                sql: """
-                    UPDATE accounts
-                    SET is_active = TRUE, updated_at = strftime('%Y-%m-%d %H:%M:%f','now')
-                    WHERE id = ?
-                    """,
-                arguments: [accountId]
-            )
+            try setActiveSync(accountId: accountId, db: db)
         }
     }
 
-    /// Repair a zero-selected state after a delete or an interrupted switch.
-    public static func reconcileActive(db: LagoonDB) async throws {
-        if try await active(db: db) != nil { return }
-        guard let newest = try await mostRecentlyUpdated(db: db) else { return }
-        try await setActive(accountId: newest.id, db: db)
+    private static func setActiveSync(accountId: UUID, db: Database) throws {
+        try db.execute(sql: "UPDATE accounts SET is_active = FALSE WHERE is_active = TRUE")
+        try db.execute(
+            sql: """
+                UPDATE accounts
+                SET is_active = TRUE, updated_at = strftime('%Y-%m-%d %H:%M:%f','now')
+                WHERE id = ?
+                """,
+            arguments: [accountId]
+        )
     }
 
-    private static func mostRecentlyUpdated(
-        db: LagoonDB
-    ) async throws -> Account? {
+    /// Repair a zero-selected state after a delete or an interrupted switch.
+    ///
+    /// One write transaction, deliberately. "Nobody is active" → "newest
+    /// account" → "activate it" used to be three separate transactions, so an
+    /// activate that landed in the gap was silently reverted by the flip
+    /// below: the user clicked account B, and the UI went back to C.
+    public static func reconcileActive(db: LagoonDB) async throws {
+        try db.write { raw in
+            let tx = LagoonDB(transaction: raw)
+            if try activeSync(db: tx) != nil { return }
+            guard let newest = try mostRecentlyUpdatedSync(db: tx) else { return }
+            try setActiveSync(accountId: newest.id, db: raw)
+        }
+    }
+
+    private static func mostRecentlyUpdatedSync(db: LagoonDB) throws -> Account? {
         let sql = accountColumns + "\n            ORDER BY updated_at DESC, id\n            LIMIT 1"
         return try db.read { db in
             try Row.fetchOne(db, sql: sql).map { try Self.decode($0) }
@@ -210,18 +226,6 @@ public enum AccountStore {
         let sql = accountColumns + "\n            WHERE oauth_user = ? AND provider = ?\n            LIMIT 1"
         return try db.read { db in
             try Row.fetchOne(db, sql: sql, arguments: [oauthUser, provider.rawValue])
-                .map { try Self.decode($0) }
-        }
-    }
-
-    public static func find(
-        byEmail email: String,
-        provider: MailProviderKind,
-        db: LagoonDB
-    ) async throws -> Account? {
-        let sql = accountColumns + "\n            WHERE email = ? AND provider = ?\n            LIMIT 1"
-        return try db.read { db in
-            try Row.fetchOne(db, sql: sql, arguments: [email, provider.rawValue])
                 .map { try Self.decode($0) }
         }
     }

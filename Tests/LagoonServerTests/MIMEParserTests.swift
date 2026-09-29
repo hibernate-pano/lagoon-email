@@ -395,4 +395,284 @@ final class MIMEParserTests: XCTestCase {
         XCTAssertEqual(parsed.html, "<p>hello <b>world</b></p>")
         XCTAssertTrue(parsed.attachments.isEmpty)
     }
+
+    // MARK: - message/rfc822
+
+    /// A forwarded `.eml` that comes before the real body. Recursing into it
+    /// without registering it as an attachment loses the forward entirely
+    /// (nothing in `attachments`, so nothing in the UI to download) and lets
+    /// the forwarded text stand in for the sender's actual message.
+    func test_parse_forwardedMessageFirst_keepsRealBodyAndListsTheForward() throws {
+        let raw = """
+        Content-Type: multipart/mixed; boundary="m"
+
+        --m
+        Content-Type: message/rfc822
+        Content-Disposition: attachment; filename="forwarded.eml"
+
+        From: someone@else.example
+        Subject: forwarded
+        Content-Type: text/plain
+
+        FORWARDED BODY
+        --m
+        Content-Type: text/plain; charset=UTF-8
+
+        THE REAL BODY
+        --m--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let parsed = MIMEParser.parse(message: Data(raw.utf8), decodeAttachmentBytes: true)
+
+        XCTAssertEqual(parsed.text, "THE REAL BODY")
+        XCTAssertEqual(parsed.attachments.count, 1)
+        let forward = try XCTUnwrap(parsed.attachments.first)
+        XCTAssertEqual(forward.id, "1.1", "the id must address the .eml part itself")
+        XCTAssertEqual(forward.filename, "forwarded.eml")
+        XCTAssertEqual(forward.mimeType, "message/rfc822")
+        XCTAssertEqual(forward.disposition, .attachment)
+        XCTAssertTrue(String(decoding: forward.data, as: UTF8.self).contains("FORWARDED BODY"))
+    }
+
+    /// Same message, forward *after* the body: the forward must still be
+    /// downloadable, and must not displace the body that was seen first.
+    func test_parse_forwardedMessageLast_listsTheForwardWithoutStealingTheBody() {
+        let raw = """
+        Content-Type: multipart/mixed; boundary="m"
+
+        --m
+        Content-Type: text/plain; charset=UTF-8
+
+        THE REAL BODY
+        --m
+        Content-Type: message/rfc822
+        Content-Disposition: attachment; filename="forwarded.eml"
+
+        Subject: forwarded
+        Content-Type: text/plain
+
+        FORWARDED BODY
+        --m--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let parsed = MIMEParser.parse(message: Data(raw.utf8))
+
+        XCTAssertEqual(parsed.text, "THE REAL BODY")
+        XCTAssertEqual(parsed.attachments.map(\.id), ["1.2"])
+        XCTAssertEqual(parsed.attachments.first?.filename, "forwarded.eml")
+    }
+
+    /// An inline forward is meant to be read, so its text joins the body — but
+    /// it still has to be a downloadable attachment, and its HTML must not
+    /// become the message's HTML: the detail view renders `html` in preference
+    /// to `text`, which would hide the sender's real message.
+    func test_parse_inlineForwardedMessage_contributesTextButNotHtml() throws {
+        let raw = """
+        Content-Type: multipart/mixed; boundary="m"
+
+        --m
+        Content-Type: text/plain; charset=UTF-8
+
+        THE REAL BODY
+        --m
+        Content-Type: message/rfc822
+
+        Subject: forwarded
+        Content-Type: text/html
+
+        <p>FORWARDED HTML</p>
+        --m--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let parsed = MIMEParser.parse(message: Data(raw.utf8), decodeAttachmentBytes: true)
+
+        XCTAssertEqual(parsed.text, "THE REAL BODY", "the real body was seen first and must win")
+        XCTAssertNil(parsed.html, "a forwarded message must not become the message's html")
+        XCTAssertEqual(parsed.attachments.map(\.id), ["1.2"])
+        XCTAssertEqual(parsed.attachments.first?.disposition, .inline)
+        let forward = try XCTUnwrap(parsed.attachments.first)
+        XCTAssertTrue(String(decoding: forward.data, as: UTF8.self).contains("FORWARDED HTML"))
+    }
+
+    /// The recursion numbers its child under the forwarding part, so an
+    /// attachment *inside* the forward cannot claim the forward's own id.
+    func test_parse_inlineForward_itsOwnAttachmentGetsADistinctId() {
+        let raw = """
+        Content-Type: multipart/mixed; boundary="m"
+
+        --m
+        Content-Type: message/rfc822
+
+        Content-Type: multipart/mixed; boundary="i"
+
+        --i
+        Content-Type: text/plain
+
+        forwarded text
+        --i
+        Content-Type: application/pdf
+        Content-Disposition: attachment; filename="inner.pdf"
+
+        inner
+        --i--
+        --m--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let parsed = MIMEParser.parse(message: Data(raw.utf8))
+
+        let ids = parsed.attachments.map(\.id)
+        XCTAssertEqual(Set(ids).count, ids.count, "ids must be unique: \(ids)")
+        XCTAssertTrue(ids.contains("1.1"), "the forwarded .eml itself: \(ids)")
+        XCTAssertTrue(ids.contains("1.1.2"), "the attachment inside it: \(ids)")
+    }
+
+    // MARK: - LF-only line endings
+
+    /// LF-only line endings are accepted by the header split, so they must be
+    /// accepted by the boundary search too. A `--boundary` is only recognized
+    /// after CRLF, which used to collapse the whole message into one part: the
+    /// base64 of the PDF landed in the body text and the attachment list came
+    /// back empty.
+    func test_parse_lfOnlyMultipartMixed_keepsAttachmentsOutOfTheBody() throws {
+        let pdfBytes = Data("%PDF-1.4 test".utf8)
+        let raw = """
+        Content-Type: multipart/mixed; boundary="b"
+
+        --b
+        Content-Type: text/plain; charset=UTF-8
+
+        Hello
+        --b
+        Content-Type: application/pdf
+        Content-Transfer-Encoding: base64
+        Content-Disposition: attachment; filename="report.pdf"
+
+        \(pdfBytes.base64EncodedString())
+        --b--
+        """
+        let parsed = MIMEParser.parse(message: Data(raw.utf8), decodeAttachmentBytes: true)
+
+        XCTAssertEqual(parsed.text, "Hello")
+        XCTAssertEqual(parsed.attachments.count, 1)
+        let attachment = try XCTUnwrap(parsed.attachments.first)
+        XCTAssertEqual(attachment.filename, "report.pdf")
+        XCTAssertEqual(attachment.data, pdfBytes)
+        XCTAssertFalse(parsed.hasMore)
+    }
+
+    /// The same message with CRLF must parse identically — the fix reframes
+    /// LF-only bodies, and a CRLF body must not gain a second CR anywhere.
+    func test_parse_crlfMultipartMixed_isUnaffectedByTheReframing() {
+        let pdfBytes = Data("%PDF-1.4 test".utf8)
+        let raw = """
+        Content-Type: multipart/mixed; boundary="b"
+
+        --b
+        Content-Type: text/plain; charset=UTF-8
+
+        Hello
+        --b
+        Content-Type: application/pdf
+        Content-Transfer-Encoding: base64
+        Content-Disposition: attachment; filename="report.pdf"
+
+        \(pdfBytes.base64EncodedString())
+        --b--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let parsed = MIMEParser.parse(message: Data(raw.utf8), decodeAttachmentBytes: true)
+
+        XCTAssertEqual(parsed.text, "Hello")
+        XCTAssertEqual(parsed.attachments.count, 1)
+        XCTAssertEqual(parsed.attachments[0].data, pdfBytes)
+    }
+
+    /// `multipart/alternative` with LF endings used to keep one part, so the
+    /// HTML variant vanished into the text and the detail view fell back to
+    /// plain text.
+    func test_parse_lfOnlyMultipartAlternative_keepsTheHTMLVariant() {
+        let raw = """
+        Content-Type: multipart/alternative; boundary="a"
+
+        --a
+        Content-Type: text/plain; charset=UTF-8
+
+        plain version
+        --a
+        Content-Type: text/html; charset=UTF-8
+
+        <p>HTML version</p>
+        --a--
+        """
+        let parsed = MIMEParser.parse(message: Data(raw.utf8))
+
+        XCTAssertEqual(parsed.text, "plain version")
+        XCTAssertEqual(parsed.html, "<p>HTML version</p>")
+    }
+
+    // MARK: - RFC 5987 filenames
+
+    /// `filename*=UTF-8''…` is percent-encoded and names its own charset.
+    /// Neither the escapes nor the `UTF-8''` prefix may reach the UI — the
+    /// attachment row shows `filename` verbatim.
+    func test_parse_filenameStarExtendedParameter_decodesToTheRealName() {
+        let raw = """
+        Content-Type: multipart/mixed; boundary="b"
+
+        --b
+        Content-Type: text/plain
+
+        body
+        --b
+        Content-Type: application/pdf
+        Content-Disposition: attachment; filename*=UTF-8''%E6%8A%A5%E5%91%8A%20Q3.pdf
+
+        %PDF
+        --b--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let parsed = MIMEParser.parse(message: Data(raw.utf8))
+
+        XCTAssertEqual(parsed.attachments.count, 1)
+        XCTAssertEqual(parsed.attachments[0].filename, "报告 Q3.pdf")
+    }
+
+    /// The same extended form on `Content-Type; name*` — the parameter the
+    /// parser never even looked at, so the filename was simply missing and the
+    /// row fell back to showing the mime type.
+    func test_parse_contentTypeNameStarExtendedParameter_decodesToTheRealName() {
+        let raw = """
+        Content-Type: multipart/mixed; boundary="b"
+
+        --b
+        Content-Type: text/plain
+
+        body
+        --b
+        Content-Type: application/pdf; name*=UTF-8''%E6%8A%A5%E5%91%8A.pdf
+        Content-Disposition: attachment
+
+        %PDF
+        --b--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let parsed = MIMEParser.parse(message: Data(raw.utf8))
+
+        XCTAssertEqual(parsed.attachments.count, 1)
+        XCTAssertEqual(parsed.attachments[0].filename, "报告.pdf")
+    }
+
+    /// RFC 6266 §4.3: a sender that sends both forms keeps the plain one.
+    func test_parse_filename_prefersPlainFormOverExtendedForm() {
+        let raw = """
+        Content-Type: multipart/mixed; boundary="b"
+
+        --b
+        Content-Type: text/plain
+
+        body
+        --b
+        Content-Type: application/pdf
+        Content-Disposition: attachment; filename="report.pdf"; filename*=UTF-8''%E6%8A%A5.pdf
+
+        %PDF
+        --b--
+        """.replacingOccurrences(of: "\n", with: "\r\n")
+        let parsed = MIMEParser.parse(message: Data(raw.utf8))
+
+        XCTAssertEqual(parsed.attachments.first?.filename, "report.pdf")
+    }
 }

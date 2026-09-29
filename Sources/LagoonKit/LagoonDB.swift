@@ -30,10 +30,6 @@ public struct LagoonDB {
         self.existing = transaction
     }
 
-    /// True when this handle joins a caller-owned transaction (writes will not
-    /// open their own).
-    public var isInTransaction: Bool { existing != nil }
-
     /// Runs `body` with a database handle, joining the caller's transaction
     /// when there is one. On a pool this participates in GRDB's implicit
     /// write transaction; nested via `transaction:` it is plain SQL on the

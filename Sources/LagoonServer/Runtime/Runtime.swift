@@ -62,7 +62,7 @@ public final class RunningLagoonServer: @unchecked Sendable {
     public func stop() async {
         await syncEngine.stop()
         await serviceGroup.triggerGracefulShutdown()
-        _ = try? await runTask.value
+        _ = await runTask.value
     }
 }
 
@@ -117,7 +117,8 @@ public enum LagoonRuntime {
             logger.info("AI gateway disabled: set LLM_PROVIDER_PRIMARY_BASE_URL and LLM_PROVIDER_PRIMARY_API_KEY")
         }
 
-        let makeProvider = MailProviderFactory.factory(db: db, logger: logger)
+        let providerFactory = MailProviderFactory.factory(db: db, logger: logger)
+        let makeProvider = providerFactory.builder
 
         let router = Router()
         router.add(middleware: LoopbackHostMiddleware(
@@ -126,7 +127,8 @@ public enum LagoonRuntime {
         router.add(middleware: APIAuthMiddleware(token: apiToken))
         HealthRoutes.register(on: router)
         AccountsRoutes.register(
-            on: router, db: db, logger: logger, sync: syncEngine, makeProvider: makeProvider
+            on: router, db: db, logger: logger, sync: syncEngine,
+            makeProvider: makeProvider, releaseProvider: providerFactory.release
         )
         SyncRoutes.register(on: router, db: db, sync: syncEngine)
         MessageRoutes.register(

@@ -45,7 +45,7 @@ struct ConnectView: View {
         _qqEmail = State(initialValue: prefillEmail ?? "")
     }
 
-    private let api = APIClient()
+    private let api = APIClient.shared
 
     var body: some View {
         VStack(spacing: 16) {

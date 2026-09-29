@@ -15,10 +15,7 @@ public enum SyncRoutes {
             guard let raw = req.uri.queryParameters["accountId"].map(String.init),
                   let uuid = UUID(uuidString: raw)
             else {
-                return Response(
-                    status: .badRequest,
-                    body: .init(byteBuffer: ByteBuffer(string: "accountId missing or malformed"))
-                )
+                return RouteJSON.error(.badRequest, "malformed-accountId")
             }
             let limit = max(1, min(Int(req.uri.queryParameters["limit"] ?? "50") ?? 50, 200))
             // Optional 发件人归集 filter: exact from_address, bound as a
@@ -31,27 +28,35 @@ public enum SyncRoutes {
             let stackMatch: MessageStore.StackMatch?
             if let raw = req.uri.queryParameters["stackId"].map(String.init), let ruleId = UUID(uuidString: raw) {
                 guard let rule = try await StackStore.listStackRule(id: ruleId, accountId: uuid, db: db) else {
-                    return Response(status: .notFound, body: .init(byteBuffer: ByteBuffer(string: "unknown-stack")))
+                    return RouteJSON.error(.notFound, "unknown-stack")
                 }
                 stackMatch = rule.kind == .sender ? .sender(rule.value) : .keyword(rule.value)
             } else {
                 stackMatch = nil
             }
-            let msgs = try await MessageStore.recent(
-                forAccount: uuid, limit: limit, sender: sender,
-                archived: archived, stackMatch: stackMatch, db: db
-            )
-            let unread = try await MessageStore.unreadCount(forAccount: uuid, db: db)
-            let cursor = SyncCursor(accountId: uuid, lastFetchedAt: Date(), totalUnread: unread)
-            let payload = SyncResponse(cursor: cursor, messages: msgs)
-            let enc = JSONEncoder()
-            enc.dateEncodingStrategy = .iso8601
-            let data = try enc.encode(payload)
-            return Response(
-                status: .ok,
-                headers: [.contentType: "application/json; charset=utf-8"],
-                body: .init(byteBuffer: ByteBuffer(data: data))
-            )
+            // Every store call below can throw, and Hummingbird's default
+            // error handler answers an escaping throw with an *empty* 500 —
+            // not the `{"error":…}` envelope the client decodes. Wrapping
+            // keeps one error shape across every route.
+            do {
+                let msgs = try await MessageStore.recent(
+                    forAccount: uuid, limit: limit, sender: sender,
+                    archived: archived, stackMatch: stackMatch, db: db
+                )
+                let unread = try await MessageStore.unreadCount(forAccount: uuid, db: db)
+                let cursor = SyncCursor(accountId: uuid, lastFetchedAt: Date(), totalUnread: unread)
+                let payload = SyncResponse(cursor: cursor, messages: msgs)
+                let enc = JSONEncoder()
+                enc.dateEncodingStrategy = .iso8601
+                let data = try enc.encode(payload)
+                return Response(
+                    status: .ok,
+                    headers: [.contentType: "application/json; charset=utf-8"],
+                    body: .init(byteBuffer: ByteBuffer(data: data))
+                )
+            } catch {
+                return RouteJSON.error(.internalServerError, "internal-error")
+            }
         }
 
         router.post("api/sync") { _, _ -> Response in

@@ -155,4 +155,87 @@ final class AccountStoreTests: XCTestCase {
             XCTAssertTrue(ids.contains(b.id), "AccountStore.all must include inserted account B")
         }
     }
+
+    /// `reconcileActive` repairs a zero-selected state, but it used to be
+    /// three separate transactions: "nobody is active" → "newest account" →
+    /// activate it. An activate that committed inside that gap was undone by
+    /// the final flip, because the flip used the account list read *before*
+    /// the activate — so the user clicked account B and the UI went back to
+    /// the previously-newest account C.
+    ///
+    /// The test holds SQLite's single write lock (the pool serializes writers)
+    /// while it activates B, and runs `reconcileActive` alongside. Reconcile's
+    /// write can only proceed after B's transaction commits, so a
+    /// single-transaction reconcile reads "B is active" and leaves it alone.
+    func test_reconcileActive_doesNotRevertAnActivateThatCommittedDuringIt() async throws {
+        let oauthA = "acct-\(UUID().uuidString)"
+        let oauthB = "acct-\(UUID().uuidString)"
+        let oauthC = "acct-\(UUID().uuidString)"
+        try await TestDatabase.withConnection(cleanup: { conn in
+            try? await TestDatabase.deleteAccount(oauthUser: oauthA, provider: .qq, db: conn)
+            try? await TestDatabase.deleteAccount(oauthUser: oauthB, provider: .qq, db: conn)
+            try? await TestDatabase.deleteAccount(oauthUser: oauthC, provider: .qq, db: conn)
+        }) { conn in
+            let a = makeAccount(oauthUser: oauthA, email: "a@example.com")
+            let b = makeAccount(oauthUser: oauthB, email: "b@example.com")
+            let c = makeAccount(oauthUser: oauthC, email: "c@example.com")
+            for account in [a, b, c] {
+                try await AccountStore.upsert(account, credentials: Data([1]), db: conn)
+            }
+            // C is the most recently updated, so a reconcile run right now
+            // would pick C. A is oldest, B is the one the user clicks.
+            try conn.write { raw in
+                try raw.execute(
+                    sql: "UPDATE accounts SET updated_at = ? WHERE id = ?",
+                    arguments: ["2026-01-01 00:00:00.000", a.id]
+                )
+                try raw.execute(
+                    sql: "UPDATE accounts SET updated_at = ? WHERE id = ?",
+                    arguments: ["2026-01-02 00:00:00.000", b.id]
+                )
+                try raw.execute(
+                    sql: "UPDATE accounts SET updated_at = ? WHERE id = ?",
+                    arguments: ["2026-01-03 00:00:00.000", c.id]
+                )
+            }
+            let noneActive = try await AccountStore.active(db: conn)
+            XCTAssertNil(noneActive, "precondition: no mailbox is selected")
+
+            // The activate holds SQLite's single write lock from its first
+            // UPDATE until the test releases it, so reconcile's reads see the
+            // pre-activate snapshot and its write can only land afterwards —
+            // exactly the interleaving that used to lose the user's choice.
+            let lockHeld = DispatchSemaphore(value: 0)
+            let mayCommit = DispatchSemaphore(value: 0)
+            let activate = Task { () -> Void in
+                // `LagoonDB.write` is synchronous: this blocks the calling
+                // thread on purpose, holding SQLite's write lock.
+                try? conn.write { raw in
+                    try raw.execute(sql: "UPDATE accounts SET is_active = FALSE WHERE is_active = TRUE")
+                    try raw.execute(
+                        sql: "UPDATE accounts SET is_active = TRUE WHERE id = ?",
+                        arguments: [b.id]
+                    )
+                    lockHeld.signal()
+                    mayCommit.wait()
+                }
+            }
+            lockHeld.wait()
+            let reconcile = Task { try await AccountStore.reconcileActive(db: conn) }
+            // Blocking (not `await`ing) so reconcile's reads definitely run
+            // before the activate is allowed to commit.
+            Thread.sleep(forTimeInterval: 0.3)
+            mayCommit.signal()
+            try await reconcile.value
+            await activate.value
+
+            let active = try await AccountStore.active(db: conn)
+            XCTAssertEqual(
+                active?.id, b.id,
+                "the mailbox the user just selected must survive a concurrent reconcile"
+            )
+            let actives = try await AccountStore.all(db: conn).filter(\.isActive)
+            XCTAssertEqual(actives.count, 1)
+        }
+    }
 }

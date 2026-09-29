@@ -20,7 +20,6 @@ public actor NIOSSLStreamTransport: StreamTransport {
 
     private let group: EventLoopGroup
     private var channel: Channel?
-    private var inbound: IteratorBox?
     private var pending = ByteBuffer()
 
     private var pumpTask: Task<Void, Never>?
@@ -96,14 +95,22 @@ public actor NIOSSLStreamTransport: StreamTransport {
                     wrappingChannelSynchronously: channel
                 )
             }.get()
-            self.inbound = IteratorBox(asyncChannel.inbound.makeAsyncIterator())
+            let box = IteratorBox(asyncChannel.inbound.makeAsyncIterator())
             self.channel = channel
             // From here on, only the read pump touches the inbound iterator.
             pumpEpoch += 1
             let epoch = pumpEpoch
             pumpRunning = true
             readFailure = nil
-            pumpTask = Task { await self.pumpChunks(epoch: epoch) }
+            // The pump is handed the iterator and a *weak* owner, never
+            // `self`: a parked `next()` is the normal state of an idle
+            // session, and a pump that retained the transport — directly or
+            // through its own closure — would keep the TLS session and its
+            // file descriptor alive for as long as the process ran.
+            let owner = Owner(transport: self)
+            pumpTask = Task {
+                await Self.runPump(box: box, epoch: epoch, owner: owner)
+            }
         } catch {
             try? await channel.close().get()
             throw MailError.unreachable("tls-handshake")
@@ -145,7 +152,6 @@ public actor NIOSSLStreamTransport: StreamTransport {
         pumpTask?.cancel()
         pumpTask = nil
         pumpRunning = false
-        inbound = nil
         if let channel {
             try? await channel.close().get()
             readFailure = StreamTransportError.closed
@@ -155,6 +161,18 @@ public actor NIOSSLStreamTransport: StreamTransport {
         wakeReadWaiters()
     }
 
+    /// Last resort for a transport that is dropped without `close()` — a
+    /// provider rebuilt in place, an account deleted, a failed connect. By
+    /// this point nothing else can reach the transport (the read pump no
+    /// longer retains it), so this is the only chance to hand the socket back
+    /// rather than leave an authenticated session on the server until its own
+    /// idle timeout. `close(promise: nil)` is fire-and-forget: the event loop
+    /// keeps the channel alive until the close runs, and a deinit cannot await.
+    deinit {
+        pumpTask?.cancel()
+        channel?.close(promise: nil)
+    }
+
     // MARK: - Byte plumbing
 
     /// Sole consumer of the inbound iterator. NIO's producer precondition-fails
@@ -162,41 +180,45 @@ public actor NIOSSLStreamTransport: StreamTransport {
     /// read-timeout abandoned one read and IDLE/a command read overlapped it.
     /// Here `next()` is only ever called by this loop, sequentially; readers
     /// wait on `pending` instead of on the wire.
-    private func pumpChunks(epoch: Int) async {
-        guard epoch == pumpEpoch, let box = inbound else { return }
-        await pumpLoop(box: box, epoch: epoch)
-        // A stale epoch means close()/connect() already published the failure
-        // and woke the readers; only the current generation finalizes here.
-        guard epoch == pumpEpoch else { return }
-        pumpRunning = false
-        wakeReadWaiters()
+    ///
+    /// `nonisolated` on purpose. The loop spends its life parked inside
+    /// `box.next()`; running it as an actor method would hold the transport
+    /// for exactly that long, and a retained transport holds the TLS session
+    /// and the file descriptor. Everything it touches goes back through
+    /// `Owner`, which reaches the actor only for the length of one call.
+    private nonisolated static func runPump(box: IteratorBox, epoch: Int, owner: Owner) async {
+        do {
+            while let chunk = try await box.next() {
+                guard await owner.deliver(chunk, epoch: epoch) else { return }
+            }
+            await owner.pumpEnded(epoch: epoch, unreachable: false)
+        } catch is CancellationError {
+            await owner.pumpEnded(epoch: epoch, unreachable: false)
+        } catch {
+            // TLS handshake, certificate and socket failures are all
+            // "cannot reach the mailbox" as far as the sync loop is
+            // concerned.
+            await owner.pumpEnded(epoch: epoch, unreachable: true)
+        }
     }
 
-    private func pumpLoop(box: IteratorBox, epoch: Int) async {
-        do {
-            while epoch == pumpEpoch {
-                guard let chunk = try await box.next() else {
-                    if epoch == pumpEpoch {
-                        readFailure = StreamTransportError.closed
-                    }
-                    break
-                }
-                guard epoch == pumpEpoch else { break }
-                pending.writeImmutableBuffer(chunk)
-                wakeReadWaiters()
-            }
-        } catch is CancellationError {
-            if epoch == pumpEpoch {
-                readFailure = StreamTransportError.closed
-            }
-        } catch {
-            if epoch == pumpEpoch {
-                // TLS handshake, certificate and socket failures are all
-                // "cannot reach the mailbox" as far as the sync loop is
-                // concerned.
-                readFailure = MailError.unreachable("read")
-            }
-        }
+    /// Publish one chunk. False means the pump belongs to a superseded
+    /// generation (or the transport is gone): stop reading.
+    fileprivate func absorb(_ chunk: ByteBuffer, epoch: Int) -> Bool {
+        guard epoch == pumpEpoch else { return false }
+        pending.writeImmutableBuffer(chunk)
+        wakeReadWaiters()
+        return true
+    }
+
+    /// The pump stopped. A stale epoch means `close()`/`connect()` already
+    /// published the failure and woke the readers; only the current generation
+    /// finalizes here.
+    fileprivate func pumpEnded(epoch: Int, unreachable: Bool) {
+        guard epoch == pumpEpoch else { return }
+        readFailure = unreachable ? MailError.unreachable("read") : StreamTransportError.closed
+        pumpRunning = false
+        wakeReadWaiters()
     }
 
     private func wakeReadWaiters() {
@@ -271,6 +293,27 @@ private final class IteratorBox: @unchecked Sendable {
 
     func next() async throws -> ByteBuffer? {
         try await iterator.next()
+    }
+}
+
+/// The read pump's route back into the transport, held weakly on purpose:
+/// the pump outlives individual calls by design, and it must never be the
+/// reason a transport stays alive.
+private final class Owner: @unchecked Sendable {
+    private weak var transport: NIOSSLStreamTransport?
+
+    init(transport: NIOSSLStreamTransport) {
+        self.transport = transport
+    }
+
+    /// False when the generation was superseded or the transport is gone.
+    func deliver(_ chunk: ByteBuffer, epoch: Int) async -> Bool {
+        guard let transport else { return false }
+        return await transport.absorb(chunk, epoch: epoch)
+    }
+
+    func pumpEnded(epoch: Int, unreachable: Bool) async {
+        await transport?.pumpEnded(epoch: epoch, unreachable: unreachable)
     }
 }
 

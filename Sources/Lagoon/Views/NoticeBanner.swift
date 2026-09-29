@@ -130,6 +130,11 @@ struct NoticeBannerView: View {
 /// `ErrorCenter.shared.banner` at the root of the app.
 struct NoticeBannerModifier: ViewModifier {
     @Binding var banner: ErrorBanner?
+    /// Held so a replaced banner's timer cannot dismiss its successor. The
+    /// handle is the only thing distinguishing "one banner waiting out its
+    /// auto-dismiss" from "an orphan timer that will clear someone else's
+    /// banner 6s from now".
+    @State private var dismissTask: Task<Void, Never>?
 
     func body(content: Content) -> some View {
         VStack(spacing: 0) {
@@ -140,10 +145,16 @@ struct NoticeBannerModifier: ViewModifier {
             content
         }
         .animation(.spring(response: 0.3, dampingFraction: 0.85), value: banner?.id)
-        .onChange(of: banner?.autoDismissAfter) { _, duration in
-            guard let duration else { return }
-            Task { @MainActor in
+        // Keyed on `id`, not `autoDismissAfter`: two consecutive banners with
+        // the same duration (two 6s info toasts, say) share a Duration value,
+        // so keying on it fired no onChange and the second banner inherited —
+        // and inherited back the deadline of — the first one's timer.
+        .onChange(of: banner?.id) { _, _ in
+            dismissTask?.cancel()
+            guard let duration = banner?.autoDismissAfter else { return }
+            dismissTask = Task { @MainActor in
                 try? await Task.sleep(for: duration)
+                guard !Task.isCancelled else { return }
                 withAnimation { self.banner = nil }
             }
         }

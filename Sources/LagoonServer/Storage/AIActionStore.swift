@@ -41,19 +41,48 @@ public enum AIActionStore {
         return try Self.decode(row)
     }
 
+    /// Undo is single-use: the undo route answers 409 `already-undone` for a
+    /// second attempt. Both client entry points pick from this list — ⌘Z takes
+    /// the newest `isUndoable` row, the action-history sheet shows a button
+    /// per row — so an already-undone action must not appear here at all.
+    /// Leaving it in made both entry points dead ends: ⌘Z kept re-picking the
+    /// same undone archive and never reached an older one.
     public static func recent(
         accountId: UUID,
         since: Date? = nil,
         limit: Int = 50,
         db: LagoonDB
     ) async throws -> [AIAction] {
+        // `ai_actions_undo_of_idx` covers this subquery's predicate. Written
+        // out per branch rather than interpolated: the SQL guardrail rejects
+        // interpolation outside SQLBuilder.
         let sql: String
         let args: [DatabaseValueConvertible?]
         if let since {
-            sql = "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE account_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT ?"
+            sql = """
+                SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions
+                WHERE account_id = ? AND created_at >= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM ai_actions u
+                      WHERE u.account_id = ai_actions.account_id
+                        AND u.kind = 'undo'
+                        AND json_extract(u.payload, '$.undoOf') = ai_actions.id
+                  )
+                ORDER BY created_at DESC LIMIT ?
+                """
             args = [accountId, since, limit]
         } else {
-            sql = "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE account_id = ? ORDER BY created_at DESC LIMIT ?"
+            sql = """
+                SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions
+                WHERE account_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM ai_actions u
+                      WHERE u.account_id = ai_actions.account_id
+                        AND u.kind = 'undo'
+                        AND json_extract(u.payload, '$.undoOf') = ai_actions.id
+                  )
+                ORDER BY created_at DESC LIMIT ?
+                """
             args = [accountId, limit]
         }
         return try db.read { db in
@@ -62,15 +91,55 @@ public enum AIActionStore {
         }
     }
 
-    public static func find(id: Int64, db: LagoonDB) async throws -> AIAction? {
-        return try db.read { db in
-            try Row.fetchOne(
-                db,
-                sql: "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE id = ?",
+    /// Looked up inside the undo route's claim transaction: "found / expired /
+    /// already undone" and the insert of the undo row must be one unit, so
+    /// none of those reads may escape to their own transaction.
+    public static func findSync(id: Int64, db: Database) throws -> AIAction? {
+        try Row.fetchOne(
+            db,
+            sql: "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE id = ?",
+            arguments: [id]
+        ).map { try Self.decode($0) }
+    }
+
+    /// Whether an action has already been reversed.
+    ///
+    /// Undo is not idempotent: replaying an archive-undo moves a message out
+    /// of a folder it is no longer in, and replaying a mark-read-undo clears
+    /// a `\Seen` flag the user has since set again. The client shows an Undo
+    /// button for six seconds and ⌘Z re-fetches recent history, so a
+    /// double-fire is reachable without any malice — and ⌘Z has no in-flight
+    /// guard at all, so two of them can be in flight together. Read inside
+    /// the undo route's claim transaction, so the answer and the undo row
+    /// cannot disagree.
+    public static func isUndoneSync(id: Int64, accountId: UUID, db: Database) throws -> Bool {
+        let undone = try Row.fetchOne(
+            db,
+            sql: """
+                SELECT 1 FROM ai_actions
+                WHERE account_id = ? AND kind = 'undo'
+                  AND json_extract(payload, '$.undoOf') = ?
+                LIMIT 1
+                """,
+            arguments: [accountId, "\(id)"]
+        )
+        return undone != nil
+    }
+
+    /// Retracts the undo row the undo route claims *before* it runs the
+    /// inverse. That row is a claim, not a record: when the inverse throws,
+    /// nothing was reversed, and keeping the row would mark the action undone
+    /// for good — the one outcome single-use undo must never produce.
+    /// Scoped to `kind = 'undo'` so no ordinary audit row can be removed by it.
+    public static func deleteUndo(id: Int64, db: LagoonDB) async throws {
+        try db.write {
+            try $0.execute(
+                sql: "DELETE FROM ai_actions WHERE id = ? AND kind = 'undo'",
                 arguments: [id]
-            ).map { try Self.decode($0) }
+            )
         }
     }
+
 
     /// Looks up a previously completed send by the client's idempotency key.
     public static func findSend(

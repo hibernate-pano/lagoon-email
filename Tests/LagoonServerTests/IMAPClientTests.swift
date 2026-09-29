@@ -229,7 +229,9 @@ final class IMAPClientTests: XCTestCase {
 
         let selected = try await client.select("INBOX")
 
-        XCTAssertEqual(selected, IMAPSelected(exists: 12, uidValidity: 42, uidNext: 100))
+        XCTAssertEqual(
+            selected, IMAPSelected(mailbox: "INBOX", exists: 12, uidValidity: 42, uidNext: 100)
+        )
         let lines = await wire(transport)
         XCTAssertEqual(lines, [#"A0001 SELECT "INBOX""#])
     }
@@ -393,21 +395,25 @@ final class IMAPClientTests: XCTestCase {
         XCTAssertEqual(lines, ["A0001 UID SEARCH ALL"])
     }
 
-    func test_fetchTextSnippet_readsLiteralBytes() async throws {
+    func test_fetchTextSnippets_readsRangeIntoUIDKeyedMap() async throws {
         let transport = ScriptedTransport()
         let client = try await makeClient(transport: transport)
 
-        let snippet = Data("Hello Lagoon".utf8)
-        await transport.enqueue("* 1 FETCH (UID 5 BODY[]<0> {\(snippet.count)}")
-        await transport.enqueueLiteral(snippet)
+        let first = Data("Hello Lagoon".utf8)
+        let second = Data("Second preview".utf8)
+        await transport.enqueue("* 1 FETCH (UID 5 BODY[]<0> {\(first.count)}")
+        await transport.enqueueLiteral(first)
+        await transport.enqueue(")")
+        await transport.enqueue("* 2 FETCH (UID 6 BODY[]<0> {\(second.count)}")
+        await transport.enqueueLiteral(second)
         await transport.enqueue(")")
         await transport.enqueue("A0001 OK FETCH completed")
 
-        let fetched = try await client.fetchTextSnippet(uid: 5)
+        let fetched = try await client.fetchTextSnippets(uids: [5, 6])
 
-        XCTAssertEqual(fetched, [IMAPFetchedText(uid: 5, snippet: snippet)])
+        XCTAssertEqual(fetched, [5: first, 6: second])
         let lines = await wire(transport)
-        XCTAssertEqual(lines, ["A0001 UID FETCH 5 (UID BODY.PEEK[]<0.32768>)"])
+        XCTAssertEqual(lines, ["A0001 UID FETCH 5,6 (UID BODY.PEEK[]<0.32768>)"])
     }
 
     func test_fetchFullBody_returnsRawBytes() async throws {

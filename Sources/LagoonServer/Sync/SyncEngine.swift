@@ -159,6 +159,19 @@ public actor AccountSyncLoop {
         return made
     }
 
+    /// Hand the provider's session back and forget it. The engine is not the
+    /// only holder — the route pool keeps its own provider per account — but
+    /// the loop it does own must not be dropped with the connection still
+    /// open: QQ caps concurrent IMAP sessions per account, and an abandoned
+    /// one stays authenticated until the server's own idle timeout.
+    public func shutdown() async {
+        let held = provider
+        provider = nil
+        capabilitiesChecked = false
+        lastNegotiated = nil
+        await held?.shutdown()
+    }
+
     // MARK: - Persistence
 
     /// Persist one change set. Order matters: wipe first when the remote
@@ -299,9 +312,7 @@ public actor AccountSyncLoop {
     /// Credentials are wrong, revoked, or absent: record `needsReconnect`, drop
     /// the cached provider, and park until the user reconnects.
     private func markNeedsReconnect(label: String, email: String) async {
-        provider = nil
-        capabilitiesChecked = false
-        lastNegotiated = nil
+        await shutdown()
         consecutiveFailures = 0
         logger.warning("sync.needsReconnect", metadata: [
             "account": .string(email),
@@ -319,9 +330,7 @@ public actor AccountSyncLoop {
     private func markFailure(_ error: Error, email: String) async {
         consecutiveFailures += 1
         let label = (error as? MailError)?.logLabel ?? "\(type(of: error))"
-        provider = nil
-        capabilitiesChecked = false
-        lastNegotiated = nil
+        await shutdown()
         try? await AccountStore.updateHealth(
             accountId: accountId,
             health: SyncHealth(
@@ -400,7 +409,11 @@ public actor SyncEngine {
         for task in running { task.cancel() }
         for task in running { await task.value }
         tasks = [:]
+        // The loops are idle by now, so each one can hand its session back
+        // instead of being dropped with the connection still open.
+        let stopped = Array(loops.values)
         loops = [:]
+        for loop in stopped { await loop.shutdown() }
         // Drop queued restarts: a restart that has not started yet must not
         // install a loop after this teardown finished.
         restartTails = [:]
@@ -412,7 +425,9 @@ public actor SyncEngine {
         tasks[id]?.cancel()
         if let task = tasks[id] { await task.value }
         tasks[id] = nil
+        let stopped = loops[id]
         loops[id] = nil
+        await stopped?.shutdown()
     }
 
     /// Reconcile the running loops with the stored accounts: start a loop for
