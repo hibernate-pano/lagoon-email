@@ -8,37 +8,13 @@ import PostgresNIO
 @testable import LagoonServer
 @testable import LagoonKit
 
-/// End-to-end route tests. `POST /webhook/gmail` needs no database; the
-/// `GET /api/accounts` and M1 `/api/briefing` + `/api/messages/*` tests use a
+/// End-to-end route tests. The /// `GET /api/accounts` and M1 `/api/briefing` + `/api/messages/*` tests use a
 /// guarded test-DB connection injected into the router.
 final class RouteTests: XCTestCase {
     override func tearDown() {
         URLProtocolStub.reset()
         super.tearDown()
     }
-    func test_postWebhookGmail_returns501() async throws {
-        // No secret configured (nil + empty env) → the ceiling holds.
-        // The 501 path never touches the database.
-        try await TestDatabase.withConnection { conn in
-            let router = Router()
-            GmailWebhookRoutes.register(
-                on: router, db: conn, logger: Self.testLogger, webhookSecret: nil
-            )
-            let app = Application(router: router)
-
-            try await app.test(.router) { client in
-                try await client.execute(uri: "/webhook/gmail", method: .post) { response in
-                    // Nil secret + empty env → 501 ceiling. If the ambient
-                    // environment exports LAGOON_WEBHOOK_SECRET the route
-                    // instead demands auth (401) — either way no sync happens.
-                    XCTAssertTrue(
-                        response.status == .notImplemented || response.status == .unauthorized
-                    )
-                }
-            }
-        }
-    }
-
     func test_getAccounts_emptyTestDatabase_returnsEmptyJSONArray() async throws {
         try await TestDatabase.withConnection { conn in
             // The shared lagoon_test DB is only empty if prior tests cleaned up
@@ -70,11 +46,11 @@ final class RouteTests: XCTestCase {
     func test_getAccounts_returnsInsertedAccountAsConnectedAccount() async throws {
         let oauthUser = "route-\(UUID().uuidString)"
         try await TestDatabase.withConnection(cleanup: { conn in
-            try? await TestDatabase.deleteAccount(oauthUser: oauthUser, provider: .gmail, db: conn)
+            try? await TestDatabase.deleteAccount(oauthUser: oauthUser, provider: .qq, db: conn)
         }) { conn in
             let account = Account(
                 id: UUID(),
-                provider: .gmail,
+                provider: .qq,
                 oauthUser: oauthUser,
                 email: "route-\(UUID().uuidString)@example.com",
                 credentials: nil,
@@ -110,7 +86,7 @@ final class RouteTests: XCTestCase {
                     XCTAssertTrue(
                         decoded.contains(ConnectedAccount(
                             id: account.id,
-                            provider: .gmail,
+                            provider: .qq,
                             email: account.email,
                             syncHealth: SyncHealth(status: .ok),
                             capabilities: .unknown
@@ -169,44 +145,15 @@ final class RouteTests: XCTestCase {
 
     private static let testLogger = Logger(label: "route-tests")
 
-    private static func makeSession() -> URLSession {
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [URLProtocolStub.self]
-        return URLSession(configuration: config)
-    }
-
-    /// Gmail collaborators for routes whose default provider builder needs them.
-    /// The stubbed session keeps any accidental network call inside the process.
-    private func makeGmailCollaborators(
-        db: PostgresConnection
-    ) -> (GmailClient, GmailTokenService) {
-        let session = Self.makeSession()
-        let client = GmailClient(session: session)
-        let tokens = GmailTokenService(
-            db: db,
-            oauth: GoogleOAuthClient(
-                clientID: "test-client",
-                clientSecret: "test-secret",
-                redirectURI: "http://127.0.0.1:9999/callback",
-                session: session
-            ),
-            logger: Self.testLogger
-        )
-        return (client, tokens)
-    }
-
     private func makeMessageRouter(
-        db: PostgresConnection,
+        db: LagoonDB,
         summarizer: (any MessageSummarizing)? = nil,
         makeProvider: MailProviderFactory.Builder? = nil
     ) -> Router<BasicRequestContext> {
-        let (client, tokens) = makeGmailCollaborators(db: db)
         let router = Router()
         MessageRoutes.register(
             on: router,
             db: db,
-            client: client,
-            tokens: tokens,
             logger: Self.testLogger,
             summarizer: summarizer,
             makeProvider: makeProvider
@@ -215,7 +162,7 @@ final class RouteTests: XCTestCase {
     }
 
     private func makeBriefingRouter(
-        db: PostgresConnection,
+        db: LagoonDB,
         classifier: (any BriefingClassifying)? = nil
     ) -> Router<BasicRequestContext> {
         let router = Router()
@@ -231,7 +178,7 @@ final class RouteTests: XCTestCase {
     /// Message + briefing routes on one router, for tests that mutate state
     /// through a message route and observe it through the feed (pinning).
     private func makeM1Router(
-        db: PostgresConnection,
+        db: LagoonDB,
         summarizer: (any MessageSummarizing)? = nil,
         classifier: (any BriefingClassifying)? = nil
     ) -> Router<BasicRequestContext> {
@@ -248,7 +195,7 @@ final class RouteTests: XCTestCase {
     private func makeAccount(oauthUser: String, email: String) -> Account {
         Account(
             id: UUID(),
-            provider: .gmail,
+            provider: .qq,
             oauthUser: oauthUser,
             email: email,
             credentials: nil,
@@ -287,7 +234,7 @@ final class RouteTests: XCTestCase {
 
     /// Row-scoped cleanup: only the account this test created (and its
     /// cascading message_headers / message_pins rows) is removed.
-    private func cleanup(accountId: UUID) -> @Sendable (PostgresConnection) async -> Void {
+    private func cleanup(accountId: UUID) -> @Sendable (LagoonDB) async -> Void {
         { conn in
             try? await TestDatabase.deleteMessages(accountId: accountId, db: conn)
             try? await TestDatabase.deleteAccount(id: accountId, db: conn)
@@ -297,7 +244,7 @@ final class RouteTests: XCTestCase {
     private func seedAccount(
         _ account: Account,
         credentials: Data = Data([1, 2, 3]),
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws {
         try await AccountStore.upsert(
             account,
@@ -326,32 +273,6 @@ final class RouteTests: XCTestCase {
             httpVersion: "HTTP/1.1",
             headerFields: ["Content-Type": "application/json"]
         )!
-    }
-
-    /// Minimal Gmail `format=full` payload: one text/plain part plus From /
-    /// Subject / To headers, enough for `GmailBodyExtractor.plainText`.
-    private static func gmailFullMessageJSON(
-        remoteId: String,
-        subject: String,
-        from: String,
-        text: String
-    ) -> Data {
-        let payload: [String: Any] = [
-            "mimeType": "text/plain",
-            "headers": [
-                ["name": "From", "value": from],
-                ["name": "Subject", "value": subject],
-                ["name": "To", "value": "me@example.com"],
-            ],
-            "body": ["data": Data(text.utf8).base64EncodedString()],
-        ]
-        let message: [String: Any] = [
-            "id": remoteId,
-            "threadId": "thread-\(remoteId)",
-            "internalDate": "1700000000000",
-            "payload": payload,
-        ]
-        return (try? JSONSerialization.data(withJSONObject: message)) ?? Data("{}".utf8)
     }
 
     /// Every key appearing anywhere in a JSON object/array tree.
@@ -447,15 +368,14 @@ final class RouteTests: XCTestCase {
     // MARK: - 聚合规则 (stacks)
 
     private func makeStackRouter(
-        db: PostgresConnection,
+        db: LagoonDB,
         makeProvider: MailProviderFactory.Builder? = nil
     ) -> Router<BasicRequestContext> {
-        let (client, tokens) = makeGmailCollaborators(db: db)
         let router = Router()
         SyncRoutes.register(on: router, db: db, sync: nil)
         StackRoutes.register(on: router, db: db, logger: Self.testLogger)
         ActionsRoutes.register(
-            on: router, db: db, client: client, tokens: tokens,
+            on: router, db: db,
             logger: Self.testLogger, makeProvider: makeProvider
         )
         return router
@@ -895,70 +815,6 @@ final class RouteTests: XCTestCase {
         }
     }
 
-    /// With a summarizer injected, the route fetches the body from the stubbed
-    /// Gmail full response and returns the normalized 200 `MessageSummary`.
-    func test_getSummary_fakeSummarizer_returns200MessageSummary() async throws {
-        let oauthUser = "route-\(UUID().uuidString)"
-        let account = makeAccount(oauthUser: oauthUser, email: "me-\(UUID().uuidString)@example.com")
-        let remoteId = "msg-\(UUID())"
-
-        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
-            try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
-                // Valid (non-expired) token so the route uses it directly and
-                // never calls the OAuth refresh endpoint.
-                try await seedAccount(
-                    account,
-                    credentials: try CredentialVault.seal(.gmail(
-                        accessToken: "access-\(UUID())",
-                        refreshToken: "refresh-\(UUID())",
-                        expiresAt: Date().addingTimeInterval(3600)
-                    )),
-                    db: conn
-                )
-                let bodyJSON = Self.gmailFullMessageJSON(
-                    remoteId: remoteId,
-                    subject: "Hello",
-                    from: "Alice <alice@example.com>",
-                    text: "Please review the plan."
-                )
-                URLProtocolStub.install { request in
-                    let url = request.url!
-                    guard url.host == "gmail.googleapis.com" else {
-                        return (Self.http(url, 404), Data())
-                    }
-                    return (Self.http(url, 200), bodyJSON)
-                }
-
-                let summarizer = FakeSummarizer(
-                    summary: "Review plan",
-                    actionItems: ["Review plan"],
-                    provider: "fake"
-                )
-                let app = Application(router: makeMessageRouter(db: conn, summarizer: summarizer))
-                try await app.test(.router) { client in
-                    try await client.execute(
-                        uri: "/api/messages/\(remoteId)/summary?accountId=\(account.id.uuidString)",
-                        method: .get
-                    ) { response in
-                        XCTAssertEqual(response.status, .ok)
-                        XCTAssertEqual(
-                            response.headers[.contentType],
-                            "application/json; charset=utf-8"
-                        )
-                        let decoded = try JSONDecoder().decode(
-                            MessageSummary.self,
-                            from: Data(buffer: response.body)
-                        )
-                        XCTAssertEqual(decoded.remoteId, remoteId)
-                        XCTAssertEqual(decoded.summary, "Review plan")
-                        XCTAssertEqual(decoded.actionItems, ["Review plan"])
-                        XCTAssertEqual(decoded.provider, "fake")
-                    }
-                }
-            }
-        }
-    }
-
     // MARK: - POST /api/messages/{remoteId}/read
 
     func test_postRead_returns204AndFlipsIsRead() async throws {
@@ -1110,7 +966,7 @@ final class RouteTests: XCTestCase {
     /// router splits paths with `omittingEmptySubsequences: true`, so an empty
     /// path segment collapses and the `:remoteId` capture can never be empty.
     /// `/api/messages//read` therefore 404s (route does not match).
-    func test_emptyGmailIdPathSegment_is404_malformedGmailId400BranchUnreachable() async throws {
+    func test_emptyRemoteIdPathSegment_is404_malformedRemoteId400BranchUnreachable() async throws {
         try await TestDatabase.withConnection { conn in
             let app = Application(router: makeMessageRouter(db: conn))
             try await app.test(.router) { client in
@@ -1287,7 +1143,7 @@ final class RouteTests: XCTestCase {
     }
 
     private func makeAccountsRouter(
-        db: PostgresConnection,
+        db: LagoonDB,
         provider: any MailProvider,
         sync: SyncEngine? = nil
     ) -> Router<BasicRequestContext> {
@@ -1821,9 +1677,8 @@ final class RouteTests: XCTestCase {
             )
             let provider = StubMailProvider()
             let router = makeMessageRouter(db: conn, makeProvider: { _ in provider })
-            let (client, tokens) = makeGmailCollaborators(db: conn)
-            ActionsRoutes.register(
-                on: router, db: conn, client: client, tokens: tokens,
+                ActionsRoutes.register(
+                on: router, db: conn,
                 logger: Self.testLogger, makeProvider: { _ in provider }
             )
             let app = Application(router: router)
@@ -1859,9 +1714,8 @@ final class RouteTests: XCTestCase {
             )
             let provider = StubMailProvider()
             let router = makeMessageRouter(db: conn, makeProvider: { _ in provider })
-            let (client, tokens) = makeGmailCollaborators(db: conn)
-            ActionsRoutes.register(
-                on: router, db: conn, client: client, tokens: tokens,
+                ActionsRoutes.register(
+                on: router, db: conn,
                 logger: Self.testLogger, makeProvider: { _ in provider }
             )
             let app = Application(router: router)
@@ -1884,13 +1738,12 @@ final class RouteTests: XCTestCase {
     /// Registers message + action routes on one router with the same stub
     /// provider, so a send and its audit row can be exercised end to end.
     private func makeSendRouter(
-        db: PostgresConnection,
+        db: LagoonDB,
         provider: any MailProvider
     ) -> Router<BasicRequestContext> {
         let router = makeMessageRouter(db: db, makeProvider: { _ in provider })
-        let (client, tokens) = makeGmailCollaborators(db: db)
         ActionsRoutes.register(
-            on: router, db: db, client: client, tokens: tokens,
+            on: router, db: db,
             logger: Self.testLogger, makeProvider: { _ in provider }
         )
         return router
@@ -2284,7 +2137,7 @@ final class RouteTests: XCTestCase {
     /// Account row with a usable archive folder — the archive route refuses to
     /// run without it (409).
     private func seedArchiveCapableAccount(
-        _ account: Account, db: PostgresConnection
+        _ account: Account, db: LagoonDB
     ) async throws {
         try await seedAccount(
             Account(
@@ -2544,9 +2397,8 @@ final class RouteTests: XCTestCase {
 
             let provider = StubMailProvider()
             let router = makeMessageRouter(db: conn, makeProvider: { _ in provider })
-            let (client, tokens) = makeGmailCollaborators(db: conn)
-            ActionsRoutes.register(
-                on: router, db: conn, client: client, tokens: tokens,
+                ActionsRoutes.register(
+                on: router, db: conn,
                 logger: Self.testLogger, makeProvider: { _ in provider }
             )
             BriefingRoutes.register(on: router, db: conn, logger: Self.testLogger)
@@ -2595,10 +2447,12 @@ final class RouteTests: XCTestCase {
                 payload: ["remoteId": "expired-1", "remoteWrite": "false"],
                 db: conn
             )
-            try await conn.query(
-                "UPDATE ai_actions SET expires_at = now() - interval '1 second' WHERE id = $1",
-                [PostgresData(int64: action.id)]
-            ).get()
+            try await conn.write { db in
+                try db.execute(
+                    sql: "UPDATE ai_actions SET expires_at = strftime('%Y-%m-%d %H:%M:%f','now','-1 second') WHERE id = ?",
+                    arguments: [action.id]
+                )
+            }
             let provider = StubMailProvider()
             let app = Application(router: makeSendRouter(db: conn, provider: provider))
 

@@ -1,40 +1,36 @@
 import Foundation
-import PostgresNIO
+import GRDB
 import LagoonKit
 
-/// Postgres-backed whitelist autopilot rules (spec 2026-09-19 §3).
+/// SQLite-backed whitelist autopilot rules (spec 2026-09-19 §3).
 public enum AutoArchiveStore {
     public enum StoreError: Error { case insertFailed }
 
     /// Lowercased sender addresses for the sync loop's auto-archive matching.
     public static func senderAddresses(
         accountId: UUID,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> Set<String> {
-        let rows = try await db.query(
-            "SELECT sender_address FROM auto_archive_rules WHERE account_id = $1",
-            [PostgresData(uuid: accountId)]
-        ).get()
-        let addresses = try rows.map { row -> String in
-            try row.makeRandomAccess()["sender_address"].decode(String.self)
+        let sql = "SELECT sender_address FROM auto_archive_rules WHERE account_id = ?"
+        return try db.read { db in
+            let rows = try Row.fetchAll(db, sql: sql, arguments: [accountId])
+            return Set(rows.compactMap { $0.optionalText("sender_address") })
         }
-        return Set(addresses)
     }
 
     public static func list(
         accountId: UUID,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> [AutoArchiveRule] {
-        let rows = try await db.query(
-            """
+        let sql = """
             SELECT id, account_id, sender_address, created_at
             FROM auto_archive_rules
-            WHERE account_id = $1
+            WHERE account_id = ?
             ORDER BY created_at DESC, id DESC
-            """,
-            [PostgresData(uuid: accountId)]
-        ).get()
-        return try rows.map(decode)
+        """
+        return try db.read { db in
+            try Row.fetchAll(db, sql: sql, arguments: [accountId]).map(decode)
+        }
     }
 
     /// Insert-or-return-existing: creating a duplicate rule is a no-op that
@@ -43,45 +39,54 @@ public enum AutoArchiveStore {
     public static func create(
         accountId: UUID,
         senderAddress: String,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> AutoArchiveRule {
         let address = senderAddress.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let rows = try await db.query(
-            """
-            INSERT INTO auto_archive_rules (account_id, sender_address)
-            VALUES ($1, $2)
-            ON CONFLICT (account_id, sender_address) DO UPDATE SET sender_address = EXCLUDED.sender_address
-            RETURNING id, account_id, sender_address, created_at
-            """,
-            [PostgresData(uuid: accountId), PostgresData(string: address)]
-        ).get()
-        guard let row = rows.first else {
-            throw StoreError.insertFailed
+        return try db.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO auto_archive_rules (account_id, sender_address)
+                    VALUES (?, ?)
+                    ON CONFLICT (account_id, sender_address) DO UPDATE SET sender_address = EXCLUDED.sender_address
+                    """,
+                arguments: [accountId, address]
+            )
+            guard let row = try Row.fetchOne(
+                db,
+                sql: "SELECT id, account_id, sender_address, created_at FROM auto_archive_rules WHERE account_id = ? AND sender_address = ?",
+                arguments: [accountId, address]
+            ) else {
+                throw StoreError.insertFailed
+            }
+            return try decode(row)
         }
-        return try decode(row)
     }
 
     public static func find(
         id: Int64,
         accountId: UUID,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> AutoArchiveRule? {
-        let rows = try await db.query(
-            "SELECT id, account_id, sender_address, created_at FROM auto_archive_rules WHERE id = $1 AND account_id = $2",
-            [PostgresData(int64: id), PostgresData(uuid: accountId)]
-        ).get()
-        return try rows.first.map(decode)
+        return try db.read { db in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT id, account_id, sender_address, created_at FROM auto_archive_rules WHERE id = ? AND account_id = ?",
+                arguments: [id, accountId]
+            ).map(decode)
+        }
     }
 
     public static func delete(
         id: Int64,
         accountId: UUID,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws {
-        try await db.query(
-            "DELETE FROM auto_archive_rules WHERE id = $1 AND account_id = $2",
-            [PostgresData(int64: id), PostgresData(uuid: accountId)]
-        ).get()
+        try db.write {
+            try $0.execute(
+                sql: "DELETE FROM auto_archive_rules WHERE id = ? AND account_id = ?",
+                arguments: [id, accountId]
+            )
+        }
     }
 
     /// Remove the rule for one sender (undoing an auto-archive, V2 C2).
@@ -90,13 +95,15 @@ public enum AutoArchiveStore {
     public static func deleteSender(
         _ senderAddress: String,
         accountId: UUID,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws {
         let address = senderAddress.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        try await db.query(
-            "DELETE FROM auto_archive_rules WHERE account_id = $1 AND sender_address = $2",
-            [PostgresData(uuid: accountId), PostgresData(string: address)]
-        ).get()
+        try db.write {
+            try $0.execute(
+                sql: "DELETE FROM auto_archive_rules WHERE account_id = ? AND sender_address = ?",
+                arguments: [accountId, address]
+            )
+        }
     }
 
     /// An address crosses the trust boundary. One ordinary mailbox, no display
@@ -118,49 +125,46 @@ public enum AutoArchiveStore {
         accountId: UUID,
         minCount: Int = 5,
         limit: Int = 5,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> [AutoArchiveSuggestion] {
         let sql = """
             SELECT m.from_address AS sender,
                    MAX(NULLIF(m.from_name, '')) AS from_name,
                    COUNT(*) AS archive_count
             FROM message_headers m
-            WHERE m.account_id = $1
+            WHERE m.account_id = ?
               AND m.is_archived = TRUE
               AND m.is_deleted = FALSE
-              AND m.received_at >= now() - interval '30 days'
+              AND m.received_at >= strftime('%Y-%m-%d %H:%M:%f','now','-30 days')
               AND NOT EXISTS (
                   SELECT 1 FROM auto_archive_rules r
                   WHERE r.account_id = m.account_id AND r.sender_address = m.from_address
               )
             GROUP BY m.from_address
-            HAVING COUNT(*) >= $2
+            HAVING COUNT(*) >= ?
             ORDER BY archive_count DESC, sender ASC
-            LIMIT $3
+            LIMIT ?
         """
-        let rows = try await db.query(sql, [
-            PostgresData(uuid: accountId),
-            PostgresData(int: minCount),
-            PostgresData(int: limit),
-        ]).get()
-        return try rows.map { row in
-            let r = row.makeRandomAccess()
-            return AutoArchiveSuggestion(
-                sender: try r["sender"].decode(String.self),
-                fromName: (try? r["from_name"].decode(String.self)).flatMap { $0.isEmpty ? nil : $0 },
-                archiveCount: try r["archive_count"].decode(Int.self)
-            )
+        return try db.read { db in
+            let rows = try Row.fetchAll(db, sql: sql, arguments: [accountId, minCount, limit])
+            return rows.map { row in
+                AutoArchiveSuggestion(
+                    sender: row["sender"],
+                    fromName: row.optionalText("from_name"),
+                    archiveCount: row["archive_count"]
+                )
+            }
         }
     }
 
     // MARK: - Decoding
 
-    private static func decode(_ row: PostgresNIO.PostgresRow) throws -> AutoArchiveRule {
-        let r = row.makeRandomAccess()
-        let id: Int64 = try r["id"].decode(Int64.self)
-        let accountId: UUID = try r["account_id"].decode(UUID.self)
-        let address: String = try r["sender_address"].decode(String.self)
-        let createdAt: Date = try r["created_at"].decode(Date.self)
-        return AutoArchiveRule(id: id, accountId: accountId, senderAddress: address, createdAt: createdAt)
+    private static func decode(_ row: Row) throws -> AutoArchiveRule {
+        AutoArchiveRule(
+            id: row["id"],
+            accountId: row["account_id"],
+            senderAddress: row["sender_address"],
+            createdAt: row["created_at"]
+        )
     }
 }

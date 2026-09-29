@@ -3,7 +3,7 @@ import LagoonKit
 
 /// A thread of related mail (会话归集): every message sharing one merge key,
 /// newest first. The primary key is the server's `thread_id` (References
-/// chain root for IMAP, Gmail's native thread id); the affinity rule
+/// chain root); the affinity rule
 /// additionally merges same-sender + same-normalized-subject threads, which
 /// QQ/marketing mail routinely splits by omitting References headers.
 struct Conversation: Identifiable, Equatable {

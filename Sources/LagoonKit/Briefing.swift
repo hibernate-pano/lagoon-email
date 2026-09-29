@@ -161,7 +161,7 @@ public struct MessageBody: Codable, Equatable, Sendable {
 /// One file attached to a message (M1.6 spec §1.1). `id` is the server's
 /// stable per-message identifier for the part — opaque to the client, used
 /// in `GET /api/messages/{remoteId}/attachments/{id}`. For IMAP this is the
-/// dotted part path; for Gmail it is `body.attachmentId`.
+/// dotted part path.
 public struct Attachment: Codable, Equatable, Sendable, Identifiable {
     public let id: String
     public let filename: String?

@@ -14,17 +14,17 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
     /// `List-Unsubscribe` header, and which messages Lagoon has already
     /// sent a reply for.
     public struct Signals: Sendable {
-        public let pinnedGmailIds: Set<String>
-        public let listUnsubscribeGmailIds: Set<String>
+        public let pinnedRemoteIds: Set<String>
+        public let listUnsubscribeRemoteIds: Set<String>
         public let repliedRemoteIds: Set<String>
 
         public init(
-            pinnedGmailIds: Set<String> = [],
-            listUnsubscribeGmailIds: Set<String> = [],
+            pinnedRemoteIds: Set<String> = [],
+            listUnsubscribeRemoteIds: Set<String> = [],
             repliedRemoteIds: Set<String> = []
         ) {
-            self.pinnedGmailIds = pinnedGmailIds
-            self.listUnsubscribeGmailIds = listUnsubscribeGmailIds
+            self.pinnedRemoteIds = pinnedRemoteIds
+            self.listUnsubscribeRemoteIds = listUnsubscribeRemoteIds
             self.repliedRemoteIds = repliedRemoteIds
         }
     }
@@ -69,8 +69,8 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
         Self.group(
             for: message,
             accountEmail: accountEmail,
-            pinnedGmailIds: signals.pinnedGmailIds,
-            listUnsubscribeGmailIds: signals.listUnsubscribeGmailIds,
+            pinnedRemoteIds: signals.pinnedRemoteIds,
+            listUnsubscribeRemoteIds: signals.listUnsubscribeRemoteIds,
             repliedRemoteIds: signals.repliedRemoteIds
         )
     }
@@ -87,15 +87,15 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
     public static func group(
         for message: MessageHeader,
         accountEmail: String,
-        pinnedGmailIds: Set<String>,
-        listUnsubscribeGmailIds: Set<String>,
+        pinnedRemoteIds: Set<String>,
+        listUnsubscribeRemoteIds: Set<String>,
         repliedRemoteIds: Set<String> = [],
         now: Date = Date()
     ) -> (group: BriefingGroup, reason: BriefingReason) {
-        if pinnedGmailIds.contains(message.remoteId) {
+        if pinnedRemoteIds.contains(message.remoteId) {
             return (.pinned, .pinned)
         }
-        if listUnsubscribeGmailIds.contains(message.remoteId) {
+        if listUnsubscribeRemoteIds.contains(message.remoteId) {
             return (.subscriptionNoise, .listUnsubscribe)
         }
         if matchesSubscriptionSender(message.fromAddress) {
@@ -106,9 +106,9 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
         }
         // Already replied = already handled: leave "needs reply" even when the
         // message is unread (replies usually follow a read, but the send
-        // audit is the stronger signal either way). Gmail rows are keyed by
-        // Gmail id while Sent harvesting yields Message-IDs, so both the row
-        // id and the stored Message-ID header are matched.
+        // audit is the stronger signal either way). Rows are keyed by IMAP
+        // UID while Sent harvesting yields Message-IDs, so both the row id and
+        // the stored Message-ID header are matched.
         if repliedRemoteIds.contains(message.remoteId)
             || message.messageIdHeader.map({ repliedRemoteIds.contains($0) }) == true {
             return (.safeToArchive, .replied)

@@ -1,26 +1,24 @@
 import Foundation
 import Hummingbird
 import Logging
-import PostgresNIO
+import GRDB
 import LagoonKit
 import LagoonAI
 
 struct DraftListResponse: Encodable { let drafts: [DraftReply] }
 
 /// AI-generated reply drafts. POST generates three variants and stores them;
-/// POST /choose picks one (and pushes to Gmail Drafts when scope allows).
+/// POST /choose picks one. The chosen variant is sent over SMTP.
 public enum DraftRoutes {
     public static func register(
         on router: Router<BasicRequestContext>,
-        db: PostgresConnection,
-        client: GmailClient,
-        tokens: GmailTokenService,
+        db: LagoonDB,
         draftGenerator: (any MessageDrafting)?,
         logger: Logger,
         makeProvider: MailProviderFactory.Builder? = nil
     ) {
         let makeProvider = makeProvider
-            ?? MailProviderFactory.factory(client: client, tokens: tokens, db: db, logger: logger)
+            ?? MailProviderFactory.factory(db: db, logger: logger)
 
         router.post("api/messages/:remoteId/draft") { request, context -> Response in
             return await generateHandler(
@@ -33,7 +31,7 @@ public enum DraftRoutes {
         router.post("api/drafts/:id/choose") { request, context -> Response in
             return await chooseHandler(
                 request: request, context: context, db: db,
-                client: client, tokens: tokens, logger: logger
+                logger: logger
             )
         }
 
@@ -43,7 +41,7 @@ public enum DraftRoutes {
     }
 
     private static func generateHandler(
-        request: Request, context: BasicRequestContext, db: PostgresConnection,
+        request: Request, context: BasicRequestContext, db: LagoonDB,
         makeProvider: MailProviderFactory.Builder,
         draftGenerator: (any MessageDrafting)?, logger: Logger
     ) async -> Response {
@@ -126,8 +124,8 @@ public enum DraftRoutes {
     }
 
     private static func chooseHandler(
-        request: Request, context: BasicRequestContext, db: PostgresConnection,
-        client: GmailClient, tokens: GmailTokenService, logger: Logger
+        request: Request, context: BasicRequestContext, db: LagoonDB,
+        logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -142,7 +140,6 @@ public enum DraftRoutes {
         }
         struct ChooseReq: Decodable {
             let variant: Int
-            let pushToGmail: Bool
         }
         let req: ChooseReq
         do { req = try JSONDecoder().decode(ChooseReq.self, from: body) } catch {
@@ -169,71 +166,28 @@ public enum DraftRoutes {
         }
 
         do {
-            try await db.query(
-                "UPDATE draft_replies SET chosen_variant = $1 WHERE id = $2",
-                [PostgresData(int: req.variant), PostgresData(int64: draftId)]
-            ).get()
+            try await db.write {
+                try $0.execute(
+                    sql: "UPDATE draft_replies SET chosen_variant = ? WHERE id = ?",
+                    arguments: [req.variant, draftId]
+                )
+            }
         } catch {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
-        }
-
-        var gmailDraftId = ""
-        if req.pushToGmail {
-            do {
-                guard let account = try await AccountStore.find(byId: accountId, db: db) else {
-                    throw NSError(
-                        domain: "Lagoon.Drafts", code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "missing-account"]
-                    )
-                }
-                // Server-side drafts are a Gmail API feature; an IMAP account
-                // keeps the chosen variant locally (SMTP has no draft concept).
-                if account.provider == .gmail {
-                    let token = try await tokens.validToken(for: account)
-                    let headerRow = try? await db.query(
-                        "SELECT thread_id, from_address, subject FROM message_headers WHERE account_id = $1 AND remote_id = $2",
-                        [PostgresData(uuid: accountId), PostgresData(string: draft.remoteId)]
-                    ).get()
-                    if let row = headerRow?.rows.first,
-                       let threadId = row.column("thread_id")?.string {
-                        let from = row.column("from_address")?.string ?? ""
-                        let subject = row.column("subject")?.string ?? "(no subject)"
-                        let body = draft.variants[req.variant]
-                        let id = try await client.createDraft(
-                            accessToken: token.accessToken,
-                            threadId: threadId,
-                            to: from,
-                            subject: subject,
-                            body: body
-                        )
-                        gmailDraftId = id
-                    }
-                } else {
-                    logger.info("draft.pushSkipped", metadata: [
-                        "draftId": .string("\(draftId)"),
-                        "provider": .string(account.provider.rawValue),
-                    ])
-                }
-            } catch GmailClientError.http(let status, _) where status == 403 {
-                logger.warning("draft.scopeMissing", metadata: ["draftId": .string("\(draftId)")])
-            } catch {
-                logger.error("draft.pushFailed", metadata: ["err": .string("\(error)")])
-            }
         }
 
         struct ChooseResponse: Encodable {
             let ok: Bool
             let draftId: Int64
             let chosen: Int
-            let gmailDraftId: String
         }
         return RouteJSON.response(ChooseResponse(
-            ok: true, draftId: draftId, chosen: req.variant, gmailDraftId: gmailDraftId
+            ok: true, draftId: draftId, chosen: req.variant
         ))
     }
 
     private static func listHandler(
-        request: Request, context: BasicRequestContext, db: PostgresConnection
+        request: Request, context: BasicRequestContext, db: LagoonDB
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -249,12 +203,14 @@ public enum DraftRoutes {
         }
     }
 
-    private static func findDraft(id: Int64, db: PostgresConnection) async throws -> DraftReply? {
-        let rows = try await db.query(
-            "SELECT id, account_id, remote_id, variants, chosen_variant, created_at FROM draft_replies WHERE id = $1",
-            [PostgresData(int64: id)]
-        ).get()
-        return try rows.rows.first.map { try DraftReplyStore.decode($0) }
+    private static func findDraft(id: Int64, db: LagoonDB) async throws -> DraftReply? {
+        return try await db.read { db in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT id, account_id, remote_id, variants, chosen_variant, created_at FROM draft_replies WHERE id = ?",
+                arguments: [id]
+            ).map { try DraftReplyStore.decode($0) }
+        }
     }
 
     /// Ask the AI gateway for real reply variants. Summarization is a separate
@@ -295,7 +251,7 @@ public enum DraftRoutes {
 // MARK: - Search
 
 public enum SearchRoutes {
-    public static func register(on router: Router<BasicRequestContext>, db: PostgresConnection) {
+    public static func register(on router: Router<BasicRequestContext>, db: LagoonDB) {
         router.get("api/search") { request, _ -> Response in
             guard let accountId = RouteParams.accountId(from: request) else {
                 return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -323,32 +279,20 @@ public enum SearchRoutes {
     }
 
     private static func search(
-        accountId: UUID, q: String, sender: String?, since: Date?, db: PostgresConnection
+        accountId: UUID, q: String, sender: String?, since: Date?, db: LagoonDB
     ) async throws -> [MessageHeader] {
         // LIKE specials in the query are data, not wildcards.
         let escaped = q.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "%", with: "\\%")
             .replacingOccurrences(of: "_", with: "\\_")
         let pattern = "%\(escaped)%"
-        // One path, two recalls: ILIKE substrings (precise, CJK-safe) ORed
-        // with a plainto_tsquery match (English inflection recall). The
-        // tsvector expression must match `message_bodies_fts_idx` exactly —
-        // `coalesce(body_text, '')` here would be a *different* expression
-        // from the indexed `body_text`, and the index could never be chosen.
-        // `body_text` is NOT NULL (migration 015), so the left join's NULL side
-        // simply fails the `@@` instead of needing a coalesce.
-        // plainto_tsquery never throws on user input — the worst case is an
-        // empty query that matches nothing.
-        //
-        // # ponytail: matching the indexed expression only makes the index
-        // *eligible*; the leading-wildcard `b.body_text ILIKE '%q%'` arm of the
-        // same OR still forces a sequential scan for the combined predicate, so
-        // this query is not index-backed end to end. Upgrade path: split into
-        // two queries (a GIN-only tsvector match UNIONed with the header/body
-        // ILIKE pass) once body recall grows enough to hurt, or drop the ILIKE
-        // arm behind a "match all words" mode. Deliberately not done here: the
-        // brief says do not restructure the search.
-        let sql = """
+        // One path, one recall: LIKE substrings over subject/snippet/from/body.
+        // The Postgres build ORed a plainto_tsquery arm into this predicate for
+        // English inflection recall; SQLite has no tsvector and the body LIKE
+        // arm already covers the same text, so the arm is gone rather than
+        // emulated. Optional sender/since filters are appended as static
+        // fragments (never user text) so binding stays positional.
+        var sql = """
             SELECT m.id, m.account_id, m.remote_id, m.thread_id,
                    m.from_address,
                    NULLIF(m.from_name, '') as from_name,
@@ -359,25 +303,28 @@ public enum SearchRoutes {
             FROM message_headers m
             LEFT JOIN message_bodies b
               ON b.account_id = m.account_id AND b.remote_id = m.remote_id
-            WHERE m.account_id = $1
+            WHERE m.account_id = ?
               AND m.is_deleted = FALSE
-              AND (m.subject ILIKE $2 ESCAPE '\\' OR m.snippet ILIKE $2 ESCAPE '\\'
-                   OR m.from_name ILIKE $2 ESCAPE '\\' OR m.from_address ILIKE $2 ESCAPE '\\'
-                   OR b.body_text ILIKE $2 ESCAPE '\\'
-                   OR to_tsvector('simple', b.body_text) @@ plainto_tsquery('simple', $5))
-              AND ($3::text IS NULL OR m.from_address = $3)
-              AND ($4::timestamptz IS NULL OR m.received_at >= $4)
-            ORDER BY m.received_at DESC
-            LIMIT 100
+              AND (m.subject LIKE ? ESCAPE '\\' OR m.snippet LIKE ? ESCAPE '\\'
+                   OR m.from_name LIKE ? ESCAPE '\\' OR m.from_address LIKE ? ESCAPE '\\'
+                   OR b.body_text LIKE ? ESCAPE '\\')
         """
-        let rows = try await db.query(sql, [
-            PostgresData(uuid: accountId),
-            PostgresData(string: pattern),
-            sender.map { PostgresData(string: $0) } ?? .null,
-            since.map { PostgresData(date: $0) } ?? .null,
-            PostgresData(string: q),
-        ]).get()
-        return try rows.map { try MessageStore.decode($0) }
+        var arguments: [DatabaseValueConvertible?] = [
+            accountId, pattern, pattern, pattern, pattern, pattern
+        ]
+        if let sender {
+            sql += "\n              AND m.from_address = ?"
+            arguments.append(sender)
+        }
+        if let since {
+            sql += "\n              AND m.received_at >= ?"
+            arguments.append(since)
+        }
+        sql += "\n            ORDER BY m.received_at DESC\n            LIMIT 100"
+        return try await db.read { db in
+            try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
+                .map { try MessageStore.decode($0) }
+        }
     }
 }
 

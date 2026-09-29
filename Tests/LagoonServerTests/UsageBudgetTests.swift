@@ -1,51 +1,51 @@
 import XCTest
 import Logging
-import PostgresNIO
+import GRDB
 import LagoonAI
 import LagoonKit
 @testable import LagoonServer
 
-/// Covers the monthly LLM cost cap (spec §6.5). Runs against the shared
-/// `lagoon_test` DB; each test uses a unique account email so cleanup is
-/// row-scoped.
+/// Covers the monthly LLM cost cap (spec §6.5). Each test opens its own
+/// hermetic SQLite store and uses a unique account email, so no cleanup is
+/// required (the Postgres harness needed row-scoped deletes; a per-test file
+/// is discarded wholesale).
 final class UsageBudgetTests: XCTestCase {
     private static let testLogger = Logger(label: "usage-budget-tests")
     private let account = "budget-\(UUID().uuidString)"
 
     private final class Fixture {
         let budget: UsageBudget
-        let connection: PostgresConnection
+        let db: LagoonDB
 
-        init(budget: UsageBudget, connection: PostgresConnection) {
+        init(budget: UsageBudget, db: LagoonDB) {
             self.budget = budget
-            self.connection = connection
+            self.db = db
         }
 
-        func close() async {
-            try? await connection.close()
-        }
+        func close() async {}
     }
 
-    override func tearDown() async throws {
-        let clean = account
-        _ = try? await TestDatabase.withConnection { conn in
-            try? await conn.query(
-                "DELETE FROM usage_log WHERE account_email = $1",
-                [PostgresData(string: clean)]
-            ).get()
-        }
-    }
+    override func tearDown() async throws {}
 
     private func makeBudget(capUSD: Double) async throws -> Fixture {
-        guard let conn = try await TestDatabase.connect() else {
-            throw XCTSkip("no safe test database; set DATABASE_URL to a *_test loopback")
-        }
+        let db = try await TestDatabase.requireConnection()
         let budget = try await UsageBudget(
-            db: conn,
+            db: db,
             capUSDPerMonth: capUSD,
             logger: Self.testLogger
         )
-        return Fixture(budget: budget, connection: conn)
+        return Fixture(budget: budget, db: db)
+    }
+
+    /// Rebuilds the budget actor over the same store — the "restart" half of
+    /// the persistence test.
+    private func reopen(_ f: Fixture, capUSD: Double) async throws -> Fixture {
+        let budget = try await UsageBudget(
+            db: f.db,
+            capUSDPerMonth: capUSD,
+            logger: Self.testLogger
+        )
+        return Fixture(budget: budget, db: f.db)
     }
 
     func test_disabledBudget_neverThrows() async throws {
@@ -139,13 +139,14 @@ final class UsageBudgetTests: XCTestCase {
             promptTokens: 100, completionTokens: 50,
             costMicrosUSD: 1234
         )
-        let verify = try await TestDatabase.connect()!
-        defer { Task { try? await verify.close() } }
-        let count = try await verify.query(
-            "SELECT count(*) AS c FROM usage_log WHERE account_email = $1",
-            [PostgresData(string: clean)]
-        ).get()
-        let n = try count.rows.first!.makeRandomAccess()["c"].decode(Int.self)
+        let n: Int = try f.db.read { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: "SELECT count(*) AS c FROM usage_log WHERE account_email = ?",
+                arguments: [clean]
+            ) else { return 0 }
+            return row["c"]
+        }
         XCTAssertEqual(n, 1)
     }
 
@@ -165,16 +166,13 @@ final class UsageBudgetTests: XCTestCase {
     }
 
     func test_recordPersistsAcrossRestart() async throws {
-        do {
-            let f = try await makeBudget(capUSD: 10)
-            try await f.budget.record(
-                capability: "summary", model: "m", accountEmail: account,
-                promptTokens: 1_000, completionTokens: 500,
-                costMicrosUSD: 250_000   // $0.25
-            )
-            await f.close()
-        }
-        let f2 = try await makeBudget(capUSD: 10)
+        let f = try await makeBudget(capUSD: 10)
+        try await f.budget.record(
+            capability: "summary", model: "m", accountEmail: account,
+            promptTokens: 1_000, completionTokens: 500,
+            costMicrosUSD: 250_000   // $0.25
+        )
+        let f2 = try await reopen(f, capUSD: 10)
         defer { Task { await f2.close() } }
         let total = await f2.budget.currentMonthUSD
         let calls = await f2.budget.callCount

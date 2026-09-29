@@ -3,7 +3,7 @@ import Foundation
 import Logging
 import Hummingbird
 import NIOCore
-import PostgresNIO
+import GRDB
 import LagoonKit
 @testable import LagoonServer
 
@@ -253,7 +253,7 @@ final class AutoArchiveTests: XCTestCase {
     private static func makeAccount() -> Account {
         Account(
             id: UUID(),
-            provider: .gmail,
+            provider: .qq,
             oauthUser: "auto-\(UUID().uuidString)",
             email: "auto-\(UUID().uuidString)@example.com",
             credentials: nil,
@@ -261,7 +261,7 @@ final class AutoArchiveTests: XCTestCase {
         )
     }
 
-    private static func cleanup(accountId: UUID) -> @Sendable (PostgresConnection) async -> Void {
+    private static func cleanup(accountId: UUID) -> @Sendable (LagoonDB) async -> Void {
         { conn in
             try? await TestDatabase.deleteMessages(accountId: accountId, db: conn)
             try? await TestDatabase.deleteAccount(id: accountId, db: conn)
@@ -278,13 +278,13 @@ final class AutoArchiveTests: XCTestCase {
         )
     }
 
-    private static func engineCleanup(oauthUser: String) -> @Sendable (PostgresConnection) async -> Void {
+    private static func engineCleanup(oauthUser: String) -> @Sendable (LagoonDB) async -> Void {
         { conn in
             try? await TestDatabase.deleteAccount(oauthUser: oauthUser, provider: .qq, db: conn)
         }
     }
 
-    private static func seedEngineAccount(_ account: Account, db: PostgresConnection) async throws {
+    private static func seedEngineAccount(_ account: Account, db: LagoonDB) async throws {
         try await AccountStore.upsert(
             account,
             credentials: try CredentialVault.seal(
@@ -295,7 +295,7 @@ final class AutoArchiveTests: XCTestCase {
     }
 
     private static func makeLoop(
-        account: Account, db: PostgresConnection, provider: StubMailProvider
+        account: Account, db: LagoonDB, provider: StubMailProvider
     ) -> AccountSyncLoop {
         AccountSyncLoop(
             account: account,
@@ -306,7 +306,7 @@ final class AutoArchiveTests: XCTestCase {
         )
     }
 
-    private static func router(db: PostgresConnection) -> Router<BasicRequestContext> {
+    private static func router(db: LagoonDB) -> Router<BasicRequestContext> {
         let router = Router()
         AutoArchiveRoutes.register(
             on: router,

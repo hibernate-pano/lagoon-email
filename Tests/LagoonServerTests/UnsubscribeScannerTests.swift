@@ -106,6 +106,51 @@ final class UnsubscribeScannerTests: XCTestCase {
         XCTAssertEqual(UnsubscribeScanner.bodyLinks(in: html), ["https://ex.com/c/123"])
     }
 
+    /// Preference-centre phrasings that plain "unsubscribe" matching missed.
+    func test_bodyLinks_managePreferencesPhrasing() {
+        let html = #"<a href="https://ex.com/p/9">Manage preferences</a>"#
+        XCTAssertEqual(UnsubscribeScanner.bodyLinks(in: html), ["https://ex.com/p/9"])
+    }
+
+    /// mailto: anchors in the BODY are a fallback candidate — ranked after
+    /// every http(s) link, they only matter when nothing web-shaped resolves.
+    func test_bodyLinks_mailtoAnchorIsFallbackAfterWebLinks() {
+        let html = """
+        <a href="mailto:bye@example.com">unsubscribe by email</a>
+        <a href="https://ex.com/u">unsubscribe here</a>
+        """
+        XCTAssertEqual(
+            UnsubscribeScanner.bodyLinks(in: html),
+            ["https://ex.com/u", "mailto:bye@example.com"]
+        )
+    }
+
+    func test_bodyLinks_mailtoOnlyAnchorStillFound() {
+        let html = #"<a href="mailto:leave@example.com?subject=unsubscribe">click to unsubscribe</a>"#
+        XCTAssertEqual(
+            UnsubscribeScanner.bodyLinks(in: html),
+            ["mailto:leave@example.com?subject=unsubscribe"]
+        )
+    }
+
+    /// The landing-page auto-confirm picks the confirm-shaped href over an
+    /// equally keyworded footer link.
+    func test_confirmLink_prefersConfirmShapedHrefs() {
+        let html = """
+        <a href="https://ex.com/prefs">Manage preferences</a>
+        <a href="https://ex.com/confirm?token=abc">Confirm unsubscribe</a>
+        """
+        XCTAssertEqual(
+            UnsubscribeScanner.confirmLink(in: html),
+            "https://ex.com/confirm?token=abc"
+        )
+    }
+
+    func test_confirmLink_fallsBackToBestCandidate() {
+        let html = #"<a href="https://ex.com/unsub">unsubscribe</a>"#
+        XCTAssertEqual(UnsubscribeScanner.confirmLink(in: html), "https://ex.com/unsub")
+    }
+
     // MARK: - SSRF guard
 
     func test_isSafe_rejectsNonHTTPSchemes() async {

@@ -181,11 +181,7 @@ struct MessageDetailView: View {
         }
         .sheet(isPresented: $showDraftPicker) {
             if let draft = draftPick {
-                DraftPickerSheet(
-                    draft: draft,
-                    provider: directory.active?.provider ?? .gmail,
-                    onPick: handleDraftPick
-                )
+                DraftPickerSheet(draft: draft, onPick: handleDraftPick)
             }
         }
         .sheet(isPresented: $showSenderSheet) {
@@ -764,14 +760,12 @@ struct MessageDetailView: View {
         return nil
     }
 
-    private func handleDraftPick(variant: Int, pushToGmail: Bool) {
+    private func handleDraftPick(variant: Int) {
         guard let draft = draftPick else { return }
         showDraftPicker = false
         Task {
             do {
-                _ = try await api.chooseDraft(
-                    draftId: draft.id, variant: variant, pushToGmail: pushToGmail
-                )
+                _ = try await api.chooseDraft(draftId: draft.id, variant: variant)
                 selectedDraftBody = draft.variants.indices.contains(variant)
                     ? draft.variants[variant]
                     : ""

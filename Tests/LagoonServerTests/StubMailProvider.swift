@@ -1,3 +1,4 @@
+import XCTest
 import Foundation
 import LagoonKit
 @testable import LagoonServer
@@ -155,5 +156,21 @@ extension RemoteHeader {
             inReplyTo: inReplyTo,
             references: references
         )
+    }
+}
+
+/// Async form of `XCTAssertThrowsError` (its autoclosure cannot await).
+/// Shared by the IMAP client/connection/provider tests.
+func XCTAssertThrowsErrorAsync<T>(
+    _ body: () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async -> Error? {
+    do {
+        _ = try await body()
+        XCTFail("expected an error to be thrown", file: file, line: line)
+        return nil
+    } catch {
+        return error
     }
 }

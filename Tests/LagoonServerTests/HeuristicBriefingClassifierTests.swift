@@ -49,8 +49,8 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         HeuristicBriefingClassifier.group(
             for: message,
             accountEmail: accountEmail,
-            pinnedGmailIds: pinned,
-            listUnsubscribeGmailIds: listUnsubscribe,
+            pinnedRemoteIds: pinned,
+            listUnsubscribeRemoteIds: listUnsubscribe,
             repliedRemoteIds: replied,
             now: now
         )
@@ -67,11 +67,11 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
         XCTAssertEqual(result.reason, .replied)
     }
 
-    /// Gmail rows are keyed by Gmail id while Sent harvesting yields
-    /// Message-IDs (V2 A2): the stored Message-ID header must match too.
+    /// Rows are keyed by IMAP UID while Sent harvesting yields Message-IDs
+    /// (V2 A2): the stored Message-ID header must match too.
     func test_replied_matchesStoredMessageIDHeader() {
         let message = header(
-            "gmail-123", from: "alice@example.com", isRead: false,
+            "remote-123", from: "alice@example.com", isRead: false,
             messageIdHeader: "<orig@example.com>"
         )
         let result = group(message, replied: ["<orig@example.com>"])
@@ -254,7 +254,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
             header("m4", from: "bob@example.com"),
         ]
         let classifier = HeuristicBriefingClassifier(
-            signals: .init(pinnedGmailIds: ["m1"], listUnsubscribeGmailIds: ["m4"])
+            signals: .init(pinnedRemoteIds: ["m1"], listUnsubscribeRemoteIds: ["m4"])
         )
         let withReasons = classifier.classifyWithReasons(messages, accountEmail: accountEmail)
         XCTAssertEqual(withReasons.count, messages.count)
@@ -272,7 +272,7 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
     /// Pins the Signals-based instance path end-to-end (pinned via Signals).
     func test_instanceSignals_drivePinnedGroup() {
         let classifier = HeuristicBriefingClassifier(
-            signals: .init(pinnedGmailIds: ["m1"], listUnsubscribeGmailIds: [])
+            signals: .init(pinnedRemoteIds: ["m1"], listUnsubscribeRemoteIds: [])
         )
         let result = classifier.group(for: header("m1", from: "alice@example.com"), accountEmail: accountEmail)
         XCTAssertEqual(result.group, .pinned)

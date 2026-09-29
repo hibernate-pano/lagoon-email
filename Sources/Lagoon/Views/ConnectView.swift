@@ -1,26 +1,23 @@
 import SwiftUI
-import AppKit
 import LagoonKit
 
-/// First-run surface: pick a provider and connect.
+/// First-run surface: connect a QQ Mailbox with an address + authorization code.
 ///
-/// Gmail goes through the browser OAuth dance (the app is a bare SwiftPM
-/// executable with no `Info.plist`, so it cannot register a URL scheme; the
-/// server deep-links nothing and the view polls `GET /api/accounts` instead).
-/// QQ Mail is an in-app form: address + authorization code, checked by the
-/// server before it stores anything.
+/// The form is the only entry point (the app is a bare SwiftPM executable with
+/// no `Info.plist` and registers no URL scheme, so a browser OAuth round-trip
+/// has nowhere to land). The server probes the mailbox before storing anything.
 struct ConnectView: View {
-    enum Mode: String, CaseIterable, Identifiable {
-        case gmail
-        case qq
-        var id: String { rawValue }
-    }
-
     @EnvironmentObject var accounts: AccountStore
     @Environment(\.l10n) private var l10n
     @Environment(\.dismiss) private var dismiss
 
-    @State private var mode: Mode = .qq
+    /// RootView presents this as a sheet (connect/reconnect while accounts
+    /// exist) — there `dismiss()` closes the sheet. As the WindowGroup root
+    /// (onboarding, no account yet) `dismiss()` would close the ENTIRE
+    /// window and leave the app running windowless; LagoonApp's switch on
+    /// `accounts.accountId` swaps the content to RootView instead.
+    var presentedAsSheet: Bool = false
+
     @State private var qqEmail = ""
     @State private var qqAuthCode = ""
     @State private var showAuthCode = false
@@ -39,25 +36,16 @@ struct ConnectView: View {
         case authCode
     }
 
-    /// Pre-filled by RootView's "Reconnect" banner; selecting the QQ tab and
-    /// filling the address is the whole point of that entry path.
+    /// Pre-filled by RootView's "Reconnect" banner.
     private let prefillEmail: String?
 
-    init(prefillEmail: String? = nil) {
+    init(prefillEmail: String? = nil, presentedAsSheet: Bool = false) {
         self.prefillEmail = prefillEmail
+        self.presentedAsSheet = presentedAsSheet
         _qqEmail = State(initialValue: prefillEmail ?? "")
-        _mode = State(initialValue: .qq)
     }
 
-    // Gmail polling state.
-    @State private var isPolling = false
-    /// Bumped on every Connect click so `.task(id:)` restarts the poll loop
-    /// with a fresh 3-minute deadline.
-    @State private var connectAttempt = 0
-
     private let api = APIClient()
-    private static let pollInterval: Duration = .seconds(2)
-    private static let pollTimeout: Duration = .seconds(180)
 
     var body: some View {
         VStack(spacing: 16) {
@@ -67,25 +55,7 @@ struct ConnectView: View {
             Text(l10n.connectPrompt)
                 .foregroundStyle(.secondary)
 
-            Picker(l10n.connectMethod, selection: $mode) {
-                Text("Gmail").tag(Mode.gmail)
-                Text(l10n.connectQQTab).tag(Mode.qq)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(maxWidth: 280)
-            .onChange(of: mode) { _, newMode in
-                errorMessage = nil
-                accountExistsEmail = nil
-                if newMode == .qq {
-                    focusedField = qqEmail.isEmpty ? .email : .authCode
-                }
-            }
-
-            switch mode {
-            case .gmail: gmailSection
-            case .qq: qqSection
-            }
+            qqSection
 
             if let accountExistsEmail {
                 VStack(spacing: 8) {
@@ -109,19 +79,20 @@ struct ConnectView: View {
             if accounts.accountId != nil {
                 Button(l10n.cancel) {
                     connectTask?.cancel()
-                    dismiss()
+                    if presentedAsSheet { dismiss() }
                 }
                 .keyboardShortcut(.cancelAction)
             }
         }
         .padding(40)
-        .frame(minWidth: 460, maxWidth: 460, minHeight: 420)
-        // Polls while the view is visible; SwiftUI cancels the task on disappear.
-        .task(id: connectAttempt) { await pollForConnection() }
+        .frame(minWidth: 460, maxWidth: 460, minHeight: 380)
+        // Editing either field invalidates whatever the last attempt said.
+        // This used to be the segmented-control's `onChange`; with a single
+        // provider there is no tab switch left to hang it on.
+        .onChange(of: qqEmail) { _, _ in clearFailureState() }
+        .onChange(of: qqAuthCode) { _, _ in clearFailureState() }
         .onAppear {
-            if mode == .qq {
-                focusedField = qqEmail.isEmpty ? .email : .authCode
-            }
+            focusedField = qqEmail.isEmpty ? .email : .authCode
         }
         // A sheet can be closed while the probe is still in flight; without
         // this the request keeps running and can adopt an account the user
@@ -129,34 +100,9 @@ struct ConnectView: View {
         .onDisappear { connectTask?.cancel() }
     }
 
-    @ViewBuilder
-    private var gmailSection: some View {
-        Button {
-            errorMessage = nil
-            NSWorkspace.shared.open(api.oauthStartURL)
-            connectAttempt += 1
-        } label: {
-            HStack(spacing: 6) {
-                if isPolling && connectAttempt > 0 {
-                    ProgressView().controlSize(.small)
-                }
-                Text(l10n.connectGmail)
-            }
-        }
-        .controlSize(.large)
-        .buttonStyle(.borderedProminent)
-        .disabled(isPolling && connectAttempt > 0)
-
-        if isPolling && connectAttempt > 0 {
-            // The button carries the spinner; a second one here just competes.
-            Text(l10n.waitingForApproval)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        } else {
-            Text(l10n.afterApproval)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+    private func clearFailureState() {
+        errorMessage = nil
+        accountExistsEmail = nil
     }
 
     @ViewBuilder
@@ -255,7 +201,7 @@ struct ConnectView: View {
             // adopt the account they backed out of.
             if Task.isCancelled { return }
             try accounts.set(accountId: account.id)
-            dismiss()
+            if presentedAsSheet { dismiss() }
         } catch let apiError as APIError {
             applyConnectFailure(apiError, email: email)
         } catch let urlError as URLError {
@@ -340,7 +286,7 @@ struct ConnectView: View {
             }
             try await api.activateAccount(id: row.id)
             try accounts.set(accountId: row.id)
-            dismiss()
+            if presentedAsSheet { dismiss() }
         } catch let urlError as URLError where urlError.code == .cancelled {
             return
         } catch is CancellationError {
@@ -349,78 +295,5 @@ struct ConnectView: View {
             errorMessage = l10n.checkConnectionFailed + error.lagoonUIMessage
             accountExistsEmail = nil
         }
-    }
-
-    /// M0 completion handshake for the Gmail dance: poll `GET /api/accounts`
-    /// until the OAuth round-trip lands a row.
-    private func pollForConnection() async {
-        // connectAttempt starts at 0: opening the sheet must not kick off a
-        // 3-minute Gmail poll (and the "waiting for browser approval" copy)
-        // before the user has even clicked Connect.
-        guard connectAttempt > 0 else { return }
-        guard mode == .gmail else { return }
-        isPolling = true
-        errorMessage = nil
-        defer { isPolling = false }
-
-        // Snapshot at poll start: only a row that appears or recovers *after*
-        // this moment counts as landed. Without the baseline the poll would
-        // steal a pre-existing row within one cycle, bouncing "add account"
-        // straight back to the feed before the form can be used.
-        let baseline = (try? await api.fetchAccounts()) ?? []
-
-        let deadline = ContinuousClock.now + Self.pollTimeout
-        while !Task.isCancelled {
-            if ContinuousClock.now >= deadline {
-                errorMessage = l10n.stillNotConnected
-                return
-            }
-
-            do {
-                let connected = try await api.fetchAccounts()
-                if let landed = Self.landedGmailAccount(current: connected, baseline: baseline) {
-                    do {
-                        try accounts.set(accountId: landed.id)
-                        dismiss()
-                        return
-                    } catch {
-                        errorMessage = l10n.saveAccountFailed + error.lagoonUIMessage
-                        return
-                    }
-                }
-            } catch {
-                errorMessage = l10n.checkConnectionFailed + error.lagoonUIMessage
-            }
-
-            do {
-                try await Task.sleep(for: Self.pollInterval)
-            } catch {
-                return // view disappeared / task cancelled
-            }
-        }
-    }
-
-    /// The account the Gmail OAuth round-trip just landed, if any: a gmail row
-    /// that is new since the poll started (first connect), or a previously
-    /// unhealthy gmail row that now reads `.ok` — the callback upserts
-    /// credentials in place (same id) and ticks the sync engine, so recovery
-    /// is visible within seconds. Rows that were healthy at baseline are never
-    /// selected: the connect surface is reachable while accounts exist, and
-    /// stealing one would yank the user out of the form.
-    static func landedGmailAccount(
-        current: [ConnectedAccount],
-        baseline: [ConnectedAccount]
-    ) -> ConnectedAccount? {
-        let baselineById = Dictionary(
-            baseline.map { ($0.id, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        for account in current where account.provider == .gmail && account.isActive {
-            guard let before = baselineById[account.id] else { return account }
-            if before.syncHealth.status != .ok, account.syncHealth.status == .ok {
-                return account
-            }
-        }
-        return nil
     }
 }

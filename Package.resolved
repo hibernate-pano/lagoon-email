@@ -1,5 +1,5 @@
 {
-  "originHash" : "06b0d2833c45dd02ce12f1bd103988d30643e641779f00e9f2a3cdc159ecd405",
+  "originHash" : "847ca74105710b3cb9fc3786072c62f48d34e2855a6a91d020c8174cbc5b0e54",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -11,21 +11,21 @@
       }
     },
     {
+      "identity" : "grdb.swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/groue/GRDB.swift.git",
+      "state" : {
+        "revision" : "b83108d10f42680d78f23fe4d4d80fc88dab3212",
+        "version" : "7.11.1"
+      }
+    },
+    {
       "identity" : "hummingbird",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/hummingbird-project/hummingbird.git",
       "state" : {
         "revision" : "17d8de63af08ad6f9531ae0e0f0606dc92779360",
         "version" : "2.6.0"
-      }
-    },
-    {
-      "identity" : "postgres-nio",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/vapor/postgres-nio.git",
-      "state" : {
-        "revision" : "39ce38a93408937bcd27f521f3cdf88266136b80",
-        "version" : "1.33.1"
       }
     },
     {

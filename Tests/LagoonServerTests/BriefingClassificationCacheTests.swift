@@ -1,7 +1,7 @@
 import XCTest
 import Foundation
 import Logging
-import PostgresNIO
+import GRDB
 import Hummingbird
 import HummingbirdTesting
 @testable import LagoonServer
@@ -107,7 +107,7 @@ final class BriefingClassificationCacheTests: XCTestCase {
     private func makeAccount(oauthUser: String) -> Account {
         Account(
             id: UUID(),
-            provider: .gmail,
+            provider: .qq,
             oauthUser: oauthUser,
             email: "\(oauthUser)@example.com",
             credentials: nil,

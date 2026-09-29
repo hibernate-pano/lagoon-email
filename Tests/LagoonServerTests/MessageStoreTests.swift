@@ -1,5 +1,5 @@
 import XCTest
-import PostgresNIO
+import GRDB
 @testable import LagoonServer
 @testable import LagoonKit
 
@@ -7,7 +7,7 @@ final class MessageStoreTests: XCTestCase {
     private func makeAccount(oauthUser: String) -> Account {
         Account(
             id: UUID(),
-            provider: .gmail,
+            provider: .qq,
             oauthUser: oauthUser,
             email: "m@example.com",
             credentials: nil,
@@ -38,9 +38,9 @@ final class MessageStoreTests: XCTestCase {
 
     /// Deletes only this test's account (by `oauth_user`); `message_headers`
     /// rows are removed by the `ON DELETE CASCADE` FK.
-    private func cleanup(_ oauthUser: String) -> @Sendable (PostgresConnection) async -> Void {
+    private func cleanup(_ oauthUser: String) -> @Sendable (LagoonDB) async -> Void {
         { conn in
-            try? await TestDatabase.deleteAccount(oauthUser: oauthUser, provider: .gmail, db: conn)
+            try? await TestDatabase.deleteAccount(oauthUser: oauthUser, provider: .qq, db: conn)
         }
     }
 

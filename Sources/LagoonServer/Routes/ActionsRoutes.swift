@@ -1,7 +1,7 @@
 import Foundation
 import Hummingbird
 import Logging
-import PostgresNIO
+import GRDB
 import LagoonKit
 
 struct ArchiveResponse: Encodable { let ok: Bool; let remoteId: String; let remote: Bool; let actionId: Int64 }
@@ -29,14 +29,12 @@ struct NotUndoable: Error { let kind: AIActionKind }
 public enum ActionsRoutes {
     public static func register(
         on router: Router<BasicRequestContext>,
-        db: PostgresConnection,
-        client: GmailClient,
-        tokens: GmailTokenService,
+        db: LagoonDB,
         logger: Logger,
         makeProvider: MailProviderFactory.Builder? = nil
     ) {
         let makeProvider = makeProvider
-            ?? MailProviderFactory.factory(client: client, tokens: tokens, db: db, logger: logger)
+            ?? MailProviderFactory.factory(db: db, logger: logger)
 
         // POST /api/messages/{remoteId}/archive?accountId=
         // Moves the message through the account's provider (`MailProvider.archive`).
@@ -107,7 +105,7 @@ public enum ActionsRoutes {
     // MARK: - Archive
 
     private static func archiveHandler(
-        request: Request, context: BasicRequestContext, db: PostgresConnection,
+        request: Request, context: BasicRequestContext, db: LagoonDB,
         makeProvider: MailProviderFactory.Builder, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
@@ -149,16 +147,15 @@ public enum ActionsRoutes {
 
         let action: AIAction
         do {
-            action = try await db.withTransaction(logger: logger) { transaction in
-                try await transaction.query(
-                    "UPDATE message_headers SET is_archived = TRUE WHERE remote_id = $1 AND account_id = $2",
-                    [PostgresData(string: remoteId), PostgresData(uuid: accountId)]
-                ).get()
-                return try await AIActionStore.record(
+            action = try db.write { raw in
+                try MessageStore.setArchivedSync(
+                    true, remoteId: remoteId, accountId: accountId, db: raw
+                )
+                return try AIActionStore.recordSync(
                     accountId: accountId,
                     kind: .archive,
                     payload: ["remoteId": remoteId, "remoteWrite": "true"],
-                    db: transaction
+                    db: raw
                 )
             }
         } catch {
@@ -189,7 +186,7 @@ public enum ActionsRoutes {
 
     /// 删除：远端先移入废纸篓，本地再翻旗标。与归档同一套审计/撤销。
     private static func deleteHandler(
-        request: Request, context: BasicRequestContext, db: PostgresConnection,
+        request: Request, context: BasicRequestContext, db: LagoonDB,
         makeProvider: MailProviderFactory.Builder, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
@@ -223,18 +220,18 @@ public enum ActionsRoutes {
         }
         let action: AIAction
         do {
-            action = try await db.withTransaction(logger: logger) { transaction in
-                try await MessageStore.setDeleted(
-                    remoteId: remoteId, accountId: accountId, deleted: true, db: transaction
+            action = try db.write { raw in
+                try MessageStore.setDeletedSync(
+                    remoteId: remoteId, accountId: accountId, deleted: true, db: raw
                 )
-                return try await AIActionStore.record(
+                return try AIActionStore.recordSync(
                     accountId: accountId,
                     kind: .delete,
                     payload: [
                         "remoteId": remoteId,
                         "remoteWrite": "true",
                     ],
-                    db: transaction
+                    db: raw
                 )
             }
         } catch {
@@ -259,7 +256,7 @@ public enum ActionsRoutes {
     /// client cannot one-shot the provider's rate budget; per-item errors are
     /// reported, not thrown — a sweep that half-succeeded must say so.
     private static func archiveBulkHandler(
-        request: Request, db: PostgresConnection,
+        request: Request, db: LagoonDB,
         makeProvider: MailProviderFactory.Builder, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
@@ -304,10 +301,12 @@ public enum ActionsRoutes {
                     payload: ["remoteId": remoteId, "remoteWrite": "true"],
                     db: db
                 )
-                try await db.query(
-                    "UPDATE message_headers SET is_archived = TRUE WHERE remote_id = $1 AND account_id = $2",
-                    [PostgresData(string: remoteId), PostgresData(uuid: accountId)]
-                ).get()
+                try db.write {
+                    try $0.execute(
+                        sql: "UPDATE message_headers SET is_archived = TRUE WHERE remote_id = ? AND account_id = ?",
+                        arguments: [remoteId, accountId]
+                    )
+                }
                 items.append(ArchiveBulkItem(remoteId: remoteId, ok: true, actionId: action.id))
             } catch let error as MailError {
                 // Same label the per-message route would return; logged there,
@@ -329,7 +328,7 @@ public enum ActionsRoutes {
     // MARK: - Unsubscribe
 
     private static func unsubscribeHandler(
-        request: Request, context: BasicRequestContext, db: PostgresConnection,
+        request: Request, context: BasicRequestContext, db: LagoonDB,
         makeProvider: MailProviderFactory.Builder, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
@@ -356,7 +355,9 @@ public enum ActionsRoutes {
 
         // Resolution order for 一键退订:
         //   1. live List-Unsubscribe header (parsed by the same scanner as
-        //      the body, so bare unbracketed URLs work too)
+        //      the body, so bare unbracketed URLs work too). A companion
+        //      List-Unsubscribe-Post header (RFC 8058) upgrades the hit to
+        //      a true one-click POST: no page, no click at all.
         //   2. links harvested earlier (sync-time header + first-open body)
         //   3. the HTML body, fetched and scanned on the spot
         // A failed header read no longer aborts the chain: stored links may
@@ -372,6 +373,7 @@ public enum ActionsRoutes {
         var target: (url: URL, publisher: String)?
         var headerFailureResponse: Response?
         var bodyFailureResponse: Response?
+        var oneClickHeader = false
         /// A mailto: was offered by some stage. Accumulated, NOT acted on
         /// immediately: headerLinks/bodyLinks admit the mailto scheme and the
         /// sync-time writers persist it, so bailing out per stage meant a
@@ -379,6 +381,9 @@ public enum ActionsRoutes {
         var sawMailto = false
         do {
             let headers = try await provider.fetchRawHeaderValues(remoteId: remoteId)
+            if let post = headers.first(where: { $0.key.lowercased() == "list-unsubscribe-post" })?.value {
+                oneClickHeader = post.lowercased().contains("one-click")
+            }
             if let raw = headers.first(where: { $0.key.lowercased() == "list-unsubscribe" })?.value {
                 switch await pickUnsubTarget(links: UnsubscribeScanner.headerLinks(raw)) {
                 case .http(let url, let pub):
@@ -466,7 +471,7 @@ public enum ActionsRoutes {
 
         let outcome: UnsubHit
         do {
-            outcome = try await hitUnsubscribe(url: unsubscribeURL)
+            outcome = try await hitUnsubscribe(url: unsubscribeURL, oneClick: oneClickHeader)
         } catch {
             logger.warning("unsubscribe.requestFailed", metadata: [
                 "remoteId": .string(remoteId),
@@ -489,12 +494,12 @@ public enum ActionsRoutes {
 
         let action: AIAction
         do {
-            action = try await db.withTransaction(logger: logger) { transaction in
-                try await transaction.query(
-                    "UPDATE message_headers SET is_archived = TRUE, is_read = TRUE WHERE remote_id = $1 AND account_id = $2",
-                    [PostgresData(string: remoteId), PostgresData(uuid: accountId)]
-                ).get()
-                return try await AIActionStore.record(
+            action = try db.write { raw in
+                try raw.execute(
+                    sql: "UPDATE message_headers SET is_archived = TRUE, is_read = TRUE WHERE remote_id = ? AND account_id = ?",
+                    arguments: [remoteId, accountId]
+                )
+                return try AIActionStore.recordSync(
                     accountId: accountId,
                     kind: .unsubscribe,
                     payload: [
@@ -502,7 +507,7 @@ public enum ActionsRoutes {
                         "publisher": publisher,
                         "remote": "true",
                     ],
-                    db: transaction
+                    db: raw
                 )
             }
         } catch {
@@ -519,7 +524,7 @@ public enum ActionsRoutes {
     // MARK: - Classify override
 
     private static func classifyOverrideHandler(
-        request: Request, context: BasicRequestContext, db: PostgresConnection, logger: Logger
+        request: Request, context: BasicRequestContext, db: LagoonDB, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -578,8 +583,8 @@ public enum ActionsRoutes {
                 )
                 let heuristic = HeuristicBriefingClassifier(
                     signals: .init(
-                        pinnedGmailIds: pinned,
-                        listUnsubscribeGmailIds: unsubscribed
+                        pinnedRemoteIds: pinned,
+                        listUnsubscribeRemoteIds: unsubscribed
                     )
                 ).group(for: message, accountEmail: account.email)
                 fromGroup = overrides[message.fromAddress] ?? heuristic.group
@@ -593,15 +598,15 @@ public enum ActionsRoutes {
 
         let action: AIAction
         do {
-            action = try await db.withTransaction(logger: logger) { transaction in
-                try await AIActionStore.insertOverride(
+            action = try db.write { raw in
+                try AIActionStore.insertOverrideSync(
                     accountId: accountId,
                     remoteId: remoteId,
                     fromGroup: fromGroup,
                     toGroup: toGroup,
-                    db: transaction
+                    db: raw
                 )
-                return try await AIActionStore.record(
+                return try AIActionStore.recordSync(
                     accountId: accountId,
                     kind: .classifyOverride,
                     payload: [
@@ -609,7 +614,7 @@ public enum ActionsRoutes {
                         "fromGroup": fromGroup.rawValue,
                         "toGroup": toGroup.rawValue,
                     ],
-                    db: transaction
+                    db: raw
                 )
             }
         } catch {
@@ -626,7 +631,7 @@ public enum ActionsRoutes {
     // MARK: - List actions
 
     private static func listActionsHandler(
-        request: Request, context: BasicRequestContext, db: PostgresConnection, logger: Logger
+        request: Request, context: BasicRequestContext, db: LagoonDB, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -651,7 +656,7 @@ public enum ActionsRoutes {
     // MARK: - Undo action
 
     private static func undoActionHandler(
-        request: Request, context: BasicRequestContext, db: PostgresConnection,
+        request: Request, context: BasicRequestContext, db: LagoonDB,
         makeProvider: MailProviderFactory.Builder, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
@@ -722,7 +727,7 @@ public enum ActionsRoutes {
     private static func reverse(
         action: AIAction, account: Account,
         makeProvider: MailProviderFactory.Builder,
-        db: PostgresConnection, logger: Logger
+        db: LagoonDB, logger: Logger
     ) async throws {
         let remoteId = action.payload["remoteId"] ?? ""
         switch action.kind {
@@ -733,10 +738,12 @@ public enum ActionsRoutes {
             } else if action.payload["remoteWrite"] == "true" {
                 throw MailError.notConfigured("provider missing during undo")
             }
-            try await db.query(
-                "UPDATE message_headers SET is_archived = FALSE WHERE remote_id = $1 AND account_id = $2",
-                [PostgresData(string: remoteId), PostgresData(uuid: account.id)]
-            ).get()
+            try db.write {
+                try $0.execute(
+                    sql: "UPDATE message_headers SET is_archived = FALSE WHERE remote_id = ? AND account_id = ?",
+                    arguments: [remoteId, account.id]
+                )
+            }
             // Undoing an auto-archive retires its rule (V2 C2): otherwise the
             // next sync round re-archives the same sender and the undo was a
             // lie. Sender prefers the action payload and falls back to the
@@ -766,10 +773,12 @@ public enum ActionsRoutes {
                 throw MailError.notConfigured("provider missing during undo")
             }
             try await provider.setRead(remoteId: remoteId, isRead: false)
-            try await db.query(
-                "UPDATE message_headers SET is_read = FALSE WHERE remote_id = $1 AND account_id = $2",
-                [PostgresData(string: remoteId), PostgresData(uuid: account.id)]
-            ).get()
+            try db.write {
+                try $0.execute(
+                    sql: "UPDATE message_headers SET is_read = FALSE WHERE remote_id = ? AND account_id = ?",
+                    arguments: [remoteId, account.id]
+                )
+            }
         case .pin:
             try await MessageStore.setPinned(false, remoteId: remoteId, accountId: account.id, db: db)
         case .unpin:
@@ -855,16 +864,18 @@ public enum ActionsRoutes {
     /// Harvested candidates from the header row; empty on any read failure
     /// (the caller falls through to the live body scan).
     private static func storedUnsubscribeLinks(
-        remoteId: String, accountId: UUID, db: PostgresConnection
+        remoteId: String, accountId: UUID, db: LagoonDB
     ) async -> [String] {
-        guard let rows = try? await db.query(
-            "SELECT unsubscribe_links FROM message_headers WHERE remote_id = $1 AND account_id = $2",
-            [PostgresData(string: remoteId), PostgresData(uuid: accountId)]
-        ).get(),
-            let row = rows.rows.first
+        // `try?` fully flattens the Row? the closure returns.
+        guard let row = try? db.read({ raw in
+            try Row.fetchOne(
+                raw,
+                sql: "SELECT unsubscribe_links FROM message_headers WHERE remote_id = ? AND account_id = ?",
+                arguments: [remoteId, accountId]
+            )
+        })
         else { return [] }
-        let r = row.makeRandomAccess()
-        return (try? r["unsubscribe_links"].decode([String].self)) ?? []
+        return row.decodedStringArray("unsubscribe_links")
     }
 
     /// Outcome of hitting an unsubscribe endpoint — 2xx alone is NOT success:
@@ -877,29 +888,36 @@ public enum ActionsRoutes {
         case failed
     }
 
-    /// Best-effort POST or GET to the unsubscribe endpoint. Many publishers use
-    /// a tracking pixel (GET); some use a form (POST). We try POST first.
+    /// Best-effort unsubscribe against the chosen endpoint. When the sender
+    /// advertised RFC 8058 one-click support, a POST with the standard body
+    /// *is* the unsubscribe — no page, no extra click. Otherwise a single GET
+    /// (the tokenized tracking-link unsubscribe, by far the most common).
+    ///
+    /// The old blind POST-before-GET is gone: POSTing a GET-shaped link
+    /// usually returned a 200 landing page whose "manage preferences" footer
+    /// then made `classifyHit` report "needs manual" — and the GET, the one
+    /// request that would actually have unsubscribed, never ran.
     ///
     /// Redirects go through the session's delegate: EVERY hop is re-checked
     /// against the SSRF guard, because a public URL that 302s to loopback or
     /// 169.254.169.254 would otherwise defeat `isSafe`. An unsafe hop cancels
     /// the task (fail closed).
     ///
-    /// ponytail: ceiling — one wall-clock budget for BOTH attempts
+    /// ponytail: ceiling — one wall-clock budget for ALL attempts
     /// (`unsubscribeTimeout`), a streaming body cap (`maxUnsubscribeBodyBytes`)
     /// and a per-attempt timeout. The budget is enforced by cancelling the
     /// task group, so the hard floor is "whatever URLSession still owes us":
     /// if the transport ignored cancellation the worst case degrades to
     /// per-attempt timeouts, not to an unbounded hang.
     static func hitUnsubscribe(
-        url: URL, session: URLSession = guardedSession
+        url: URL, oneClick: Bool = false, session: URLSession = guardedSession
     ) async throws -> UnsubHit {
         #if DEBUG
         // ponytail: seam for offline route tests — absent from release builds.
         if let probe = hitUnsubscribeProbe { return try await probe(url) }
         #endif
         return try await withThrowingTaskGroup(of: UnsubHit.self) { group in
-            group.addTask { try await Self.attemptUnsubscribe(url: url, session: session) }
+            group.addTask { try await Self.attemptUnsubscribe(url: url, oneClick: oneClick, session: session) }
             group.addTask {
                 try await Task.sleep(for: Self.unsubscribeTimeout)
                 throw URLError(.timedOut)
@@ -910,43 +928,121 @@ public enum ActionsRoutes {
         }
     }
 
-    /// One POST, then one GET. 2xx only is a candidate for success; anything
-    /// else is not. In particular a 3xx must NEVER be classified: with the
-    /// redirect guard in place a 3xx that reaches us is either a hop the guard
-    /// refused or a chain the server cut short — recording that as completed
-    /// would archive the mail and tell the user they unsubscribed.
-    private static func attemptUnsubscribe(url: URL, session: URLSession) async throws -> UnsubHit {
-        for method in ["POST", "GET"] {
+    /// RFC 8058 one-click POST when the sender advertised it (the POST body
+    /// is mandated by the RFC), then one GET. 2xx only is a candidate for
+    /// success; anything else is not. In particular a 3xx must NEVER be
+    /// classified: with the redirect guard in place a 3xx that reaches us is
+    /// either a hop the guard refused or a chain the server cut short —
+    /// recording that as completed would archive the mail and tell the user
+    /// they unsubscribed.
+    private static func attemptUnsubscribe(
+        url: URL, oneClick: Bool, session: URLSession
+    ) async throws -> UnsubHit {
+        if oneClick {
             var request = URLRequest(url: url)
-            request.httpMethod = method
+            request.httpMethod = "POST"
             request.timeoutInterval = 10
             request.setValue("Lagoon/1.0", forHTTPHeaderField: "User-Agent")
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("List-Unsubscribe=One-Click".utf8)
             let data: Data
             let response: URLResponse
             do {
                 (data, response) = try await session.data(for: request)
             } catch let error as URLError where error.code == .cancelled {
                 // A refused redirect hop or a body past the streaming cap:
-                // a deliberate stop, not a transport fault — report failure
-                // instead of bubbling a 500.
+                // a deliberate stop, not a transport fault.
                 return .failed
             }
-            guard let http = response as? HTTPURLResponse else { continue }
-            if (200..<300).contains(http.statusCode) { return classifyHit(data: data) }
-            if (300..<400).contains(http.statusCode) { return .failed }
+            if let http = response as? HTTPURLResponse {
+                if (200..<300).contains(http.statusCode) {
+                    return await classifyAndConfirm(data: data, session: session)
+                }
+                if (300..<400).contains(http.statusCode) { return .failed }
+                // 4xx/5xx: the endpoint rejected the POST (405-style). Fall
+                // through to the GET rather than reporting failure — some
+                // senders advertise the header but only serve the link.
+            }
         }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 10
+        request.setValue("Lagoon/1.0", forHTTPHeaderField: "User-Agent")
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch let error as URLError where error.code == .cancelled {
+            return .failed
+        }
+        guard let http = response as? HTTPURLResponse else { return .failed }
+        if (200..<300).contains(http.statusCode) {
+            return await classifyAndConfirm(data: data, session: session)
+        }
+        if (300..<400).contains(http.statusCode) { return .failed }
         return .failed
     }
 
     /// ponytail: a 2xx body is "completed" unless it re-offers unsubscribe
-    /// links (same scanner as the email body). Ceiling: a confirmation page
-    /// with a preferences-center footer link degrades to manual instead of
-    /// auto-completing — honest fallback, not a false success.
+    /// links (same scanner as the email body) — a confirmation page with a
+    /// preferences-center footer must not auto-complete as a false success.
+    /// Success phrases are checked FIRST: the typical confirmation page ends
+    /// with "you have been unsubscribed" while still linking to a preferences
+    /// centre, and the old link-only rule read that as "needs manual" — the
+    /// single largest source of "明明退订了却提示失败".
     static func classifyHit(data: Data) -> UnsubHit {
-        guard let body = String(data: data, encoding: .utf8),
-              !UnsubscribeScanner.bodyLinks(in: body).isEmpty
-        else { return .completed }
+        guard let body = String(data: data, encoding: .utf8) else { return .completed }
+        if containsSuccessSignal(body) { return .completed }
+        if UnsubscribeScanner.bodyLinks(in: body).isEmpty { return .completed }
         return .landingPage
+    }
+
+    /// English phrases are worded so a confirmation *ask* ("you are about to
+    /// be unsubscribed") does not match — it lacks the completed tense.
+    private static let successSignals = [
+        "successfully unsubscribed", "have been unsubscribed",
+        "has been unsubscribed", "you've been unsubscribed",
+        "you are unsubscribed", "you're unsubscribed", "you're now unsubscribed",
+        "no longer subscribed", "removed from our mailing list",
+        "removed from our list", "removed you from",
+        "退订成功", "已退订", "已为您退订", "已成功退订", "已取消订阅", "取消订阅成功",
+    ]
+
+    static func containsSuccessSignal(_ body: String) -> Bool {
+        let lower = body.lowercased()
+        return successSignals.contains { lower.contains($0) }
+    }
+
+    /// 2xx but judged a landing page → follow the page's own confirm entry
+    /// ONCE and judge that response by the same rules. This is the click the
+    /// user used to have to make by hand ("链接点进去还需要再点一次"); now the
+    /// server makes it. Depth is capped at one: a page that is still ambiguous
+    /// after the follow-up is honestly manual, never a guessed success.
+    static func classifyAndConfirm(data: Data, session: URLSession) async -> UnsubHit {
+        let first = classifyHit(data: data)
+        guard first == .landingPage else { return first }
+        guard let body = String(data: data, encoding: .utf8),
+              let candidate = UnsubscribeScanner.confirmLink(in: body),
+              let url = URL(string: candidate),
+              await UnsubscribeScanner.isSafe(url: url)
+        else { return .landingPage }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 10
+        request.setValue("Lagoon/1.0", forHTTPHeaderField: "User-Agent")
+        let data2: Data
+        let response2: URLResponse
+        do {
+            (data2, response2) = try await session.data(for: request)
+        } catch {
+            return .landingPage
+        }
+        guard let http = response2 as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode)
+        else { return .landingPage }
+        return classifyHit(data: data2)
     }
 
     /// Streaming cap on the unsubscribe response: `data(for:)` would buffer

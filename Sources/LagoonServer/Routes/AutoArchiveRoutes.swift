@@ -1,6 +1,7 @@
 import Foundation
 import Hummingbird
-import PostgresNIO
+import GRDB
+import Logging
 import NIOCore
 import LagoonKit
 
@@ -17,7 +18,7 @@ import LagoonKit
 public enum AutoArchiveRoutes {
     public static func register(
         on router: Router<BasicRequestContext>,
-        db: PostgresConnection,
+        db: LagoonDB,
         logger: Logger
     ) {
         router.get("api/auto-archive") { request, _ -> Response in

@@ -34,3 +34,7 @@ Support/Lagoon.iconset/
 .pi/
 .v2c/
 .video_agent/
+
+# ZCode session scratch (same convention as .mimosa/.pi/.v2c/.video_agent)
+.zcode/
+.zcodeignore

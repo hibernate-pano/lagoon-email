@@ -14,9 +14,6 @@ final class ServerConfigTests: XCTestCase {
         ServerConfig(
             host: host,
             port: 8080,
-            googleClientID: "",
-            googleClientSecret: "",
-            googleRedirectURI: "http://127.0.0.1:8080/oauth/gmail/callback"
         )
     }
 

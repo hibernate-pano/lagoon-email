@@ -2,14 +2,13 @@ import Foundation
 import LagoonKit
 
 /// Provider-neutral header row as it arrives from the wire, before it becomes a
-/// stored `MessageHeader`. `remoteId` is provider-native (Gmail message id /
-/// IMAP UID string) and only unique within one account.
+/// stored `MessageHeader`. `remoteId` is provider-native (an IMAP UID string)
+/// and only unique within one account.
 public extension RemoteHeader {
     /// Split a threading header (In-Reply-To/References) into whitespace-
     /// separated tokens, verbatim. Tokens keep their `<...>` brackets: the
     /// store's Message-ID identity is the exact header string, so stripping
-    /// brackets would break the match. Shared by the IMAP and Gmail Sent
-    /// harvesters.
+    /// brackets would break the match. Shared by the Sent harvester.
     static func messageIDTokens(_ value: String) -> Set<String> {
         Set(
             value.split(whereSeparator: { $0.isWhitespace })
@@ -186,7 +185,7 @@ public protocol ArchiveFolderResolving: Sendable {
 }
 
 /// The one seam every mailbox backend implements. Routes and the sync engine
-/// talk to this, never to Gmail/IMAP directly.
+/// talk to this, never to IMAP directly.
 public protocol MailProvider: Sendable {
     var kind: MailProviderKind { get }
 
@@ -194,7 +193,7 @@ public protocol MailProvider: Sendable {
     func capabilities() async -> MailCapabilities
 
     /// Fetch changes newer than `cursor`, waiting up to `waitUpTo` for
-    /// something to happen (long-poll for Gmail, IDLE for IMAP).
+    /// something to happen (IDLE, bounded by the loop's poll cadence).
     func pullChanges(after cursor: MailSyncState, waitUpTo: Duration) async throws -> MailChangeSet
 
     /// Body on demand: plain text, optional HTML, attachment metadata +
@@ -320,8 +319,8 @@ public struct FetchedAttachmentBytes: Sendable, Equatable {
     }
 }
 
-/// Single-attachment response cap. Gmail caps at 25 MB, so we use the
-/// same number for IMAP to give the client a uniform UX.
+/// Single-attachment response cap (aligned with the 25 MB limit the big
+/// providers enforce, so the client gets a uniform UX).
 public enum AttachmentLimit {
     public static let maxBytes = 25 * 1024 * 1024
 }

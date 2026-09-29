@@ -448,7 +448,7 @@ struct HTMLMessageView: NSViewRepresentable {
 
     /// Replaces `src="cid:xxx"` with `src="data:<mime>;base64,<bytes>"`.
     /// Case-insensitive on both the `Content-ID` key and the `cid:` ref so
-    /// senders that differ in capitalization (a common GMail quirk) still
+    /// senders that differ in capitalization (a common mail-client quirk) still
     /// resolve.
     static func resolveCidReferences(in html: String, with map: [String: Data]) -> String {
         guard !map.isEmpty else { return html }

@@ -2,7 +2,7 @@ import Foundation
 import Logging
 import Hummingbird
 import NIOCore
-import PostgresNIO
+import GRDB
 import LagoonKit
 import LagoonAI
 
@@ -74,7 +74,7 @@ enum RouteParams {
 
     /// `remoteId` path component: percent-decoded, non-empty, treated as an
     /// opaque string. It is only ever passed to parameterized queries or
-    /// percent-encoded into the Gmail URL.
+    /// percent-encoded into the message URL.
     static func remoteId(from context: BasicRequestContext) -> String? {
         guard let raw = context.parameters.get("remoteId"), !raw.isEmpty else { return nil }
         let decoded = raw.removingPercentEncoding ?? raw
@@ -96,15 +96,13 @@ struct SendResponse: Codable { let ok: Bool; let providerMessageId: String? }
 public enum MessageRoutes {
     public static func register(
         on router: Router<BasicRequestContext>,
-        db: PostgresConnection,
-        client: GmailClient,
-        tokens: GmailTokenService,
+        db: LagoonDB,
         logger: Logger,
         summarizer: (any MessageSummarizing)? = nil,
         makeProvider: MailProviderFactory.Builder? = nil
     ) {
         let makeProvider = makeProvider
-            ?? MailProviderFactory.factory(client: client, tokens: tokens, db: db, logger: logger)
+            ?? MailProviderFactory.factory(db: db, logger: logger)
 
         // GET /api/messages/{remoteId}/body?accountId=<uuid>
         // 200 MessageBody | 400 malformed | 404 unknown | 410 message-gone
@@ -411,7 +409,7 @@ public enum MessageRoutes {
 
     private static func composeHandler(
         request: Request,
-        db: PostgresConnection,
+        db: LagoonDB,
         makeProvider: MailProviderFactory.Builder,
         logger: Logger
     ) async -> Response {
@@ -549,7 +547,7 @@ public enum MessageRoutes {
     private static func sendHandler(
         request: Request,
         context: BasicRequestContext,
-        db: PostgresConnection,
+        db: LagoonDB,
         makeProvider: MailProviderFactory.Builder,
         logger: Logger
     ) async -> Response {
@@ -759,7 +757,7 @@ public enum MessageRoutes {
         account: Account,
         remoteId: String,
         provider: any MailProvider,
-        db: PostgresConnection,
+        db: LagoonDB,
         logger: Logger
     ) async throws -> MessageBody {
         if let stored = try? await BodyStore.get(

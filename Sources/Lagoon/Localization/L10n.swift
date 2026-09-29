@@ -280,15 +280,6 @@ public struct L10n: Sendable, Equatable {
     // MARK: - Connect
 
     public var connectPrompt: String { pick("连接你的邮箱开始使用。", "Connect your mailbox to begin.") }
-    public var connectMethod: String { pick("连接方式", "Connection method") }
-    public var connectGmail: String { pick("连接 Gmail", "Connect Gmail") }
-    public var waitingForApproval: String {
-        pick("等待浏览器授权…", "waiting for browser approval…")
-    }
-    public var afterApproval: String {
-        pick("在浏览器中完成授权后回到这里。", "After approving in the browser, return here.")
-    }
-    public var stillNotConnected: String { pick("仍未连接 —— 请重试", "still not connected — try again") }
     public var saveAccountFailed: String { pick("保存账号失败：", "Could not save account: ") }
     public var checkConnectionFailed: String {
         pick("检查连接失败：", "Could not check connection: ")
@@ -368,7 +359,6 @@ public struct L10n: Sendable, Equatable {
     public var deleteAccountFailed: String { pick("删除这个账号失败：", "Could not remove this account: ") }
     public func providerName(_ kind: MailProviderKind) -> String {
         switch kind {
-        case .gmail: return pick("Gmail", "Gmail")
         case .qq: return pick("QQ 邮箱", "QQ Mail")
         }
     }
@@ -523,10 +513,7 @@ public struct L10n: Sendable, Equatable {
     }
     public var pinning: String { pick("正在置顶…", "Pinning…") }
     public var draftVariants: String { pick("AI 草稿（3 个版本）", "AI drafts (3 variants)") }
-    public var pushToGmailDrafts: String { pick("保存到 Gmail 草稿", "Save to Gmail drafts") }
-    public var chooseAndSendToGmail: String { pick("选这个 → 存到 Gmail Drafts",
-                                              "Use this → save to Gmail Drafts") }
-    public var chooseOnly: String { pick("只选中", "Select only") }
+    public var chooseAndSend: String { pick("选这个 → 发送", "Use this → send") }
     public var generatingDrafts: String { pick("正在生成 3 个草稿…", "Generating 3 drafts…") }
     public var draftFailed: String { pick("生成草稿失败：", "Draft generation failed: ") }
     public var pickOne: String { pick("选一个版本", "Pick a version") }
@@ -568,7 +555,7 @@ public struct L10n: Sendable, Equatable {
     public var opening: String { pick("正在打开…", "Opening…") }
     public var nothingHereYet: String { pick("还没有内容", "Nothing here yet") }
     public var inboxZero: String { pick("收件箱已清空", "Inbox zero") }
-    public var tapGmailToSync: String {
+    public var tapToSync: String {
         pick("添加一个邮箱账号，让 Lagoon 开始同步。", "Add an email account to start syncing.")
     }
     public var copiedToClipboard: String { pick("已复制", "Copied") }

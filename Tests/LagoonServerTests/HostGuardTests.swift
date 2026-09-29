@@ -106,10 +106,7 @@ final class HostGuardTests: XCTestCase {
     func test_tokenizedLanBindAuthority_isServed() async throws {
         let cfg = ServerConfig(
             host: "192.168.1.50",
-            port: 8080,
-            googleClientID: "",
-            googleClientSecret: "",
-            googleRedirectURI: "http://192.168.1.50:8080/oauth/gmail/callback"
+            port: 8080
         )
         let app = makeApp(
             allowedNames: cfg.allowedHostNames(apiToken: "secret"),
@@ -127,10 +124,7 @@ final class HostGuardTests: XCTestCase {
     func test_tokenizedLanBind_stillRejectsForeignHostNames() async throws {
         let cfg = ServerConfig(
             host: "192.168.1.50",
-            port: 8080,
-            googleClientID: "",
-            googleClientSecret: "",
-            googleRedirectURI: ""
+            port: 8080
         )
         for hostile in ["evil.com", "evil.com:8080", "127.0.0.1.evil.com", "192.168.1.51"] {
             let app = makeApp(

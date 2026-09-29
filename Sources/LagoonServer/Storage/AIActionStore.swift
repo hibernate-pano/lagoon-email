@@ -1,75 +1,95 @@
 import Foundation
-import PostgresNIO
+import GRDB
 import LagoonKit
 
-/// Postgres-backed audit log for `ai_actions`. Append-only.
+/// SQLite-backed audit log for `ai_actions`. Append-only.
 public enum AIActionStore {
     public static func record(
         accountId: UUID,
         kind: AIActionKind,
         payload: [String: String],
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> AIAction {
+        try db.write { db in
+            try recordSync(accountId: accountId, kind: kind, payload: payload, db: db)
+        }
+    }
+
+    /// Sync core for callers inside a transaction: action routes compose
+    /// "flip the local flag + record the action" atomically in one
+    /// `pool.write` closure and hand the raw `Database` handle here.
+    public static func recordSync(
+        accountId: UUID,
+        kind: AIActionKind,
+        payload: [String: String],
+        db: Database
+    ) throws -> AIAction {
         let payloadJSON = try Self.encode(payload)
-        let sql = """
-            INSERT INTO ai_actions (account_id, kind, payload)
-            VALUES ($1, $2, $3::jsonb)
-            RETURNING id, account_id, kind, payload, created_at, expires_at
-        """
-        let rows = try await db.query(sql, [
-            PostgresData(uuid: accountId),
-            PostgresData(string: kind.rawValue),
-            PostgresData(jsonb: payloadJSON),
-        ]).get()
-        return try Self.decode(rows.rows.first!)
+        // INSERT ... RETURNING (SQLite 3.35+): the row comes back with its
+        // server-generated id, created_at and expires_at defaults applied.
+        guard let row = try Row.fetchOne(
+            db,
+            sql: """
+                INSERT INTO ai_actions (account_id, kind, payload)
+                VALUES (?, ?, ?)
+                RETURNING id, account_id, kind, payload, created_at, expires_at
+                """,
+            arguments: [accountId, kind.rawValue, payloadJSON]
+        ) else {
+            throw StoreError.insertFailed
+        }
+        return try Self.decode(row)
     }
 
     public static func recent(
         accountId: UUID,
         since: Date? = nil,
         limit: Int = 50,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> [AIAction] {
         let sql: String
-        let params: [PostgresData]
+        let args: [DatabaseValueConvertible?]
         if let since {
-            sql = "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE account_id = $1 AND created_at >= $2 ORDER BY created_at DESC LIMIT $3"
-            params = [PostgresData(uuid: accountId), PostgresData(date: since), PostgresData(int: limit)]
+            sql = "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE account_id = ? AND created_at >= ? ORDER BY created_at DESC LIMIT ?"
+            args = [accountId, since, limit]
         } else {
-            sql = "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE account_id = $1 ORDER BY created_at DESC LIMIT $2"
-            params = [PostgresData(uuid: accountId), PostgresData(int: limit)]
+            sql = "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE account_id = ? ORDER BY created_at DESC LIMIT ?"
+            args = [accountId, limit]
         }
-        let rows = try await db.query(sql, params).get()
-        return try rows.map { try Self.decode($0) }
+        return try db.read { db in
+            try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+                .map { try Self.decode($0) }
+        }
     }
 
-    public static func find(id: Int64, db: PostgresConnection) async throws -> AIAction? {
-        let rows = try await db.query(
-            "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE id = $1",
-            [PostgresData(int64: id)]
-        ).get()
-        return try rows.rows.first.map { try Self.decode($0) }
+    public static func find(id: Int64, db: LagoonDB) async throws -> AIAction? {
+        return try db.read { db in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT id, account_id, kind, payload, created_at, expires_at FROM ai_actions WHERE id = ?",
+                arguments: [id]
+            ).map { try Self.decode($0) }
+        }
     }
 
     /// Looks up a previously completed send by the client's idempotency key.
     public static func findSend(
         accountId: UUID,
         requestId: String,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> AIAction? {
-        let rows = try await db.query(
-            """
-            SELECT id, account_id, kind, payload, created_at, expires_at
-            FROM ai_actions
-            WHERE account_id = $1 AND kind = 'send' AND payload->>'requestId' = $2
-            LIMIT 1
-            """,
-            [
-                PostgresData(uuid: accountId),
-                PostgresData(string: requestId),
-            ]
-        ).get()
-        return try rows.rows.first.map { try Self.decode($0) }
+        return try db.read { db in
+            try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT id, account_id, kind, payload, created_at, expires_at
+                    FROM ai_actions
+                    WHERE account_id = ? AND kind = 'send' AND json_extract(payload, '$.requestId') = ?
+                    LIMIT 1
+                    """,
+                arguments: [accountId, requestId]
+            ).map { try Self.decode($0) }
+        }
     }
 
     /// remoteIds Lagoon actually sent a reply to, plus Message-IDs harvested
@@ -78,22 +98,21 @@ public enum AIActionStore {
     /// *original* message's remoteId in the send action's payload, so this is
     /// the authoritative "already replied" signal for the briefing classifier.
     /// The classifier matches rows on both `remoteId` and the stored
-    /// Message-ID header, which is what covers Gmail (Gmail rows are keyed by
-    /// Gmail id, not Message-ID).
+    /// Message-ID header: rows are keyed by IMAP UID while Sent harvesting
+    /// yields Message-IDs, so one key alone cannot decide.
     public static func repliedRemoteIds(
         accountId: UUID,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> Set<String> {
         let sql = """
-            SELECT DISTINCT payload->>'remoteId' AS rid
+            SELECT DISTINCT json_extract(payload, '$.remoteId') AS rid
             FROM ai_actions
-            WHERE account_id = $1 AND kind = 'send' AND payload ? 'remoteId'
+            WHERE account_id = ? AND kind = 'send' AND json_extract(payload, '$.remoteId') IS NOT NULL
         """
-        let rows = try await db.query(sql, [PostgresData(uuid: accountId)]).get()
-        let ids = try rows.map { row -> String in
-            try row.makeRandomAccess()["rid"].decode(String.self)
+        return try db.read { db in
+            let rows = try Row.fetchAll(db, sql: sql, arguments: [accountId])
+            return Set(rows.compactMap { $0.optionalText("rid") })
         }
-        return Set(ids)
     }
 
     /// Audited (kind, createdAt) events for the time-saved report, with
@@ -104,57 +123,59 @@ public enum AIActionStore {
     public static func timeSavedEvents(
         accountId: UUID,
         since: Date,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> [(kind: AIActionKind, createdAt: Date)] {
         let sql = """
             SELECT a.kind, a.created_at
             FROM ai_actions a
-            WHERE a.account_id = $1 AND a.created_at >= $2
-              AND NOT (a.kind = 'send' AND a.payload ? 'sentFolder')
+            WHERE a.account_id = ? AND a.created_at >= ?
+              AND NOT (a.kind = 'send' AND json_extract(a.payload, '$.sentFolder') IS NOT NULL)
               AND NOT EXISTS (
                   SELECT 1 FROM ai_actions u
                   WHERE u.account_id = a.account_id AND u.kind = 'undo'
-                    AND u.payload->>'undoOf' = a.id::text
+                    AND json_extract(u.payload, '$.undoOf') = CAST(a.id AS TEXT)
               )
         """
-        let rows = try await db.query(sql, [
-            PostgresData(uuid: accountId),
-            PostgresData(date: since),
-        ]).get()
-        return try rows.map { row in
-            let r = row.makeRandomAccess()
-            let kindStr: String = try r["kind"].decode(String.self)
-            let createdAt: Date = try r["created_at"].decode(Date.self)
-            return (kind: AIActionKind(rawValue: kindStr) ?? .archive, createdAt: createdAt)
+        return try db.read { db in
+            let rows = try Row.fetchAll(db, sql: sql, arguments: [accountId, since])
+            return rows.map { row in
+                let kindStr: String = row["kind"]
+                let createdAt: Date = row["created_at"]
+                return (kind: AIActionKind(rawValue: kindStr) ?? .archive, createdAt: createdAt)
+            }
         }
     }
 
     /// Per-(account, sender) override lookup used by the heuristic classifier.
     public static func overridesBySender(
         accountId: UUID,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> [String: BriefingGroup] {
         let sql = """
             WITH ranked AS (
                 SELECT o.to_group, m.from_address, o.created_at,
-                    row_number() OVER (PARTITION BY m.from_address ORDER BY o.created_at DESC) AS rn
+                    row_number() OVER (PARTITION BY m.from_address ORDER BY o.created_at DESC, o.rowid DESC) AS rn
                 FROM ai_overrides o
                 JOIN message_headers m ON m.remote_id = o.remote_id AND m.account_id = o.account_id
-                WHERE o.account_id = $1
+                WHERE o.account_id = ?
             )
             SELECT from_address, to_group FROM ranked WHERE rn = 1
         """
-        let rows = try await db.query(sql, [PostgresData(uuid: accountId)]).get()
-        var result: [String: BriefingGroup] = [:]
-        for row in rows {
-            let r = row.makeRandomAccess()
-            let addr: String = try r["from_address"].decode(String.self)
-            let groupStr: String = try r["to_group"].decode(String.self)
-            if let group = BriefingGroup(rawValue: groupStr) {
-                result[addr] = group
+        // The rowid tie-break matters: created_at is millisecond TEXT, and an
+        // override + its undo-counter can land in the same millisecond on a
+        // fast machine. Without it the tie resolves in scan order (oldest
+        // first) and the undo silently appears to not flip the sender back.
+        return try db.read { db in
+            var result: [String: BriefingGroup] = [:]
+            for row in try Row.fetchAll(db, sql: sql, arguments: [accountId]) {
+                let addr: String = row["from_address"]
+                let groupStr: String = row["to_group"]
+                if let group = BriefingGroup(rawValue: groupStr) {
+                    result[addr] = group
+                }
             }
+            return result
         }
-        return result
     }
 
     public static func insertOverride(
@@ -162,45 +183,52 @@ public enum AIActionStore {
         remoteId: String,
         fromGroup: BriefingGroup,
         toGroup: BriefingGroup,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws {
-        try await db.query(
-            "INSERT INTO ai_overrides (account_id, remote_id, from_group, to_group) VALUES ($1, $2, $3, $4)",
-            [
-                PostgresData(uuid: accountId),
-                PostgresData(string: remoteId),
-                PostgresData(string: fromGroup.rawValue),
-                PostgresData(string: toGroup.rawValue),
-            ]
-        ).get()
+        try db.write {
+            try insertOverrideSync(
+                accountId: accountId, remoteId: remoteId,
+                fromGroup: fromGroup, toGroup: toGroup, db: $0
+            )
+        }
     }
 
-    public static func decode(_ row: PostgresNIO.PostgresRow) throws -> AIAction {
-        let r = row.makeRandomAccess()
-        let id: Int64 = try r["id"].decode(Int64.self)
-        let accId: UUID = try r["account_id"].decode(UUID.self)
-        let kindStr: String = try r["kind"].decode(String.self)
-        let payloadStr: String = try r["payload"].decode(String.self)
-        let createdAt: Date = try r["created_at"].decode(Date.self)
-        let expiresAt: Date? = try r["expires_at"].decode(Date?.self)
-        return AIAction(
-            id: id,
-            accountId: accId,
-            kind: AIActionKind(rawValue: kindStr) ?? .archive,
-            payload: try Self.decodePayload(payloadStr),
-            createdAt: createdAt,
-            expiresAt: expiresAt
+    /// Sync core for callers inside a transaction.
+    public static func insertOverrideSync(
+        accountId: UUID,
+        remoteId: String,
+        fromGroup: BriefingGroup,
+        toGroup: BriefingGroup,
+        db: Database
+    ) throws {
+        try db.execute(
+            sql: "INSERT INTO ai_overrides (account_id, remote_id, from_group, to_group) VALUES (?, ?, ?, ?)",
+            arguments: [accountId, remoteId, fromGroup.rawValue, toGroup.rawValue]
         )
     }
 
-    /// Returns bytes, not a String: `PostgresData(jsonb:)` has an `Encodable`
-    /// overload that would JSON-encode a String a second time, storing the
-    /// payload as a JSON string instead of an object.
-    private static func encode(_ payload: [String: String]) throws -> Data {
-        try JSONSerialization.data(withJSONObject: payload)
+    public static func decode(_ row: Row) throws -> AIAction {
+        let payloadText: String = row["payload"]
+        return AIAction(
+            id: row["id"],
+            accountId: row["account_id"],
+            kind: AIActionKind(rawValue: row["kind"]) ?? .archive,
+            payload: Self.decodePayload(payloadText),
+            createdAt: row["created_at"],
+            expiresAt: row["expires_at"]
+        )
     }
 
-    private static func decodePayload(_ json: String) throws -> [String: String] {
+    /// JSON text for the `payload` column. Encoded with JSONSerialization so a
+    /// String value stays a JSON string, never double-encoded.
+    private static func encode(_ payload: [String: String]) throws -> String {
+        String(
+            decoding: try JSONSerialization.data(withJSONObject: payload),
+            as: UTF8.self
+        )
+    }
+
+    private static func decodePayload(_ json: String) -> [String: String] {
         guard let data = json.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data),
               let dict = obj as? [String: Any]
@@ -209,63 +237,64 @@ public enum AIActionStore {
     }
 }
 
-/// Postgres-backed draft replies.
+/// SQLite-backed draft replies.
 public enum DraftReplyStore {
     public static func create(
         accountId: UUID,
         remoteId: String,
         variants: [String],
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> DraftReply {
-        let json = try JSONSerialization.data(withJSONObject: variants)
-        let rows = try await db.query(
-            """
-            INSERT INTO draft_replies (account_id, remote_id, variants)
-            VALUES ($1, $2, $3::jsonb)
-            RETURNING id, account_id, remote_id, variants, chosen_variant, created_at
-            """,
-            [
-                PostgresData(uuid: accountId),
-                PostgresData(string: remoteId),
-                PostgresData(jsonb: json),
-            ]
-        ).get()
-        return try Self.decode(rows.rows.first!)
+        let json = String(
+            decoding: try JSONSerialization.data(withJSONObject: variants),
+            as: UTF8.self
+        )
+        return try db.write { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    INSERT INTO draft_replies (account_id, remote_id, variants)
+                    VALUES (?, ?, ?)
+                    RETURNING id, account_id, remote_id, variants, chosen_variant, created_at
+                    """,
+                arguments: [accountId, remoteId, json]
+            ) else {
+                throw StoreError.insertFailed
+            }
+            return try Self.decode(row)
+        }
     }
 
     public static func list(
         accountId: UUID,
         remoteId: String? = nil,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> [DraftReply] {
         let sql: String
-        let params: [PostgresData]
+        let args: [DatabaseValueConvertible?]
         if let remoteId {
-            sql = "SELECT id, account_id, remote_id, variants, chosen_variant, created_at FROM draft_replies WHERE account_id = $1 AND remote_id = $2 ORDER BY created_at DESC"
-            params = [PostgresData(uuid: accountId), PostgresData(string: remoteId)]
+            sql = "SELECT id, account_id, remote_id, variants, chosen_variant, created_at FROM draft_replies WHERE account_id = ? AND remote_id = ? ORDER BY created_at DESC"
+            args = [accountId, remoteId]
         } else {
-            sql = "SELECT id, account_id, remote_id, variants, chosen_variant, created_at FROM draft_replies WHERE account_id = $1 ORDER BY created_at DESC LIMIT 50"
-            params = [PostgresData(uuid: accountId)]
+            sql = "SELECT id, account_id, remote_id, variants, chosen_variant, created_at FROM draft_replies WHERE account_id = ? ORDER BY created_at DESC LIMIT 50"
+            args = [accountId]
         }
-        let rows = try await db.query(sql, params).get()
-        return try rows.map { try Self.decode($0) }
+        return try db.read { db in
+            try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+                .map { try Self.decode($0) }
+        }
     }
 
-    public static func decode(_ row: PostgresNIO.PostgresRow) throws -> DraftReply {
-        let r = row.makeRandomAccess()
-        let id: Int64 = try r["id"].decode(Int64.self)
-        let accId: UUID = try r["account_id"].decode(UUID.self)
-        let remoteId: String = try r["remote_id"].decode(String.self)
-        let variantsJSON: String = try r["variants"].decode(String.self)
-        let chosenVariant: Int? = try? r["chosen_variant"].decode(Int.self)
-        let createdAt: Date = try r["created_at"].decode(Date.self)
+    public static func decode(_ row: Row) throws -> DraftReply {
+        let variantsJSON: String = row["variants"]
+        let chosen: Int? = row["chosen_variant"]
         return DraftReply(
-            id: id,
-            accountId: accId,
-            remoteId: remoteId,
-            variants: parseVariantsJSON(variantsJSON),
-            chosenVariant: chosenVariant,
-            createdAt: createdAt
+            id: row["id"],
+            accountId: row["account_id"],
+            remoteId: row["remote_id"],
+            variants: Self.parseVariantsJSON(variantsJSON),
+            chosenVariant: chosen,
+            createdAt: row["created_at"]
         )
     }
 

@@ -12,9 +12,15 @@ public enum TokenCipherError: Error {
 /// The key is `LAGOON_TOKEN_KEY`: base64 of exactly 32 random bytes.
 /// Stored blobs are `AES.GCM.SealedBox.combined` (nonce || ciphertext || tag).
 /// This is intentionally fail-closed: a missing or malformed key throws and we
-/// never read or write a plaintext secret. (A client-keychain key is impossible
-/// here — the server must decrypt the secret to act on the user's behalf.)
+/// never read or write a plaintext secret.
+///
+/// In the embedded (V3) runtime the key never touches an environment file:
+/// the app loads it from the Keychain and injects it through `keyProvider`
+/// before the server starts. The CLI keeps the env-var contract.
 public enum AccessTokenCipher {
+    /// Embedded runtime seam: non-nil return values replace the env lookup.
+    public static var keyProvider: (() throws -> SymmetricKey)?
+
     /// Encrypt `plaintext` into `AES.GCM.SealedBox.combined`.
     public static func seal(_ plaintext: String) throws -> Data {
         let key = try loadKey()
@@ -34,12 +40,15 @@ public enum AccessTokenCipher {
         return text
     }
 
-    /// Validate `LAGOON_TOKEN_KEY` without touching any data. Called at startup.
+    /// Validate the configured key without touching any data. Called at startup.
     public static func validateKey() throws {
         _ = try loadKey()
     }
 
     private static func loadKey() throws -> SymmetricKey {
+        if let keyProvider {
+            return try keyProvider()
+        }
         guard let raw = ProcessInfo.processInfo.environment["LAGOON_TOKEN_KEY"], !raw.isEmpty else {
             throw TokenCipherError.missingKey
         }

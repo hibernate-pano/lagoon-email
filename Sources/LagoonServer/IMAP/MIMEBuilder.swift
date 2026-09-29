@@ -1,8 +1,8 @@
 import Foundation
 
-/// Builds the RFC 5322 message that both write paths send: SMTP flushes these
-/// bytes verbatim, Gmail wraps them in `raw`. Everything is CRLF-framed and the
-/// body is base64, so no line can ever need dot-stuffing or folding.
+/// Builds the RFC 5322 message the SMTP path sends verbatim. Everything is
+/// CRLF-framed and the body is base64, so no line can ever need dot-stuffing
+/// or folding.
 public enum MIMEBuilder {
     /// A reply to `outbound`, with `messageId` used verbatim (the caller owns
     /// generating and remembering `<uuid@lagoon>`).

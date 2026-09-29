@@ -17,7 +17,7 @@ struct BriefingFeedView: View {
     @State private var collapsedGroups: Set<BriefingGroup> = Set(BriefingGroup.allCases.filter(\.collapsedByDefault))
     @State private var path: [String] = []
     @State private var scrollProxy: ScrollViewProxy?
-    @State private var selectedGmailId: String? = nil
+    @State private var selectedMessageId: String? = nil
     /// False when another surface is showing (RootView keeps both alive).
     /// The poll loop sleeps instead of refreshing, and hidden shortcuts
     /// are disabled by the parent — keep-alive without traffic or hotkeys.
@@ -229,7 +229,7 @@ struct BriefingFeedView: View {
     }
 
     private var feedList: some View {
-        List(selection: $selectedGmailId) {
+        List(selection: $selectedMessageId) {
             ForEach(BriefingGroup.allCases) { group in
                 let groupItems = items.filter { $0.group == group }
                 if !groupItems.isEmpty {
@@ -312,7 +312,7 @@ struct BriefingFeedView: View {
         // light damping reads as "the row slid into the tray" — closer to
         // Mail.app than the default easeInOut.
         .animation(.spring(response: 0.32, dampingFraction: 0.85), value: items.map(\.message.remoteId))
-        .onDeleteCommand { if let id = selectedGmailId { Task { await archiveAndUndo(byId: id) } } }
+        .onDeleteCommand { if let id = selectedMessageId { Task { await archiveAndUndo(byId: id) } } }
         .onMoveCommand { direction in
             moveSelection(direction: direction)
         }
@@ -367,7 +367,7 @@ struct BriefingFeedView: View {
                 ContentUnavailableView {
                     Label(l10n.inboxZero, systemImage: "checkmark.seal")
                 } description: {
-                    Text(l10n.tapGmailToSync)
+                    Text(l10n.tapToSync)
                 }
             }
         }
@@ -400,7 +400,7 @@ struct BriefingFeedView: View {
 
         guard !visible.isEmpty else { return }
 
-        let current = selectedGmailId.flatMap { id in visible.firstIndex(where: { $0.message.remoteId == id }) } ?? 0
+        let current = selectedMessageId.flatMap { id in visible.firstIndex(where: { $0.message.remoteId == id }) } ?? 0
 
         let next: Int
 
@@ -418,7 +418,7 @@ struct BriefingFeedView: View {
 
         let target = visible[next].message.remoteId
 
-        selectedGmailId = target
+        selectedMessageId = target
 
         withAnimation { scrollProxy?.scrollTo(target, anchor: .center) }
 
@@ -449,7 +449,7 @@ struct BriefingFeedView: View {
             Button(l10n.previousInGroup) { moveSelection(direction: .up) }
                 .keyboardShortcut("k", modifiers: [])
             Button(l10n.openSelected) {
-                if let selectedGmailId { path = [selectedGmailId] }
+                if let selectedMessageId { path = [selectedMessageId] }
             }
             .keyboardShortcut(.return, modifiers: [])
             // Mail.app's back gesture: ⌘[ pops one level off the

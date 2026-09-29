@@ -1,7 +1,8 @@
 import Foundation
 import Hummingbird
 import NIOCore
-import PostgresNIO
+import GRDB
+import Logging
 import LagoonKit
 
 /// 用户自定义聚合（归集规则）的 CRUD。规则求值发生在 GET /api/messages 的
@@ -9,7 +10,7 @@ import LagoonKit
 public enum StackRoutes {
     public static func register(
         on router: Router<BasicRequestContext>,
-        db: PostgresConnection,
+        db: LagoonDB,
         logger: Logger
     ) {
         // GET /api/stacks?accountId= → {stacks: [{rule, count}]}

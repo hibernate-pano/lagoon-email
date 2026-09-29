@@ -1,7 +1,7 @@
 import XCTest
 import Logging
 import Hummingbird
-import PostgresNIO
+import GRDB
 import LagoonKit
 @testable import LagoonServer
 
@@ -17,7 +17,7 @@ final class TimeSavedRouteTests: XCTestCase {
     private func makeAccount(email: String) -> Account {
         Account(
             id: UUID(),
-            provider: .gmail,
+            provider: .qq,
             oauthUser: "route-\(UUID().uuidString)",
             email: email,
             credentials: nil,
@@ -41,7 +41,7 @@ final class TimeSavedRouteTests: XCTestCase {
         )
     }
 
-    private func cleanup(accountId: UUID) -> @Sendable (PostgresConnection) async -> Void {
+    private func cleanup(accountId: UUID) -> @Sendable (LagoonDB) async -> Void {
         { conn in
             try? await TestDatabase.deleteMessages(accountId: accountId, db: conn)
             try? await TestDatabase.deleteAccount(id: accountId, db: conn)
@@ -89,10 +89,12 @@ final class TimeSavedRouteTests: XCTestCase {
                 accountId: account.id, kind: .archive,
                 payload: ["remoteId": "old-\(UUID())"], db: conn
             )
-            _ = try await conn.query(
-                "UPDATE ai_actions SET created_at = now() - interval '9 days' WHERE id = $1",
-                [PostgresData(int64: stale.id)]
-            ).get()
+            _ = try conn.write {
+                try $0.execute(
+                    sql: "UPDATE ai_actions SET created_at = strftime('%Y-%m-%d %H:%M:%f','now','-9 days') WHERE id = ?",
+                    arguments: [stale.id]
+                )
+            }
 
             let app = Application(router: Self.router(db: conn))
             try await app.test(.router) { client in
@@ -209,7 +211,7 @@ final class TimeSavedRouteTests: XCTestCase {
 
     // MARK: - Router
 
-    private static func router(db: PostgresConnection) -> Router<BasicRequestContext> {
+    private static func router(db: LagoonDB) -> Router<BasicRequestContext> {
         let router = Router()
         TimeSavedRoutes.register(
             on: router,

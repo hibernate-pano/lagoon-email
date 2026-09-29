@@ -1,7 +1,7 @@
 import Foundation
 import Logging
 import LagoonKit
-import PostgresNIO
+import GRDB
 
 /// IMAP-backed `MailProvider` (QQ first).
 ///
@@ -22,7 +22,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     /// harvested (no bodies, no snippets), but an unbounded first scan on a
     /// decade-old Sent mailbox is still a pointless FETCH.
     static let sentBackfillWindow: Int64 = 200
-    /// Poll cadence when the server has no IDLE — the Gmail poller's rhythm.
+    /// Poll cadence when the server has no IDLE.
     static let pollInterval: Duration = .seconds(30)
     /// One IDLE stretch. The loop leaves IDLE, re-SELECTs and re-enters, so a
     /// long `waitUpTo` never exceeds the protocol's IDLE ceiling.
@@ -33,7 +33,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     public let kind: MailProviderKind
 
     private let account: Account
-    private let db: PostgresConnection?
+    private let db: LagoonDB?
     private let logger: Logger
     private let transportFactory: @Sendable () -> any StreamTransport
     /// Full INBOX membership reconciliation. Enabled in production; provider
@@ -91,7 +91,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
 
     public init(
         account: Account,
-        db: PostgresConnection?,
+        db: LagoonDB?,
         logger: Logger,
         reconcilesInbox: Bool = true,
         transportFactory: @escaping @Sendable () -> any StreamTransport = {
@@ -213,8 +213,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             // A round that only harvested new sent Message-IDs still has to be
             // returned: dropping it here loses the reply signal and leaves the
             // persisted sent cursor behind, so the next round re-scans the same
-            // 200-message Sent backfill forever. Same contract as the Gmail
-            // path, which returns on `repliedMessageIds` too.
+            // 200-message Sent backfill forever.
             if !change.upserts.isEmpty || change.resetRequired
                 || !change.repliedMessageIds.isEmpty {
                 return change
@@ -254,8 +253,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                     upserts: [],
                     resetRequired: true,
                     cursor: MailSyncState(
-                        historyId: cursor.historyId,
-                        uidValidity: inbox.uidValidity,
+                                    uidValidity: inbox.uidValidity,
                         lastUid: nil,
                         archiveFolder: archiveFolder
                     )
@@ -312,8 +310,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                 upserts: upserts,
                 resetRequired: false,
                 cursor: MailSyncState(
-                    historyId: cursor.historyId,
-                    uidValidity: inbox.uidValidity,
+                            uidValidity: inbox.uidValidity,
                     lastUid: nextLastUid,
                     archiveFolder: archiveFolder,
                     sentUidValidity: sent.validity ?? cursor.sentUidValidity,
@@ -539,9 +536,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     /// the preset host only. The auth code is the same one IMAP uses, read
     /// straight from the sealed blob and never held past the session.
     public func send(_ outbound: OutboundMessage) async throws -> String? {
-        guard let preset = ProviderPresets.imap(for: account.provider) else {
-            throw MailError.notConfigured("no smtp preset")
-        }
+        let preset = ProviderPresets.imap()
         let credentials = try await imapCredentials()
         let smtp = SMTPClient(transport: transportFactory(), logger: logger)
         let messageID = "<\(UUID().uuidString.lowercased())@lagoon>"
@@ -605,9 +600,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     private func connectedClient() async throws -> IMAPClient {
         if let client { return client }
         let credentials = try await imapCredentials()
-        guard let preset = ProviderPresets.imap(for: account.provider) else {
-            throw MailError.notConfigured("no imap preset")
-        }
+        let preset = ProviderPresets.imap()
         let connection = IMAPConnection(transport: transportFactory(), logger: logger)
         let client = IMAPClient(connection: connection, logger: logger)
         do {

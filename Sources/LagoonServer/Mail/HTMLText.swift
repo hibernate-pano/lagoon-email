@@ -1,7 +1,7 @@
 import Foundation
 
-/// HTML → text helpers shared by the Gmail payload extractor and the IMAP MIME
-/// parser. Kept free of any transport concerns: pure string in, string out.
+/// HTML → text helpers for the IMAP MIME parser. Kept free of any transport
+/// concerns: pure string in, string out.
 public enum HTMLText {
     /// Remove scripts/styles/tags, decode entities, collapse whitespace.
     public static func strip(_ html: String) -> String {

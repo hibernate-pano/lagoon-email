@@ -19,19 +19,17 @@ public struct IMAPPreset: Sendable, Equatable {
 }
 
 public enum ProviderPresets {
-    /// Constants are provider contracts, not configuration: both ports are the
-    /// implicit-TLS ones the spec restricts us to (993 / 465).
-    public static func imap(for kind: MailProviderKind) -> IMAPPreset? {
-        switch kind {
-        case .qq:
-            return IMAPPreset(
-                imapHost: "imap.qq.com",
-                imapPort: 993,
-                smtpHost: "smtp.qq.com",
-                smtpPort: 465
-            )
-        case .gmail:
-            return nil  // Gmail goes through the REST API, not IMAP.
-        }
+    /// The IMAP/SMTP endpoints for the one supported provider. Ports are the
+    /// implicit-TLS pair the spec restricts us to (993 / 465).
+    ///
+    /// Non-optional: every caller already holds an `IMAPProvider`, so there is
+    /// no state in which this could fail to resolve.
+    public static func imap() -> IMAPPreset {
+        IMAPPreset(
+            imapHost: "imap.qq.com",
+            imapPort: 993,
+            smtpHost: "smtp.qq.com",
+            smtpPort: 465
+        )
     }
 }

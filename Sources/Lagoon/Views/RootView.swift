@@ -43,7 +43,30 @@ struct RootView: View {
     private var language: AppLanguage { AppLanguage(rawValue: languageTag) ?? .zhHans }
     private var l10n: L10n { L10n(language: language) }
 
-    var body: some View {
+    // Extracted from `body`: the combined expression sits right at the
+    // Swift type-checker's time limit, and any upstream change (e.g. a new
+    // ConnectView parameter) tips it over into an unreasonable-time error.
+    @ViewBuilder private var briefingSurface: some View {
+        BriefingFeedView(isVisible: surface == .briefing, onShowAllMessages: { surface = .allMessages })
+            .opacity(surface == .briefing ? 1 : 0)
+            .disabled(surface != .briefing)
+            .allowsHitTesting(surface == .briefing)
+            .accessibilityHidden(surface != .briefing)
+    }
+
+    @ViewBuilder private var messagesSurface: some View {
+        MessageListView(isVisible: surface == .allMessages, onShowBriefing: { surface = .briefing })
+            .opacity(surface == .allMessages ? 1 : 0)
+            .disabled(surface != .allMessages)
+            .allowsHitTesting(surface == .allMessages)
+            .accessibilityHidden(surface != .allMessages)
+    }
+
+    // `body` used to be one giant SwiftUI expression that sat right at the
+    // type-checker's time limit; adding a ConnectView parameter tipped it
+    // over into "unable to type-check in reasonable time". The three computed
+    // properties below keep each chain small enough to check quickly.
+    private var decorated: some View {
         VStack(spacing: 0) {
             if let banner = priorityBanner {
                 NoticeBannerView(banner: banner, onDismiss: { dismissPriorityBanner(banner) })
@@ -54,16 +77,8 @@ struct RootView: View {
             // no shortcuts, hidden from VoiceOver) and its poller sleeps via
             // `isVisible`, so keep-alive costs no traffic.
             ZStack {
-                BriefingFeedView(isVisible: surface == .briefing, onShowAllMessages: { surface = .allMessages })
-                    .opacity(surface == .briefing ? 1 : 0)
-                    .disabled(surface != .briefing)
-                    .allowsHitTesting(surface == .briefing)
-                    .accessibilityHidden(surface != .briefing)
-                MessageListView(isVisible: surface == .allMessages, onShowBriefing: { surface = .briefing })
-                    .opacity(surface == .allMessages ? 1 : 0)
-                    .disabled(surface != .allMessages)
-                    .allowsHitTesting(surface == .allMessages)
-                    .accessibilityHidden(surface != .allMessages)
+                briefingSurface
+                messagesSurface
             }
             .id(accounts.accountId)
         }
@@ -87,67 +102,87 @@ struct RootView: View {
                 TimeSavedBar()
             }
         }
-        .sheet(isPresented: $showSearch) {
-            SearchSheet()
-        }
-        .sheet(isPresented: $showUsage) {
-            UsageSheet()
-        }
-        .sheet(isPresented: $showActionHistory) {
-            ActionHistorySheet()
-        }
-        .sheet(isPresented: $showAutoArchiveRules) {
-            AutoArchiveRulesSheet()
-        }
-        .sheet(isPresented: $showCompose) {
-            if let accountId = accounts.accountId {
-                NewMessageSheet(accountId: accountId) { _ in
-                    errorCenter.report(.init(
-                        severity: .info,
-                        title: l10n.sent,
-                        autoDismissAfter: .seconds(4)
-                    ))
-                }
+    }
+
+    private var sheetStack: some View {
+        decorated
+            .sheet(isPresented: $showSearch) {
+                SearchSheet()
+            }
+            .sheet(isPresented: $showUsage) {
+                UsageSheet()
+            }
+            .sheet(isPresented: $showActionHistory) {
+                ActionHistorySheet()
+            }
+            .sheet(isPresented: $showAutoArchiveRules) {
+                AutoArchiveRulesSheet()
+            }
+            .sheet(isPresented: $showCompose) {
+                composeSheet
+            }
+            .sheet(isPresented: $showConnect, onDismiss: {
+                // A successful connect/reconnect can clear the health banner; refresh
+                // the directory immediately instead of waiting up to 30s.
+                Task { await directory.refresh() }
+            }) {
+                ConnectView(prefillEmail: connectPrefillEmail, presentedAsSheet: true)
+            }
+            .sheet(isPresented: $showHealthDetail) {
+                healthDetailSheet
+            }
+            .sheet(isPresented: $showCommandPalette) {
+                commandPalette
+            }
+            .sheet(isPresented: $showShortcuts) {
+                ShortcutsSheet()
+            }
+            .sheet(isPresented: $showAbout) {
+                AboutSheet()
+            }
+    }
+
+    @ViewBuilder private var composeSheet: some View {
+        if let accountId = accounts.accountId {
+            NewMessageSheet(accountId: accountId) { _ in
+                errorCenter.report(.init(
+                    severity: .info,
+                    title: l10n.sent,
+                    autoDismissAfter: .seconds(4)
+                ))
             }
         }
-        .sheet(isPresented: $showConnect, onDismiss: {
-            // A successful connect/reconnect can clear the health banner; refresh
-            // the directory immediately instead of waiting up to 30s.
-            Task { await directory.refresh() }
-        }) {
-            ConnectView(prefillEmail: connectPrefillEmail)
-        }
-        .sheet(isPresented: $showHealthDetail) {
-            if let active = directory.active {
-                SyncHealthDetailSheet(
-                    health: active.syncHealth,
-                    capabilities: active.capabilities
-                )
-            }
-        }
-        // ⌘K is the power-user fast path; mirrors Things / Linear / Superhuman.
-        .sheet(isPresented: $showCommandPalette) {
-            CommandPaletteView(
-                onNewMessage: { showCompose = true },
-                onSearch: { showSearch = true },
-                onShowBriefing: { surface = .briefing },
-                onShowAllMessages: { surface = .allMessages },
-                onShowUsage: { showUsage = true },
-                onShowActionHistory: { showActionHistory = true },
-                onShowAutoArchiveRules: { showAutoArchiveRules = true },
-                onShowShortcuts: { showShortcuts = true },
-                onRefresh: {
-                    Task { try? await api.requestSync(); await directory.refresh() }
-                },
-                onToggleSound: { SoundEffects.isEnabled.toggle() }
+    }
+
+    @ViewBuilder private var healthDetailSheet: some View {
+        if let active = directory.active {
+            SyncHealthDetailSheet(
+                health: active.syncHealth,
+                capabilities: active.capabilities
             )
         }
-        .sheet(isPresented: $showShortcuts) {
-            ShortcutsSheet()
-        }
-        .sheet(isPresented: $showAbout) {
-            AboutSheet()
-        }
+    }
+
+    private var commandPalette: some View {
+        // ⌘K is the power-user fast path; mirrors Things / Linear / Superhuman.
+        CommandPaletteView(
+            onNewMessage: { showCompose = true },
+            onSearch: { showSearch = true },
+            onShowBriefing: { surface = .briefing },
+            onShowAllMessages: { surface = .allMessages },
+            onShowUsage: { showUsage = true },
+            onShowActionHistory: { showActionHistory = true },
+            onShowAutoArchiveRules: { showAutoArchiveRules = true },
+            onShowShortcuts: { showShortcuts = true },
+            onRefresh: {
+                Task { try? await api.requestSync(); await directory.refresh() }
+            },
+            onToggleSound: { SoundEffects.isEnabled.toggle() }
+        )
+    }
+
+    var body: some View {
+        sheetStack
         // Binding the environment store (not a throwaway one): UndoController
         // holds it weakly, so the real owner must be the one bound.
         .onAppear {
@@ -459,11 +494,7 @@ struct RootView: View {
 
     private func reconnect() {
         errorCenter.dismiss()
-        // Only QQ re-auth is an in-app form; Gmail reconnect goes through
-        // the browser OAuth dance, so leaving the default Gmail tab is
-        // correct.
-        let active = directory.active
-        connectPrefillEmail = active?.provider == .qq ? active?.email : nil
+        connectPrefillEmail = directory.active?.email
         showConnect = true
     }
 

@@ -4,15 +4,36 @@ import AppKit
 @main
 struct LagoonApp: App {
     @StateObject private var accounts = AccountStore()
+    @StateObject private var serverBoot = EmbeddedServerBoot()
 
     var body: some Scene {
         WindowGroup("Lagoon") {
             Group {
-                if accounts.accountId == nil {
-                    ConnectView()
-                } else {
-                    // Spec §7.1: the Briefing Feed is the default landing surface.
-                    RootView()
+                switch serverBoot.phase {
+                case .starting:
+                    // The embedded server binds in well under a second; this
+                    // only exists so no view races a not-yet-listening socket.
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("Lagoon 正在启动…").foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .failed(let message):
+                    VStack(spacing: 12) {
+                        Text("启动失败").font(.headline)
+                        Text(message).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        Button("重试") { serverBoot.retry() }
+                            .buttonStyle(.borderedProminent)
+                    }
+                    .padding(32)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .ready:
+                    if accounts.accountId == nil {
+                        ConnectView()
+                    } else {
+                        // Spec §7.1: the Briefing Feed is the default landing surface.
+                        RootView()
+                    }
                 }
             }
             .environmentObject(accounts)
@@ -20,6 +41,7 @@ struct LagoonApp: App {
             // (toggles, links, picker segments, selection highlight)
             // reads as "Lagoon teal", not "system blue".
             .tint(LagoonTheme.brand)
+            .task { await serverBoot.run() }
             // When launched as a bare executable (`swift run Lagoon`), macOS
             // treats the process as background and the window never activates.
             // A real .app bundle (M1) makes this unnecessary.

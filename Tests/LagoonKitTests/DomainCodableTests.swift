@@ -23,11 +23,11 @@ final class DomainCodableTests: XCTestCase {
     func test_account_roundtrip() throws {
         let a = Account(
             id: UUID(),
-            provider: .gmail,
+            provider: .qq,
             oauthUser: "u",
             email: "u@example.com",
             credentials: Data([0x01, 0x02]),
-            syncState: MailSyncState(historyId: "h1"),
+            syncState: MailSyncState(lastUid: 42),
             capabilities: MailCapabilities(archiveFolder: true, idle: true, move: true, serverSnippet: true),
             isActive: true,
             syncHealth: SyncHealth(status: .ok)

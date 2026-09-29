@@ -1,13 +1,13 @@
 import Foundation
 import Hummingbird
-import PostgresNIO
+import GRDB
 import NIOCore
 import LagoonKit
 
 public enum SyncRoutes {
     public static func register(
         on router: Router<BasicRequestContext>,
-        db: PostgresConnection,
+        db: LagoonDB,
         sync: SyncEngine? = nil
     ) {
         router.get("api/messages") { req, _ -> Response in

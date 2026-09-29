@@ -1,9 +1,11 @@
 import Foundation
 
-/// Mail provider identity. `gmail` uses the Gmail REST API; `qq` uses IMAP+SMTP
-/// with a QQ 授权码. Adding a provider = new case here + a CHECK migration +
-/// a `ProviderPresets` entry + a `MailProvider` implementation.
+/// Mail provider identity. QQ Mail uses IMAP+SMTP with a 授权码.
+///
+/// Single provider on purpose: a QQ-only MVP carries no provider abstraction
+/// cost. Adding one back means a case here, a `ProviderPresets` entry, a
+/// `MailProvider` implementation and — for any provider whose credential
+/// payload differs — a case in `AccountCredentials`.
 public enum MailProviderKind: String, Codable, Sendable, CaseIterable {
-    case gmail
     case qq
 }

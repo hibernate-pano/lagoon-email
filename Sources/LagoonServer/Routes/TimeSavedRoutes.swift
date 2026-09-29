@@ -1,7 +1,7 @@
 import Foundation
 import Hummingbird
 import Logging
-import PostgresNIO
+import GRDB
 import LagoonKit
 
 /// Declared per-action minute estimates for the time-saved report (spec
@@ -39,7 +39,7 @@ public enum TimeSavedRoutes {
 
     public static func register(
         on router: Router<BasicRequestContext>,
-        db: PostgresConnection,
+        db: LagoonDB,
         logger: Logger
     ) {
         router.get("api/time-saved") { request, _ -> Response in

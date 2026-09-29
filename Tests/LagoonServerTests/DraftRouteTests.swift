@@ -3,7 +3,7 @@ import Foundation
 import Hummingbird
 import HummingbirdTesting
 import Logging
-import PostgresNIO
+import GRDB
 import LagoonKit
 @testable import LagoonServer
 
@@ -60,21 +60,11 @@ final class DraftRouteTests: XCTestCase {
     }
 
     private static func makeRouter(
-        provider: StubMailProvider, db: PostgresConnection
+        provider: StubMailProvider, db: LagoonDB
     ) -> Router<BasicRequestContext> {
         let router = Router<BasicRequestContext>()
-        let session = URLSession(configuration: .ephemeral)
-        let client = GmailClient(session: session)
-        let tokens = GmailTokenService(
-            db: db,
-            oauth: GoogleOAuthClient(
-                clientID: "t", clientSecret: "s",
-                redirectURI: "http://127.0.0.1:9/cb", session: session
-            ),
-            logger: logger
-        )
         DraftRoutes.register(
-            on: router, db: db, client: client, tokens: tokens,
+            on: router, db: db,
             draftGenerator: FakeDrafting(), logger: logger,
             makeProvider: { _ in provider }
         )
@@ -121,11 +111,14 @@ final class DraftRouteTests: XCTestCase {
             }
 
             // The audit row still records the generation.
-            let actions = try await conn.query(
-                "SELECT count(*) AS n FROM ai_actions WHERE account_id = $1 AND kind = 'draft_create'",
-                [PostgresData(uuid: account.id)]
-            ).get()
-            let n = try actions.rows.first?.makeRandomAccess()["n"].decode(Int.self)
+            let n = try conn.read { db in
+                guard let row = try Row.fetchOne(
+                    db,
+                    sql: "SELECT count(*) AS n FROM ai_actions WHERE account_id = ? AND kind = 'draft_create'",
+                    arguments: [account.id]
+                ) else { return 0 }
+                return row["n"]
+            }
             XCTAssertEqual(n, 1)
         }
     }

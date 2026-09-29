@@ -2,7 +2,7 @@ import XCTest
 import Foundation
 import Logging
 import Hummingbird
-import PostgresNIO
+import GRDB
 @testable import LagoonServer
 @testable import LagoonKit
 
@@ -22,7 +22,7 @@ final class BodyStoreTests: XCTestCase {
         )
     }
 
-    private func seed(_ account: Account, db: PostgresConnection) async throws {
+    private func seed(_ account: Account, db: LagoonDB) async throws {
         try await AccountStore.upsert(account, credentials: Data([1, 2, 3]), db: db)
     }
 
@@ -57,7 +57,7 @@ final class BodyStoreTests: XCTestCase {
         )
     }
 
-    private func cleanup(_ account: Account) -> @Sendable (PostgresConnection) async -> Void {
+    private func cleanup(_ account: Account) -> @Sendable (LagoonDB) async -> Void {
         { conn in
             try? await TestDatabase.deleteMessages(accountId: account.id, db: conn)
             try? await TestDatabase.deleteAccount(id: account.id, db: conn)
@@ -137,18 +137,8 @@ final class BodyStoreTests: XCTestCase {
 
             let provider = RecipientBodyProvider()
             let router = Router<BasicRequestContext>()
-            let session = URLSession(configuration: .ephemeral)
             MessageRoutes.register(
                 on: router, db: conn,
-                client: GmailClient(session: session),
-                tokens: GmailTokenService(
-                    db: conn,
-                    oauth: GoogleOAuthClient(
-                        clientID: "t", clientSecret: "s",
-                        redirectURI: "http://127.0.0.1:9/cb", session: session
-                    ),
-                    logger: Self.logger
-                ),
                 logger: Self.logger,
                 makeProvider: { _ in provider }
             )
@@ -255,18 +245,8 @@ final class BodyStoreTests: XCTestCase {
 
             let provider = FlakyBodyProvider()
             let router = Router<BasicRequestContext>()
-            let session = URLSession(configuration: .ephemeral)
-            let client = GmailClient(session: session)
-            let tokens = GmailTokenService(
-                db: conn,
-                oauth: GoogleOAuthClient(
-                    clientID: "t", clientSecret: "s",
-                    redirectURI: "http://127.0.0.1:9/cb", session: session
-                ),
-                logger: Self.logger
-            )
             MessageRoutes.register(
-                on: router, db: conn, client: client, tokens: tokens,
+                on: router, db: conn,
                 logger: Self.logger, makeProvider: { _ in provider }
             )
             let app = Application(router: router)

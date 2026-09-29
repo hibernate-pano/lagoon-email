@@ -1,26 +1,28 @@
 import Foundation
-import PostgresNIO
+import GRDB
 import LagoonKit
 
+public enum StoreError: Error {
+    case insertFailed
+}
+
 /// Provider-tagged credential payload stored (AES-GCM sealed) in
-/// `accounts.credentials`. Adding a provider means adding a case here and in
-/// `MailProviderKind`; nothing else in storage needs to know the shape.
+/// `accounts.credentials`.
+///
+/// One case, but the enum shape and the `kind` tag stay: the tag is what makes
+/// a sealed blob self-describing, so a future provider with a different payload
+/// adds a case here instead of reinterpreting existing bytes. The decoder
+/// rejects any unknown `kind` rather than guessing.
 public enum AccountCredentials: Codable, Sendable, Equatable {
-    case gmail(accessToken: String, refreshToken: String, expiresAt: Date)
     case imap(username: String, authCode: String)
 
     private enum CodingKeys: String, CodingKey {
-        case kind, accessToken, refreshToken, expiresAt, username, authCode
+        case kind, username, authCode
     }
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .gmail(let accessToken, let refreshToken, let expiresAt):
-            try c.encode("gmail", forKey: .kind)
-            try c.encode(accessToken, forKey: .accessToken)
-            try c.encode(refreshToken, forKey: .refreshToken)
-            try c.encode(expiresAt, forKey: .expiresAt)
         case .imap(let username, let authCode):
             try c.encode("imap", forKey: .kind)
             try c.encode(username, forKey: .username)
@@ -31,12 +33,6 @@ public enum AccountCredentials: Codable, Sendable, Equatable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         switch try c.decode(String.self, forKey: .kind) {
-        case "gmail":
-            self = .gmail(
-                accessToken: try c.decode(String.self, forKey: .accessToken),
-                refreshToken: try c.decode(String.self, forKey: .refreshToken),
-                expiresAt: try c.decode(Date.self, forKey: .expiresAt)
-            )
         case "imap":
             self = .imap(
                 username: try c.decode(String.self, forKey: .username),
@@ -79,25 +75,28 @@ public enum CredentialVault {
     public static func write(
         _ credentials: AccountCredentials,
         accountId: UUID,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws {
-        try await db.query(
-            "UPDATE accounts SET credentials = $2, updated_at = now() WHERE id = $1",
-            [PostgresData(uuid: accountId), PostgresData(bytes: try seal(credentials))]
-        ).get()
+        try db.write {
+            try $0.execute(
+                sql: "UPDATE accounts SET credentials = ?, updated_at = strftime('%Y-%m-%d %H:%M:%f','now') WHERE id = ?",
+                arguments: [try seal(credentials), accountId]
+            )
+        }
     }
 
     public static func read(
         accountId: UUID,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws -> AccountCredentials {
-        let result = try await db.query(
-            "SELECT credentials FROM accounts WHERE id = $1",
-            [PostgresData(uuid: accountId)]
-        ).get()
-        guard let row = result.rows.first,
-              let blob = try row.makeRandomAccess()["credentials"].decode(Data?.self)
-        else { throw AccountStoreError.notFound }
-        return try open(blob)
+        return try db.read { db in
+            let blob: Data? = try Row.fetchOne(
+                db,
+                sql: "SELECT credentials FROM accounts WHERE id = ?",
+                arguments: [accountId]
+            )?["credentials"]
+            guard let blob else { throw AccountStoreError.notFound }
+            return try open(blob)
+        }
     }
 }

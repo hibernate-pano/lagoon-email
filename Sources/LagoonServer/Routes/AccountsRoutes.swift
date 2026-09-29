@@ -2,7 +2,7 @@ import Foundation
 import Logging
 import Hummingbird
 import NIOCore
-import PostgresNIO
+import GRDB
 import LagoonKit
 
 public enum AccountsRoutes {
@@ -22,7 +22,7 @@ public enum AccountsRoutes {
     /// `MailProviderFactory.factory(...)`, tests script a fake.
     public static func register(
         on router: Router<BasicRequestContext>,
-        db: PostgresConnection,
+        db: LagoonDB,
         logger: Logger,
         sync: SyncEngine? = nil,
         makeProvider: @escaping MailProviderFactory.Builder

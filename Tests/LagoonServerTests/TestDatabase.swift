@@ -1,138 +1,72 @@
 import Foundation
 import XCTest
-import PostgresNIO
-import NIOCore
+import GRDB
 @testable import LagoonKit
+import LagoonServer
 
-/// Guarded Postgres access for the Lagoon server integration tests.
+/// Hermetic SQLite test harness. Every `withConnection` opens a **fresh
+/// temp-file database** with the full schema applied, so tests are fully
+/// isolated from each other and from anything on the machine — no Docker, no
+/// shared `lagoon_test` database, and nothing is ever skipped because a test
+/// DB is unreachable.
 ///
-/// The old tests issued unqualified table-wide deletes against whatever
-/// `DATABASE_URL` pointed at, so running `swift test` by hand against the dev
-/// database wiped real data. `connect()` is fail-closed:
-///
-///   * `DATABASE_URL` (default `.../lagoon_test`) is parsed;
-///   * the connection is only attempted when the host is loopback **and** the
-///     database name ends in `_test`;
-///   * otherwise it returns `nil`, callers `throw XCTSkip`, and nothing is
-///     touched — there is no fallback to a non-test database.
-///
-/// Cleanup helpers delete only the rows a test created (by `id` / `oauth_user`).
+/// The old Postgres harness needed the row-scoped `cleanup:` discipline
+/// because `lagoon_test` persisted between runs and a table-wide wipe could
+/// destroy real data. A per-test file that is deleted afterwards makes that
+/// concern structurally impossible; `cleanup:` is still accepted (legacy call
+/// sites pass it) and is simply a no-op slot now.
 enum TestDatabase {
-    static let defaultURLString = "postgres://lagoon:lagoon@127.0.0.1:5433/lagoon_test"
-
-    /// One shared group for the lifetime of the test process. NIO event loops
-    /// keep their parent group alive, so a per-call group would leak a thread
-    /// per test; a single shared group is the smallest safe footprint.
-    private static let eventLoopGroup = LagoonPostgres.makeEventLoopGroup()
-
-    // MARK: - Guard
-
-    static func resolvedURL() -> URL? {
-        let raw = ProcessInfo.processInfo.environment["DATABASE_URL"] ?? defaultURLString
-        return URL(string: raw)
+    /// Runs `body` with a private LagoonDB over a fresh SQLite file.
+    static func withConnection(
+        cleanup: (LagoonDB) async -> Void = { _ in },
+        _ body: (LagoonDB) async throws -> Void
+    ) async throws {
+        let pool = try makePool()
+        defer { try? pool.close() }
+        try await body(LagoonDB(pool))
     }
 
-    static func databaseName(from url: URL) -> String {
-        url.path.split(separator: "/").map(String.init).last ?? ""
+    /// A second, independent store for tests that need two (the SyncEngine
+    /// tests that used to need one Postgres connection per loop). The engine
+    /// shares one pool now, so this mostly serves direct-construction tests.
+    static func requireConnection() async throws -> LagoonDB {
+        LagoonDB(try makePool())
     }
 
-    static func isLoopbackHost(_ host: String) -> Bool {
-        switch host.lowercased() {
-        case "127.0.0.1", "::1", "localhost": return true
-        default: return false
+    static func makePool() throws -> DatabasePool {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lagoon-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return try LagoonDatabase.open(path: dir.appendingPathComponent("lagoon.sqlite").path)
+    }
+
+    // MARK: - Direct helpers (ported call sites; scoped deletes)
+
+    static func deleteAccount(id: UUID, db: LagoonDB) async throws {
+        try db.write {
+            try $0.execute(sql: "DELETE FROM accounts WHERE id = ?", arguments: [id])
         }
-    }
-
-    /// The data-loss guard: only a loopback host *and* a database whose name
-    /// ends in `_test` may ever be touched.
-    static func isSafeTestDatabase(_ url: URL) -> Bool {
-        guard let host = url.host, !host.isEmpty else { return false }
-        let name = databaseName(from: url)
-        return isLoopbackHost(host) && name.lowercased().hasSuffix("_test")
-    }
-
-    static func makeConfig(from url: URL) -> PostgresConfig? {
-        guard let host = url.host,
-              let port = url.port,
-              let user = url.user,
-              let pass = url.password
-        else { return nil }
-        return PostgresConfig(
-            host: host,
-            port: port,
-            username: user,
-            password: pass,
-            database: databaseName(from: url),
-            tls: url.query?.contains("sslmode=require") ?? false
-        )
-    }
-
-    /// Returns a connection to the dedicated test DB, or `nil` when the
-    /// configured DB is not a safe test DB. Callers must skip on `nil` and
-    /// never proceed against a non-test database.
-    static func connect() async throws -> PostgresConnection? {
-        guard let url = resolvedURL(), isSafeTestDatabase(url) else { return nil }
-        guard let cfg = makeConfig(from: url) else { return nil }
-        return try await LagoonPostgres.connect(cfg, on: eventLoopGroup.any())
-    }
-
-    /// A second connection for multi-loop tests: loops must never share one
-    /// (a Postgres connection serves one query at a time). Closed by the
-    /// engine that owns it; aborts the test when the test DB is unreachable.
-    static func requireConnection() async throws -> PostgresConnection {
-        guard let conn = try await connect() else {
-            throw XCTSkip("test database unavailable")
-        }
-        return conn
-    }
-
-    // MARK: - Row-scoped cleanup (never DELETE the whole table)
-
-    static func deleteAccount(id: UUID, db: PostgresConnection) async throws {
-        try await db.query("DELETE FROM accounts WHERE id = $1", [PostgresData(uuid: id)]).get()
     }
 
     static func deleteAccount(
         oauthUser: String,
         provider: MailProviderKind,
-        db: PostgresConnection
+        db: LagoonDB
     ) async throws {
-        try await db.query(
-            "DELETE FROM accounts WHERE oauth_user = $1 AND provider = $2",
-            [PostgresData(string: oauthUser), PostgresData(string: provider.rawValue)]
-        ).get()
-    }
-
-    static func deleteMessages(accountId: UUID, db: PostgresConnection) async throws {
-        try await db.query(
-            "DELETE FROM message_headers WHERE account_id = $1",
-            [PostgresData(uuid: accountId)]
-        ).get()
-    }
-
-    // MARK: - Test harness
-
-    /// Runs `body` with a guarded test connection and always runs `cleanup`
-    /// (row-scoped) before closing — even when `body` throws. Skips the test
-    /// when no safe test database is configured.
-    static func withConnection(
-        cleanup: @Sendable (PostgresConnection) async -> Void = { _ in },
-        _ body: (PostgresConnection) async throws -> Void
-    ) async throws {
-        let maybe = try await connect()
-        try XCTSkipIf(
-            maybe == nil,
-            "skipping: DATABASE_URL must be a loopback host and a database name ending in _test; refusing to touch a non-test database"
-        )
-        guard let conn = maybe else { return }
-        do {
-            try await body(conn)
-        } catch {
-            await cleanup(conn)
-            try? await conn.close()
-            throw error
+        try db.write {
+            try $0.execute(
+                sql: "DELETE FROM accounts WHERE oauth_user = ? AND provider = ?",
+                arguments: [oauthUser, provider.rawValue]
+            )
         }
-        await cleanup(conn)
-        try await conn.close()
+    }
+
+    static func deleteMessages(accountId: UUID, db: LagoonDB) async throws {
+        try db.write {
+            try $0.execute(
+                sql: "DELETE FROM message_headers WHERE account_id = ?",
+                arguments: [accountId]
+            )
+        }
     }
 }

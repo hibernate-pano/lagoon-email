@@ -4,7 +4,7 @@ import Network
 import Hummingbird
 import HummingbirdTesting
 import Logging
-import PostgresNIO
+import GRDB
 import LagoonKit
 @testable import LagoonServer
 
@@ -37,7 +37,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         )
     }
 
-    private func cleanup(_ account: Account) -> @Sendable (PostgresConnection) async -> Void {
+    private func cleanup(_ account: Account) -> @Sendable (LagoonDB) async -> Void {
         { conn in
             try? await TestDatabase.deleteMessages(accountId: account.id, db: conn)
             try? await TestDatabase.deleteAccount(id: account.id, db: conn)
@@ -61,21 +61,11 @@ final class UnsubscribeRouteTests: XCTestCase {
     }
 
     private static func makeRouter(
-        provider: any MailProvider, db: PostgresConnection
+        provider: any MailProvider, db: LagoonDB
     ) -> Router<BasicRequestContext> {
         let router = Router<BasicRequestContext>()
-        let session = URLSession(configuration: .ephemeral)
-        let client = GmailClient(session: session)
-        let tokens = GmailTokenService(
-            db: db,
-            oauth: GoogleOAuthClient(
-                clientID: "t", clientSecret: "s",
-                redirectURI: "http://127.0.0.1:9/cb", session: session
-            ),
-            logger: logger
-        )
         ActionsRoutes.register(
-            on: router, db: db, client: client, tokens: tokens,
+            on: router, db: db,
             logger: logger, makeProvider: { _ in provider }
         )
         return router
@@ -131,10 +121,11 @@ final class UnsubscribeRouteTests: XCTestCase {
         private static let lock = NSLock()
         private static var script: [String: Reply] = [:]
         private static var seen: [URL] = []
+        private static var requests: [(url: URL, method: String, body: Data)] = []
 
         static func reset() {
             lock.lock(); defer { lock.unlock() }
-            script = [:]; seen = []
+            script = [:]; seen = []; requests = []
         }
         static func script(_ reply: Reply, for url: String) {
             lock.lock(); defer { lock.unlock() }
@@ -144,6 +135,10 @@ final class UnsubscribeRouteTests: XCTestCase {
             lock.lock(); defer { lock.unlock() }
             return seen
         }
+        static var seenRequests: [(url: URL, method: String, body: Data)] {
+            lock.lock(); defer { lock.unlock() }
+            return requests
+        }
 
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -152,6 +147,7 @@ final class UnsubscribeRouteTests: XCTestCase {
             guard let url = request.url else { return }
             Self.lock.lock()
             Self.seen.append(url)
+            Self.requests.append((url, request.httpMethod ?? "GET", Self.requestBody(of: request)))
             let reply = Self.script["\(url) \(request.httpMethod ?? "GET")"]
                 ?? Self.script[url.absoluteString]
                 ?? Self.script[url.host ?? ""]
@@ -167,6 +163,25 @@ final class UnsubscribeRouteTests: XCTestCase {
             }
             client?.urlProtocol(self, didLoad: body)
             client?.urlProtocolDidFinishLoading(self)
+        }
+
+        /// `URLProtocol` usually delivers a set body via `httpBodyStream`,
+        /// not `httpBody` — read whichever carries it.
+        private static func requestBody(of request: URLRequest) -> Data {
+            if let body = request.httpBody, !body.isEmpty { return body }
+            guard let stream = request.httpBodyStream else { return Data() }
+            stream.open()
+            defer { stream.close() }
+            var body = Data()
+            let size = 4096
+            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: size)
+            defer { buffer.deallocate() }
+            while stream.hasBytesAvailable {
+                let read = stream.read(buffer, maxLength: size)
+                guard read > 0 else { break }
+                body.append(buffer, count: read)
+            }
+            return body
         }
 
         override func stopLoading() {}
@@ -359,11 +374,14 @@ final class UnsubscribeRouteTests: XCTestCase {
             )
             XCTAssertEqual(row?.isRead, true, "success marks the message read")
             XCTAssertEqual(row?.isArchived, true, "success archives locally")
-            let actions = try await conn.query(
-                "SELECT count(*) AS n FROM ai_actions WHERE account_id = $1 AND kind = 'unsubscribe'",
-                [PostgresData(uuid: account.id)]
-            ).get()
-            let n = try actions.rows.first?.makeRandomAccess()["n"].decode(Int.self)
+            let n = try conn.read { db in
+                guard let row = try Row.fetchOne(
+                    db,
+                    sql: "SELECT count(*) AS n FROM ai_actions WHERE account_id = ? AND kind = 'unsubscribe'",
+                    arguments: [account.id]
+                ) else { return 0 }
+                return row["n"]
+            }
             XCTAssertEqual(n, 1, "the action must be recorded for undo history")
         }
     }
@@ -437,8 +455,8 @@ final class UnsubscribeRouteTests: XCTestCase {
     /// A `mailto:` in the header must NOT short-circuit the chain: the body
     /// offers a real https unsubscribe link, so the endpoint must use it.
     /// (Pre-fix this 422'd `unsubscribe-manual-required` at the header stage —
-    /// Gmail/IMAP now persist mailto entries into `unsubscribe_links`, so the
-    /// header stage alone could never decide.)
+    /// IMAP now persists mailto entries into `unsubscribe_links`, so the header
+    /// stage alone could never decide.)
     func test_mailtoHeader_fallsThroughToBodyHTTPSLink() async throws {
         let account = makeAccount()
         let provider = StubMailProvider()
@@ -704,22 +722,130 @@ final class UnsubscribeRouteTests: XCTestCase {
         )
     }
 
-    /// A 4xx falls through to the second verb: publishers that only serve a
-    /// tracking pixel answer POST with 405, and the GET is the real one.
-    func test_hitUnsubscribe_postFallsBackToGet() async throws {
+    /// The blind POST is gone. The old POST-first probe burned the one
+    /// request that mattered: a GET-shaped link answered the unexpected POST
+    /// with a 200 landing page, classifyHit saw a re-offered link and said
+    /// "needs manual" — and the GET, the thing that actually unsubscribes,
+    /// never ran.
+    func test_hitUnsubscribe_getOnly_noBlindPost() async throws {
         StubURLProtocol.reset()
-        StubURLProtocol.script(.init(status: 405), for: "https://8.8.8.8/u POST")
         StubURLProtocol.script(
-            .init(status: 200, body: Data(#"<p>Unsubscribe <a href="https://ex.com/u">here</a></p>"#.utf8)),
+            .init(status: 200, body: Data("You are unsubscribed".utf8)),
             for: "https://8.8.8.8/u GET"
         )
         let hit = try await ActionsRoutes.hitUnsubscribe(
             url: URL(string: "https://8.8.8.8/u")!, session: Self.stubProbeSession()
         )
-        XCTAssertEqual(hit, .landingPage, "the GET landed on a page that re-offers a link")
+        XCTAssertEqual(hit, .completed)
+        XCTAssertEqual(StubURLProtocol.seenRequests.count, 1, "GET only — no POST probe")
+        XCTAssertEqual(StubURLProtocol.seenRequests[0].method, "GET")
+    }
+
+    /// RFC 8058: when the sender advertised List-Unsubscribe-Post, the POST
+    /// with the mandated body IS the unsubscribe — no page, no extra click.
+    func test_hitUnsubscribe_oneClickPostsRFCBody() async throws {
+        StubURLProtocol.reset()
+        StubURLProtocol.script(.init(status: 200), for: "https://8.8.8.8/u POST")
+        let hit = try await ActionsRoutes.hitUnsubscribe(
+            url: URL(string: "https://8.8.8.8/u")!, oneClick: true,
+            session: Self.stubProbeSession()
+        )
+        XCTAssertEqual(hit, .completed)
+        XCTAssertEqual(StubURLProtocol.seenRequests.count, 1, "the POST completes; no GET follows")
+        XCTAssertEqual(StubURLProtocol.seenRequests[0].method, "POST")
         XCTAssertEqual(
-            StubURLProtocol.seenURLs.count, 2,
-            "the 405 POST must fall through to the GET"
+            String(data: StubURLProtocol.seenRequests[0].body, encoding: .utf8),
+            "List-Unsubscribe=One-Click",
+            "the body is the one mandated by RFC 8058"
+        )
+    }
+
+    /// A one-click POST rejected with 4xx/5xx falls back to the GET (some
+    /// senders advertise the header but only serve the link).
+    func test_hitUnsubscribe_oneClickRejected_fallsBackToGet() async throws {
+        StubURLProtocol.reset()
+        StubURLProtocol.script(.init(status: 405), for: "https://8.8.8.8/u POST")
+        StubURLProtocol.script(
+            .init(status: 200, body: Data("You have been unsubscribed".utf8)),
+            for: "https://8.8.8.8/u GET"
+        )
+        let hit = try await ActionsRoutes.hitUnsubscribe(
+            url: URL(string: "https://8.8.8.8/u")!, oneClick: true,
+            session: Self.stubProbeSession()
+        )
+        XCTAssertEqual(hit, .completed)
+        XCTAssertEqual(StubURLProtocol.seenRequests.count, 2)
+        XCTAssertEqual(StubURLProtocol.seenRequests.map(\.method), ["POST", "GET"])
+    }
+
+    /// The landing page's own confirm entry is followed once, server-side —
+    /// the click the user used to make by hand. The success phrase on the
+    /// second hop completes the unsubscribe.
+    func test_landingPageConfirmFollowedAutomatically() async throws {
+        StubURLProtocol.reset()
+        StubURLProtocol.script(
+            .init(status: 200, body: Data(
+                #"""
+                <html><body>
+                <p>Are you sure you want to unsubscribe from this list?</p>
+                <a href="https://8.8.8.8/confirm?token=abc">Confirm unsubscribe</a>
+                </body></html>
+                """#.utf8
+            )),
+            for: "https://8.8.8.8/u GET"
+        )
+        StubURLProtocol.script(
+            .init(status: 200, body: Data("You have been unsubscribed".utf8)),
+            for: "https://8.8.8.8/confirm?token=abc GET"
+        )
+        let hit = try await ActionsRoutes.hitUnsubscribe(
+            url: URL(string: "https://8.8.8.8/u")!, session: Self.stubProbeSession()
+        )
+        XCTAssertEqual(hit, .completed, "the server makes the confirm click for the user")
+        XCTAssertEqual(StubURLProtocol.seenRequests.count, 2)
+        XCTAssertEqual(
+            StubURLProtocol.seenRequests[1].url.absoluteString,
+            "https://8.8.8.8/confirm?token=abc"
+        )
+    }
+
+    /// A landing page whose confirm entry is unsafe (loopback) must NOT be
+    /// followed — one hop, SSRF guard respected, honest landingPage.
+    func test_landingPageConfirm_unsafeLinkNotFollowed() async throws {
+        StubURLProtocol.reset()
+        StubURLProtocol.script(
+            .init(status: 200, body: Data(
+                #"<p>Unsubscribe <a href="http://127.0.0.1:9/x">confirm here</a></p>"#.utf8
+            )),
+            for: "https://8.8.8.8/u GET"
+        )
+        let hit = try await ActionsRoutes.hitUnsubscribe(
+            url: URL(string: "https://8.8.8.8/u")!, session: Self.stubProbeSession()
+        )
+        XCTAssertEqual(hit, .landingPage)
+        XCTAssertEqual(StubURLProtocol.seenRequests.count, 1, "the unsafe confirm link is never fetched")
+    }
+
+    /// A confirmation page that STILL links a preferences centre completes:
+    /// the success phrase outranks the re-offered link. The old link-only
+    /// rule turned exactly this page into "退订请求未完成".
+    func test_classifyHit_successPhraseBeatsFooterLinks() {
+        let confirmation = #"""
+        <html><body><p>You have been unsubscribed from our mailing list.</p>
+        <a href="https://8.8.8.8/prefs">Manage preferences</a></body></html>
+        """#
+        XCTAssertEqual(
+            ActionsRoutes.classifyHit(data: Data(confirmation.utf8)),
+            .completed,
+            "a success phrase must win over a re-offered preferences link"
+        )
+        let ask = #"""
+        <p>Confirm you want to unsubscribe <a href="https://8.8.8.8/c">here</a></p>
+        """#
+        XCTAssertEqual(
+            ActionsRoutes.classifyHit(data: Data(ask.utf8)),
+            .landingPage,
+            "a confirmation ASK (no completed tense) is still a landing page"
         )
     }
 
@@ -826,11 +952,14 @@ final class UnsubscribeRouteTests: XCTestCase {
                 remoteId: "u-page", accountId: account.id, db: conn
             )
             XCTAssertEqual(row?.isArchived, false, "an opened page must not archive the mail")
-            let actions = try await conn.query(
-                "SELECT count(*) AS n FROM ai_actions WHERE account_id = $1 AND kind = 'unsubscribe'",
-                [PostgresData(uuid: account.id)]
-            ).get()
-            let n = try actions.rows.first?.makeRandomAccess()["n"].decode(Int.self)
+            let n = try conn.read { db in
+                guard let row = try Row.fetchOne(
+                    db,
+                    sql: "SELECT count(*) AS n FROM ai_actions WHERE account_id = ? AND kind = 'unsubscribe'",
+                    arguments: [account.id]
+                ) else { return 0 }
+                return row["n"]
+            }
             XCTAssertEqual(n, 0, "no success may be recorded for a landing page")
         }
     }

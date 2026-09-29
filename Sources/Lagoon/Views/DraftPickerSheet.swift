@@ -1,28 +1,16 @@
 import SwiftUI
 import LagoonKit
 
-/// Sheet for picking one of the AI-generated draft variants and optionally
-/// pushing it to Gmail Drafts.
+/// Sheet for picking one of the AI-generated draft variants. The chosen
+/// variant is sent over SMTP — IMAP has no server-side draft concept, so
+/// there is nothing to push to.
 struct DraftPickerSheet: View {
     let draft: DraftReply
-    let provider: MailProviderKind
-    let onPick: (Int, Bool) -> Void
+    let onPick: (Int) -> Void
 
     @Environment(\.l10n) private var l10n
     @Environment(\.dismiss) private var dismiss
     @State private var selected: Int = 0
-    @State private var pushToGmail: Bool
-
-    init(
-        draft: DraftReply,
-        provider: MailProviderKind,
-        onPick: @escaping (Int, Bool) -> Void
-    ) {
-        self.draft = draft
-        self.provider = provider
-        self.onPick = onPick
-        _pushToGmail = State(initialValue: provider == .gmail)
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -55,35 +43,15 @@ struct DraftPickerSheet: View {
                     .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
             }
             .frame(minHeight: 120, maxHeight: 240)
-            if provider == .gmail {
-                Toggle(l10n.pushToGmailDrafts, isOn: $pushToGmail)
-                    .toggleStyle(.switch)
-            }
             HStack {
                 Spacer()
-                if provider == .gmail {
-                    Button(l10n.chooseOnly) {
-                        onPick(selected, false)
-                        dismiss()
-                    }
-                    .lineLimit(1)
-                    .disabled(draft.variants.isEmpty)
-                    Button(l10n.chooseAndSendToGmail) {
-                        onPick(selected, true)
-                        dismiss()
-                    }
-                    .lineLimit(1)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(draft.variants.isEmpty)
-                } else {
-                    Button(l10n.chooseOnly) {
-                        onPick(selected, false)
-                        dismiss()
-                    }
-                    .lineLimit(1)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(draft.variants.isEmpty)
+                Button(l10n.chooseAndSend) {
+                    onPick(selected)
+                    dismiss()
                 }
+                .lineLimit(1)
+                .keyboardShortcut(.defaultAction)
+                .disabled(draft.variants.isEmpty)
             }
         }
         .padding(20)

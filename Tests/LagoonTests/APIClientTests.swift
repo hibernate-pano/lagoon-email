@@ -256,7 +256,7 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(queryValue("limit", in: request), "7")
     }
 
-    func test_fetchBody_percentEncodesGmailIdAndDecodesISO8601ReceivedAt() async throws {
+    func test_fetchBody_percentEncodesRemoteIdAndDecodesISO8601ReceivedAt() async throws {
         let accountId = UUID()
         let remoteId = "a/b?c#d e"
         let receivedAt = Date(timeIntervalSince1970: 1_700_000_000)
@@ -406,13 +406,6 @@ final class APIClientTests: XCTestCase {
         }
     }
 
-    func test_oauthStartURL_endsWithOAuthGmailStart() {
-        let client = makeClient()
-        XCTAssertTrue(
-            client.oauthStartURL.absoluteString.hasSuffix("/oauth/gmail/start"),
-            client.oauthStartURL.absoluteString
-        )
-    }
 
     // MARK: - T9: IMAP connect + account directory
 

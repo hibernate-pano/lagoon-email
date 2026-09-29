@@ -2,9 +2,9 @@ import XCTest
 import Foundation
 @testable import LagoonServer
 
-/// `MIMEBuilder.reply` produces the exact bytes that will be handed to SMTP or
-/// to the Gmail raw endpoint, so every assertion here is about the wire format:
-/// CRLF framing, header shape, RFC 2047 subject and base64 body.
+/// `MIMEBuilder.reply` produces the exact bytes handed to SMTP, so every
+/// assertion here is about the wire format: CRLF framing, header shape,
+/// RFC 2047 subject and base64 body.
 final class MIMEBuilderTests: XCTestCase {
     private func outbound(
         fromEmail: String = "me@qq.com",

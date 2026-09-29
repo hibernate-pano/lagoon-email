@@ -82,4 +82,51 @@ public enum KeychainStore {
             throw KeychainError.unexpectedStatus(status)
         }
     }
+
+    // MARK: - Generic string secrets (embedded runtime keys)
+
+    /// Stores an arbitrary string secret (the AES key base64, the API token,
+    /// the migrated AI environment). Same generic-password class, distinct
+    /// service per secret.
+    public static func saveString(_ value: String, service: String) throws {
+        let data = Data(value.utf8)
+        let query = baseQuery(service: service)
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+        ]
+        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if updateStatus == errSecItemNotFound {
+            var add = query
+            add[kSecValueData as String] = data
+            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            let addStatus = SecItemAdd(add as CFDictionary, nil)
+            guard addStatus == errSecSuccess else {
+                throw KeychainError.unexpectedStatus(addStatus)
+            }
+        } else if updateStatus != errSecSuccess {
+            throw KeychainError.unexpectedStatus(updateStatus)
+        }
+    }
+
+    /// Returns `nil` only when no item exists for `service`.
+    public static func loadString(service: String) throws -> String? {
+        var query = baseQuery(service: service)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        switch status {
+        case errSecSuccess:
+            guard let data = item as? Data,
+                  let string = String(data: data, encoding: .utf8)
+            else { throw KeychainError.corruptData }
+            return string
+        case errSecItemNotFound:
+            return nil
+        default:
+            throw KeychainError.unexpectedStatus(status)
+        }
+    }
 }

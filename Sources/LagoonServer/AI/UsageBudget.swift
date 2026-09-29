@@ -1,6 +1,6 @@
 import Foundation
 import Logging
-import PostgresNIO
+import GRDB
 import LagoonKit
 import LagoonAI
 
@@ -11,7 +11,7 @@ import LagoonAI
 /// talking to one Postgres; concurrent multi-instance writes race and can let
 /// the cap drift upward by one in-flight call's cost.
 public actor UsageBudget: BudgetPolicy {
-    private let db: PostgresConnection
+    private let db: LagoonDB
     private let capMicrosUSD: Int64
     private let yearMonth: String
     private var totalMicrosUSD: Int64 = 0
@@ -23,7 +23,7 @@ public actor UsageBudget: BudgetPolicy {
 
     /// `capUSDPerMonth <= 0` disables enforcement (and warns once on startup).
     public init(
-        db: PostgresConnection,
+        db: LagoonDB,
         capUSDPerMonth: Double,
         logger: Logger
     ) async throws {
@@ -143,23 +143,25 @@ public actor UsageBudget: BudgetPolicy {
         let callCount: Int
     }
 
-    private static func summary(db: PostgresConnection, yearMonth: String) async throws -> MonthSummary {
-        let rows = try await db.query(
-            "SELECT COALESCE(SUM(cost_micro_usd), 0)::bigint AS total, COUNT(*)::int AS calls FROM usage_log WHERE year_month = $1",
-            [PostgresData(string: yearMonth)]
-        ).get()
-        guard let row = rows.rows.first else {
+    private static func summary(db: LagoonDB, yearMonth: String) async throws -> MonthSummary {
+        let row = try await db.read { db in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT COALESCE(SUM(cost_micro_usd), 0) AS total, COUNT(*) AS calls FROM usage_log WHERE year_month = ?",
+                arguments: [yearMonth]
+            )
+        }
+        guard let row else {
             return MonthSummary(costMicrosUSD: 0, callCount: 0)
         }
-        let random = row.makeRandomAccess()
         return MonthSummary(
-            costMicrosUSD: try random["total"].decode(Int64.self),
-            callCount: try random["calls"].decode(Int.self)
+            costMicrosUSD: row["total"],
+            callCount: row["calls"]
         )
     }
 
     private static func insert(
-        db: PostgresConnection,
+        db: LagoonDB,
         yearMonth: String,
         accountEmail: String,
         capability: String,
@@ -172,16 +174,18 @@ public actor UsageBudget: BudgetPolicy {
             INSERT INTO usage_log (
                 year_month, account_email, capability, model,
                 prompt_tokens, completion_tokens, cost_micro_usd
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """
-        try await db.query(sql, [
-            PostgresData(string: yearMonth),
-            PostgresData(string: accountEmail),
-            PostgresData(string: capability),
-            PostgresData(string: model),
-            PostgresData(int: promptTokens),
-            PostgresData(int: completionTokens),
-            PostgresData(int64: costMicrosUSD),
-        ]).get()
+        try await db.write {
+            try $0.execute(sql: sql, arguments: [
+                yearMonth,
+                accountEmail,
+                capability,
+                model,
+                promptTokens,
+                completionTokens,
+                costMicrosUSD,
+            ])
+        }
     }
 }

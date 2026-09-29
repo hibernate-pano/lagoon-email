@@ -1,5 +1,5 @@
 import XCTest
-import PostgresNIO
+import GRDB
 @testable import LagoonServer
 @testable import LagoonKit
 
@@ -7,31 +7,30 @@ final class AccountStoreTests: XCTestCase {
     private func makeAccount(
         oauthUser: String,
         email: String = "u@example.com",
-        historyId: String? = nil
+        lastUid: Int64? = nil
     ) -> Account {
         Account(
             id: UUID(),
-            provider: .gmail,
+            provider: .qq,
             oauthUser: oauthUser,
             email: email,
             credentials: nil,
-            syncState: MailSyncState(historyId: historyId)
+            syncState: MailSyncState(lastUid: lastUid)
         )
     }
 
     private func sealedCredentials() throws -> Data {
-        try CredentialVault.seal(.gmail(
-            accessToken: "access-\(UUID().uuidString)",
-            refreshToken: "refresh-\(UUID().uuidString)",
-            expiresAt: Date().addingTimeInterval(3600)
+        try CredentialVault.seal(.imap(
+            username: "user-\(UUID().uuidString)",
+            authCode: "code-\(UUID().uuidString)"
         ))
     }
 
     /// Deletes only the account row this test created (by `oauth_user`).
     /// There is deliberately no table-wide delete helper.
-    private func cleanup(_ oauthUser: String) -> @Sendable (PostgresConnection) async -> Void {
+    private func cleanup(_ oauthUser: String) -> @Sendable (LagoonDB) async -> Void {
         { conn in
-            try? await TestDatabase.deleteAccount(oauthUser: oauthUser, provider: .gmail, db: conn)
+            try? await TestDatabase.deleteAccount(oauthUser: oauthUser, provider: .qq, db: conn)
         }
     }
 
@@ -46,12 +45,12 @@ final class AccountStoreTests: XCTestCase {
             )
             let back = try await AccountStore.find(
                 byOAuthUser: oauthUser,
-                provider: .gmail,
+                provider: .qq,
                 db: conn
             )
             XCTAssertEqual(back?.id, a.id)
             XCTAssertEqual(back?.email, a.email)
-            XCTAssertEqual(back?.provider, .gmail)
+            XCTAssertEqual(back?.provider, .qq)
             XCTAssertEqual(back?.credentials, Data([1, 2, 3]))
         }
     }
@@ -67,32 +66,22 @@ final class AccountStoreTests: XCTestCase {
                     db: conn
                 )
 
-                let newAccess = "access-\(UUID().uuidString)"
-                let newRefresh = "refresh-\(UUID().uuidString)"
-                let expiry = Date().addingTimeInterval(3600)
+                let newUser = "user-\(UUID().uuidString)"
+                let newCode = "code-\(UUID().uuidString)"
                 try await AccountStore.updateCredentials(
                     accountId: a.id,
-                    credentials: try CredentialVault.seal(.gmail(
-                        accessToken: newAccess,
-                        refreshToken: newRefresh,
-                        expiresAt: expiry
+                    credentials: try CredentialVault.seal(.imap(
+                        username: newUser, authCode: newCode
                     )),
                     db: conn
                 )
 
                 let stored = try await CredentialVault.read(accountId: a.id, db: conn)
-                guard case .gmail(let access, let refresh, let expires) = stored else {
-                    return XCTFail("expected gmail credentials after updateCredentials")
+                guard case .imap(let username, let authCode) = stored else {
+                    return XCTFail("expected imap credentials after updateCredentials")
                 }
-                XCTAssertEqual(access, newAccess)
-                XCTAssertEqual(refresh, newRefresh)
-                // The sealed blob is ISO-8601 JSON, so the expiry round-trips at
-                // second granularity (the 60s refresh margin absorbs the slack).
-                XCTAssertEqual(
-                    expires.timeIntervalSince1970,
-                    expiry.timeIntervalSince1970,
-                    accuracy: 1.0
-                )
+                XCTAssertEqual(username, newUser)
+                XCTAssertEqual(authCode, newCode)
             }
         }
     }
@@ -102,20 +91,20 @@ final class AccountStoreTests: XCTestCase {
     func test_upsert_existingAccount_keepsCursorAndActiveFlag() async throws {
         let oauthUser = "acct-\(UUID().uuidString)"
         try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
-            let first = makeAccount(oauthUser: oauthUser, email: "first@example.com", historyId: "h1")
+            let first = makeAccount(oauthUser: oauthUser, email: "first@example.com", lastUid: 42)
             try await AccountStore.upsert(first, credentials: Data([1]), db: conn)
             // The active choice survives a credential refresh: `upsert`'s
             // ON CONFLICT branch only touches email/credentials.
             try await AccountStore.setActive(accountId: first.id, db: conn)
 
-            let second = makeAccount(oauthUser: oauthUser, email: "second@example.com", historyId: nil)
+            let second = makeAccount(oauthUser: oauthUser, email: "second@example.com", lastUid: nil)
             try await AccountStore.upsert(second, credentials: Data([2]), db: conn)
 
-            let found = try await AccountStore.find(byOAuthUser: oauthUser, provider: .gmail, db: conn)
+            let found = try await AccountStore.find(byOAuthUser: oauthUser, provider: .qq, db: conn)
             XCTAssertEqual(found?.id, first.id, "same (provider, oauth_user) must reuse the row")
             XCTAssertEqual(found?.email, "second@example.com")
             XCTAssertEqual(found?.credentials, Data([2]))
-            XCTAssertEqual(found?.syncState.historyId, "h1", "re-connect must not reset the cursor")
+            XCTAssertEqual(found?.syncState.lastUid, 42, "re-connect must not reset the cursor")
             XCTAssertEqual(found?.isActive, true, "re-connect must not clear the active flag")
         }
     }
@@ -126,8 +115,8 @@ final class AccountStoreTests: XCTestCase {
         let oauthA = "acct-\(UUID().uuidString)"
         let oauthB = "acct-\(UUID().uuidString)"
         try await TestDatabase.withConnection(cleanup: { conn in
-            try? await TestDatabase.deleteAccount(oauthUser: oauthA, provider: .gmail, db: conn)
-            try? await TestDatabase.deleteAccount(oauthUser: oauthB, provider: .gmail, db: conn)
+            try? await TestDatabase.deleteAccount(oauthUser: oauthA, provider: .qq, db: conn)
+            try? await TestDatabase.deleteAccount(oauthUser: oauthB, provider: .qq, db: conn)
         }) { conn in
             let a = makeAccount(oauthUser: oauthA, email: "a-\(UUID().uuidString)@example.com")
             let b = makeAccount(oauthUser: oauthB, email: "b-\(UUID().uuidString)@example.com")
@@ -152,8 +141,8 @@ final class AccountStoreTests: XCTestCase {
         let oauthA = "acct-\(UUID().uuidString)"
         let oauthB = "acct-\(UUID().uuidString)"
         try await TestDatabase.withConnection(cleanup: { conn in
-            try? await TestDatabase.deleteAccount(oauthUser: oauthA, provider: .gmail, db: conn)
-            try? await TestDatabase.deleteAccount(oauthUser: oauthB, provider: .gmail, db: conn)
+            try? await TestDatabase.deleteAccount(oauthUser: oauthA, provider: .qq, db: conn)
+            try? await TestDatabase.deleteAccount(oauthUser: oauthB, provider: .qq, db: conn)
         }) { conn in
             let a = makeAccount(oauthUser: oauthA, email: "a-\(UUID().uuidString)@example.com")
             let b = makeAccount(oauthUser: oauthB, email: "b-\(UUID().uuidString)@example.com")

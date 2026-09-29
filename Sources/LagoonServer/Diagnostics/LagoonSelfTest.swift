@@ -1,18 +1,18 @@
 import Foundation
 import Logging
-import PostgresNIO
+import GRDB
 import LagoonKit
 
 /// Explicit real-account smoke test. It sends only to the selected account's
 /// own address and never accepts an arbitrary recipient.
-enum LagoonSelfTest {
+public enum LagoonSelfTest {
     /// The QQ account the diagnostics act on.
     ///
     /// Several mailboxes can be stored at once, so the choice is never
     /// accidental: an explicit `--account <email>` wins, otherwise the active
     /// QQ account wins, then any stored QQ account.
     private static func qqAccount(
-        db: PostgresConnection, logger: Logger
+        db: LagoonDB, logger: Logger
     ) async throws -> Account {
         let accounts = try await AccountStore.all(db: db)
             .filter { $0.provider == .qq }
@@ -32,7 +32,7 @@ enum LagoonSelfTest {
         logger.info("self-test account", metadata: ["email": .string(first.email)])
         return first
     }
-    static func listMailboxes(db: PostgresConnection, logger: Logger) async throws {
+    public static func listMailboxes(db: LagoonDB, logger: Logger) async throws {
         let account = try await qqAccount(db: db, logger: logger)
         let provider = IMAPProvider(account: account, db: db, logger: logger)
         for mailbox in try await provider.diagnosticMailboxes() {
@@ -40,7 +40,7 @@ enum LagoonSelfTest {
         }
     }
 
-    static func find(subject: String, db: PostgresConnection, logger: Logger) async throws {
+    public static func find(subject: String, db: LagoonDB, logger: Logger) async throws {
         let account = try await qqAccount(db: db, logger: logger)
         let provider = IMAPProvider(account: account, db: db, logger: logger)
         for (mailbox, uid) in try await provider.diagnosticFind(subject: subject) {
@@ -48,14 +48,14 @@ enum LagoonSelfTest {
         }
     }
 
-    static func restore(remoteId: String, db: PostgresConnection, logger: Logger) async throws {
+    public static func restore(remoteId: String, db: LagoonDB, logger: Logger) async throws {
         let account = try await qqAccount(db: db, logger: logger)
         let provider = IMAPProvider(account: account, db: db, logger: logger)
         try await provider.unarchive(remoteId: remoteId)
         print("restore: ok remoteId=\(remoteId)")
     }
 
-    static func run(db: PostgresConnection, logger: Logger) async throws {
+    public static func run(db: LagoonDB, logger: Logger) async throws {
         let account = try await qqAccount(db: db, logger: logger)
 
         let marker = "[Lagoon Self-Test \(UUID().uuidString.prefix(8))]"

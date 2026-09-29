@@ -1,7 +1,7 @@
 import Foundation
 import Logging
 import Hummingbird
-import PostgresNIO
+import GRDB
 import LagoonKit
 
 /// GET /api/briefing — the Briefing Feed (spec §7.1).
@@ -18,7 +18,7 @@ public enum BriefingRoutes {
 
     public static func register(
         on router: Router<BasicRequestContext>,
-        db: PostgresConnection,
+        db: LagoonDB,
         logger: Logger,
         classifier: (any BriefingClassifying)? = nil,
         cache: BriefingClassificationCache = BriefingClassificationCache(),
@@ -69,8 +69,8 @@ public enum BriefingRoutes {
 
             let heuristics = HeuristicBriefingClassifier(
                 signals: .init(
-                    pinnedGmailIds: pinned,
-                    listUnsubscribeGmailIds: listUnsubscribe,
+                    pinnedRemoteIds: pinned,
+                    listUnsubscribeRemoteIds: listUnsubscribe,
                     repliedRemoteIds: replied
                 )
             )

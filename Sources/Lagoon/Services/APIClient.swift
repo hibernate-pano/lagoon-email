@@ -105,6 +105,12 @@ public final class APIClient: Sendable {
            url.scheme != nil, url.host != nil {
             return url
         }
+        // Embedded runtime: the in-process server records the port it actually
+        // bound (8080, or the next free port when 8080 was taken).
+        let port = UserDefaults.standard.integer(forKey: "lagoon.serverPort")
+        if port > 0 {
+            return URL(string: "http://127.0.0.1:\(port)") ?? URL(fileURLWithPath: "/")
+        }
         return URL(string: "http://127.0.0.1:8080") ?? URL(fileURLWithPath: "/")
     }
 
@@ -122,11 +128,6 @@ public final class APIClient: Sendable {
             config.timeoutIntervalForResource = 90
             self.session = URLSession(configuration: config)
         }
-    }
-
-    /// Browser entry point for the OAuth dance. Used by ConnectView.
-    public var oauthStartURL: URL {
-        baseURL.appendingPathComponent("oauth/gmail/start")
     }
 
     /// `sender` narrows to one exact `from_address` (发件人归集); nil keeps
@@ -565,13 +566,13 @@ public final class APIClient: Sendable {
         return try Self.decode(DraftReply.self, from: data)
     }
 
-    /// POST /api/drafts/{id}/choose {variant, pushToGmail}.
-    public func chooseDraft(draftId: Int64, variant: Int, pushToGmail: Bool) async throws -> ChooseDraftResponse {
+    /// POST /api/drafts/{id}/choose {variant}.
+    public func chooseDraft(draftId: Int64, variant: Int) async throws -> ChooseDraftResponse {
         let url = try makeURL(path: ["api", "drafts", "\(draftId)", "choose"], query: [])
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: Any] = ["variant": variant, "pushToGmail": pushToGmail]
+        let body: [String: Any] = ["variant": variant]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = APITimeout.fast.seconds
         let (data, _) = try await send(request, timeout: .fast)
@@ -699,7 +700,7 @@ public final class APIClient: Sendable {
     }
 
     /// Builds a URL where every supplied path component is percent-encoded.
-    /// Gmail ids are opaque and may contain `/`, `?` or `#`, which
+    /// Remote ids are opaque and may contain `/`, `?` or `#`, which
     /// `appendingPathComponent` would leave in place and thus change the route.
     private func makeURL(path: [String], query: [URLQueryItem]) throws -> URL {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {

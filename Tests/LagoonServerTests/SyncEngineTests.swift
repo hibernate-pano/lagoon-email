@@ -1,7 +1,7 @@
 import XCTest
 import Foundation
 import Logging
-import PostgresNIO
+import GRDB
 @testable import LagoonServer
 @testable import LagoonKit
 
@@ -25,7 +25,7 @@ final class SyncEngineTests: XCTestCase {
         )
     }
 
-    private func seed(_ account: Account, db: PostgresConnection) async throws {
+    private func seed(_ account: Account, db: LagoonDB) async throws {
         try await AccountStore.upsert(
             account,
             credentials: try CredentialVault.seal(
@@ -35,14 +35,14 @@ final class SyncEngineTests: XCTestCase {
         )
     }
 
-    private func cleanup(_ oauthUser: String) -> @Sendable (PostgresConnection) async -> Void {
+    private func cleanup(_ oauthUser: String) -> @Sendable (LagoonDB) async -> Void {
         { conn in
             try? await TestDatabase.deleteAccount(oauthUser: oauthUser, provider: .qq, db: conn)
         }
     }
 
     private func makeLoop(
-        db: PostgresConnection,
+        db: LagoonDB,
         account: Account,
         provider: (any MailProvider)?,
         sleeper: SleepRecorder = SleepRecorder(),
@@ -60,11 +60,11 @@ final class SyncEngineTests: XCTestCase {
         )
     }
 
-    private func health(_ accountId: UUID, db: PostgresConnection) async throws -> SyncHealth? {
+    private func health(_ accountId: UUID, db: LagoonDB) async throws -> SyncHealth? {
         try await AccountStore.find(byId: accountId, db: db)?.syncHealth
     }
 
-    private func syncState(_ accountId: UUID, db: PostgresConnection) async throws -> MailSyncState? {
+    private func syncState(_ accountId: UUID, db: LagoonDB) async throws -> MailSyncState? {
         try await AccountStore.find(byId: accountId, db: db)?.syncState
     }
 
@@ -392,7 +392,7 @@ final class SyncEngineTests: XCTestCase {
                 let account = makeAccount(oauthUser: oauthUser)
                 try await seed(account, db: conn)
 
-                let provider = StubMailProvider.failing(.notConfigured("gmail credentials missing"))
+                let provider = StubMailProvider.failing(.notConfigured("provider credentials missing"))
                 let sleeper = SleepRecorder()
                 let loop = makeLoop(db: conn, account: account, provider: provider, sleeper: sleeper)
 
@@ -592,8 +592,7 @@ final class SyncEngineTests: XCTestCase {
                     makeProvider: { account, _ in
                         providers[account.id] ?? StubMailProvider()
                     },
-                    sleep: { _ in },
-                    makeDB: { try await TestDatabase.requireConnection() }
+                    sleep: { _ in }
                 )
 
                 try await AccountStore.setActive(accountId: healthy.id, db: conn)
@@ -643,7 +642,7 @@ final class SyncEngineTests: XCTestCase {
         }
     }
 
-    /// (i) Two wakes for the same mailbox at once (two Gmail pushes, or a push
+    /// (i) Two wakes for the same mailbox at once (two pushes, or a push
     /// landing while `refresh()` is restarting loops) must not tear down each
     /// other's work. Actor isolation does NOT serialize this: every `await` is
     /// a reentrancy point, so both callers used to cancel, both cleared
@@ -664,7 +663,6 @@ final class SyncEngineTests: XCTestCase {
                 try await seed(account, db: conn)
 
                 let probe = OverlapProbe()
-                let opened = ConnectionLog()
                 // Keyed by account id: a multi-active engine (other tests run
                 // in parallel against the same DB) syncs every stored row, so
                 // an unknown account gets an empty-script stub, never this one.
@@ -677,12 +675,7 @@ final class SyncEngineTests: XCTestCase {
                     makeProvider: { row, _ in
                         probes[row.id]?() ?? StubMailProvider()
                     },
-                    sleep: { _ in },
-                    makeDB: {
-                        let loopConn = try await TestDatabase.requireConnection()
-                        opened.record(loopConn)
-                        return loopConn
-                    }
+                    sleep: { _ in }
                 )
                 defer { Task { await engine.stop() } }
 
@@ -704,21 +697,26 @@ final class SyncEngineTests: XCTestCase {
                 }
 
                 // One live loop per account, no matter how the wakes interleave.
+                // The poll waits for ROUNDS EVIDENCE (2+ post-storm pulls) AND a
+                // landed message: the storm's first loop is cancelled mid-pull
+                // (before applying), so breaking on pull count alone can read
+                // the store before the surviving loop's first apply lands.
                 var maxInFlight = probe.maxConcurrentPulls
-                var pulls = probe.pulls
+                var applied: Set<String> = []
                 for _ in 0..<100 {
                     maxInFlight = probe.maxConcurrentPulls
-                    pulls = probe.pulls
-                    if pulls > pullsBeforeStorm + 1 { break }
+                    applied = Set(try await MessageStore.recent(
+                        forAccount: account.id, limit: 50, db: conn
+                    ).map(\.remoteId))
+                    if applied.contains("storm-1"), probe.pulls > pullsBeforeStorm + 1 { break }
                     try await Task.sleep(for: .milliseconds(20))
                 }
                 XCTAssertEqual(
                     maxInFlight, 1,
                     "two loops for one account means one of them is a zombie the engine lost track of"
                 )
-                let pullsAfterStorm = pulls
                 XCTAssertGreaterThan(
-                    pullsAfterStorm, pullsBeforeStorm,
+                    probe.pulls, pullsBeforeStorm,
                     "the surviving loop must keep working after the storm"
                 )
                 let stored = try await MessageStore.recent(
@@ -726,26 +724,25 @@ final class SyncEngineTests: XCTestCase {
                 )
                 XCTAssertEqual(
                     Set(stored.map(\.remoteId)), ["storm-1"],
-                    "the surviving loop must still apply mail on its own connection"
+                    "the surviving loop must still apply mail"
                 )
 
                 await engine.stop()
                 try await Task.sleep(for: .milliseconds(150))
-                let leaked = await opened.stillOpen()
-                XCTAssertTrue(
-                    leaked.isEmpty,
-                    "every connection the engine opened must be closed by stop(); still open: \(leaked.count)"
+                let loop = await engine.loop(forAccount: account.id)
+                XCTAssertNil(
+                    loop,
+                    "stop() must tear the loop down, not leave it running"
                 )
             }
         }
     }
 
-    /// (j) The provider a loop builds must receive THAT loop's connection, not
-    /// the shared one. `IMAPProvider` falls back to `CredentialVault.read` when
-    /// the account row has no inline credentials — on the shared connection
-    /// that reintroduces the cross-loop desync the per-loop connections exist
-    /// to prevent (see .memory/shared-postgres-connection-desyncs-under-concurrency.md).
-    func test_makeProvider_receivesTheLoopsOwnConnection() async throws {
+    /// (j) One loop builds exactly one provider. The Postgres build also used
+    /// this hook to assert per-loop connection ownership; SQLite shares one
+    /// WAL pool by design, so what still matters is that the factory is bound
+    /// to the loop exactly once and receives a usable handle.
+    func test_makeProvider_builtOncePerLoop() async throws {
         let oauthUser = "sync-conn-\(UUID().uuidString)"
 
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
@@ -753,9 +750,9 @@ final class SyncEngineTests: XCTestCase {
                 let account = makeAccount(oauthUser: oauthUser)
                 try await seed(account, db: conn)
 
-                let seen = ConnectionLog()
+                let builds = ProviderBuildCounter()
                 // Keyed by account id (unknown rows get an empty stub): the
-                // test asserts on connections, not on scripted mail.
+                // test asserts on factory calls, not on scripted mail.
                 let stubs: [UUID: @Sendable () -> StubMailProvider] = [
                     account.id: { StubMailProvider() }
                 ]
@@ -763,11 +760,10 @@ final class SyncEngineTests: XCTestCase {
                     db: conn,
                     logger: Logger(label: "sync-conn-tests"),
                     makeProvider: { row, loopDB in
-                        seen.record(loopDB)
+                        builds.record(loopDB)
                         return stubs[row.id]?() ?? StubMailProvider()
                     },
-                    sleep: { _ in },
-                    makeDB: { try await TestDatabase.requireConnection() }
+                    sleep: { _ in }
                 )
                 defer { Task { await engine.stop() } }
 
@@ -779,16 +775,11 @@ final class SyncEngineTests: XCTestCase {
                 // on a task that may not have had its first turn yet.
                 var providersBuilt = 0
                 for _ in 0..<100 {
-                    providersBuilt = seen.count
+                    providersBuilt = builds.builds
                     if providersBuilt > 0 { break }
                     try await Task.sleep(for: .milliseconds(20))
                 }
 
-                let sharedConnections = seen.count(where: { $0 === conn })
-                XCTAssertEqual(
-                    sharedConnections, 0,
-                    "the shared connection must never reach a loop's provider"
-                )
                 XCTAssertEqual(
                     providersBuilt, 1,
                     "one loop builds exactly one provider"
@@ -809,7 +800,6 @@ final class SyncEngineTests: XCTestCase {
                 try await seed(account, db: conn)
 
                 let probe = OverlapProbe()
-                let opened = ConnectionLog()
                 let probes: [UUID: @Sendable () -> SlowProbeProvider] = [
                     account.id: { SlowProbeProvider(probe: probe) }
                 ]
@@ -817,12 +807,7 @@ final class SyncEngineTests: XCTestCase {
                     db: conn,
                     logger: Logger(label: "sync-deleted-tests"),
                     makeProvider: { row, _ in probes[row.id]?() ?? StubMailProvider() },
-                    sleep: { _ in },
-                    makeDB: {
-                        let loopConn = try await TestDatabase.requireConnection()
-                        opened.record(loopConn)
-                        return loopConn
-                    }
+                    sleep: { _ in }
                 )
                 defer { Task { await engine.stop() } }
 
@@ -851,12 +836,13 @@ final class SyncEngineTests: XCTestCase {
                     "a deleted account must not keep an IMAP session alive"
                 )
                 // The loop also self-parks when the row vanishes, so "pulls
-                // stopped" proves nothing on its own — the connection is the
-                // evidence: a parked loop's connection is closed by the wake.
-                let leaked = await opened.stillOpen()
-                XCTAssertTrue(
-                    leaked.isEmpty,
-                    "waking a deleted account must close its connection, not leave it parked"
+                // stopped" proves nothing on its own — the loop teardown is
+                // the evidence: the wake must remove the parked loop, not
+                // leave it installed forever.
+                let loop = await engine.loop(forAccount: account.id)
+                XCTAssertNil(
+                    loop,
+                    "waking a deleted account must tear its loop down, not leave it parked"
                 )
             }
         }
@@ -939,37 +925,18 @@ actor SlowProbeProvider: MailProvider {
     private static let unsupported = MailError.notConfigured("probe provider")
 }
 
-/// Records the connections an engine hands out and which ones are still open.
-final class ConnectionLog: @unchecked Sendable {
+/// Counts how many times the engine's provider factory fired (SQLite shares
+/// one pool, so there is no per-connection identity left to track).
+final class ProviderBuildCounter: @unchecked Sendable {
     private let lock = NSLock()
-    private var seen: [PostgresConnection] = []
+    private var count = 0
 
-    var count: Int { lock.lock(); defer { lock.unlock() }; return seen.count }
+    var builds: Int { lock.lock(); defer { lock.unlock() }; return count }
 
-    func record(_ conn: PostgresConnection) {
+    func record(_ db: LagoonDB) {
         lock.lock()
-        seen.append(conn)
+        count += 1
         lock.unlock()
-    }
-
-    func count(where predicate: (PostgresConnection) -> Bool) -> Int {
-        lock.lock()
-        let copy = seen
-        lock.unlock()
-        return copy.filter(predicate).count
-    }
-
-    /// Connections the engine has not closed yet. Uses the channel state,
-    /// never a probe query: `query` on a closed PostgresConnection never
-    /// completes its future (the `.get()` then blocks the calling thread
-    /// forever), which hung every test that awaited this helper. Only call
-    /// this once the engine has stopped: a connection serves one query at a
-    /// time, and a live loop's connection always looks open.
-    func stillOpen() async -> [PostgresConnection] {
-        lock.lock()
-        let copy = seen
-        lock.unlock()
-        return copy.filter { !$0.isClosed }
     }
 }
 

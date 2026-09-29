@@ -19,12 +19,10 @@ public struct ChooseDraftResponse: Codable, Sendable, Equatable {
     public let ok: Bool
     public let draftId: Int64
     public let chosen: Int
-    public let gmailDraftId: String
 }
 
 public struct SendResponse: Codable, Sendable, Equatable {
     public let ok: Bool
-    /// Server-side Message-ID when the provider reports one (SMTP path always
-    /// does; Gmail returns its own message id).
+    /// Server-side Message-ID reported by the SMTP send path.
     public let providerMessageId: String?
 }

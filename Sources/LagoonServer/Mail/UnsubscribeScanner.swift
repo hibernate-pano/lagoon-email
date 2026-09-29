@@ -21,6 +21,8 @@ public enum UnsubscribeScanner {
         "unsubscribe", "un-subscribe", "opt-out", "optout", "opt out",
         "list-unsubscribe", "stop receiving", "leave the program",
         "email preferences", "contact preferences",
+        "manage preferences", "subscription preferences", "communication preferences",
+        "email settings", "subscription settings",
         "退订", "退訂", "取消订阅", "取消訂閱", "撤销订阅", "不再接收", "停止接收",
     ]
 
@@ -65,6 +67,9 @@ public enum UnsubscribeScanner {
     /// dropped; HTML entities in hrefs are decoded (`&amp;` is ubiquitous).
     public static func bodyLinks(in html: String) -> [String] {
         var scored: [(url: String, score: Int, order: Int)] = []
+        // mailto: anchors are a fallback, never a first choice — they are
+        // ranked after every http(s) candidate (see the merge at the end).
+        var mailtos: [(url: String, order: Int)] = []
 
         // Pass 1: <a href="…">text</a>
         let anchorPattern = #"<a\b[^>]*?href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#
@@ -81,6 +86,12 @@ public enum UnsubscribeScanner {
                 let text = stripTags(
                     ns.substring(with: match.range(at: 2))
                 ).trimmingCharacters(in: .whitespacesAndNewlines)
+                if let mailto = normalizedMailto(href) {
+                    if containsKeyword(text) || containsKeyword(href) {
+                        mailtos.append((mailto, mailtos.count))
+                    }
+                    return
+                }
                 guard let url = normalizedWebURL(href) else { return }
                 var score = 0
                 if containsKeyword(text) { score = 2 }
@@ -117,7 +128,28 @@ public enum UnsubscribeScanner {
             seen.insert(item.url)
             out.append(item.url)
         }
+        for item in mailtos.sorted(by: { $0.order < $1.order })
+        where !seen.contains(item.url) && out.count < 10 {
+            seen.insert(item.url)
+            out.append(item.url)
+        }
         return out
+    }
+
+    // MARK: - Landing-page confirm link
+
+    /// The one URL an unsubscribe landing page itself offers for the actual
+    /// confirmation. hrefs carrying confirm-shaped tokens win ("the button
+    /// the user would have clicked"); otherwise the scanner's best candidate.
+    /// Drives the single automatic confirmation hop in `classifyAndConfirm`.
+    public static func confirmLink(in html: String) -> String? {
+        let links = bodyLinks(in: html)
+        let preferred = links.first { link in
+            let lower = link.lowercased()
+            return ["confirm", "one-click", "oneclick", "optout", "opt-out", "unsubscribe"]
+                .contains { lower.contains($0) }
+        }
+        return preferred ?? links.first
     }
 
     // MARK: - Safety (SSRF guard)
@@ -160,6 +192,17 @@ public enum UnsubscribeScanner {
               scheme == "http" || scheme == "https",
               url.host?.isEmpty == false
         else { return nil }
+        return trimmed
+    }
+
+    /// A `mailto:` unsubscribe address from a body anchor — the manual
+    /// fallback when a message offers no web link. Trimmed like a web URL;
+    /// scheme validation happens in `pickUnsubTarget`.
+    static func normalizedMailto(_ raw: String) -> String? {
+        let trimmed = trimTrailingPunctuation(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        guard trimmed.lowercased().hasPrefix("mailto:") else { return nil }
         return trimmed
     }
 
