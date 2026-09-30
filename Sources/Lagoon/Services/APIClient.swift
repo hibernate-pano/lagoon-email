@@ -660,11 +660,12 @@ public final class APIClient: Sendable {
         _ = try await send(request, timeout: .fast)
     }
 
-    /// POST /api/messages/{remoteId}/read?accountId= → 204.
-    public func markRead(remoteId: String, accountId: UUID) async throws {
-        try await post(path: ["api", "messages", remoteId, "read"], query: [
-            .init(name: "accountId", value: accountId.uuidString)
-        ])
+    /// POST /api/messages/{remoteId}/read?accountId=[&isRead=] → 204.
+    /// `isRead` defaults to true; pass false to mark unread.
+    public func markRead(remoteId: String, accountId: UUID, isRead: Bool = true) async throws {
+        var query = [URLQueryItem(name: "accountId", value: accountId.uuidString)]
+        if !isRead { query.append(URLQueryItem(name: "isRead", value: "false")) }
+        try await post(path: ["api", "messages", remoteId, "read"], query: query)
     }
 
     /// POST /api/messages/{remoteId}/pin?accountId=&pinned= → 204.

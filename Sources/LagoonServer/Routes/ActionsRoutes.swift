@@ -876,12 +876,7 @@ public enum ActionsRoutes {
                 throw MailError.notConfigured("provider missing during undo")
             }
             try await provider.setRead(remoteId: remoteId, isRead: false)
-            try db.write {
-                try $0.execute(
-                    sql: "UPDATE message_headers SET is_read = FALSE WHERE remote_id = ? AND account_id = ?",
-                    arguments: [remoteId, account.id]
-                )
-            }
+            try await MessageStore.setRead(remoteId: remoteId, accountId: account.id, isRead: false, db: db)
         case .pin:
             try await MessageStore.setPinned(false, remoteId: remoteId, accountId: account.id, db: db)
         case .unpin:

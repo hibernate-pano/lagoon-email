@@ -303,6 +303,16 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(queryValue("accountId", in: request), accountId.uuidString)
     }
 
+    func test_markRead_withIsReadFalse_sendsIsReadParam() async throws {
+        let accountId = UUID()
+        stub(status: 204, body: Data())
+
+        try await makeClient().markRead(remoteId: "msg-1", accountId: accountId, isRead: false)
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(queryValue("isRead", in: request), "false")
+    }
+
     /// POST /draft answers with a bare DraftReply (DraftRouteTests pins the
     /// server side). Regression: the server once wrapped it in
     /// {"drafts":[…]} — every generate then failed client-side with

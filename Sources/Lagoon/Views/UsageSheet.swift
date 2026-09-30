@@ -6,6 +6,8 @@ struct UsageSheet: View {
     @Environment(\.l10n) private var l10n
     @Environment(\.dismiss) private var dismiss
     @State private var report: UsageReport?
+    @State private var aiStatus: AIStatus?
+    @State private var showAISettings = false
     @State private var errorBanner: ErrorBanner?
     private let api = APIClient.shared
 
@@ -38,6 +40,20 @@ struct UsageSheet: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
+            Divider()
+            HStack {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill((aiStatus?.configured ?? false) ? Color.green : Color.orange)
+                        .frame(width: 8, height: 8)
+                    Text((aiStatus?.configured ?? false) ? l10n.aiSettingsConfigured : l10n.aiSettingsNotConfigured)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(l10n.aiSettingsTitle) { showAISettings = true }
+                    .buttonStyle(.link)
+            }
             } else {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
@@ -49,10 +65,16 @@ struct UsageSheet: View {
         .noticeBanner($errorBanner)
         .frame(minWidth: 420, maxWidth: 420, minHeight: 180)
         .task { await load() }
+        .sheet(isPresented: $showAISettings) {
+            AISettingsSheet(aiStatus: aiStatus)
+        }
     }
 
     private func load() async {
         errorBanner = nil
+        if let status = try? await api.fetchAIStatus() {
+            aiStatus = status
+        }
         do {
             report = try await api.fetchUsage()
         } catch {

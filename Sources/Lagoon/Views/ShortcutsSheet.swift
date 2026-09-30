@@ -50,7 +50,7 @@ struct ShortcutsSheet: View {
 
             // Global
             Entry(id: "undo", keys: "⌘Z", description: l10n.shortcutZ),
-            Entry(id: "refresh", keys: "⌘R", description: l10n.shortcutRefresh),
+            Entry(id: "refresh", keys: "⌥⌘R", description: l10n.shortcutRefresh),
         ]
     }
 

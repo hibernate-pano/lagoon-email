@@ -167,6 +167,35 @@ public enum MessageStore {
     /// The pin join is what lets the client render pin state: pins live in
     /// their own table, so a plain `message_headers` read leaves the client
     /// with no way to tell a pinned mail from an unpinned one.
+    /// Shared WHERE clause for `recent()` and `count()` so the badge
+    /// total can never drift from the list it labels. Returns the clause
+    /// (starting at WHERE) plus its bound arguments in order.
+    static func filterSQL(
+        accountId: UUID,
+        sender: String?,
+        archived: Bool,
+        stackMatch: StackMatch?
+    ) -> (String, [DatabaseValueConvertible?]) {
+        var clause = "WHERE h.account_id = ? AND h.is_deleted = FALSE AND h.is_archived = "
+        clause += archived ? "TRUE" : "FALSE"
+        var arguments: [DatabaseValueConvertible?] = [accountId]
+        switch stackMatch {
+        case .sender(let address):
+            clause += "\n            AND h.from_address = ?"
+            arguments.append(address)
+        case .keyword(let value):
+            clause += "\n            AND h.subject LIKE ? ESCAPE '\\'"
+            arguments.append(likePattern(containing: value))
+        case nil:
+            break
+        }
+        if sender != nil {
+            clause += "\n            AND h.from_address = ?"
+            arguments.append(sender)
+        }
+        return (clause, arguments)
+    }
+
     public static func recent(
         forAccount accountId: UUID,
         limit: Int,
@@ -175,7 +204,15 @@ public enum MessageStore {
         stackMatch: StackMatch? = nil,
         db: LagoonDB
     ) async throws -> [MessageHeader] {
-        var sql = """
+        let (whereClause, filterArgs) = filterSQL(
+            accountId: accountId, sender: sender, archived: archived, stackMatch: stackMatch
+        )
+        // Assembled with joined() rather than interpolation: the SQL
+        // guardrail rejects `\()` inside a SELECT literal, and `+`
+        // concatenation with a SQL literal, even when the spliced piece
+        // is a static fragment with bound parameters.
+        let sql = [
+            """
             SELECT h.id, h.account_id, h.remote_id, h.thread_id, h.from_address,
                    NULLIF(h.from_name, '') AS from_name,
                    NULLIF(h.subject, '') AS subject,
@@ -187,25 +224,14 @@ public enum MessageStore {
             LEFT JOIN message_pins
                    ON message_pins.account_id = h.account_id
                   AND message_pins.remote_id = h.remote_id
-            WHERE h.account_id = ? AND h.is_deleted = FALSE AND h.is_archived =
-        """
-        sql += archived ? " TRUE" : " FALSE"
-        var arguments: [DatabaseValueConvertible?] = [accountId]
-        switch stackMatch {
-        case .sender(let address):
-            sql += "\n            AND h.from_address = ?"
-            arguments.append(address)
-        case .keyword(let value):
-            sql += "\n            AND h.subject LIKE ? ESCAPE '\\'"
-            arguments.append(likePattern(containing: value))
-        case nil:
-            break
-        }
-        if sender != nil {
-            sql += "\n            AND h.from_address = ?"
-            arguments.append(sender)
-        }
-        sql += "\n            ORDER BY h.received_at DESC\n            LIMIT ?"
+            """,
+            whereClause,
+            """
+            ORDER BY h.received_at DESC
+            LIMIT ?
+            """,
+        ].joined(separator: "\n")
+        var arguments = filterArgs
         arguments.append(limit)
         return try db.read { db in
             try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
@@ -280,12 +306,21 @@ public enum MessageStore {
         accountId: UUID,
         db: LagoonDB
     ) async throws {
+        try await setRead(remoteId: remoteId, accountId: accountId, isRead: true, db: db)
+    }
+
+    public static func setRead(
+        remoteId: String,
+        accountId: UUID,
+        isRead: Bool,
+        db: LagoonDB
+    ) async throws {
         let sql = """
-            UPDATE message_headers SET is_read = TRUE
+            UPDATE message_headers SET is_read = ?
             WHERE remote_id = ? AND account_id = ?
         """
         try db.write {
-            try $0.execute(sql: sql, arguments: [remoteId, accountId])
+            try $0.execute(sql: sql, arguments: [isRead, remoteId, accountId])
         }
     }
 
@@ -369,6 +404,30 @@ public enum MessageStore {
             sql: "UPDATE message_headers SET is_archived = ? WHERE remote_id = ? AND account_id = ?",
             arguments: [archived, remoteId, accountId]
         )
+    }
+
+    /// Total rows matching `recent()`'s filter (minus LIMIT): the archive
+    /// cabinet badge and any future "N results" UI. Same WHERE clause as
+    /// `recent()` by construction — both funnel through `filterSQL`.
+    public static func count(
+        forAccount accountId: UUID,
+        sender: String? = nil,
+        archived: Bool = false,
+        stackMatch: StackMatch? = nil,
+        db: LagoonDB
+    ) async throws -> Int {
+        let (whereClause, arguments) = filterSQL(
+            accountId: accountId, sender: sender, archived: archived, stackMatch: stackMatch
+        )
+        // Joined, not interpolated — see recent() above.
+        let sql = [
+            "SELECT COUNT(*) AS count FROM message_headers h",
+            whereClause,
+        ].joined(separator: " ")
+        return try db.read { db in
+            let row = try Row.fetchOne(db, sql: sql, arguments: StatementArguments(arguments))
+            return row.map { $0["count"] } ?? 0
+        }
     }
 
     public static func unreadCount(

@@ -537,6 +537,44 @@ public struct L10n: Sendable, Equatable {
             "Provider token rates are not configured; calls are counted, but the dollar cap cannot be enforced."
         )
     }
+
+    // MARK: - AI settings (V1: MiniMax key entry, stored in Keychain envJSON)
+
+    public var aiSettingsTitle: String { pick("AI 设置", "AI Settings") }
+    public var aiSettingsApiKey: String { pick("API Key", "API Key") }
+    public var aiSettingsApiKeyPlaceholder: String { pick("MiniMax API Key", "MiniMax API Key") }
+    public var aiSettingsApiKeyHelp: String {
+        pick(
+            "在 MiniMax 开放平台申请，仅存于本机钥匙串，不会离开这台 Mac（调用时随邮件文本发给模型服务商）。",
+            "Get one from the MiniMax platform. Stored only in this Mac's Keychain; sent to the model provider alongside mail text on each call."
+        )
+    }
+    public var aiSettingsBaseURL: String { pick("接口地址", "Base URL") }
+    public var aiSettingsModel: String { pick("模型", "Model") }
+    public var aiSettingsBudget: String { pick("每月上限（美元）", "Monthly cap (USD)") }
+    public var aiSettingsBudgetHelp: String {
+        pick("设为 0 表示不限制。", "0 means no limit.")
+    }
+    public var aiSettingsSave: String { pick("保存", "Save") }
+    public var aiSettingsSaved: String {
+        pick("已保存，重启 App 后生效。", "Saved — restart the app to apply.")
+    }
+    public var aiSettingsSaveFailed: String { pick("保存失败：", "Could not save: ") }
+    public var aiSettingsConfigured: String { pick("AI 已配置", "AI configured") }
+    public var aiSettingsNotConfigured: String { pick("AI 未配置", "AI not configured") }
+    public var aiNotConfiguredTitle: String { pick("AI 未配置", "AI not configured") }
+    public var aiNotConfiguredDetail: String {
+        pick(
+            "填上 MiniMax Key 即可启用摘要和草稿，邮件不受影响。",
+            "Add your MiniMax key to enable summaries and drafts; mail is unaffected."
+        )
+    }
+    public var aiSettingsRestartHint: String {
+        pick(
+            "Key 改动需要重启 App 才能生效（内嵌服务只在启动时读取一次）。",
+            "Key changes need an app restart (the embedded server reads them once at launch)."
+        )
+    }
     public var overrideGroup: String { pick("改分组为…", "Change group to…") }
     public var moreActions: String { pick("更多操作", "More actions") }
     public var overrideApplied: String { pick("已记录你的偏好", "Noted your preference") }
@@ -576,7 +614,7 @@ public struct L10n: Sendable, Equatable {
     public var shortcutJ: String { pick("J = 下一封", "J = next") }
     public var shortcutK: String { pick("K = 上一封", "K = previous") }
     public var shortcutZ: String { pick("⌘Z = 撤销", "⌘Z = undo") }
-    public var shortcutRefresh: String { pick("⌘R = 刷新", "⌘R = refresh") }
+    public var shortcutRefresh: String { pick("⌥⌘R = 刷新", "⌥⌘R = refresh") }
     public var shortcutSummarize: String { pick("⌘D = AI 摘要", "⌘D = AI summary") }
     public var shortcutDraft: String { pick("⌘⇧D = 起草回复", "⌘⇧D = draft reply") }
     public var shortcutSearch: String { pick("⌘F = 搜索", "⌘F = search") }

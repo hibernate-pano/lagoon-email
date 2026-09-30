@@ -211,17 +211,11 @@ struct BriefingFeedView: View {
             }
             .keyboardShortcut("0", modifiers: .command)
             .help(l10n.showRawListHelp)
-            // ⌘R is "refresh" on the feed and "reply" on the open message,
-            // and the detail view is a push inside this same stack — so
-            // both bindings are live at once and the wrong one wins.
-            // Attach the shortcut only at the root, the same shape ⌘0 and
-            // ⌘[ already use.
-            if path.isEmpty {
-                refreshControl
-                    .keyboardShortcut("r", modifiers: .command)
-            } else {
-                refreshControl
-            }
+            // Refresh is ⌥⌘R so it never collides with ⌘R = reply on the
+            // open message. No path.isEmpty guard needed: the modifiers
+            // are disjoint, so both bindings stay live in the same stack.
+            refreshControl
+                .keyboardShortcut("r", modifiers: [.command, .option])
         }
         .padding()
     }
@@ -305,6 +299,9 @@ struct BriefingFeedView: View {
                                         .disabled(!canArchive)
                                     Button(item.group == .pinned ? l10n.unpin : l10n.pin) {
                                         togglePin(item: item)
+                                    }
+                                    Button(readVerbTitle(item.message, l10n: l10n)) {
+                                        Task { await toggleRead(item) }
                                     }
                                     // Whitelist autopilot is offered only on
                                     // subscription noise: auto-archiving a
@@ -665,6 +662,30 @@ struct BriefingFeedView: View {
     }
 
 
+
+    /// Feed-level read/unread toggle (context menu). Same two-way wire
+    /// as the list's `toggleRead`: optimistic flip, revert on failure.
+    private func toggleRead(_ item: BriefingItem) async {
+        guard let accountId = accounts.accountId else { return }
+        let target = !item.message.isRead
+        setRead(remoteId: item.message.remoteId, isRead: target)
+        do {
+            try await api.markRead(
+                remoteId: item.message.remoteId,
+                accountId: accountId,
+                isRead: target
+            )
+        } catch {
+            setRead(remoteId: item.message.remoteId, isRead: !target)
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.markReadFailedTitle,
+                detail: l10n.markReadFailedDetail,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.toggleRead(item) }
+            )
+        }
+    }
 
     private func archiveAndUndo(_ item: BriefingItem) async {
 

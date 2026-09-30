@@ -146,13 +146,10 @@ struct StackListSheet: View {
         do {
             let response = try await api.fetchStacks(accountId: accountId)
             stacks = response.stacks
-            // The archived row's badge. `/api/messages?archived=true` returns
-            // no total, and `cursor.totalUnread` is unread-specific, so the
-            // only number available is the size of the window we asked for —
-            // this reads 0 or 1, not the real count. Fixing it needs a server
-            // total; see the report rather than fudging the number here.
+            // The archived row's badge: the server's `totalCount`
+            // ignores LIMIT, so this is the real cabinet size.
             let archived = try await api.fetchMessages(accountId: accountId, limit: 1, archived: true)
-            archivedCount = archived.messages.count
+            archivedCount = archived.totalCount ?? archived.messages.count
         } catch {
             errorBanner = ErrorBanner(severity: .error, title: l10n.loadFailed, detail: error.lagoonUIMessage)
         }

@@ -44,8 +44,12 @@ public enum SyncRoutes {
                     archived: archived, stackMatch: stackMatch, db: db
                 )
                 let unread = try await MessageStore.unreadCount(forAccount: uuid, db: db)
+                let total = try await MessageStore.count(
+                    forAccount: uuid, sender: sender,
+                    archived: archived, stackMatch: stackMatch, db: db
+                )
                 let cursor = SyncCursor(accountId: uuid, lastFetchedAt: Date(), totalUnread: unread)
-                let payload = SyncResponse(cursor: cursor, messages: msgs)
+                let payload = SyncResponse(cursor: cursor, messages: msgs, totalCount: total)
                 let enc = JSONEncoder()
                 enc.dateEncodingStrategy = .iso8601
                 let data = try enc.encode(payload)

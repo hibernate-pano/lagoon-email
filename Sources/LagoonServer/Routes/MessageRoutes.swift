@@ -219,15 +219,28 @@ public enum MessageRoutes {
             )
         }
 
-        // POST /api/messages/{remoteId}/read?accountId=<uuid> -> 204
+        // POST /api/messages/{remoteId}/read?accountId=<uuid>[&isRead=false] -> 204
         // Local state is authoritative and never blocks on the network; the
-        // remote `\Seen` write is best-effort (spec §3.7).
+        // remote `\Seen` write is best-effort (spec §3.7). `isRead` defaults
+        // to true so every existing caller keeps working; `isRead=false`
+        // clears `\Seen` remotely AND locally — the store's monotonic OR is
+        // bypassed with a direct write, the same shape the undo route uses.
         router.post("api/messages/:remoteId/read") { request, context -> Response in
             guard let accountId = RouteParams.accountId(from: request) else {
                 return RouteJSON.error(.badRequest, "malformed-accountId")
             }
             guard let remoteId = RouteParams.remoteId(from: context) else {
                 return RouteJSON.error(.badRequest, "malformed-remoteId")
+            }
+            let isRead: Bool
+            if let raw = request.uri.queryParameters["isRead"].map(String.init) {
+                switch raw.lowercased() {
+                case "true", "1", "yes": isRead = true
+                case "false", "0", "no": isRead = false
+                default: return RouteJSON.error(.badRequest, "malformed-isRead")
+                }
+            } else {
+                isRead = true
             }
             let account: Account
             do {
@@ -243,7 +256,7 @@ public enum MessageRoutes {
                 return RouteJSON.error(.internalServerError, "internal-error")
             }
             do {
-                try await MessageStore.markRead(remoteId: remoteId, accountId: accountId, db: db)
+                try await MessageStore.setRead(remoteId: remoteId, accountId: accountId, isRead: isRead, db: db)
             } catch {
                 logger.error("markRead failed", metadata: [
                     "accountId": .string(accountId.uuidString),
@@ -254,7 +267,7 @@ public enum MessageRoutes {
             }
             if let provider = makeProvider(account) {
                 do {
-                    try await provider.setRead(remoteId: remoteId, isRead: true)
+                    try await provider.setRead(remoteId: remoteId, isRead: isRead)
                 } catch {
                     logger.warning("markRead.remoteFailed", metadata: [
                         "remoteId": .string(remoteId),

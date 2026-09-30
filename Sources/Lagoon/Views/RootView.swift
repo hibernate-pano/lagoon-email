@@ -23,6 +23,7 @@ struct RootView: View {
     @State private var showHealthDetail = false
     @State private var showCommandPalette = false
     @State private var showShortcuts = false
+    @State private var showAISettings = false
     @State private var showAbout = false
     /// Seeded by the "Reconnect" banner so the QQ form comes up pre-filled;
     /// "Add account" deliberately leaves it nil.
@@ -145,6 +146,9 @@ struct RootView: View {
             .sheet(isPresented: $showShortcuts) {
                 ShortcutsSheet()
             }
+            .sheet(isPresented: $showAISettings) {
+                AISettingsSheet(aiStatus: directory.aiStatus)
+            }
             .sheet(isPresented: $showAbout) {
                 AboutSheet()
             }
@@ -182,6 +186,7 @@ struct RootView: View {
             onShowActionHistory: { showActionHistory = true },
             onShowAutoArchiveRules: { showAutoArchiveRules = true },
             onShowShortcuts: { showShortcuts = true },
+            onShowAISettings: { showAISettings = true },
             onRefresh: {
                 Task { try? await api.requestSync(); await directory.refresh() }
             },
@@ -391,7 +396,16 @@ struct RootView: View {
     /// credit flag itself clears on the next successful AI call after top-up.
     private var aiStatusBanner: ErrorBanner? {
         guard !aiStatusDismissed else { return nil }
-        guard let status = directory.aiStatus, status.configured else { return nil }
+        guard let status = directory.aiStatus else { return nil }
+        if !status.configured {
+            return ErrorBanner(
+                severity: .info,
+                title: l10n.aiNotConfiguredTitle,
+                detail: l10n.aiNotConfiguredDetail,
+                actionLabel: l10n.aiSettingsTitle,
+                action: { [self] in await MainActor.run { self.showAISettings = true } }
+            )
+        }
         if status.creditExhausted {
             return ErrorBanner(
                 severity: .warning,
@@ -568,6 +582,7 @@ struct RootView: View {
             Menu {
                 Button(l10n.budgetThisMonth) { Task { @MainActor in showUsage = true } }
                     .keyboardShortcut("b", modifiers: [.command])
+                Button(l10n.aiSettingsTitle) { Task { @MainActor in showAISettings = true } }
                 Button(l10n.actionHistory) { Task { @MainActor in showActionHistory = true } }
                 Button(l10n.autoArchiveRulesTitle) { Task { @MainActor in showAutoArchiveRules = true } }
                 Divider()

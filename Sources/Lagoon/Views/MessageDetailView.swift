@@ -334,8 +334,7 @@ struct MessageDetailView: View {
 
             Divider()
 
-            Button(l10n.markRead) { Task { await markReadOnce(force: true) } }
-                .disabled(isRead)
+            Button(isRead ? l10n.markAsUnread : l10n.markAsRead) { Task { await toggleReadState() } }
             Button(l10n.overrideGroup) { showOverrideMenu = true }
             Button(l10n.unsubscribe, role: .destructive) { Task { await unsubscribe() } }
                 .disabled(header == nil)
@@ -820,6 +819,27 @@ struct MessageDetailView: View {
                     inlineImageData[key.lowercased()] = data
                 }
             }
+        }
+    }
+
+    /// Manual read/unread toggle from the ⋯ menu. Unlike the automatic
+    /// `markReadOnce` on appear, this is user intent and flips both ways.
+    private func toggleReadState() async {
+        let target = !isRead
+        isRead = target
+        onReadStateChange(remoteId, target)
+        do {
+            try await api.markRead(remoteId: remoteId, accountId: accountId, isRead: target)
+        } catch {
+            isRead = !target
+            onReadStateChange(remoteId, !target)
+            actionBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.markReadFailedTitle,
+                detail: l10n.markReadFailedDetail,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.toggleReadState() }
+            )
         }
     }
 

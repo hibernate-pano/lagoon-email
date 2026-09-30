@@ -111,17 +111,11 @@ struct MessageListView: View {
                     }
                     .keyboardShortcut("0", modifiers: .command)
                     .help(l10n.backToBriefingHelp)
-                    // ⌘R is "refresh" on the list and "reply" on the open
-                    // message, and the detail view is a push inside this
-                    // same stack — so both bindings are live at once and
-                    // the wrong one wins. Attach the shortcut only at the
-                    // root, the same shape ⌘0 and ⌘[ already use.
-                    if path.isEmpty {
-                        refreshControl
-                            .keyboardShortcut("r", modifiers: .command)
-                    } else {
-                        refreshControl
-                    }
+                    // Refresh is ⌥⌘R so it never collides with ⌘R = reply on the
+                    // open message. No path.isEmpty guard needed: the modifiers
+                    // are disjoint, so both bindings stay live in the same stack.
+                    refreshControl
+                        .keyboardShortcut("r", modifiers: [.command, .option])
                 }
                 .padding()
 
@@ -589,24 +583,22 @@ struct MessageListView: View {
         }
     }
 
-    /// Mark a message read. One-way on purpose: the server's read route
-    /// hardcodes `isRead: true` and records no inverse action, so a
-    /// "mark unread" flip would be reverted by the next poll with nothing
-    /// the user could undo. The Unread verb is absent from the row menu
-    /// for the same reason — see `RowChrome`.
+    /// Two-way read toggle. The server's `/read` route takes `isRead`
+    /// and writes it both locally (direct UPDATE, bypassing the sync OR)
+    /// and remotely (`\\Seen` add/remove), and `IMAPProvider.setRead`
+    /// re-baselines `reportedRead` so the next sync round does not flip it
+    /// back. Optimistic flip with revert on failure, same as before.
     private func toggleRead(_ m: MessageHeader) async {
-        // Optimistic flip so the dot clears before the round trip; reverted
-        // if the server refuses. A no-op for an already-read row.
-        guard !m.isRead else { return }
+        let target = !m.isRead
         invalidatePendingRefresh()
         if let index = messages.firstIndex(where: { $0.remoteId == m.remoteId }) {
-            messages[index] = m.withRead(true)
+            messages[index] = m.withRead(target)
         }
         do {
-            try await api.markRead(remoteId: m.remoteId, accountId: m.accountId)
+            try await api.markRead(remoteId: m.remoteId, accountId: m.accountId, isRead: target)
         } catch {
             if let index = messages.firstIndex(where: { $0.remoteId == m.remoteId }) {
-                messages[index] = m.withRead(false)
+                messages[index] = m.withRead(m.isRead)
             }
         }
     }
@@ -660,22 +652,11 @@ struct MessageListView: View {
 
 // MARK: - Row chrome
 
-/// Whether a list row may offer the read verb at all.
-///
-/// Read state is one-way on the wire — the server's read route only ever
-/// sets `isRead: true` — and `toggleRead` returns immediately on an
-/// already-read row. Rendering the control anyway left something that
-/// looked live and did nothing: no request, no state change, and the only
-/// visual difference (the unread dot, the bold subject) not moving.
-/// `MessageDetailView` greys the same verb out (`.disabled(isRead)`); a
-/// row drops it instead, which also means the leading swipe disappears
-/// when there is nothing for it to do.
-///
-/// Free function rather than a member of the (private) `RowChrome`: the
-/// policy is the part worth pinning, and it is reachable from the
-/// modifier, from the tests, and from anywhere else a row is drawn.
-func offersReadVerb(_ message: MessageHeader) -> Bool {
-    !message.isRead
+/// Read/unread toggle label for a row. The wire is two-way since V1:
+/// `/read?isRead=false` clears `\\Seen` remotely and writes FALSE locally,
+/// so both directions are live controls.
+func readVerbTitle(_ message: MessageHeader, l10n: L10n) -> String {
+    message.isRead ? l10n.markAsUnread : l10n.markAsRead
 }
 
 /// Tag + triage gestures shared by every tappable row (single message or
@@ -692,20 +673,16 @@ private struct RowChrome: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if offersReadVerb(message) {
-            chrome(content)
-                .swipeActions(edge: .leading) {
-                    // Leading swipe = mark read. Single gesture, no
-                    // destructive styling so the row snaps back without
-                    // warning.
-                    Button { onToggleRead() } label: {
-                        Label(l10n.markAsRead, systemImage: "envelope.open")
-                    }
-                    .tint(.blue)
+        chrome(content)
+            .swipeActions(edge: .leading) {
+                // Leading swipe = read/unread toggle. Single gesture, no
+                // destructive styling so the row snaps back without
+                // warning.
+                Button { onToggleRead() } label: {
+                    Label(readVerbTitle(message, l10n: l10n), systemImage: "envelope.open")
                 }
-        } else {
-            chrome(content)
-        }
+                .tint(.blue)
+            }
     }
 
     private func chrome(_ content: Content) -> some View {
@@ -718,9 +695,7 @@ private struct RowChrome: ViewModifier {
                 }
             }
             .contextMenu {
-                if offersReadVerb(message) {
-                    Button(l10n.markAsRead) { onToggleRead() }
-                }
+                Button(readVerbTitle(message, l10n: l10n)) { onToggleRead() }
                 Button(l10n.archived) { onArchive() }
                 Divider()
                 // 聚合: seed a persistent rule from this row — one tap for the

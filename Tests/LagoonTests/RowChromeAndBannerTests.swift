@@ -3,9 +3,9 @@ import SwiftUI
 import LagoonKit
 @testable import Lagoon
 
-/// F5: the row's read verb is dead on an already-read row, because the
-/// server's read route is one-way and `toggleRead` returns immediately.
-/// The control rendered anyway — swipeable, clickable, and visibly inert.
+/// F5 (fixed as V1): the wire is two-way now — `/read?isRead=false`
+/// clears `\\Seen` remotely and writes FALSE locally — so the row offers
+/// the toggle in both directions instead of hiding it on read rows.
 final class RowReadVerbTests: XCTestCase {
     private func header(isRead: Bool) -> MessageHeader {
         MessageHeader(
@@ -23,56 +23,55 @@ final class RowReadVerbTests: XCTestCase {
         )
     }
 
-    func test_unreadRowOffersTheReadVerb() {
-        XCTAssertTrue(offersReadVerb(header(isRead: false)))
+    func test_readVerbTitlePointsBothWays() {
+        XCTAssertEqual(readVerbTitle(header(isRead: false), l10n: L10n(language: .zhHans)), "标为已读")
+        XCTAssertEqual(readVerbTitle(header(isRead: true), l10n: L10n(language: .zhHans)), "标为未读")
     }
 
-    /// The regression: an already-read row used to render "标记为已读" in
-    /// both the leading swipe and the context menu, and tapping either did
-    /// nothing at all.
-    func test_readRowDoesNotOfferTheReadVerb() {
-        XCTAssertFalse(
-            offersReadVerb(header(isRead: true)),
-            "the verb is a no-op here; rendering it is a dead control"
-        )
-    }
-
-    /// The rule only makes sense because the wire is one-way. If a route
-    /// ever accepts `isRead: false`, both this and `toggleRead`'s own guard
-    /// have to change together — this test is the reminder.
-    func test_theVerbIsGatedOnTheSameConditionToggleReadUses() throws {
+    /// The toggle must compute its target from the row, not early-return:
+    /// a `guard !m.isRead else { return }` here means mark-unread is dead.
+    func test_toggleReadHasNoOneWayGuard() throws {
         let source = try ViewSource.read("MessageListView")
-        let line = try XCTUnwrap(
-            source.components(separatedBy: "\n").first { $0.contains("guard !m.isRead") },
-            "toggleRead's early return moved; the row verb's gate must be revisited"
+        XCTAssertFalse(
+            source.contains("guard !m.isRead else { return }"),
+            "toggleRead still early-returns on read rows; mark-unread is dead"
         )
-        XCTAssertEqual(line.trimmingCharacters(in: .whitespaces), "guard !m.isRead else { return }")
+        XCTAssertTrue(
+            source.contains("let target = !m.isRead"),
+            "toggleRead must derive its target from the row"
+        )
+    }
+
+    /// The API client must send isRead=false for the unread direction.
+    func test_apiClientSendsIsReadFalse() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/Lagoon/Services/APIClient.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(source.contains("isRead"), "APIClient.markRead lost its isRead parameter")
     }
 }
 
-/// F29: ⌘R is "refresh" on a list surface and "reply" on the message the
-/// user has pushed onto it, and both were live at once. The app's own help
-/// sheet listed ⌘R twice, which is the same bug stated out loud.
+/// F29 (fixed as V1 decision): refresh moved to ⌥⌘R so it never collides
+/// with ⌘R = reply on the open message. The old `path.isEmpty` guard is gone
+/// on purpose — disjoint modifiers mean both bindings stay live in the same
+/// stack without stealing each other.
 final class RefreshShortcutScopeTests: XCTestCase {
-    private static let refreshShortcut = #".keyboardShortcut("r", modifiers: .command)"#
+    private static let replyShortcut = #".keyboardShortcut("r", modifiers: .command)"#
+    private static let refreshShortcut = #".keyboardShortcut("r", modifiers: [.command, .option])"#
 
-    /// Both list headers attach ⌘R only while the navigation stack is at
-    /// the root. Asserted on the source: a keyboard shortcut is not
-    /// reachable from a unit test, and the package has no UI-test target.
-    func test_refreshShortcutIsOnlyBoundAtTheRootOfTheStack() throws {
+    /// Both list surfaces bind refresh as ⌥⌘R, and no plain ⌘R remains there
+    /// to fight the detail view's reply binding.
+    func test_refreshUsesOptionCommandRAndReplyKeepsCommandR() throws {
         for view in ["MessageListView", "BriefingFeedView"] {
             let source = try ViewSource.read(view)
-            let shortcut = try XCTUnwrap(
+            XCTAssertNotNil(
                 source.range(of: Self.refreshShortcut),
-                "\(view): the ⌘R binding disappeared"
+                "\(view): the ⌥⌘R refresh binding disappeared"
             )
-            // A push always makes `path` non-empty, so the binding has to
-            // sit inside a `path.isEmpty` guard.
-            let guards = ViewSource.occurrences(of: "if path.isEmpty {", in: source)
-            XCTAssertFalse(guards.isEmpty, "\(view): no `path.isEmpty` guard found")
-            XCTAssertTrue(
-                guards.contains { $0 < shortcut.lowerBound },
-                "\(view): ⌘R is bound outside a `path.isEmpty` guard, so it also fires on an open message"
+            XCTAssertNil(
+                source.range(of: Self.replyShortcut),
+                "\(view): plain ⌘R is still bound here and will steal reply"
             )
         }
     }
@@ -83,7 +82,7 @@ final class RefreshShortcutScopeTests: XCTestCase {
     func test_theMessageKeepsCommandRForReply() throws {
         let detail = try ViewSource.read("MessageDetailView")
         let reply = try XCTUnwrap(
-            detail.range(of: Self.refreshShortcut),
+            detail.range(of: Self.replyShortcut),
             "the reply binding disappeared"
         )
         let preceding = detail[detail.startIndex..<reply.lowerBound]
@@ -96,6 +95,16 @@ final class RefreshShortcutScopeTests: XCTestCase {
             between.contains(".keyboardShortcut"),
             "another binding sits between the reply label and its ⌘R"
         )
+    }
+
+    /// The help surfaces must not list ⌘R twice: reply keeps ⌘R, refresh
+    /// shows ⌥⌘R.
+    func test_helpSurfacesShowDisjointShortcuts() throws {
+        let sheet = ShortcutsSheet().entries
+        let reply = sheet.first { $0.id == "reply" }
+        let refresh = sheet.first { $0.id == "refresh" }
+        XCTAssertEqual(reply?.keys, "⌘R")
+        XCTAssertEqual(refresh?.keys, "⌥⌘R")
     }
 }
 
@@ -178,6 +187,23 @@ final class PriorityBannerDismissalTests: XCTestCase {
                 "\(banner) has no dismiss branch; its ✕ does nothing"
             )
         }
+    }
+
+    /// V1: an unconfigured AI must surface a banner that routes to the
+    /// settings sheet — otherwise a fresh install shows no AI hint and no
+    /// path to fix it. The banner's action opens the sheet.
+    func test_unconfiguredAIBannerRoutesToSettings() throws {
+        let source = try ViewSource.read("RootView")
+        let start = try XCTUnwrap(source.range(of: "private var aiStatusBanner"))
+        let body = source[start.lowerBound...].prefix(2_000)
+        XCTAssertTrue(
+            body.contains("!status.configured"),
+            "aiStatusBanner lost its unconfigured branch; fresh installs get no AI hint"
+        )
+        XCTAssertTrue(
+            body.contains("showAISettings = true"),
+            "the unconfigured banner must open the AI settings sheet"
+        )
     }
 
     /// The load-error branch used to set `syncHealthDismissed`, which

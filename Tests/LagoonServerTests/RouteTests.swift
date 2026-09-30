@@ -207,6 +207,7 @@ final class RouteTests: XCTestCase {
         remoteId: String,
         from: String,
         isRead: Bool = false,
+        isArchived: Bool = false,
         daysAgo: Double = 0,
         subject: String? = nil,
         messageIdHeader: String? = nil,
@@ -224,7 +225,7 @@ final class RouteTests: XCTestCase {
             snippet: nil,
             receivedAt: Date().addingTimeInterval(-daysAgo * 24 * 60 * 60),
             isRead: isRead,
-            isArchived: false,
+            isArchived: isArchived,
             messageIdHeader: messageIdHeader,
             inReplyTo: inReplyTo,
             references: references
@@ -359,6 +360,92 @@ final class RouteTests: XCTestCase {
                         from: Data(buffer: response.body)
                     )
                     XCTAssertTrue(decoded.messages.isEmpty, "injection-shaped sender must be a literal, not SQL")
+                }
+            }
+        }
+    }
+
+    /// `totalCount` ignores LIMIT so the archive badge shows the real size,
+    /// not the window length. The regression read 0/1 because the client
+    /// counted the window it asked for.
+    func test_getMessages_totalCount_ignoresLimit() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            for i in 0..<3 {
+                try await MessageStore.upsert(
+                    makeHeader(accountId: account.id, remoteId: "t-\(i)-\(UUID())", from: "a@example.com"),
+                    db: conn
+                )
+            }
+
+            let router = Router()
+            SyncRoutes.register(on: router, db: conn, sync: nil)
+            let app = Application(router: router)
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages?accountId=\(account.id.uuidString)&limit=1",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        SyncResponse.self,
+                        from: Data(buffer: response.body)
+                    )
+                    XCTAssertEqual(decoded.messages.count, 1)
+                    XCTAssertEqual(decoded.totalCount, 3)
+                }
+            }
+        }
+    }
+
+    /// The count shares the list's filter: `archived=true` counts the
+    /// cabinet, and the default counts the live inbox — never each other.
+    func test_getMessages_totalCount_respectsArchivedFilter() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let live = makeHeader(accountId: account.id, remoteId: "live-\(UUID())", from: "a@example.com")
+            let dead = makeHeader(
+                accountId: account.id, remoteId: "dead-\(UUID())", from: "a@example.com", isArchived: true
+            )
+            for header in [live, dead] {
+                try await MessageStore.upsert(header, db: conn)
+            }
+
+            let router = Router()
+            SyncRoutes.register(on: router, db: conn, sync: nil)
+            let app = Application(router: router)
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages?accountId=\(account.id.uuidString)&archived=true",
+                    method: .get
+                ) { response in
+                    let decoded = try Self.iso8601Decoder().decode(
+                        SyncResponse.self,
+                        from: Data(buffer: response.body)
+                    )
+                    XCTAssertEqual(decoded.totalCount, 1)
+                    XCTAssertEqual(decoded.messages.map(\.remoteId), [dead.remoteId])
+                }
+                try await client.execute(
+                    uri: "/api/messages?accountId=\(account.id.uuidString)",
+                    method: .get
+                ) { response in
+                    let decoded = try Self.iso8601Decoder().decode(
+                        SyncResponse.self,
+                        from: Data(buffer: response.body)
+                    )
+                    XCTAssertEqual(decoded.totalCount, 1)
+                    XCTAssertEqual(decoded.messages.map(\.remoteId), [live.remoteId])
                 }
             }
         }
@@ -989,6 +1076,65 @@ final class RouteTests: XCTestCase {
                 true,
                 "POST /read must persist is_read = TRUE"
             )
+        }
+    }
+
+    func test_postRead_withIsReadFalse_clearsIsRead() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id,
+                remoteId: "m-\(UUID())",
+                from: "alice@example.com",
+                isRead: true
+            )
+            try await MessageStore.upsert(message, db: conn)
+
+            let app = Application(router: makeMessageRouter(db: conn))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/read?accountId=\(account.id.uuidString)&isRead=false",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .noContent)
+                }
+            }
+
+            let recent = try await MessageStore.recent(
+                forAccount: account.id,
+                limit: 50,
+                db: conn
+            )
+            XCTAssertEqual(
+                recent.first { $0.remoteId == message.remoteId }?.isRead,
+                false,
+                "POST /read?isRead=false must persist is_read = FALSE (bypasses the sync OR)"
+            )
+        }
+    }
+
+    func test_postRead_withMalformedIsRead_returns400() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let app = Application(router: makeMessageRouter(db: conn))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/m-1/read?accountId=\(account.id.uuidString)&isRead=maybe",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                }
+            }
         }
     }
 

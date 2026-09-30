@@ -24,6 +24,7 @@ struct CommandPaletteView: View {
     let onShowActionHistory: () -> Void
     let onShowAutoArchiveRules: () -> Void
     let onShowShortcuts: () -> Void
+    let onShowAISettings: () -> Void
     let onRefresh: () -> Void
     let onToggleSound: () -> Void
 
@@ -54,8 +55,9 @@ struct CommandPaletteView: View {
             Command(id: "search", title: l10n.search, shortcut: "⌘F", systemImage: "magnifyingglass", action: { run(onSearch) }),
             Command(id: "show-briefing", title: l10n.briefing, shortcut: "⌘0", systemImage: "rectangle.grid.2x2", action: { run(onShowBriefing) }),
             Command(id: "show-all", title: l10n.allMessages, shortcut: "⌘0", systemImage: "list.bullet", action: { run(onShowAllMessages) }),
-            Command(id: "refresh", title: l10n.refresh, shortcut: "⌘R", systemImage: "arrow.clockwise", action: { run(onRefresh) }),
+            Command(id: "refresh", title: l10n.refresh, shortcut: "⌥⌘R", systemImage: "arrow.clockwise", action: { run(onRefresh) }),
             Command(id: "usage", title: l10n.budgetThisMonth, shortcut: "⌘B", systemImage: "chart.bar", action: { run(onShowUsage) }),
+            Command(id: "ai-settings", title: l10n.aiSettingsTitle, shortcut: nil, systemImage: "sparkles", action: { run(onShowAISettings) }),
             Command(id: "history", title: l10n.actionHistory, shortcut: nil, systemImage: "clock.arrow.circlepath", action: { run(onShowActionHistory) }),
             Command(id: "rules", title: l10n.autoArchiveRulesTitle, shortcut: nil, systemImage: "list.bullet.indent", action: { run(onShowAutoArchiveRules) }),
             Command(id: "shortcuts", title: l10n.commandPalette, shortcut: "⌘/", systemImage: "questionmark.circle", action: { run(onShowShortcuts) }),
@@ -64,7 +66,7 @@ struct CommandPaletteView: View {
     }
 
     /// Substring match, case-insensitive. The palette is small enough
-    /// (10 commands) that we don't need a real fuzzy matcher — a prefix
+    /// (11 commands) that we don't need a real fuzzy matcher — a prefix
     /// or substring hit is faster and predictable.
     private var filtered: [Command] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)

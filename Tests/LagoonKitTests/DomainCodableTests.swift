@@ -89,6 +89,27 @@ final class DomainCodableTests: XCTestCase {
         XCTAssertEqual(back.messages.first?.receivedAt, receivedAt)
     }
 
+    func test_syncResponse_totalCount_roundTrips() throws {
+        let accountId = UUID()
+        let response = SyncResponse(
+            cursor: SyncCursor(accountId: accountId, lastFetchedAt: Date(timeIntervalSince1970: 1_700_000_500), totalUnread: 0),
+            messages: [],
+            totalCount: 42
+        )
+        let back = try makeDecoder().decode(SyncResponse.self, from: try makeEncoder().encode(response))
+        XCTAssertEqual(back.totalCount, 42)
+        XCTAssertEqual(back, response)
+    }
+
+    func test_syncResponse_totalCount_missingKey_decodesNil() throws {
+        // Payloads encoded before the server sent totalCount must still decode.
+        let json = """
+        {"cursor":{"accountId":"00000000-0000-0000-0000-000000000000","lastFetchedAt":"2024-01-01T00:00:00Z","totalUnread":0},"messages":[]}
+        """.data(using: .utf8)!
+        let back = try makeDecoder().decode(SyncResponse.self, from: json)
+        XCTAssertNil(back.totalCount)
+    }
+
     func test_encoded_dates_are_iso8601_strings_not_numbers() throws {
         let accountId = UUID()
         let response = SyncResponse(
