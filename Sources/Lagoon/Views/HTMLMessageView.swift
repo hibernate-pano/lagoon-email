@@ -468,6 +468,26 @@ struct HTMLMessageView: NSViewRepresentable {
     </style>
     """
 
+    /// Whether the WebView must be reloaded for these inputs.
+    ///
+    /// Extracted so the exactness of the comparison can be tested directly:
+    /// the guard's whole job is telling "same document" from "same shape,
+    /// different bytes" apart, and that is a pure function of the two stored
+    /// inputs. A test that re-implemented the comparison could not fail when
+    /// this code regressed, so the comparison lives here and the test calls
+    /// it.
+    ///
+    /// `nil` means "never loaded", which must not compare equal to an empty
+    /// document — an empty email still has to render and get the CSS wrapper.
+    static func needsReload(
+        loadedHTML: String?,
+        loadedAttachments: [String: Data],
+        newHTML: String,
+        newAttachments: [String: Data]
+    ) -> Bool {
+        loadedHTML != Optional(newHTML) || loadedAttachments != newAttachments
+    }
+
     func updateNSView(_ webView: PassThroughScrollWebView, context: Context) {
         let coordinator = context.coordinator
         // Bail out BEFORE the pipeline, not after. The guard used to sit
@@ -483,8 +503,12 @@ struct HTMLMessageView: NSViewRepresentable {
         // entries, different bytes" apart, so an inline image swapped under
         // a reused Content-ID needed the reload far more than the count ever
         // justified.
-        if coordinator.sourceHTML == Optional(html),
-           coordinator.sourceAttachments == attachmentsByCid {
+        if !Self.needsReload(
+            loadedHTML: coordinator.sourceHTML,
+            loadedAttachments: coordinator.sourceAttachments,
+            newHTML: html,
+            newAttachments: attachmentsByCid
+        ) {
             return
         }
         coordinator.sourceHTML = html
