@@ -66,17 +66,65 @@ ALLOWED=(
 # sources this file and calls it directly.
 warn_diagnostic_name() {
   perl -ne '
-    # OSC-8 form first — it is the only place the name is not plain text.
-    if (/\e\]8;;[^\e]*\e\\([A-Za-z]+)\e\]8;;/) { print "$1\n"; next }
-    # Plain form: the `[#Name]` group at the end of the diagnostic.
-    if (/\[#([A-Za-z]+)\]/) { print "$1\n"; next }
-    # Last resort: everything after the fixed-width "warning: " column.
-    if (/warning:\s(.*)$/) {
-      my $rest = $1;
-      $rest =~ s/\s+$//;
-      # Keep only a bare identifier-ish token; drop URLs and sentences.
-      if ($rest =~ m{^([A-Za-z]+)\b}) { print "$1\n" }
+    my $line = $_;
+    chomp $line;
+
+    # Strip the fixed-width prefix so only the message remains:
+    #   <file>:<line>:<col>: warning: <message>
+    #
+    # A line with no "warning:" marker is not a diagnostic at all and must
+    # yield nothing: the old fallback regex would happily turn arbitrary text
+    # ("not a diagnostic line") into the bogus class "not". That is a hole in
+    # the safe direction, so the marker is required before anything else runs.
+    my $msg;
+    if ($line =~ /warning:\s*(.*)$/) { $msg = $1 } else { next }
+
+    # 1. Swift 6.2+ appends the diagnostic name: `... [#DeprecatedDeclaration]`.
+    #    When present it is authoritative — no guessing.
+    if ($line =~ /\[#([A-Za-z_][A-Za-z0-9_]*)\]/) { print "$1\n"; next }
+
+    # 2. OSC-8 hyperlink form (colour diagnostics on). The name sits between
+    #    the opening terminator and the closing `\e]8;;`; matched directly
+    #    because stripping escapes first glues the URL onto the name.
+    if ($line =~ /\e\]8;;[^\e]*\e\\([A-Za-z_][A-Za-z0-9_]*)\e\]8;;/) {
+      print "$1\n"; next;
     }
+
+    # 3. Swift 6.1 and earlier print NO name at all, so the class has to be
+    #    derived from the message text. Only the gated classes need to be
+    #    recognised here; anything else stays "unclassified" and is reported,
+    #    which is the safe direction.
+    #
+    #    These patterns are deliberately anchored to the wording the compiler
+    #    actually emits. Verified against the real Swift 6.1.2 output captured
+    #    from CI (see scripts/test-warn-gate.sh, which pins these strings).
+    if ($msg =~ /^initialization of\s+(?:immutable|variable)\s+.+?\s+was never used/) {
+      print "NoUsage\n"; next;
+    }
+    if ($msg =~ /^variable\s+.+?\s+was never used/) {
+      print "NoUsage\n"; next;
+    }
+    if ($msg =~ /^result of call to\s+.+?\s+is unused/) {
+      print "NoUsage\n"; next;
+    }
+    if ($msg =~ /^immutable value\s+.+?\s+was never used/) {
+      print "NoUsage\n"; next;
+    }
+    if ($msg =~ /^no\s+.async.\s+operations occur within\s+.await./) {
+      print "UnnecessaryEffectMarker\n"; next;
+    }
+    # Deprecations on Swift 6.1 look like:
+    #   'kCFStreamPropertyHTTPSProxyHost' was deprecated in macOS 10.11: ...
+    #   'inbound' is deprecated: Use the executeThenClose scoped method instead.
+    if ($msg =~ /^.+?\s+(?:was|is)\s+deprecated\b/) {
+      print "DeprecatedDeclaration\n"; next;
+    }
+
+    # 4. Fallback: a bare identifier as the first token (old behaviour, kept
+    #    for diagnostic shapes not covered above). Quoted messages start with
+    #    a quote and therefore fall through to "unclassified", which the gate
+    #    reports rather than silently allowing.
+    if ($msg =~ /^([A-Za-z_][A-Za-z0-9_]*)\b/) { print "$1\n" }
   '
 }
 

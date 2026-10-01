@@ -78,20 +78,93 @@ if [ "$name" = "NoUsage" ]; then ok "NoUsage parsed"; else bad "NoUsage parsed �
 name="$(printf '%s\n' "/r/Tests/A.swift:9:9: warning: no 'async' operations occur within 'await' expression [#UnnecessaryEffectMarker]" | warn_diagnostic_name)"
 if [ "$name" = "UnnecessaryEffectMarker" ]; then ok "UnnecessaryEffectMarker parsed"; else bad "UnnecessaryEffectMarker parsed — got '$name'"; fi
 
-# A line with no marker at all must fall back to the fixed-width column rather
-# than silently becoming empty (which the caller would relabel "(unclassified)"
-# and then let through the Tests/ branch).
+# A marker-less NoUsage message is classified by its text (Swift 6.1 shape),
+# not by the first word of the sentence — "result" would be meaningless.
 name="$(printf '%s\n' "/r/Sources/A.swift:1:1: warning: result of call to 'x' is unused" | warn_diagnostic_name)"
-if [ "$name" = "result" ]; then
-  ok "marker-less line falls back to the warning: column"
+if [ "$name" = "NoUsage" ]; then
+  ok "marker-less result-of-call -> NoUsage (classified by text)"
 else
-  bad "marker-less line falls back to the warning: column — got '$name'"
+  bad "marker-less result-of-call -> got '$name', want 'NoUsage'"
 fi
 
 # A totally unparseable line yields nothing, so the caller substitutes its own
-# placeholder. Must not print garbage.
+# placeholder. This is a safety property: arbitrary text must NEVER be turned
+# into a diagnostic name, or a stray line could collide with an allowlist entry.
 name="$(printf '%s\n' "not a diagnostic line at all" | warn_diagnostic_name)"
 if [ -z "$name" ]; then ok "unparseable line yields empty (caller supplies placeholder)"; else bad "unparseable line yields empty — got '$name'"; fi
+
+# Same property with a file:line:col prefix but no "warning:" marker.
+name="$(printf '%s\n' "/r/Sources/A.swift:1:1: note: something else entirely" | warn_diagnostic_name)"
+if [ -z "$name" ]; then ok "non-warning diagnostic line yields empty"; else bad "non-warning diagnostic line yields empty — got '$name'"; fi
+
+# ---------------------------------------------------------------------------
+echo "== Swift 6.1 form: no [#Name] marker (real CI regression) =="
+#
+# The gate shipped broken a SECOND time because every fixture above carried the
+# `[#Name]` marker that Swift 6.2+ appends. CI runs Swift 6.1.2, which appends
+# nothing, so all three real warnings parsed as (unclassified) and the gate
+# reported its own allowlisted entries as violations again.
+#
+# These strings are copied verbatim from the failing CI run (run 36893921673),
+# so the parser is pinned against bytes the compiler actually produced rather
+# than against what this machine's newer toolchain produces.
+
+name="$(printf '%s\n' "/Users/runner/work/lagoon-email/lagoon-email/Sources/LagoonAI/ProviderHTTP.swift:53:17: warning: 'kCFStreamPropertyHTTPSProxyHost' was deprecated in macOS 10.11: Use NSURLSession API for http requests" | warn_diagnostic_name)"
+if [ "$name" = "DeprecatedDeclaration" ]; then
+  ok "Swift 6.1 deprecation (no marker) -> DeprecatedDeclaration"
+else
+  bad "Swift 6.1 deprecation (no marker) -> got '$name', want 'DeprecatedDeclaration'"
+fi
+
+name="$(printf '%s\n' "/Users/runner/work/lagoon-email/lagoon-email/Sources/LagoonServer/Networking/NIOSSLStreamTransport.swift:98:48: warning: 'inbound' is deprecated: Use the executeThenClose scoped method instead." | warn_diagnostic_name)"
+if [ "$name" = "DeprecatedDeclaration" ]; then
+  ok "Swift 6.1 is-deprecated form -> DeprecatedDeclaration"
+else
+  bad "Swift 6.1 is-deprecated form -> got '$name', want 'DeprecatedDeclaration'"
+fi
+
+# The two classes the Tests/ pass gates on, in their 6.1 (marker-less) shape.
+name="$(printf '%s\n' "/r/Tests/A.swift:1:16: warning: initialization of immutable value 'unused' was never used; consider replacing with assignment to '_' or removing it" | warn_diagnostic_name)"
+if [ "$name" = "NoUsage" ]; then
+  ok "Swift 6.1 NoUsage (no marker) -> NoUsage"
+else
+  bad "Swift 6.1 NoUsage (no marker) -> got '$name', want 'NoUsage'"
+fi
+
+name="$(printf '%s\n' "/r/Tests/A.swift:1:18: warning: no 'async' operations occur within 'await' expression" | warn_diagnostic_name)"
+if [ "$name" = "UnnecessaryEffectMarker" ]; then
+  ok "Swift 6.1 UnnecessaryEffectMarker (no marker) -> UnnecessaryEffectMarker"
+else
+  bad "Swift 6.1 UnnecessaryEffectMarker (no marker) -> got '$name', want 'UnnecessaryEffectMarker'"
+fi
+
+# End-to-end: the exact three warnings from the failing CI log must be
+# allowlisted, i.e. the run that was red must now be green.
+cat > "$tmp/ci_6_1.log" <<LOG
+$repo_root/Sources/LagoonAI/ProviderHTTP.swift:53:17: warning: 'kCFStreamPropertyHTTPSProxyHost' was deprecated in macOS 10.11: Use NSURLSession API for http requests
+$repo_root/Sources/LagoonAI/ProviderHTTP.swift:54:17: warning: 'kCFStreamPropertyHTTPSProxyPort' was deprecated in macOS 10.11: Use NSURLSession API for http requests
+$repo_root/Sources/LagoonServer/Networking/NIOSSLStreamTransport.swift:98:48: warning: 'inbound' is deprecated: Use the executeThenClose scoped method instead.
+LOG
+rc=0
+run_warn_gate "$tmp/ci_6_1.log" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "the exact CI-failing warning set now passes (regression closed)"
+else
+  bad "the exact CI-failing warning set now passes — got exit $rc"
+fi
+
+# And a NEW unmarked warning must still be caught, so the text classifier does
+# not become a blanket "allow everything without a marker" hole.
+cat > "$tmp/ci_6_1_new.log" <<LOG
+$repo_root/Sources/LagoonServer/Routes/MessageRoutes.swift:9:9: warning: variable 'zzz' was never used
+LOG
+rc=0
+run_warn_gate "$tmp/ci_6_1_new.log" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 1 ]; then
+  ok "new marker-less Sources/ warning still rejected"
+else
+  bad "new marker-less Sources/ warning still rejected — got exit $rc"
+fi
 
 # ---------------------------------------------------------------------------
 echo "== allowlist matching =="
