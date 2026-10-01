@@ -17,17 +17,39 @@ public enum ProviderHTTP {
            let parsed = URL(string: raw.trimmingCharacters(in: .whitespaces)),
            let host = parsed.host,
            let port = parsed.port {
-            // Both key families are required and both are deprecated.
-            // `kCFNetworkProxies*` is the documented NSURLSession spelling;
-            // the `kCFStreamPropertyHTTPSProxy*` pair is what actually takes
-            // effect for https:// on Apple platforms, and dropping it
-            // silently sends LLM traffic straight past the user's proxy
-            // (Clash here). Kept on purpose — see scripts/warn-gate.sh,
-            // which allowlists exactly these two.
+            // The previous comment here claimed the `kCFStreamPropertyHTTPSProxy*`
+            // pair was "what actually takes effect for https://", and that
+            // dropping it would silently route LLM traffic past the user's proxy.
+            // Measured on macOS 27 / Swift 6.4, that claim is false. Probing
+            // CFNetwork with a proxy address that is NOT in the system
+            // ExceptionsList (a loopback proxy cannot measure this — see below):
+            //
+            //   kCFNetworkProxiesHTTPSEnable/Proxy/Port   honoured
+            //   kCFStreamPropertyHTTPSProxyHost/Port       honoured
+            //   both families together (this dictionary)    honoured
+            //   empty dictionary                           ignored (system config)
+            //
+            // So `kCFNetworkProxiesHTTPS*` is the documented, non-deprecated
+            // spelling and behaves identically; the deprecated pair is redundant
+            // belt-and-braces, kept only so an SDK regression in the documented
+            // keys cannot silently bypass the proxy. It is allowlisted in
+            // scripts/warn-gate.sh.
+            //
+            // Measurement note, because this is easy to get wrong: testing
+            // against a proxy on 127.0.0.1 (the usual local Clash/Surge setup)
+            // produces a FALSE NEGATIVE. `scutil --proxy` lists 127.0.0.1 in
+            // ExceptionsList, so CFNetwork bypasses the configured proxy for
+            // loopback destinations and the system config answers instead — a
+            // kCFNetworkProxiesHTTPS* probe returns kCFErrorDomainCFNetwork/310
+            // while an empty dictionary succeeds. That inverted result is what
+            // makes the deprecated pair look uniquely necessary.
             cfg.connectionProxyDictionary = [
                 kCFNetworkProxiesHTTPEnable as String: true,
                 kCFNetworkProxiesHTTPProxy as String: host,
                 kCFNetworkProxiesHTTPPort as String: port,
+                kCFNetworkProxiesHTTPSEnable as String: true,
+                kCFNetworkProxiesHTTPSProxy as String: host,
+                kCFNetworkProxiesHTTPSPort as String: port,
                 kCFStreamPropertyHTTPSProxyHost as String: host,
                 kCFStreamPropertyHTTPSProxyPort as String: port
             ]

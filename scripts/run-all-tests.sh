@@ -13,6 +13,13 @@ bash scripts/lint-no-silent-catch.sh
 
 echo "== Guardrail self-tests =="
 bash scripts/test-guardrails.sh
+# The warning gate shipped permanently red because its diagnostic parser only
+# recognised swiftc's OSC-8 colour form while the gate itself builds with
+# -no-color-diagnostics. It has no fixture of its own, so nothing noticed for a
+# day. Its self-test is cheap (no swift build) and must run BEFORE the gate, so
+# a parser regression fails here with a clear cause instead of surfacing later
+# as three mysterious "unapproved warning(s)".
+bash scripts/test-warn-gate.sh
 
 # Before the tests, not after: on 2026-09-29 three live defects were found
 # living inside warnings this suite had been discarding — an unsubscribe body
