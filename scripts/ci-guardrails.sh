@@ -30,7 +30,7 @@ SECRET_RULES=(
 #   (b) a multi-line """SELECT ... \(x)"""  /  raw #"SELECT ... \#(x)"#
 #   (c) a concatenation  "SELECT " + "\(x)"  /  "SELECT " + x  /  x + "SELECT "
 #
-# The old single-line rg regex only matched (a) on one physical line and missed
+# The old single-line grep regex only matched (a) on one physical line and missed
 # the multi-line style that dominates this repo. This scanner tokenizes Swift
 # string literals (skipping // and /* */ comments) so literal length/newlines
 # do not matter, then checks concatenation chains joined by `+`. Bare `+`
@@ -173,20 +173,78 @@ PERL
 # Rule 2: secret-shaped values in tracked files.
 # Prints `rule=<label>` + `file:line:<redacted line>`; never the full secret.
 # Returns: 0 = hits, 1 = clean.
+# Engine note: this used to shell out to ripgrep. `rg` is NOT a baseline tool --
+# stock macOS and the macos-15 GitHub runner do not ship it -- so the whole
+# guardrail refused to run in CI and `run-all-tests.sh` died on its first step.
+# Every test in the suite was blocked by a scanner that only existed on the
+# author's machine. Perl is the right engine here: it is already the parser for
+# rule 1, and it is present on every macOS install and every GitHub runner.
+#
+# Output format matches the previous `rg -n` shape exactly (`file:line:redacted`)
+# so the fixtures in scripts/test-guardrails.sh keep pinning the same contract.
 secret_hits_for_files() {
   [ "$#" -gt 0 ] || return 1
   local found=0 rule label pattern repl out
   for rule in "${SECRET_RULES[@]}"; do
     IFS='|' read -r label pattern repl <<<"$rule"
-    out="$(printf '%s\0' "$@" \
-      | xargs -0 rg -n --with-filename --no-heading --no-ignore --text --pcre2 \
-          -e "$pattern" -r "$repl" 2>/dev/null || true)"
+    out="$(perl -e '
+      use strict; use warnings;
+      my ($pattern, $repl) = (shift, shift);
+      my $safe = $repl;
+      $safe =~ s/\\/\\\\/g; $safe =~ s/\$/\\\$/g; $safe =~ s/\@/\\\@/g;
+      my $re = qr/$pattern/;
+      for my $file (@ARGV) {
+        open my $fh, "<", $file or next;
+        binmode $fh;
+        my $no = 0;
+        while (my $line = <$fh>) {
+          $no++;
+          chomp $line;
+          next unless $line =~ /$re/;
+          (my $o = $line) =~ s/$re/$safe/g;
+          print "$file:$no:$o\n";
+        }
+        close $fh;
+      }
+    ' -- "$pattern" "$repl" "$@" 2>/dev/null || true)"
     if [ -n "$out" ]; then
       printf 'rule=%s\n%s\n' "$label" "$out"
       found=1
     fi
   done
   [ "$found" -eq 1 ]
+}
+
+# ---------------------------------------------------------------------------
+# Rule 3: raw to_vector() outside SQL comments / migration files.
+# Prints `file:line:content` for hits. Returns: 0 = hits, 1 = clean.
+# Same return convention as sql_hits_for_files.
+tovector_hits_for_files() {
+  [ "$#" -gt 0 ] || return 1
+  local out rc
+  out="$(perl -e '
+    use strict; use warnings;
+    my $hit = 0;
+    for my $file (@ARGV) {
+      next if $file =~ /\.sql$/;
+      open my $fh, "<", $file or next;
+      my $no = 0;
+      while (my $line = <$fh>) {
+        $no++;
+        next if $line =~ /^\s*--/;
+        next unless $line =~ /to_vector\(/;
+        print "$file:$no:$line";
+        $hit = 1;
+      }
+      close $fh;
+    }
+    exit($hit ? 1 : 0);
+  ' -- "$@")" && rc=0 || rc=$?
+  case "$rc" in
+    0) return 1 ;;                                    # clean
+    1) printf '%s\n' "$out"; return 0 ;;              # hits
+    *) echo "guardrail: to_vector scanner failed (rc=$rc)" >&2; return 2 ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -207,18 +265,23 @@ run_all_checks() {
   local fail=0
   local f hits rc
 
-  if ! command -v rg >/dev/null 2>&1; then
-    echo "FAIL: ripgrep (rg) is required for guardrails" >&2
+  if ! command -v perl >/dev/null 2>&1; then
+    echo "FAIL: perl is required for guardrails (baseline on macOS and GitHub runners)" >&2
     return 1
   fi
 
   # Rule 1 ------------------------------------------------------------------
+  # One filesystem walk feeds rules 1 and 3, and `find` keeps this free of the
+  # non-baseline tools that made the guardrail unrunnable in CI.
   local sql_files=()
+  local -a all_files=()
   while IFS= read -r f; do
-    if [ "${f##*/}" != "SQLBuilder.swift" ]; then
-      sql_files+=("$f")
-    fi
-  done < <(rg --files Sources Tests -g '*.swift' 2>/dev/null || true)
+    all_files+=("$f")
+    case "${f##*/}" in
+      SQLBuilder.swift) ;;
+      *.swift) sql_files+=("$f") ;;
+    esac
+  done < <(find Sources Tests -type f 2>/dev/null | sort)
 
   hits="$(sql_hits_for_files "${sql_files[@]}")" && rc=0 || rc=$?
   case "$rc" in
@@ -249,15 +312,23 @@ run_all_checks() {
   # Rule 3: raw to_vector() concatenation outside SQL comments / migrations.
   # Migration .sql files are schema definitions, not query building, and are
   # allowed to call CREATE EXTENSION / define vector columns.
-  if rg -n --pcre2 'to_vector\(' Sources Tests 2>/dev/null \
-     | rg -v '\.sql:' \
-     | rg -v '^\s*--' > /tmp/lagoon-tovector.txt; then
-    if [ -s /tmp/lagoon-tovector.txt ]; then
+  #
+  # NOTE: this rule is currently dead code. `to_vector()` and the whole
+  # Postgres/pgvector arm were removed in the V3 embedded-SQLite rebuild, and
+  # there is not a single .sql file left in the tree. It is kept (and kept
+  # runnable) only so this change stays behaviour-preserving; deleting it is a
+  # separate call for the maintainer.
+  local tovector_hits
+  tovector_hits="$(tovector_hits_for_files "${all_files[@]}")" && rc=0 || rc=$?
+  case "$rc" in
+    0)
       echo "FAIL: raw to_vector() call found; use \$1::vector binding" >&2
-      cat /tmp/lagoon-tovector.txt >&2
+      printf '%s\n' "$tovector_hits" >&2
       fail=1
-    fi
-  fi
+      ;;
+    1) ;;
+    *) fail=1 ;;
+  esac
 
   # Rule 4: no tracked .env with secrets, at any depth (allows .env.example).
   local env_hits=""
