@@ -8,6 +8,23 @@ import CoreFoundation
 /// and never follow a redirect (a redirect could hand the provider API key to
 /// an unlisted host).
 public enum ProviderHTTP {
+    /// The `connectionProxyDictionary` for an explicit http+https proxy.
+    ///
+    /// Extracted from `makeSession()` so it can be unit-tested: a duplicate key
+    /// here is a launch-time crash (see the note at the call site), and the
+    /// only way to catch that in a test is to build the dictionary the same way
+    /// production does — a literal — and assert its contents.
+    static func proxyDictionary(host: String, port: Int) -> [String: Any] {
+        [
+            kCFNetworkProxiesHTTPEnable as String: true,
+            kCFNetworkProxiesHTTPProxy as String: host,
+            kCFNetworkProxiesHTTPPort as String: port,
+            kCFNetworkProxiesHTTPSEnable as String: true,
+            kCFNetworkProxiesHTTPSProxy as String: host,
+            kCFNetworkProxiesHTTPSPort as String: port,
+        ]
+    }
+
     public static func makeSession() -> URLSession {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 60
@@ -17,42 +34,28 @@ public enum ProviderHTTP {
            let parsed = URL(string: raw.trimmingCharacters(in: .whitespaces)),
            let host = parsed.host,
            let port = parsed.port {
-            // The previous comment here claimed the `kCFStreamPropertyHTTPSProxy*`
-            // pair was "what actually takes effect for https://", and that
-            // dropping it would silently route LLM traffic past the user's proxy.
-            // Measured on macOS 27 / Swift 6.4, that claim is false. Probing
-            // CFNetwork with a proxy address that is NOT in the system
-            // ExceptionsList (a loopback proxy cannot measure this — see below):
+            // LLM traffic is https, so the keys that matter are the HTTPS ones.
+            // Use the documented `kCFNetworkProxiesHTTPS*` spelling.
             //
-            //   kCFNetworkProxiesHTTPSEnable/Proxy/Port   honoured
-            //   kCFStreamPropertyHTTPSProxyHost/Port       honoured
-            //   both families together (this dictionary)    honoured
-            //   empty dictionary                           ignored (system config)
-            //
-            // So `kCFNetworkProxiesHTTPS*` is the documented, non-deprecated
-            // spelling and behaves identically; the deprecated pair is redundant
-            // belt-and-braces, kept only so an SDK regression in the documented
-            // keys cannot silently bypass the proxy. It is allowlisted in
-            // scripts/warn-gate.sh.
-            //
-            // Measurement note, because this is easy to get wrong: testing
-            // against a proxy on 127.0.0.1 (the usual local Clash/Surge setup)
-            // produces a FALSE NEGATIVE. `scutil --proxy` lists 127.0.0.1 in
-            // ExceptionsList, so CFNetwork bypasses the configured proxy for
-            // loopback destinations and the system config answers instead — a
-            // kCFNetworkProxiesHTTPS* probe returns kCFErrorDomainCFNetwork/310
-            // while an empty dictionary succeeds. That inverted result is what
-            // makes the deprecated pair look uniquely necessary.
-            cfg.connectionProxyDictionary = [
-                kCFNetworkProxiesHTTPEnable as String: true,
-                kCFNetworkProxiesHTTPProxy as String: host,
-                kCFNetworkProxiesHTTPPort as String: port,
-                kCFNetworkProxiesHTTPSEnable as String: true,
-                kCFNetworkProxiesHTTPSProxy as String: host,
-                kCFNetworkProxiesHTTPSPort as String: port,
-                kCFStreamPropertyHTTPSProxyHost as String: host,
-                kCFStreamPropertyHTTPSProxyPort as String: port
-            ]
+            // Do NOT also add `kCFStreamPropertyHTTPSProxyHost/Port`. An earlier
+            // revision did, on the theory that the deprecated pair was a second
+            // independent mechanism worth keeping as a fallback. It is not: the
+            // two constant families are the SAME strings —
+            //   kCFNetworkProxiesHTTPSProxy      == "HTTPSProxy"
+            //   kCFStreamPropertyHTTPSProxyHost  == "HTTPSProxy"   (identical)
+            //   kCFNetworkProxiesHTTPSPort       == "HTTPSPort"
+            //   kCFStreamPropertyHTTPSProxyPort  == "HTTPSPort"    (identical)
+            // Listing both put duplicate keys in one dictionary literal, which
+            // is a Swift runtime trap ("Dictionary literal contains duplicate
+            // keys") — the app crashed on launch for anyone with
+            // LAGOON_HTTP_PROXY set, before the server ever started. It slipped
+            // through CI and the whole test suite because no test builds this
+            // dictionary via a literal with a proxy configured; the probe that
+            // "verified" the proxy used per-key assignment (which silently
+            // overwrites instead of trapping), so it exercised a different
+            // construction than production. `proxyDictionary` below is a pure
+            // function precisely so a test can pin it.
+            cfg.connectionProxyDictionary = Self.proxyDictionary(host: host, port: port)
         } else {
             cfg.connectionProxyDictionary = [:]
         }

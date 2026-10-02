@@ -613,3 +613,71 @@ final class AIGatewayTests: XCTestCase {
         XCTAssertFalse(ai.creditExhausted, "a top-up recovers without a restart")
     }
 }
+
+
+/// Regression guard for a launch-time crash: `ProviderHTTP` once built its
+/// proxy dictionary with both `kCFNetworkProxiesHTTPS*` and the deprecated
+/// `kCFStreamPropertyHTTPSProxy*` keys, believing them to be two independent
+/// mechanisms. They are the same strings, so the dictionary literal had
+/// duplicate keys and trapped ("Dictionary literal contains duplicate keys")
+/// on every launch where `LAGOON_HTTP_PROXY` was set. The whole test suite
+/// stayed green because nothing built that literal — the proxy probe used
+/// per-key assignment, which silently overwrites instead of trapping.
+///
+/// These tests build the dictionary the way production does (via the shared
+/// `proxyDictionary`) so a re-introduced duplicate key crashes HERE, in a test,
+/// rather than at app launch.
+final class ProviderHTTPProxyTests: XCTestCase {
+
+    /// The two constant families are literally the same strings. This is the
+    /// root cause, asserted directly so the reason the deprecated keys must not
+    /// be added back is pinned in a test, not only in a comment.
+    func test_deprecatedAndDocumentedProxyKeysAreTheSameStrings() {
+        XCTAssertEqual(kCFNetworkProxiesHTTPSProxy as String, kCFStreamPropertyHTTPSProxyHost as String)
+        XCTAssertEqual(kCFNetworkProxiesHTTPSPort as String, kCFStreamPropertyHTTPSProxyPort as String)
+    }
+
+    /// Building the dictionary must not trap, and must carry exactly the six
+    /// documented keys — one Enable/Proxy/Port triple for http and one for
+    /// https. A duplicate key would crash this call before the assertion runs.
+    func test_proxyDictionary_buildsCleanlyWithExactlySixKeys() {
+        let dict = ProviderHTTP.proxyDictionary(host: "127.0.0.1", port: 7897)
+        XCTAssertEqual(
+            Set(dict.keys),
+            Set([
+                kCFNetworkProxiesHTTPEnable as String,
+                kCFNetworkProxiesHTTPProxy as String,
+                kCFNetworkProxiesHTTPPort as String,
+                kCFNetworkProxiesHTTPSEnable as String,
+                kCFNetworkProxiesHTTPSProxy as String,
+                kCFNetworkProxiesHTTPSPort as String,
+            ]),
+            "exactly the six documented keys, no deprecated duplicates"
+        )
+    }
+
+    /// https is where LLM traffic goes, so the HTTPS proxy must be set to the
+    /// caller's host/port. If this ever regressed, LLM traffic would bypass the
+    /// user's proxy (Clash) and go direct — a privacy failure that is silent.
+    func test_proxyDictionary_setsTheHTTPSProxyToTheCallerHostAndPort() {
+        let dict = ProviderHTTP.proxyDictionary(host: "10.0.0.5", port: 8888)
+        XCTAssertEqual(dict[kCFNetworkProxiesHTTPSProxy as String] as? String, "10.0.0.5")
+        XCTAssertEqual(dict[kCFNetworkProxiesHTTPSPort as String] as? Int, 8888)
+        XCTAssertEqual(dict[kCFNetworkProxiesHTTPSEnable as String] as? Bool, true)
+    }
+
+    /// End-to-end: `makeSession()` reads `LAGOON_HTTP_PROXY` from the process
+    /// environment and must survive building the session without trapping. This
+    /// is the path that crashed at launch; running it in a test means a
+    /// duplicate-key regression fails the suite instead of the app.
+    func test_makeSession_withProxyEnvSet_doesNotTrap() {
+        setenv("LAGOON_HTTP_PROXY", "http://127.0.0.1:7897", 1)
+        defer { unsetenv("LAGOON_HTTP_PROXY") }
+        let session = ProviderHTTP.makeSession()
+        let dict = session.configuration.connectionProxyDictionary
+        XCTAssertEqual(
+            dict?[kCFNetworkProxiesHTTPSProxy as String] as? String, "127.0.0.1",
+            "the session must route https through the configured proxy"
+        )
+    }
+}

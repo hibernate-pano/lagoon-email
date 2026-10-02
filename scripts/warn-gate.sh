@@ -37,7 +37,6 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 # file-path-fragment | diagnostic-name | why it is allowed
 ALLOWED=(
-  'Sources/LagoonAI/ProviderHTTP.swift|DeprecatedDeclaration|kCFStreamPropertyHTTPSProxy*: required for https proxying on Apple platforms, removing it bypasses the user proxy'
   'Sources/LagoonServer/Networking/NIOSSLStreamTransport.swift|DeprecatedDeclaration|NIOAsyncChannel.inbound: executeThenClose cannot express a long-lived transport'
 )
 

@@ -138,19 +138,20 @@ else
   bad "Swift 6.1 UnnecessaryEffectMarker (no marker) -> got '$name', want 'UnnecessaryEffectMarker'"
 fi
 
-# End-to-end: the exact three warnings from the failing CI log must be
-# allowlisted, i.e. the run that was red must now be green.
+# End-to-end: the deprecation CI actually still produces (Swift 6.1 marker-less
+# form) must clear the gate. ProviderHTTP's two deprecations are GONE from this
+# set — round 5 fixed the duplicate-key launch crash by deleting the deprecated
+# kCFStreamPropertyHTTPSProxy* keys at the source, so that file no longer warns
+# and no longer needs an allowlist entry. NIOSSL is the only approved warning.
 cat > "$tmp/ci_6_1.log" <<LOG
-$repo_root/Sources/LagoonAI/ProviderHTTP.swift:53:17: warning: 'kCFStreamPropertyHTTPSProxyHost' was deprecated in macOS 10.11: Use NSURLSession API for http requests
-$repo_root/Sources/LagoonAI/ProviderHTTP.swift:54:17: warning: 'kCFStreamPropertyHTTPSProxyPort' was deprecated in macOS 10.11: Use NSURLSession API for http requests
 $repo_root/Sources/LagoonServer/Networking/NIOSSLStreamTransport.swift:98:48: warning: 'inbound' is deprecated: Use the executeThenClose scoped method instead.
 LOG
 rc=0
 run_warn_gate "$tmp/ci_6_1.log" >/dev/null 2>&1 || rc=$?
 if [ "$rc" -eq 0 ]; then
-  ok "the exact CI-failing warning set now passes (regression closed)"
+  ok "the CI-produced marker-less deprecation clears the gate (6.1 form)"
 else
-  bad "the exact CI-failing warning set now passes — got exit $rc"
+  bad "the CI-produced marker-less deprecation clears the gate — got exit $rc"
 fi
 
 # And a NEW unmarked warning must still be caught, so the text classifier does
@@ -169,22 +170,27 @@ fi
 # ---------------------------------------------------------------------------
 echo "== allowlist matching =="
 
-# The regression itself: the two real, currently-approved warnings must be
-# allowlisted. Before the parser fix BOTH of these failed.
-if warn_is_allowlisted "$repo_root/Sources/LagoonAI/ProviderHTTP.swift" "DeprecatedDeclaration"; then
-  ok "ProviderHTTP deprecation is allowlisted (this failed before the fix)"
-else
-  bad "ProviderHTTP deprecation is allowlisted (this failed before the fix)"
-fi
+# NIOSSLStreamTransport is the one currently-approved warning. (ProviderHTTP
+# used to be a second; round 5 removed its deprecated keys at the source, so it
+# no longer warns and its allowlist entry was deleted — asserted just below.)
 if warn_is_allowlisted "$repo_root/Sources/LagoonServer/Networking/NIOSSLStreamTransport.swift" "DeprecatedDeclaration"; then
   ok "NIOSSLStreamTransport deprecation is allowlisted"
 else
   bad "NIOSSLStreamTransport deprecation is allowlisted"
 fi
+# ProviderHTTP must NOT be allowlisted any more. Its entry existed only for the
+# deprecated kCFStreamPropertyHTTPSProxy* keys, which duplicated the documented
+# HTTPS keys (identical "HTTPSProxy" string) and trapped the app at launch. If
+# this ever reads allowlisted again, someone re-added a key that crashes launch.
+if warn_is_allowlisted "$repo_root/Sources/LagoonAI/ProviderHTTP.swift" "DeprecatedDeclaration"; then
+  bad "ProviderHTTP must NOT be allowlisted (duplicate-key crash was fixed at source)"
+else
+  ok "ProviderHTTP is no longer allowlisted (warning removed at source)"
+fi
 
 # A warning in an allowlisted FILE but a different diagnostic must NOT pass.
 # Otherwise the allowlist becomes a whole-file exemption.
-if warn_is_allowlisted "$repo_root/Sources/LagoonAI/ProviderHTTP.swift" "NoUsage"; then
+if warn_is_allowlisted "$repo_root/Sources/LagoonServer/Networking/NIOSSLStreamTransport.swift" "NoUsage"; then
   bad "same file + different diagnostic still rejected"
 else
   ok "same file + different diagnostic still rejected"
@@ -200,10 +206,8 @@ fi
 # ---------------------------------------------------------------------------
 echo "== gate verdicts (synthetic build log) =="
 
-# Only the two allowlisted warnings → clean, exit 0.
+# The single allowlisted warning, in the Swift 6.4 marker form → clean, exit 0.
 cat > "$tmp/clean.log" <<LOG
-$repo_root/Sources/LagoonAI/ProviderHTTP.swift:31:17: warning: 'kCFStreamPropertyHTTPSProxyHost' was deprecated in macOS 10.11: Use NSURLSession API for http requests [#DeprecatedDeclaration]
-$repo_root/Sources/LagoonAI/ProviderHTTP.swift:32:17: warning: 'kCFStreamPropertyHTTPSProxyPort' was deprecated in macOS 10.11: Use NSURLSession API for http requests [#DeprecatedDeclaration]
 $repo_root/Sources/LagoonServer/Networking/NIOSSLStreamTransport.swift:98:48: warning: 'inbound' is deprecated: Use the executeThenClose scoped method instead. [#DeprecatedDeclaration]
 LOG
 rc=0
