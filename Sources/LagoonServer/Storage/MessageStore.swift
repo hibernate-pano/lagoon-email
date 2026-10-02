@@ -315,34 +315,24 @@ public enum MessageStore {
         isRead: Bool,
         db: LagoonDB
     ) async throws {
-        _ = try await setReadCapturing(
-            remoteId: remoteId, accountId: accountId, isRead: isRead, db: db
-        )
-    }
-
-    /// Same write, but returns the value it replaced (nil when the row does
-    /// not exist, in which case the UPDATE matched nothing).
-    ///
-    /// Undoing a read-state change has to restore the *previous* value, not
-    /// always flip to unread: marking a read mail as unread is a first-class
-    /// action in this app, and its inverse is "read again". The read route
-    /// needs the old value inside the same transaction as the audit row, so
-    /// this is the sync core and `setRead` is the convenience wrapper.
-    public static func setReadCapturing(
-        remoteId: String,
-        accountId: UUID,
-        isRead: Bool,
-        db: LagoonDB
-    ) async throws -> Bool? {
         try db.write {
-            try setReadSync(
+            _ = try setReadSync(
                 remoteId: remoteId, accountId: accountId, isRead: isRead, db: $0
             )
         }
     }
 
     /// Sync core for callers inside a transaction (the read route composes the
-    /// flag flip with the audit insert in one `pool.write` closure).
+    /// flag flip with the audit insert in one `pool.write` closure). Returns
+    /// the value it replaced — nil when the row does not exist, in which case
+    /// the UPDATE matched nothing.
+    ///
+    /// The previous value matters because undoing a read-state change has to
+    /// restore *that*, not always flip to unread: marking a read mail as
+    /// unread is a first-class action here, and its inverse is "read again".
+    /// The read route reads it inside the same transaction as the audit row so
+    /// the row's `previousIsRead` payload can never disagree with what was
+    /// actually overwritten.
     public static func setReadSync(
         remoteId: String,
         accountId: UUID,
