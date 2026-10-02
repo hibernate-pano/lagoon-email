@@ -281,12 +281,7 @@ final class HTMLMessageViewTests: XCTestCase {
         """
         await webView.loadHTMLString(html, baseURL: nil)
 
-        var result: String?
-        let deadline = Date().addingTimeInterval(10)
-        while result == nil, Date() < deadline {
-            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
-            result = try? await webView.evaluateJavaScript("window.__lagoonResult ?? null") as? String
-        }
+        let result = await Self.awaitPixelVerdict(of: webView)
         XCTAssertEqual(
             result, "blocked",
             "a remote image loaded; opening a message is acting as a read receipt"
@@ -328,12 +323,7 @@ final class HTMLMessageViewTests: XCTestCase {
         """
         await webView.loadHTMLString(html, baseURL: nil)
 
-        var result: String?
-        let deadline = Date().addingTimeInterval(10)
-        while result == nil, Date() < deadline {
-            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
-            result = try? await webView.evaluateJavaScript("window.__lagoonResult ?? null") as? String
-        }
+        let result = await Self.awaitPixelVerdict(of: webView)
         XCTAssertEqual(
             result, "blocked",
             "adding the rule list after the WKWebView exists does not block subresources; "
@@ -684,6 +674,37 @@ final class HTMLMessageViewTests: XCTestCase {
             if await check() { return }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
+    }
+
+    /// Polls the tracking-pixel harness until it reaches a *terminal* verdict.
+    ///
+    /// Both remote-content tests used to loop on `while result == nil`. The
+    /// page script seeds the variable with `"pending"`, which is not nil, so
+    /// the loop exited on the first successful read and the test then asserted
+    /// `"pending" == "blocked"` — a failure whenever the script had run but the
+    /// image's error event had not fired yet. Whether that window is hit
+    /// depends on the WebKit process's scheduling, so it passed for the wrong
+    /// reason on a fast machine and would fail under preemption.
+    ///
+    /// These two tests are the guard on "opening a message is not a read
+    /// receipt", so a false red here is expensive: it invites someone to relax
+    /// an assertion that is protecting the user's privacy.
+    ///
+    /// Returns the terminal value, or the last thing read (usually "pending")
+    /// if the 10s ceiling is reached — the caller asserts on it either way, so
+    /// a timeout still fails with the value that was actually observed.
+    @MainActor
+    private static func awaitPixelVerdict(of webView: WKWebView) async -> String? {
+        let deadline = Date().addingTimeInterval(10)
+        var last: String?
+        while Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
+            if let value = try? await webView.evaluateJavaScript("window.__lagoonResult ?? null") as? String {
+                last = value
+                if value == "blocked" || value == "loaded" { return value }
+            }
+        }
+        return last
     }
 
     /// `document.readyState` — "the load has committed", i.e. the DOM the
