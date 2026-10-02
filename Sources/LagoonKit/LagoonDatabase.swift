@@ -30,6 +30,8 @@ public enum LagoonDatabase {
     /// Drops the whitelist auto-archive table. Advisory-only constitution §2
     /// rule 5: no rule may execute on its own, so the table has no reader left.
     public static let advisoryOnlyVersion = "lagoon-v3"
+    /// Adds the read-only advice store (constitution §3).
+    public static let adviceVersion = "lagoon-v4"
 
     public static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
@@ -43,6 +45,9 @@ public enum LagoonDatabase {
         }
         migrator.registerMigration(advisoryOnlyVersion) { db in
             try db.execute(sql: Self.advisoryOnlyReconciliation)
+        }
+        migrator.registerMigration(adviceVersion) { db in
+            try db.execute(sql: Self.adviceReconciliation)
         }
         return migrator
     }
@@ -88,6 +93,34 @@ public enum LagoonDatabase {
     /// on the same path.
     static let advisoryOnlyReconciliation = """
         DROP TABLE IF EXISTS auto_archive_rules;
+    """
+
+    /// Adds the advice table to an already-migrated install. `IF NOT EXISTS`
+    /// keeps a fresh install — whose `lagoon-v1` body already creates it — on
+    /// the same path, exactly as `indexReconciliation` does for indexes.
+    static let adviceReconciliation = """
+        CREATE TABLE IF NOT EXISTS advice (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            remote_id  TEXT NOT NULL,
+            action     TEXT NOT NULL,
+            category   TEXT,
+            confidence TEXT NOT NULL DEFAULT 'medium',
+            rationale  TEXT,
+            due_text   TEXT,
+            source     TEXT NOT NULL DEFAULT 'heuristic',
+            model      TEXT,
+            decision   TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+            decided_at TEXT,
+            UNIQUE (account_id, remote_id),
+            FOREIGN KEY (account_id, remote_id)
+                REFERENCES message_headers(account_id, remote_id)
+                ON DELETE CASCADE
+        );
+        -- statement
+        CREATE INDEX IF NOT EXISTS advice_queue_idx
+            ON advice (account_id, decision, created_at DESC);
     """
 
     /// Opens (creating if needed) and migrates the database at `path`.
@@ -275,5 +308,33 @@ public enum LagoonDatabase {
         );
         -- statement
         CREATE INDEX stack_rules_account_idx ON stack_rules (account_id);
-        """
+        -- statement
+        -- Read-only advice (constitution §3). One row per message, upserted as
+        -- the classifier re-evaluates. Deliberately NOT part of `ai_actions`:
+        -- a suggestion is not an action, and mixing them would put rows the
+        -- user never acted on into the undo history.
+        CREATE TABLE advice (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            remote_id  TEXT NOT NULL,
+            action     TEXT NOT NULL,
+            category   TEXT,
+            confidence TEXT NOT NULL DEFAULT 'medium',
+            rationale  TEXT,
+            due_text   TEXT,
+            source     TEXT NOT NULL DEFAULT 'heuristic',
+            model      TEXT,
+            decision   TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+            decided_at TEXT,
+            UNIQUE (account_id, remote_id),
+            FOREIGN KEY (account_id, remote_id)
+                REFERENCES message_headers(account_id, remote_id)
+                ON DELETE CASCADE
+        );
+        -- statement
+        -- The decision queue: pending rows, newest first, per account.
+        CREATE INDEX advice_queue_idx
+            ON advice (account_id, decision, created_at DESC);
+    """
 }

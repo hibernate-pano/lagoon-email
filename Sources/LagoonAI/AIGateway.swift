@@ -67,11 +67,23 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
     /// Conservative upper bound for completion tokens used in pre-call cost
     /// estimation. The actual value is recorded after the call; this only
     /// prevents an obviously-too-large call from crossing the cap.
-    private static let estimatedCompletionTokens = 1_500
+    private static let estimatedCompletionTokens = 2_000
     /// A single 50-message response can exceed the provider's 4k completion
-    /// cap and arrive as truncated, unparseable text. Twelve keeps each strict
-    /// JSON answer comfortably below that ceiling.
-    private static let classificationBatchSize = 12
+    /// cap and arrive as truncated, unparseable text — and a reasoning model
+    /// spends completion tokens on its thinking, not just its answer, which is
+    /// why the ceiling binds far earlier than the JSON alone suggests.
+    ///
+    /// Halved from 12 when advice joined the same call: an entry went from
+    /// `{"m0":"needsReply"}` to an object carrying a rationale sentence in the
+    /// user's language, so the per-item completion grew by roughly an order of
+    /// magnitude. Extra round trips are cheap; a truncated answer costs the
+    /// whole batch.
+    private static let classificationBatchSize = 6
+    /// The model is told to keep a rationale to one sentence, but a length cap
+    /// is what makes that enforceable. The rationale is display text shown in a
+    /// feed row — a paragraph there is a layout bug, and an unbounded field is
+    /// a way to blow the completion budget.
+    private static let maxRationaleCharacters = 240
 
     /// Rough English token estimate: ~4 chars per token.
     private static func estimatePromptTokens(_ text: String) -> Int {
@@ -140,15 +152,16 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
         _ messages: [MessageHeader],
         accountEmail: String,
         language: String?
-    ) async throws -> [String: BriefingGroup] {
+    ) async throws -> [String: ClassificationOutcome] {
         guard !messages.isEmpty else { return [:] }
         let provider = provider(for: .classify)
-        var result: [String: BriefingGroup] = [:]
+        var result: [String: ClassificationOutcome] = [:]
 
         for start in stride(from: 0, to: messages.count, by: Self.classificationBatchSize) {
             let end = min(start + Self.classificationBatchSize, messages.count)
             let batch = Array(messages[start..<end])
-            let user = classificationPrompt(for: batch)
+            let languageTag = language.flatMap { $0.isEmpty ? nil : $0 } ?? outputLanguage
+            let user = classificationPrompt(for: batch, language: languageTag)
             try await chargeBudgetPreCheck(
                 capability: .classify,
                 provider: provider,
@@ -156,24 +169,81 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
                 userPrompt: user,
                 accountEmail: accountEmail
             )
-            let (parsed, _) = try await completeJSON(
+            let (parsed, completion) = try await completeJSON(
                 capability: .classify,
                 system: systemPrompt,
                 user: user,
                 accountEmail: accountEmail
             )
+            let batchIds = Set(batch.map(\.remoteId))
             for (id, raw) in parsed {
-                guard let raw = raw as? String,
-                      let group = BriefingGroup(rawValue: raw),
-                      group != .pinned
-                else { continue }
-                result[id] = group
+                // An id the model invented (or echoed from another account's
+                // batch) must never become a row: advice is keyed by remoteId
+                // and a fabricated key would attach one message's advice to
+                // whatever message happens to share it.
+                guard batchIds.contains(id) else { continue }
+                guard let outcome = Self.parseOutcome(raw), outcome.group != .pinned else { continue }
+                // The model name rides along on every outcome from this batch,
+                // so provenance survives into the advice row without a second
+                // lookup at write time.
+                result[id] = ClassificationOutcome(
+                    group: outcome.group,
+                    advice: outcome.advice,
+                    model: completion.model
+                )
             }
         }
         return result
     }
 
-    private func classificationPrompt(for messages: [MessageHeader]) -> String {
+    /// Parses one entry of the model's answer. Tolerates the pre-advice shape
+    /// (`{"id":"group"}`) as well as the object shape, because a model that
+    /// answers a grouped batch with bare strings still has usable groups and
+    /// dropping them would silently degrade the feed. An unparseable *action*
+    /// costs only the advice, never the group.
+    static func parseOutcome(_ raw: Any?) -> ClassificationOutcome? {
+        if let bare = raw as? String {
+            guard let group = BriefingGroup(rawValue: bare) else { return nil }
+            return ClassificationOutcome(group: group)
+        }
+        guard let object = raw as? [String: Any],
+              let groupRaw = object["group"] as? String,
+              let group = BriefingGroup(rawValue: groupRaw)
+        else { return nil }
+
+        guard let actionRaw = object["action"] as? String,
+              let action = AdvisedAction(rawValue: actionRaw)
+        else {
+            return ClassificationOutcome(group: group)
+        }
+        let category = (object["category"] as? String).flatMap(ContentCategory.init(rawValue:))
+        let confidence = (object["confidence"] as? String)
+            .flatMap(AdviceConfidence.init(rawValue:)) ?? .low
+        // A model that omits the rationale still gave a usable verdict; an
+        // empty or oversized one is trimmed rather than stored verbatim.
+        let rationale = (object["rationale"] as? String)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : String($0.prefix(maxRationaleCharacters)) }
+        let dueText = (object["due"] as? String)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : String($0.prefix(120)) }
+
+        return ClassificationOutcome(
+            group: group,
+            advice: Advice(
+                action: action,
+                category: category,
+                confidence: confidence,
+                rationale: rationale,
+                dueText: dueText
+            )
+        )
+    }
+
+    private func classificationPrompt(
+        for messages: [MessageHeader],
+        language: String
+    ) -> String {
         // Only headers/snippet/age — never a body (spec §6.6 rule 5).
         let rows: [[String: Any]] = messages.map { message in
             var row: [String: Any] = [
@@ -186,15 +256,47 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
             if let snippet = message.snippet { row["snippet"] = String(snippet.prefix(200)) }
             return row
         }
-        return """
-            Classify each email into exactly one group.
+        // Kept out of the prompt literal: the SQL guardrail scans for a SQL
+        // keyword adjacent to an interpolation in any literal, and this is
+        // display text spliced with data, not a query.
+        let rowsJSON = jsonString(rows)
+        let languageName = Self.languageName(for: language)
+        // Every interpolated value is bound to a local first, so this literal
+        // holds prose only. It names `delete` (the action vocabulary the model
+        // must choose from) and would otherwise also hold `\(...)`, which the
+        // SQL guardrail reads as an interpolated query — it cannot tell prose
+        // from SQL, and the right fix is to keep the two apart in the source
+        // rather than to loosen a CI rule for one prompt.
+        let prompt = """
+            For each email, choose one group and one suggested action.
             Groups: needsReply (a human is waiting on the user), awaitingReply (the \
             user sent the last message), safeToArchive (already handled / no action), \
             subscriptionNoise (newsletters, notifications, marketing).
-            Reply with STRICT JSON only: {"<id>":"<group>"}. Use the group \
-            identifiers and message ids exactly as given (ASCII, never translated). \
-            Omit any email you are unsure about.
-            Emails: \(jsonString(rows))
+            Actions: reply, wait, archive, delete, unsubscribe, remind, nothing.
+            Categories: personal, work, marketing, spam, notification, transactional, \
+            financial, logistics, newsletter, other.
+            Confidence: high, medium, low.
+            Reply with STRICT JSON only, one object per id:
+            {"<id>":{"group":"<group>","action":"<action>","category":"<category>","confidence":"<confidence>","rationale":"<one sentence>","due":"<date phrase or null>"}}
+            Use the group, action, category, confidence identifiers and the message \
+            ids exactly as given (ASCII, never translated). Omit any email you are \
+            unsure about.
+            The rationale is shown to the user: write it as ONE sentence in at \
+            most 200 characters, stating what the email is and why the action \
+            follows. Never invent a fact, \
+            date, amount or commitment that is not in the email.
+            "due" is null unless the email states a deadline; then quote the \
+            email's own date phrase verbatim, never a date you computed.
+            These are SUGGESTIONS for the user to act on. Nothing you output is \
+            executed. Prefer "archive"/"unsubscribe" over "delete" unless the \
+            email has no residual value, and never suggest "delete" for mail \
+            that looks like a receipt, an invoice or anything financial.
+            """
+        let languageLine = "Write every rationale in \(languageName)."
+        return """
+            \(languageLine)
+            \(prompt)
+            Emails: \(rowsJSON)
             """
     }
 

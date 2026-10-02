@@ -41,10 +41,14 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
         _ messages: [MessageHeader],
         accountEmail: String,
         language: String?
-    ) async throws -> [String: BriefingGroup] {
-        var result: [String: BriefingGroup] = [:]
+    ) async throws -> [String: ClassificationOutcome] {
+        var result: [String: ClassificationOutcome] = [:]
         for message in messages {
-            result[message.remoteId] = group(for: message, accountEmail: accountEmail).group
+            let verdict = group(for: message, accountEmail: accountEmail)
+            result[message.remoteId] = ClassificationOutcome(
+                group: verdict.group,
+                advice: Self.advice(forReason: verdict.reason)
+            )
         }
         return result
     }
@@ -131,5 +135,56 @@ public struct HeuristicBriefingClassifier: BriefingClassifying {
         guard let regex = subscriptionSenderRegex else { return false }
         let range = NSRange(fromAddress.startIndex..., in: fromAddress)
         return regex.firstMatch(in: fromAddress, range: range) != nil
+    }
+
+    // MARK: - Heuristic advice
+
+    /// The advice that follows from a reason code. A pure function of the
+    /// reason: the deterministic classifier sees headers only, so it has no
+    /// basis for a content judgment and must not pretend to one.
+    ///
+    /// Two deliberate limits (advisory-only constitution §2 rule 1):
+    ///
+    /// * **Never `.delete`.** Deciding that mail has no residual value requires
+    ///   reading it. This classifier cannot tell a marketing blast from an
+    ///   invoice, and "delete" is the one suggestion that costs the user
+    ///   something permanent. Only the model, which sees the content, may
+    ///   suggest it.
+    /// * **No prose `rationale`.** The UI already localizes each reason code
+    ///   (`L10n.reasonText`). Writing a sentence here would mean inventing copy
+    ///   in a language this code cannot see, so it returns nil and the UI shows
+    ///   the localized reason instead.
+    ///
+    /// Confidence never reaches `.high`: a header-only rule is a guess about
+    /// intent. Only the two cases backed by hard evidence — "you sent the last
+    /// message" and "Lagoon recorded your reply" — earn `.medium`.
+    static func advice(forReason reason: BriefingReason) -> Advice? {
+        switch reason {
+        case .pinned:
+            // The user pinned this deliberately. Suggesting an action on it
+            // would be second-guessing an explicit decision.
+            return nil
+        case .fromSelf:
+            return Advice(action: .wait, confidence: .medium)
+        case .replied:
+            return Advice(action: .archive, confidence: .medium)
+        case .listUnsubscribe:
+            return Advice(action: .unsubscribe, confidence: .medium)
+        case .subscriptionSender:
+            // A sender address matching a noise pattern is weaker evidence than
+            // an actual List-Unsubscribe header: `notifications@` also sends
+            // things the user may want to keep.
+            return Advice(action: .unsubscribe, confidence: .low)
+        case .readAndOld:
+            // Read and stale says nothing about value. A receipt the user filed
+            // away for tax season looks identical to a stale newsletter here.
+            return Advice(action: .archive, confidence: .low)
+        case .needsReply, .ai, .userOverride, .unclassified:
+            // "needs reply" is the fallback bucket, not a finding: the default
+            // branch lands here when no rule matched, so there is no evidence a
+            // human is waiting. Advising a reply on that basis would put a
+            // suggestion on mail that needs none.
+            return nil
+        }
     }
 }

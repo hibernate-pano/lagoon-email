@@ -155,6 +155,7 @@ public enum LagoonRuntime {
         )
         SearchRoutes.register(on: router, db: db, logger: logger)
         TimeSavedRoutes.register(on: router, db: db, logger: logger)
+        AdviceRoutes.register(on: router, db: db, logger: logger)
         StackRoutes.register(on: router, db: db, logger: logger)
         BudgetRoutes.register(
             on: router,

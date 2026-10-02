@@ -11,9 +11,13 @@ import LagoonKit
 /// Keys include the read flag, so marking a message read re-classifies it (the
 /// group legitimately changes: read + old -> safeToArchive). Entries expire
 /// after `ttl` so long-lived mail is eventually re-evaluated.
+///
+/// Entries carry the whole `ClassificationOutcome`, not just the group: advice
+/// arrives on the same call, and caching only the group would throw away the
+/// half that cost the most tokens to produce.
 public actor BriefingClassificationCache {
     private struct Entry {
-        let group: BriefingGroup?
+        let outcome: ClassificationOutcome?
         let storedAt: Date
     }
 
@@ -33,8 +37,8 @@ public actor BriefingClassificationCache {
     public func cached(
         for messages: [MessageHeader],
         now: Date = Date()
-    ) -> (known: [String: BriefingGroup], pending: [MessageHeader]) {
-        var known: [String: BriefingGroup] = [:]
+    ) -> (known: [String: ClassificationOutcome], pending: [MessageHeader]) {
+        var known: [String: ClassificationOutcome] = [:]
         var pending: [MessageHeader] = []
         for message in messages {
             guard let entry = entries[key(message)], now.timeIntervalSince(entry.storedAt) < ttl
@@ -44,7 +48,7 @@ public actor BriefingClassificationCache {
                 }
                 continue
             }
-            if let group = entry.group { known[message.remoteId] = group }
+            if let outcome = entry.outcome { known[message.remoteId] = outcome }
         }
         return (known, pending)
     }
@@ -52,13 +56,13 @@ public actor BriefingClassificationCache {
     /// Records the classifier's answer for `messages`. Ids the classifier
     /// omitted are stored as "asked, no opinion".
     public func store(
-        _ groups: [String: BriefingGroup],
+        _ outcomes: [String: ClassificationOutcome],
         for messages: [MessageHeader],
         now: Date = Date()
     ) {
         for message in messages {
             let cacheKey = key(message)
-            entries[cacheKey] = Entry(group: groups[message.remoteId], storedAt: now)
+            entries[cacheKey] = Entry(outcome: outcomes[message.remoteId], storedAt: now)
             inFlight.remove(cacheKey)
         }
         if entries.count > limit {

@@ -266,7 +266,10 @@ final class HeuristicBriefingClassifierTests: XCTestCase {
             )
         }
         let groups = try await classifier.classify(messages, accountEmail: accountEmail, language: nil)
-        XCTAssertEqual(groups, withReasons.mapValues(\.group))
+        // Only the group is compared: `classify` additionally carries the
+        // advice half, which `classifyWithReasons` does not return and which
+        // its own tests cover separately.
+        XCTAssertEqual(groups.mapValues(\.group), withReasons.mapValues(\.group))
     }
 
     /// Pins the Signals-based instance path end-to-end (pinned via Signals).

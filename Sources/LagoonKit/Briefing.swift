@@ -212,18 +212,56 @@ public struct MessageSummary: Codable, Equatable, Sendable {
     }
 }
 
-/// Classifies headers into Briefing groups. Implemented by the AI Gateway
+/// One classifier verdict: the feed group plus the read-only advice that goes
+/// with it.
+///
+/// They share a type because they share a cost. The classifier already runs in
+/// the background over the whole feed on every refresh, and asking the model a
+/// second time just to get advice would roughly double prompt tokens against
+/// the user's monthly cap — for the same headers and snippet it had already
+/// read. One call, one answer, two products.
+///
+/// `advice` is optional so a classifier that can group but cannot advise stays
+/// useful: the heuristic classifier produces advice only for the cases its rules
+/// actually cover, and a model that omits the field on one id must not lose that
+/// id's group.
+public struct ClassificationOutcome: Codable, Equatable, Sendable {
+    public let group: BriefingGroup
+    public let advice: Advice?
+    /// The model that produced this answer, or nil for the deterministic
+    /// heuristic. Carried on the outcome rather than looked up at write time so
+    /// provenance cannot be lost: a suggestion that reaches the audit view
+    /// must say which model — or which absence of one — produced it.
+    public let model: String?
+
+    public init(group: BriefingGroup, advice: Advice? = nil, model: String? = nil) {
+        self.group = group
+        self.advice = advice
+        self.model = model
+    }
+
+    /// Group-only outcome, for the many call sites that classify but do not
+    /// advise (the heuristic's non-judging reasons, the grouping-only test
+    /// doubles). Keeps `classify` readable at those sites.
+    public static func group(_ group: BriefingGroup) -> ClassificationOutcome {
+        ClassificationOutcome(group: group)
+    }
+}
+
+/// Classifies headers into Briefing groups and, in the same pass, produces the
+/// read-only advice shown in the decision queue. Implemented by the AI Gateway
 /// (`Sources/LagoonServer/AI`) and, when no LLM is configured, by the
 /// deterministic heuristic classifier in `Sources/LagoonServer/AI/Heuristics.swift`.
 /// Server routes depend only on this protocol.
 public protocol BriefingClassifying: Sendable {
-    /// - Returns: remoteId → group, for the ids the classifier is confident
-    ///   about. Ids it omits keep the heuristic/default grouping.
+    /// - Returns: remoteId → outcome, for the ids the classifier is confident
+    ///   about. Ids it omits keep the heuristic/default grouping and get no
+    ///   advice row.
     func classify(
         _ messages: [MessageHeader],
         accountEmail: String,
         language: String?
-    ) async throws -> [String: BriefingGroup]
+    ) async throws -> [String: ClassificationOutcome]
 }
 
 /// Produces the per-conversation summary + action items. Implemented by the AI

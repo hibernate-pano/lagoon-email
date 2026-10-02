@@ -20,6 +20,16 @@ subset of `MailProvider` that has no write method to call — so "sync cannot
 touch the mailbox" is enforced by the compiler, not by convention. See
 [the constitution](docs/superpowers/specs/2026-10-02-advisory-only-ai-constitution-design.md).
 
+**Advice (`GET /api/advice`).** Alongside each feed group the classifier
+returns a read-only suggestion: action, category (marketing / spam / work / …),
+confidence, and a one-sentence rationale in the reader's language. Grouping and
+advice come from **one** model call — they share the prompt, so asking twice
+would roughly double prompt tokens against the monthly cap for the same input.
+Suggestions land in their own `advice` table, never in `ai_actions`: a suggestion
+is not an action, and the user never acted on it. Recording a verdict
+(`POST /api/advice/{id}/decision`) writes only that table, and a verdict survives
+re-classification — a dismissed suggestion is never pushed back into the queue.
+
 ```
 Lagoon.app（one process）
   ├─ SwiftUI client

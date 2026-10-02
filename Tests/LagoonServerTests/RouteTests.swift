@@ -110,8 +110,10 @@ final class RouteTests: XCTestCase {
             _ messages: [MessageHeader],
             accountEmail: String,
             language: String?
-        ) async throws -> [String: BriefingGroup] {
-            groups
+        ) async throws -> [String: ClassificationOutcome] {
+            // No advice: these tests are about grouping precedence, and a
+            // suggestion row would be a side effect they do not assert on.
+            groups.mapValues { ClassificationOutcome(group: $0) }
         }
     }
 
@@ -120,7 +122,7 @@ final class RouteTests: XCTestCase {
             _ messages: [MessageHeader],
             accountEmail: String,
             language: String?
-        ) async throws -> [String: BriefingGroup] {
+        ) async throws -> [String: ClassificationOutcome] {
             throw RouteTestError.classifierFailed
         }
     }

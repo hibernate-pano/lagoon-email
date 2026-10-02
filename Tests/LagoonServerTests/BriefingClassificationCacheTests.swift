@@ -20,12 +20,14 @@ private final class CountingClassifier: BriefingClassifying, @unchecked Sendable
         _ messages: [MessageHeader],
         accountEmail: String,
         language: String?
-    ) async throws -> [String: BriefingGroup] {
+    ) async throws -> [String: ClassificationOutcome] {
         lock.lock()
         _calls += 1
         _messagesSeen += messages.count
         lock.unlock()
-        return Dictionary(uniqueKeysWithValues: messages.map { ($0.remoteId, .subscriptionNoise) })
+        return Dictionary(uniqueKeysWithValues: messages.map {
+            ($0.remoteId, ClassificationOutcome(group: .subscriptionNoise))
+        })
     }
 }
 
@@ -35,7 +37,7 @@ private struct SilentClassifier: BriefingClassifying {
         _ messages: [MessageHeader],
         accountEmail: String,
         language: String?
-    ) async throws -> [String: BriefingGroup] { [:] }
+    ) async throws -> [String: ClassificationOutcome] { [:] }
 }
 
 final class BriefingClassificationCacheTests: XCTestCase {
@@ -69,10 +71,10 @@ final class BriefingClassificationCacheTests: XCTestCase {
     func test_storedGroups_areServedAndNotAskedAgain() async {
         let cache = BriefingClassificationCache()
         let messages = [header("a"), header("b")]
-        await cache.store(["a": .needsReply], for: messages)
+        await cache.store(["a": .group(.needsReply)], for: messages)
 
         let (known, pending) = await cache.cached(for: messages)
-        XCTAssertEqual(known, ["a": .needsReply])
+        XCTAssertEqual(known, ["a": .group(.needsReply)])
         XCTAssertTrue(pending.isEmpty, "an id the classifier omitted must not be re-asked")
     }
 
@@ -81,7 +83,7 @@ final class BriefingClassificationCacheTests: XCTestCase {
     func test_readStateChange_reclassifies() async {
         let cache = BriefingClassificationCache()
         let unread = header("a", isRead: false)
-        await cache.store(["a": .needsReply], for: [unread])
+        await cache.store(["a": .group(.needsReply)], for: [unread])
 
         let read = header("a", isRead: true)
         let (known, pending) = await cache.cached(for: [read])
@@ -92,10 +94,10 @@ final class BriefingClassificationCacheTests: XCTestCase {
     func test_entriesExpireAfterTTL() async {
         let cache = BriefingClassificationCache(ttl: 60)
         let messages = [header("a")]
-        await cache.store(["a": .pinned], for: messages)
+        await cache.store(["a": .group(.pinned)], for: messages)
 
         let fresh = await cache.cached(for: messages, now: Date())
-        XCTAssertEqual(fresh.known, ["a": .pinned])
+        XCTAssertEqual(fresh.known, ["a": .group(.pinned)])
 
         let stale = await cache.cached(for: messages, now: Date().addingTimeInterval(120))
         XCTAssertTrue(stale.known.isEmpty)

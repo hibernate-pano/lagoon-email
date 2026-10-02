@@ -104,7 +104,8 @@ public enum BriefingRoutes {
                                 language: language
                             )
                             await cache.store(fresh, for: pending)
-                            for (remoteId, group) in fresh { overrides[remoteId] = group }
+                            await persistAdvice(fresh, accountId: accountId, db: db, logger: logger)
+                            for (remoteId, outcome) in fresh { overrides[remoteId] = outcome }
                         } catch {
                             logger.warning("briefing classifier failed; using heuristics", metadata: [
                                 "accountId": .string(accountId.uuidString),
@@ -121,6 +122,12 @@ public enum BriefingRoutes {
                                     language: language
                                 )
                                 await cache.store(fresh, for: pending)
+                                await persistAdvice(
+                                    fresh,
+                                    accountId: accountId,
+                                    db: db,
+                                    logger: logger
+                                )
                             } catch {
                                 await cache.clearInFlight(pending)
                                 logger.warning("briefing background classifier failed", metadata: [
@@ -131,8 +138,8 @@ public enum BriefingRoutes {
                         }
                     }
                 }
-                for (remoteId, group) in overrides where classified[remoteId] != nil {
-                    classified[remoteId] = (group, .ai)
+                for (remoteId, outcome) in overrides where classified[remoteId] != nil {
+                    classified[remoteId] = (outcome.group, .ai)
                 }
             }
 
@@ -155,6 +162,56 @@ public enum BriefingRoutes {
                 )
             }
             return RouteJSON.response(BriefingResponse(items: items))
+        }
+    }
+
+    /// Writes the advice half of a classifier answer.
+    ///
+    /// Separate from the grouping above on purpose, and never allowed to throw:
+    /// a suggestion is a derived, regenerable nicety, while the feed itself is
+    /// the product. A storage failure here must cost the user a queue row, not
+    /// their inbox — so failures are logged and swallowed here, and the next
+    /// classifier pass (the cache TTL is 6 h) writes them again.
+    ///
+    /// Advice with no `action` is not stored: the heuristic returns nil for the
+    /// reasons it cannot judge, and an advice row whose action is "unknown"
+    /// would be a suggestion the UI cannot act on or explain.
+    private static func persistAdvice(
+        _ outcomes: [String: ClassificationOutcome],
+        accountId: UUID,
+        db: LagoonDB,
+        logger: Logger
+    ) async {
+        guard !outcomes.isEmpty else { return }
+        var written = 0
+        var failed = 0
+        for (remoteId, outcome) in outcomes {
+            guard let advice = outcome.advice else { continue }
+            do {
+                // The AI gateway stamps the model on its rows; the heuristic
+                // path leaves it nil. A failure for one message (its header was
+                // reconciled away between classification and this write) must
+                // not abandon the other eleven.
+                if try await AdviceStore.upsert(
+                    accountId: accountId,
+                    remoteId: remoteId,
+                    advice: advice,
+                    source: .ai,
+                    model: outcome.model,
+                    db: db
+                ) != nil {
+                    written += 1
+                }
+            } catch {
+                failed += 1
+            }
+        }
+        if failed > 0 {
+            logger.warning("advice.persistPartial", metadata: [
+                "accountId": .string(accountId.uuidString),
+                "written": .string("\(written)"),
+                "failed": .string("\(failed)"),
+            ])
         }
     }
 }

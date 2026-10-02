@@ -113,6 +113,7 @@ final class SchemaMigrationTests: XCTestCase {
                 LagoonDatabase.currentVersion,
                 LagoonDatabase.indexVersion,
                 LagoonDatabase.advisoryOnlyVersion,
+                LagoonDatabase.adviceVersion,
             ]),
             "every registered migration must be recorded exactly once"
         )

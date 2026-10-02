@@ -188,7 +188,12 @@ final class AdvisoryOnlySyncTests: XCTestCase {
         }
         XCTAssertEqual(
             versions,
-            [LagoonDatabase.currentVersion, LagoonDatabase.indexVersion, LagoonDatabase.advisoryOnlyVersion]
+            [
+                LagoonDatabase.currentVersion,
+                LagoonDatabase.indexVersion,
+                LagoonDatabase.advisoryOnlyVersion,
+                LagoonDatabase.adviceVersion,
+            ]
         )
     }
 

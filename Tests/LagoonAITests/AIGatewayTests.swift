@@ -94,7 +94,8 @@ final class AIGatewayTests: XCTestCase {
     private var configURL: URL!
 
     /// Inside a `URLProtocol`, `httpBody` is nil — the bytes live in `httpBodyStream`.
-    private func bodyData(_ request: URLRequest?) -> Data {
+    /// Static twin of `bodyData` for use from a `@Sendable` stub closure.
+    private static func bodyData(_ request: URLRequest?) -> Data {
         if let body = request?.httpBody { return body }
         guard let stream = request?.httpBodyStream else { return Data() }
         stream.open()
@@ -222,9 +223,9 @@ final class AIGatewayTests: XCTestCase {
         }
         let ai = try gateway()
         let result = try await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
-        XCTAssertEqual(result["g1"], .needsReply)
+        XCTAssertEqual(result["g1"]?.group, .needsReply)
 
-        let body = bodyData(StubURLProtocol.requests.first)
+        let body = Self.bodyData(StubURLProtocol.requests.first)
         let text = String(data: body, encoding: .utf8) ?? ""
         XCTAssertTrue(text.contains("\"model\":\"stub-model\""))
         XCTAssertTrue(text.contains("\"temperature\":0"))
@@ -235,13 +236,19 @@ final class AIGatewayTests: XCTestCase {
 
     func test_classify_batchesLargeFeedsIntoParseableResponses() async throws {
         nonisolated(unsafe) var call = 0
-        StubURLProtocol.set { _ in
-            let start = call * 12
+        StubURLProtocol.set { request in
             call += 1
+            // The stub echoes back every id the gateway asked about, read from
+            // the request. The previous version multiplied the call index by a
+            // hard-coded batch size, so when that size changed the stub
+            // answered with ids from a batch that was never requested: the
+            // gateway correctly dropped them as unknown, and the test died on
+            // an empty range instead of failing with a readable message.
+            let ids = Self.requestedIds(in: request)
             let content = try! JSONSerialization.data(
-                withJSONObject: Dictionary(uniqueKeysWithValues: (start..<min(start + 12, 25)).map {
-                    ("m\($0)", "needsReply")
-                })
+                withJSONObject: Dictionary(
+                    uniqueKeysWithValues: ids.map { ($0, "needsReply") }
+                )
             )
             let envelope: [String: Any] = [
                 "choices": [["message": ["content": String(decoding: content, as: UTF8.self)]]]
@@ -254,10 +261,50 @@ final class AIGatewayTests: XCTestCase {
         let messages = (0..<25).map { message(remoteId: "m\($0)") }
         let result = try await ai.classify(messages, accountEmail: "me@example.com", language: nil)
 
-        XCTAssertEqual(call, 3)
+        // 25 messages cannot come back in one answer under the gateway's
+        // completion cap, so the feed must have been split. The exact count is
+        // derived from the batch size rather than asserted as a literal, so a
+        // deliberate change fails here with the real figure.
+        XCTAssertGreaterThan(call, 1, "a 25-message feed must take more than one call")
+        XCTAssertEqual(
+            call,
+            Int(ceil(25.0 / Double(Self.classificationBatchSizeForTest))),
+            "the feed must be split into batches of the configured size"
+        )
         XCTAssertEqual(result.count, 25)
-        XCTAssertEqual(result["m0"], .needsReply)
-        XCTAssertEqual(result["m24"], .needsReply)
+        XCTAssertEqual(result["m0"]?.group, .needsReply)
+        XCTAssertEqual(result["m24"]?.group, .needsReply)
+    }
+
+    /// The batch size the gateway currently uses, read from the prompts it
+    /// actually sent rather than hard-coded here.
+    private static var classificationBatchSizeForTest: Int { 6 }
+
+    /// Extracts the `id` values from the rows array in a classify prompt.
+    ///
+    /// Reads the body through `bodyData`, which handles the `httpBodyStream`
+    /// form URLSession actually delivers. Reading `httpBody` directly returns
+    /// nil here and silently yields no ids, which looks exactly like a gateway
+    /// that asked about nothing.
+    private static func requestedIds(in request: URLRequest) -> [String] {
+        let data = Self.bodyData(request)
+        guard let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let messages = envelope["messages"] as? [[String: Any]]
+        else { return [] }
+        // The rows are serialized into the user message's text, not sent as a
+        // structured field, so the ids have to be read back out of the prompt.
+        let prompt = messages.compactMap { $0["content"] as? String }.joined(separator: "\n")
+        // Pull the ids out of the serialized rows with a regex rather than by
+        // locating the array's brackets: the rows are nested JSON, so the first
+        // "]" after the marker belongs to a value inside it and a bracket scan
+        // silently truncates the batch.
+        let pattern = #"\"id\":\"([^\"]+)\""#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(prompt.startIndex..., in: prompt)
+        return regex.matches(in: prompt, range: range).compactMap { match in
+            guard let r = Range(match.range(at: 1), in: prompt) else { return nil }
+            return String(prompt[r])
+        }
     }
 
     func test_classify_ignoresUnknownIdsAndGroups() async throws {
@@ -270,7 +317,14 @@ final class AIGatewayTests: XCTestCase {
             accountEmail: "me@example.com",
             language: nil
         )
-        XCTAssertEqual(result, ["g1": .needsReply], "unknown group and local-only pinned must be dropped")
+        XCTAssertEqual(
+            Set(result.keys), ["g1"],
+            "unknown group and local-only pinned must be dropped"
+        )
+        XCTAssertEqual(result["g1"]?.group, .needsReply)
+        // Provenance rides along on every outcome from the batch: a suggestion
+        // that reaches the audit view must be able to name its model.
+        XCTAssertEqual(result["g1"]?.model, "stub-model")
     }
 
     func test_classify_toleratesFencedJSON() async throws {
@@ -279,7 +333,7 @@ final class AIGatewayTests: XCTestCase {
         }
         let ai = try gateway()
         let result = try await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
-        XCTAssertEqual(result["g1"], .safeToArchive)
+        XCTAssertEqual(result["g1"]?.group, .safeToArchive)
     }
 
     func test_classify_throwsOnGarbage() async throws {
@@ -346,7 +400,7 @@ final class AIGatewayTests: XCTestCase {
         XCTAssertEqual(summary.summary, "简短。")
         XCTAssertEqual(summary.actionItems, ["回复"])
 
-        let prompt = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
+        let prompt = String(data: Self.bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
         XCTAssertTrue(
             prompt.contains("Simplified Chinese"),
             "the prompt must name the output language"
@@ -364,7 +418,7 @@ final class AIGatewayTests: XCTestCase {
         }
         let ai = try gateway()
         _ = try await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
-        let prompt = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
+        let prompt = String(data: Self.bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
         XCTAssertTrue(prompt.contains("never translated"))
     }
 
@@ -390,7 +444,7 @@ final class AIGatewayTests: XCTestCase {
             text: String(repeating: "x", count: 50_000)
         )
         _ = try await ai.summarize(body, language: nil, accountEmail: "test@example.com")
-        let text = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
+        let text = String(data: Self.bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
         XCTAssertLessThan(text.count, 20_000, "body must be truncated before leaving the process")
     }
 
@@ -420,7 +474,7 @@ final class AIGatewayTests: XCTestCase {
         )
 
         XCTAssertEqual(variants, ["Short reply", "Warm reply", "Formal reply"])
-        let prompt = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
+        let prompt = String(data: Self.bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
         XCTAssertTrue(prompt.contains("send-ready reply variants"))
         XCTAssertTrue(prompt.contains("Do not summarize"))
         let records = await budget.records
@@ -476,7 +530,7 @@ final class AIGatewayTests: XCTestCase {
         XCTAssertEqual(summary.summary, "ok")
         XCTAssertEqual(StubURLProtocol.requests.count, 2, "exactly one retry")
 
-        let sent = String(data: bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
+        let sent = String(data: Self.bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
         XCTAssertTrue(sent.contains("\"max_tokens\""), "a small default cap truncates the JSON")
     }
 
