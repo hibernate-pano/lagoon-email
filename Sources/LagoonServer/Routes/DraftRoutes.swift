@@ -36,7 +36,7 @@ public enum DraftRoutes {
         }
 
         router.get("api/messages/:remoteId/drafts") { request, context -> Response in
-            return await listHandler(request: request, context: context, db: db)
+            return await listHandler(request: request, context: context, db: db, logger: logger)
         }
     }
 
@@ -187,7 +187,7 @@ public enum DraftRoutes {
     }
 
     private static func listHandler(
-        request: Request, context: BasicRequestContext, db: LagoonDB
+        request: Request, context: BasicRequestContext, db: LagoonDB, logger: Logger
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -199,7 +199,10 @@ public enum DraftRoutes {
             let drafts = try await DraftReplyStore.list(accountId: accountId, remoteId: remoteId, db: db)
             return RouteJSON.response(DraftListResponse(drafts: drafts))
         } catch {
-            return RouteJSON.error(.internalServerError, "internal-error")
+            return RouteJSON.failure(
+                .internalServerError, "internal-error",
+                label: "drafts", logger: logger, failure: error
+            )
         }
     }
 
@@ -233,18 +236,21 @@ public enum DraftRoutes {
     }
 
 
+    /// Delegates to `RouteJSON.failure`; the label is what makes a 500 say
+    /// which domain produced it.
     private static func errorResponse(
         _ status: HTTPResponse.Status, _ code: String, logger: Logger, error: Error
     ) -> Response {
-        logger.error("drafts.error", metadata: ["code": .string(code), "err": .string("\(error)")])
-        return RouteJSON.error(status, code)
+        RouteJSON.failure(status, code, label: "drafts", logger: logger, failure: error)
     }
 }
 
 // MARK: - Search
 
 public enum SearchRoutes {
-    public static func register(on router: Router<BasicRequestContext>, db: LagoonDB) {
+    public static func register(
+        on router: Router<BasicRequestContext>, db: LagoonDB, logger: Logger
+    ) {
         router.get("api/search") { request, _ -> Response in
             guard let accountId = RouteParams.accountId(from: request) else {
                 return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -259,7 +265,10 @@ public enum SearchRoutes {
                 let results = try await search(accountId: accountId, q: q, sender: sender, since: since, db: db)
                 return RouteJSON.response(SearchResponse(results: results, query: q))
             } catch {
-                return RouteJSON.error(.internalServerError, "internal-error")
+                return RouteJSON.failure(
+                    .internalServerError, "internal-error",
+                    label: "search", logger: logger, failure: error
+                )
             }
         }
     }

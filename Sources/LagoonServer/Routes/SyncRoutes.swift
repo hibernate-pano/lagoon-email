@@ -1,20 +1,19 @@
 import Foundation
 import Hummingbird
 import GRDB
-import NIOCore
+import Logging
 import LagoonKit
 
 public enum SyncRoutes {
     public static func register(
         on router: Router<BasicRequestContext>,
         db: LagoonDB,
+        logger: Logger,
         sync: SyncEngine? = nil
     ) {
         router.get("api/messages") { req, _ -> Response in
             // accountId is untrusted input; validated by UUID parsing (spec §6.6 rule 2).
-            guard let raw = req.uri.queryParameters["accountId"].map(String.init),
-                  let uuid = UUID(uuidString: raw)
-            else {
+            guard let uuid = RouteParams.accountId(from: req) else {
                 return RouteJSON.error(.badRequest, "malformed-accountId")
             }
             let limit = max(1, min(Int(req.uri.queryParameters["limit"] ?? "50") ?? 50, 200))
@@ -50,15 +49,17 @@ public enum SyncRoutes {
                 )
                 let cursor = SyncCursor(accountId: uuid, lastFetchedAt: Date(), totalUnread: unread)
                 let payload = SyncResponse(cursor: cursor, messages: msgs, totalCount: total)
-                let enc = JSONEncoder()
-                enc.dateEncodingStrategy = .iso8601
-                let data = try enc.encode(payload)
-                return Response(
-                    status: .ok,
-                    headers: [.contentType: "application/json; charset=utf-8"],
-                    body: .init(byteBuffer: ByteBuffer(data: data))
-                )
+                return RouteJSON.response(payload)
             } catch {
+                // This is the client's hottest path: the list view polls it
+                // every 30s. Without this line a 500 here was completely
+                // invisible — the client showed a generic error and the server
+                // recorded nothing, so there was no way to tell a store failure
+                // from a client bug.
+                logger.error("messages.listFailed", metadata: [
+                    "accountId": .string(uuid.uuidString),
+                    "err": .string("\(error)"),
+                ])
                 return RouteJSON.error(.internalServerError, "internal-error")
             }
         }

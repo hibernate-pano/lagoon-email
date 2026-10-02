@@ -381,7 +381,7 @@ final class BodyStoreTests: XCTestCase {
             )
 
             let router = Router<BasicRequestContext>()
-            SearchRoutes.register(on: router, db: conn)
+            SearchRoutes.register(on: router, db: conn, logger: Logger(label: "body-store-tests"))
             let app = Application(router: router)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601

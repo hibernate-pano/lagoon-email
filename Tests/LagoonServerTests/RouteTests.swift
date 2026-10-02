@@ -305,7 +305,7 @@ final class RouteTests: XCTestCase {
             }
 
             let router = Router()
-            SyncRoutes.register(on: router, db: conn, sync: nil)
+            SyncRoutes.register(on: router, db: conn, logger: Self.testLogger, sync: nil)
             let app = Application(router: router)
             try await app.test(.router) { client in
                 try await client.execute(
@@ -384,7 +384,7 @@ final class RouteTests: XCTestCase {
             }
 
             let router = Router()
-            SyncRoutes.register(on: router, db: conn, sync: nil)
+            SyncRoutes.register(on: router, db: conn, logger: Self.testLogger, sync: nil)
             let app = Application(router: router)
             try await app.test(.router) { client in
                 try await client.execute(
@@ -422,7 +422,7 @@ final class RouteTests: XCTestCase {
             }
 
             let router = Router()
-            SyncRoutes.register(on: router, db: conn, sync: nil)
+            SyncRoutes.register(on: router, db: conn, logger: Self.testLogger, sync: nil)
             let app = Application(router: router)
             try await app.test(.router) { client in
                 try await client.execute(
@@ -458,7 +458,7 @@ final class RouteTests: XCTestCase {
         makeProvider: MailProviderFactory.Builder? = nil
     ) -> Router<BasicRequestContext> {
         let router = Router()
-        SyncRoutes.register(on: router, db: db, sync: nil)
+        SyncRoutes.register(on: router, db: db, logger: Self.testLogger, sync: nil)
         StackRoutes.register(on: router, db: db, logger: Self.testLogger)
         ActionsRoutes.register(
             on: router, db: db,

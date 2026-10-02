@@ -1,6 +1,7 @@
 import Foundation
 import Hummingbird
 import NIOCore
+import Logging
 
 /// Route infrastructure shared by every file in `Routes/`.
 ///
@@ -48,6 +49,32 @@ enum RouteJSON {
             headers: [.contentType: "application/json; charset=utf-8"],
             body: .init(byteBuffer: ByteBuffer(data: data))
         )
+    }
+
+    /// Log a server-side failure and answer with the standard envelope.
+    ///
+    /// `label` is the domain name ("actions", "drafts") so a 500 still says
+    /// which route produced it. This exists because two files carried a
+    /// byte-for-byte identical copy of it, differing only in that string, and
+    /// four more handlers answered 500 with no logging at all — a failed
+    /// request left no trace anywhere, so a store error was indistinguishable
+    /// from a client bug. The silent-catch lint only scans
+    /// Sources/Lagoon/Views/, so nothing caught those.
+    static func failure(
+        _ status: HTTPResponse.Status,
+        _ code: String,
+        label: String,
+        logger: Logger,
+        failure: Error
+    ) -> Response {
+        logger.error("\(label).error", metadata: [
+            "code": .string(code),
+            "err": .string("\(failure)"),
+        ])
+        // Not `error(...)` unqualified: the parameter used to be named `error`,
+        // which shadowed the static method and made this line a call into
+        // `any Error`.
+        return RouteJSON.error(status, code)
     }
 
     static func encode<T: Encodable>(_ value: T) throws -> Data {

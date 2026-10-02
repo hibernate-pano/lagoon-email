@@ -183,7 +183,7 @@ public enum ActionsRoutes {
         ))
     }
 
-    // MARK: - Unsubscribe
+    // MARK: - Delete
 
     /// 删除：远端先移入废纸篓，本地再翻旗标。与归档同一套审计/撤销。
     private static func deleteHandler(
@@ -912,11 +912,12 @@ public enum ActionsRoutes {
 
     // MARK: - Helpers
 
+    /// Delegates to `RouteJSON.failure`; the label is what makes a 500 say
+    /// which domain produced it.
     private static func errorResponse(
         _ status: HTTPResponse.Status, _ code: String, logger: Logger, error: Error
     ) -> Response {
-        logger.error("actions.error", metadata: ["code": .string(code), "err": .string("\(error)")])
-        return RouteJSON.error(status, code)
+        RouteJSON.failure(status, code, label: "actions", logger: logger, failure: error)
     }
 
 

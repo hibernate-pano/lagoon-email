@@ -88,7 +88,10 @@ public enum MessageRoutes {
                 }
                 account = found
             } catch {
-                return RouteJSON.error(.internalServerError, "internal-error")
+                return RouteJSON.failure(
+                    .internalServerError, "internal-error",
+                    label: "messages", logger: logger, failure: error
+                )
             }
             guard let provider = makeProvider(account) else {
                 return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
@@ -118,7 +121,10 @@ public enum MessageRoutes {
                 }
                 account = found
             } catch {
-                return RouteJSON.error(.internalServerError, "internal-error")
+                return RouteJSON.failure(
+                    .internalServerError, "internal-error",
+                    label: "messages", logger: logger, failure: error
+                )
             }
             guard let provider = makeProvider(account) else {
                 return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
@@ -304,8 +310,21 @@ public enum MessageRoutes {
                 ])
                 return RouteJSON.error(.serviceUnavailable, "ai-credit-exhausted")
             } catch let llmError as LLMError where llmError.code == "budget-exceeded" {
+                // Deliberately not logged here: `AIGateway` already records
+                // `llm.budget.preCheckFailed` at error level with the
+                // account and the cap, so a second line would be noise for
+                // an expected, self-explaining state.
                 return RouteJSON.error(.serviceUnavailable, "ai-budget-exceeded")
             } catch let llmError as LLMError where llmError.code == "circuit-open" {
+                // An open breaker means the provider was returning a 5xx
+                // storm. This was the one degradation path that left no
+                // trace anywhere — the client saw "AI unavailable" and the
+                // server recorded nothing about why.
+                logger.warning("summarizer.circuitOpen", metadata: [
+                    "accountId": .string(accountId.uuidString),
+                    "remoteId": .string(remoteId),
+                    "detail": .string(llmError.localizedDescription),
+                ])
                 return RouteJSON.error(.serviceUnavailable, "ai-circuit-open")
             } catch {
                 logger.error("summarizer failed", metadata: [

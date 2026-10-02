@@ -130,7 +130,7 @@ public enum LagoonRuntime {
             on: router, db: db, logger: logger, sync: syncEngine,
             makeProvider: makeProvider, releaseProvider: providerFactory.release
         )
-        SyncRoutes.register(on: router, db: db, sync: syncEngine)
+        SyncRoutes.register(on: router, db: db, logger: logger, sync: syncEngine)
         MessageRoutes.register(
             on: router,
             db: db,
@@ -153,7 +153,7 @@ public enum LagoonRuntime {
             on: router, db: db, draftGenerator: ai,
             logger: logger, makeProvider: makeProvider
         )
-        SearchRoutes.register(on: router, db: db)
+        SearchRoutes.register(on: router, db: db, logger: logger)
         TimeSavedRoutes.register(on: router, db: db, logger: logger)
         AutoArchiveRoutes.register(on: router, db: db, logger: logger)
         StackRoutes.register(on: router, db: db, logger: logger)

@@ -59,12 +59,4 @@ public struct ServerConfig: Sendable {
         if !bound.isEmpty { names.insert(bound) }
         return names
     }
-
-    public static func load() -> ServerConfig {
-        let env = ProcessInfo.processInfo.environment
-        return ServerConfig(
-            host: env["LAGOON_SERVER_HOST"] ?? "127.0.0.1",
-            port: Int(env["LAGOON_SERVER_PORT"] ?? "8080") ?? 8080
-        )
-    }
 }
