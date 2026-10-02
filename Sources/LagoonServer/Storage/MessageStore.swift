@@ -315,13 +315,50 @@ public enum MessageStore {
         isRead: Bool,
         db: LagoonDB
     ) async throws {
-        let sql = """
-            UPDATE message_headers SET is_read = ?
-            WHERE remote_id = ? AND account_id = ?
-        """
+        _ = try await setReadCapturing(
+            remoteId: remoteId, accountId: accountId, isRead: isRead, db: db
+        )
+    }
+
+    /// Same write, but returns the value it replaced (nil when the row does
+    /// not exist, in which case the UPDATE matched nothing).
+    ///
+    /// Undoing a read-state change has to restore the *previous* value, not
+    /// always flip to unread: marking a read mail as unread is a first-class
+    /// action in this app, and its inverse is "read again". The read route
+    /// needs the old value inside the same transaction as the audit row, so
+    /// this is the sync core and `setRead` is the convenience wrapper.
+    public static func setReadCapturing(
+        remoteId: String,
+        accountId: UUID,
+        isRead: Bool,
+        db: LagoonDB
+    ) async throws -> Bool? {
         try db.write {
-            try $0.execute(sql: sql, arguments: [isRead, remoteId, accountId])
+            try setReadSync(
+                remoteId: remoteId, accountId: accountId, isRead: isRead, db: $0
+            )
         }
+    }
+
+    /// Sync core for callers inside a transaction (the read route composes the
+    /// flag flip with the audit insert in one `pool.write` closure).
+    public static func setReadSync(
+        remoteId: String,
+        accountId: UUID,
+        isRead: Bool,
+        db: Database
+    ) throws -> Bool? {
+        let previous: Bool? = try Row.fetchOne(
+            db,
+            sql: "SELECT is_read FROM message_headers WHERE remote_id = ? AND account_id = ?",
+            arguments: [remoteId, accountId]
+        )?["is_read"]
+        try db.execute(
+            sql: "UPDATE message_headers SET is_read = ? WHERE remote_id = ? AND account_id = ?",
+            arguments: [isRead, remoteId, accountId]
+        )
+        return previous
     }
 
     /// Remote ids the user pinned for this account. Pins are local-only and
@@ -361,20 +398,35 @@ public enum MessageStore {
         accountId: UUID,
         db: LagoonDB
     ) async throws {
+        try db.write {
+            try setPinnedSync(
+                pinned, remoteId: remoteId, accountId: accountId, db: $0
+            )
+        }
+    }
+
+    /// Sync core for callers inside a transaction (the pin route composes the
+    /// flip with the audit insert in one `pool.write` closure).
+    public static func setPinnedSync(
+        _ pinned: Bool,
+        remoteId: String,
+        accountId: UUID,
+        db: Database
+    ) throws {
         if pinned {
-            let sql = """
-                INSERT INTO message_pins (account_id, remote_id)
-                VALUES (?, ?)
-                ON CONFLICT (account_id, remote_id) DO NOTHING
-            """
-            try db.write {
-                try $0.execute(sql: sql, arguments: [accountId, remoteId])
-            }
+            try db.execute(
+                sql: """
+                    INSERT INTO message_pins (account_id, remote_id)
+                    VALUES (?, ?)
+                    ON CONFLICT (account_id, remote_id) DO NOTHING
+                    """,
+                arguments: [accountId, remoteId]
+            )
         } else {
-            let sql = "DELETE FROM message_pins WHERE account_id = ? AND remote_id = ?"
-            try db.write {
-                try $0.execute(sql: sql, arguments: [accountId, remoteId])
-            }
+            try db.execute(
+                sql: "DELETE FROM message_pins WHERE account_id = ? AND remote_id = ?",
+                arguments: [accountId, remoteId]
+            )
         }
     }
 

@@ -9,6 +9,16 @@ import LagoonAI
 /// `POST /api/messages/{remoteId}/send` response.
 struct SendResponse: Codable { let ok: Bool; let providerMessageId: String? }
 
+/// Response for the local-state mutations that joined the undo audit log
+/// (read toggle, pin toggle). `actionId` is nil when the caller did not ask
+/// for the change to be recorded — see the `record` parameter on the read
+/// route for why that distinction has to exist.
+struct StateChangeResponse: Codable {
+    let ok: Bool
+    let remoteId: String
+    let actionId: Int64?
+}
+
 /// Message-level M1 endpoints: full body, read state, pinning and AI summary.
 public enum MessageRoutes {
     public static func register(
@@ -178,8 +188,46 @@ public enum MessageRoutes {
                 ])
                 return RouteJSON.error(.internalServerError, "internal-error")
             }
+            // `record=true` marks this as a *deliberate* read/unread toggle
+            // rather than a side effect of opening the message. The two are
+            // indistinguishable on the wire otherwise: the implicit path posts
+            // `isRead=true` and so does an explicit "mark as read", so without
+            // this flag every message the user merely opened would enter the
+            // undo log — and ⌘Z would then undo "you opened this mail", which
+            // is both wrong and noisy enough that the user would stop trusting
+            // undo. Opening a message is not an action to take back.
+            let record = request.uri.queryParameters["record"].map(String.init)
+                .map { ["true", "1", "yes"].contains($0.lowercased()) } ?? false
+
+            let actionId: Int64?
             do {
-                try await MessageStore.setRead(remoteId: remoteId, accountId: accountId, isRead: isRead, db: db)
+                // The previous value and the audit row land in one transaction:
+                // an action whose payload disagrees with the row it describes
+                // would undo to the wrong state.
+                actionId = try db.write { raw -> Int64? in
+                    let previous = try MessageStore.setReadSync(
+                        remoteId: remoteId, accountId: accountId, isRead: isRead, db: raw
+                    )
+                    guard record else { return nil }
+                    // No header row means there is nothing to undo: the UPDATE
+                    // matched nothing, so an audit row would describe a state
+                    // change that never happened and its inverse would silently
+                    // do nothing too.
+                    guard previous != nil else { return nil }
+                    let action = try AIActionStore.recordSync(
+                        accountId: accountId,
+                        kind: .markRead,
+                        payload: [
+                            "remoteId": remoteId,
+                            // Undo restores THIS, not a hardcoded false: marking
+                            // a read mail unread is a real action whose inverse
+                            // is "read again".
+                            "previousIsRead": previous == true ? "true" : "false",
+                        ],
+                        db: raw
+                    )
+                    return action.id
+                }
             } catch {
                 logger.error("markRead failed", metadata: [
                     "accountId": .string(accountId.uuidString),
@@ -198,7 +246,12 @@ public enum MessageRoutes {
                     ])
                 }
             }
-            return Response(status: .noContent)
+            // Unchanged 204 for callers that did not ask for an audit row, so
+            // the implicit "opened a message" path keeps its existing contract.
+            guard record else { return Response(status: .noContent) }
+            return RouteJSON.response(StateChangeResponse(
+                ok: true, remoteId: remoteId, actionId: actionId
+            ))
         }
 
         // POST /api/messages/{remoteId}/pin?accountId=<uuid>&pinned=true|false -> 204
@@ -218,18 +271,31 @@ public enum MessageRoutes {
             case "false": pinned = false
             default: return RouteJSON.error(.badRequest, "malformed-pinned")
             }
+            let actionId: Int64?
             do {
                 // Validate the account first: without this a pin for an unknown
                 // account hit the message_pins FK and surfaced as a 500.
                 guard try await AccountStore.find(byId: accountId, db: db) != nil else {
                     return RouteJSON.error(.notFound, "unknown-account")
                 }
-                try await MessageStore.setPinned(
-                    pinned,
-                    remoteId: remoteId,
-                    accountId: accountId,
-                    db: db
-                )
+                // A pin is always a deliberate user action — unlike mark-read
+                // there is no implicit path that flips it — so it always joins
+                // the undo log. `.pin`/`.unpin` are separate kinds because
+                // reverse() has to know which direction to undo toward; the
+                // flag itself is not enough (unpinning an already-unpinned
+                // message must not "undo" into a pin).
+                actionId = try db.write { raw -> Int64? in
+                    try MessageStore.setPinnedSync(
+                        pinned, remoteId: remoteId, accountId: accountId, db: raw
+                    )
+                    let action = try AIActionStore.recordSync(
+                        accountId: accountId,
+                        kind: pinned ? .pin : .unpin,
+                        payload: ["remoteId": remoteId],
+                        db: raw
+                    )
+                    return action.id
+                }
             } catch {
                 logger.error("setPinned failed", metadata: [
                     "accountId": .string(accountId.uuidString),
@@ -238,7 +304,9 @@ public enum MessageRoutes {
                 ])
                 return RouteJSON.error(.internalServerError, "internal-error")
             }
-            return Response(status: .noContent)
+            return RouteJSON.response(StateChangeResponse(
+                ok: true, remoteId: remoteId, actionId: actionId
+            ))
         }
 
         // GET /api/messages/{remoteId}/summary?accountId=<uuid>

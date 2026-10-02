@@ -101,6 +101,18 @@ public enum ActionsRoutes {
                 makeProvider: makeProvider, logger: logger
             )
         }
+
+        // POST /api/actions/undo-bulk?accountId=  {actionIds: [...]}
+        // One ⌘Z for a bulk operation. "Mark all as read" records one audit
+        // row per message; undoing only the newest would leave the rest in
+        // place and read to the user as "undo did nothing". Per-item results,
+        // partial success reported honestly — same shape as archive-bulk.
+        router.post("api/actions/undo-bulk") { request, _ -> Response in
+            return await undoBulkHandler(
+                request: request, db: db,
+                makeProvider: makeProvider, logger: logger
+            )
+        }
     }
 
     // MARK: - Archive
@@ -734,6 +746,103 @@ public enum ActionsRoutes {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
 
+        switch await undoOne(
+            actionId: actionId, accountId: accountId, account: account,
+            makeProvider: makeProvider, db: db, logger: logger
+        ) {
+        case .undone:
+            return RouteJSON.response(UndoResponse(ok: true, undone: actionId))
+        case .notUndoable:
+            return RouteJSON.error(.badRequest, "not-undoable")
+        case .rejected(let rejection):
+            return rejection.response
+        case .failed(let error):
+            return errorResponse(.internalServerError, "undo-failed", logger: logger, error: error)
+        }
+    }
+
+    private static func undoBulkHandler(
+        request: Request, db: LagoonDB,
+        makeProvider: MailProviderFactory.Builder, logger: Logger
+    ) async -> Response {
+        guard let accountId = RouteParams.accountId(from: request) else {
+            return RouteJSON.error(.badRequest, "malformed-accountId")
+        }
+        let body: Data
+        do { body = try await RouteParams.collectBody(request) } catch {
+            return RouteJSON.error(.badRequest, "missing-body")
+        }
+        let req: UndoBulkRequest
+        do { req = try JSONDecoder().decode(UndoBulkRequest.self, from: body) } catch {
+            return RouteJSON.error(.badRequest, "invalid-body")
+        }
+        // Same ceiling as archive-bulk: one ⌘Z should not be able to make the
+        // server issue unbounded remote calls.
+        let ids = Array(Set(req.actionIds)).prefix(500)
+        guard !ids.isEmpty else {
+            return RouteJSON.error(.badRequest, "empty-actionIds")
+        }
+        let account: Account
+        do {
+            guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                return RouteJSON.error(.notFound, "unknown-account")
+            }
+            account = found
+        } catch {
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+
+        var items: [UndoBulkItem] = []
+        var undone = 0
+        // Sequential, not a task group: each inverse may perform a remote IMAP
+        // write, and the provider holds ONE connection per account by design
+        // (QQ caps concurrent sessions). Racing N inverses over it would
+        // interleave commands on a session that is strictly serial.
+        for actionId in ids {
+            switch await undoOne(
+                actionId: actionId, accountId: accountId, account: account,
+                makeProvider: makeProvider, db: db, logger: logger
+            ) {
+            case .undone:
+                undone += 1
+                items.append(UndoBulkItem(actionId: actionId, ok: true))
+            case .notUndoable:
+                // Expected for a terminal kind that slipped into the list.
+                items.append(UndoBulkItem(actionId: actionId, ok: false, errorCode: "not-undoable"))
+            case .rejected(let rejection):
+                items.append(UndoBulkItem(
+                    actionId: actionId, ok: false, errorCode: rejection.code
+                ))
+            case .failed(let error):
+                logger.error("undoBulk.itemFailed", metadata: [
+                    "actionId": .string("\(actionId)"),
+                    "err": .string("\(error)"),
+                ])
+                items.append(UndoBulkItem(actionId: actionId, ok: false, errorCode: "undo-failed"))
+            }
+        }
+        return RouteJSON.response(UndoBulkResponse(items: items, undone: undone))
+    }
+
+    /// Outcome of one inverse, so a bulk undo can report per item instead of
+    /// collapsing N results into one status code.
+    private enum UndoOutcome {
+        case undone
+        case notUndoable
+        case failed(Error)
+        case rejected(UndoRejection)
+    }
+
+    /// Claims and runs the inverse for one action.
+    ///
+    /// Extracted from `undoActionHandler` so the bulk route runs the *same*
+    /// code path — a second implementation of claim-then-reverse would drift,
+    /// and the single-use claim is the one part of undo that must not have two
+    /// versions.
+    private static func undoOne(
+        actionId: Int64, accountId: UUID, account: Account,
+        makeProvider: MailProviderFactory.Builder, db: LagoonDB, logger: Logger
+    ) async -> UndoOutcome {
         // Single-use, and the claim is taken before the inverse runs. The
         // inverse is not idempotent — replaying an archive-undo moves a
         // message out of a folder it has already left — and the read that
@@ -762,14 +871,11 @@ public enum ActionsRoutes {
                 return UndoClaim(action: action, rowId: row.id)
             }
         } catch let rejection as UndoRejection {
-            return rejection.response
+            return .rejected(rejection)
         } catch {
-            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+            return .failed(error)
         }
 
-        // Reverse each action type. Archive/read restore the remote state first;
-        // pin/unpin flip locally; classify-override inserts a counter-override;
-        // unsubscribe, send, drafting and undo itself are terminal.
         do {
             try await reverse(
                 action: claim.action, account: account,
@@ -781,12 +887,12 @@ public enum ActionsRoutes {
                 "kind": .string(error.kind.rawValue),
                 "actionId": .string("\(actionId)"),
             ])
-            return RouteJSON.error(.badRequest, "not-undoable")
+            return .notUndoable
         } catch {
             await releaseClaim(claim, actionId: actionId, db: db, logger: logger)
-            return errorResponse(.internalServerError, "undo-failed", logger: logger, error: error)
+            return .failed(error)
         }
-        return RouteJSON.response(UndoResponse(ok: true, undone: actionId))
+        return .undone
     }
 
     /// The action being undone plus the id of the undo row that claims it.
@@ -819,10 +925,24 @@ public enum ActionsRoutes {
         case alreadyUndone
 
         var response: Response {
+            RouteJSON.error(status, code)
+        }
+
+        /// The same code in bulk form, so `undo-bulk` can report per item
+        /// instead of collapsing N rejections into one status line.
+        var code: String {
             switch self {
-            case .unknownAction: return RouteJSON.error(.notFound, "unknown-action")
-            case .expired: return RouteJSON.error(.gone, "action-expired")
-            case .alreadyUndone: return RouteJSON.error(.conflict, "already-undone")
+            case .unknownAction: return "unknown-action"
+            case .expired: return "action-expired"
+            case .alreadyUndone: return "already-undone"
+            }
+        }
+
+        private var status: HTTPResponse.Status {
+            switch self {
+            case .unknownAction: return .notFound
+            case .expired: return .gone
+            case .alreadyUndone: return .conflict
             }
         }
     }
@@ -872,11 +992,25 @@ public enum ActionsRoutes {
                 }
             }
         case .markRead:
+            // Restore the value this action *replaced*, not a hardcoded
+            // `false`. Marking a read mail as unread is a first-class action
+            // here, and its inverse is "read again" — always writing false
+            // made undoing an unmark-read a no-op that silently reported
+            // success. The previous value is carried in the payload the read
+            // route records. Absent (rows written before this field existed,
+            // or a hand-made row) falls back to the old behaviour: undoing a
+            // mark-read returns the mail to unread.
+            let previousIsRead = action.payload["previousIsRead"]
+            let restoreTo: Bool = previousIsRead.map { $0 == "true" } ?? false
             guard let provider = makeProvider(account) else {
                 throw MailError.notConfigured("provider missing during undo")
             }
-            try await provider.setRead(remoteId: remoteId, isRead: false)
-            try await MessageStore.setRead(remoteId: remoteId, accountId: account.id, isRead: false, db: db)
+            // Remote first, so a failed remote write cannot be hidden behind a
+            // local success — same ordering as the archive and delete inverses.
+            try await provider.setRead(remoteId: remoteId, isRead: restoreTo)
+            try await MessageStore.setRead(
+                remoteId: remoteId, accountId: account.id, isRead: restoreTo, db: db
+            )
         case .pin:
             try await MessageStore.setPinned(false, remoteId: remoteId, accountId: account.id, db: db)
         case .unpin:

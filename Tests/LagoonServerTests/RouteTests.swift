@@ -1175,7 +1175,14 @@ final class RouteTests: XCTestCase {
                 }
 
                 try await client.execute(uri: pinURI(true), method: .post) { response in
-                    XCTAssertEqual(response.status, .noContent)
+                    // A pin is always a deliberate action, so it now returns an
+                    // audit id instead of a bare 204.
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        StateChangeResponse.self, from: Data(buffer: response.body)
+                    )
+                    XCTAssertTrue(decoded.ok)
+                    XCTAssertNotNil(decoded.actionId, "a pin must be undoable")
                 }
                 try await client.execute(uri: briefingURI, method: .get) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -1188,7 +1195,12 @@ final class RouteTests: XCTestCase {
                 }
 
                 try await client.execute(uri: pinURI(false), method: .post) { response in
-                    XCTAssertEqual(response.status, .noContent)
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        StateChangeResponse.self, from: Data(buffer: response.body)
+                    )
+                    XCTAssertTrue(decoded.ok)
+                    XCTAssertNotNil(decoded.actionId, "an unpin must be undoable")
                 }
                 try await client.execute(uri: briefingURI, method: .get) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -1344,6 +1356,10 @@ final class RouteTests: XCTestCase {
         private var trashError: MailError?
         func setTrashError(_ error: MailError?) { trashError = error }
         private(set) var readCalls: [String] = []
+        /// (remoteId, isRead) per call. `readCalls` alone cannot tell "undo
+        /// marked it unread" from "undo restored it to read", which is the
+        /// distinction the mark-read inverse depends on.
+        private(set) var readStateCalls: [(remoteId: String, isRead: Bool)] = []
         private(set) var sentOutbounds: [OutboundMessage] = []
         private var sendResult: String? = "stub-provider-message-id"
         private var sendError: MailError?
@@ -1394,6 +1410,7 @@ final class RouteTests: XCTestCase {
 
         func setRead(remoteId: String, isRead: Bool) async throws {
             readCalls.append(remoteId)
+            readStateCalls.append((remoteId, isRead))
         }
 
         func archive(remoteId: String) async throws {
@@ -2554,6 +2571,513 @@ final class RouteTests: XCTestCase {
             XCTAssertEqual(
                 unarchived, [message.remoteId],
                 "a remotely archived message must be moved back remotely too"
+            )
+        }
+    }
+
+    // MARK: - Read/pin joined the undo log
+
+    /// `record=true` is what separates "the user deliberately toggled this"
+    /// from "the user opened the message". Only the former may enter the undo
+    /// log — otherwise every mail anyone reads becomes an action that ⌘Z would
+    /// happily reverse.
+    func test_postRead_withRecord_joinsTheUndoLog_andUndoRestores() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id, remoteId: "m-\(UUID())",
+                from: "alice@example.com", isRead: false
+            )
+            try await MessageStore.upsert(message, db: conn)
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            var actionId: Int64?
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/read?accountId=\(account.id.uuidString)&record=true",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        StateChangeResponse.self, from: Data(buffer: response.body)
+                    )
+                    XCTAssertTrue(decoded.ok)
+                    actionId = decoded.actionId
+                }
+            }
+            let id = try XCTUnwrap(actionId, "a recorded read toggle must return its action id")
+
+            let stored = try await MessageStore.find(
+                remoteId: message.remoteId, accountId: account.id, db: conn
+            )
+            XCTAssertEqual(stored?.isRead, true)
+            // The audit row must carry the value it replaced, or the inverse has
+            // nothing to restore to.
+            let row = (try await AIActionStore.recent(accountId: account.id, db: conn).first { $0.id == id })
+            XCTAssertEqual(row?.kind, .markRead)
+            XCTAssertEqual(row?.payload["previousIsRead"], "false")
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(id)/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let restored = try await MessageStore.find(
+                remoteId: message.remoteId, accountId: account.id, db: conn
+            )
+            XCTAssertEqual(restored?.isRead, false, "undo must return the mail to unread")
+            let remote = await provider.readStateCalls
+            XCTAssertEqual(
+                remote.last?.isRead, false,
+                "the remote \\Seen flag must be cleared too, not just the local row"
+            )
+        }
+    }
+
+    /// Regression for a defect the dead code was hiding: `reverse()` used to
+    /// hardcode `isRead: false` for the mark-read inverse. Marking an already
+    /// read mail as *unread* is a first-class action here, and its inverse is
+    /// "read again" — the old code answered 200 and changed nothing.
+    func test_postRead_undoingAnUnmarkRead_marksItReadAgain() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            // Starts READ, so the user action is "mark unread".
+            let message = makeHeader(
+                accountId: account.id, remoteId: "m-\(UUID())",
+                from: "alice@example.com", isRead: true
+            )
+            try await MessageStore.upsert(message, db: conn)
+            let provider = StubMailProvider()
+            let app = Application(router: makeSendRouter(db: conn, provider: provider))
+
+            var actionId: Int64?
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/read?accountId=\(account.id.uuidString)&isRead=false&record=true",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    actionId = try Self.iso8601Decoder().decode(
+                        StateChangeResponse.self, from: Data(buffer: response.body)
+                    ).actionId
+                }
+            }
+            let id = try XCTUnwrap(actionId)
+            let cleared = try await MessageStore.find(
+                remoteId: message.remoteId, accountId: account.id, db: conn
+            )
+            XCTAssertEqual(cleared?.isRead, false, "the toggle itself must clear is_read")
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(id)/undo?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let restored = try await MessageStore.find(
+                remoteId: message.remoteId, accountId: account.id, db: conn
+            )
+            XCTAssertEqual(
+                restored?.isRead, true,
+                "undoing an unmark-read must set it back to READ; a hardcoded false would leave it unread"
+            )
+            let remote = await provider.readStateCalls
+            XCTAssertEqual(
+                remote.last?.isRead, true,
+                "the remote \\Seen flag must be restored as well"
+            )
+        }
+    }
+
+    /// The implicit path (opening a message) must stay 204 and must NOT write
+    /// an audit row. A log full of "you opened this mail" entries would make
+    /// ⌘Z unpredictable — the newest undoable action would usually be a read
+    /// the user never chose.
+    func test_postRead_withoutRecord_staysNoContentAndWritesNoAction() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id, remoteId: "m-\(UUID())",
+                from: "alice@example.com", isRead: false
+            )
+            try await MessageStore.upsert(message, db: conn)
+            let app = Application(router: makeSendRouter(db: conn, provider: StubMailProvider()))
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/\(message.remoteId)/read?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .noContent)
+                }
+            }
+            let stored = try await MessageStore.find(
+                remoteId: message.remoteId, accountId: account.id, db: conn
+            )
+            XCTAssertEqual(stored?.isRead, true, "the read itself still happens")
+            let actions = try await AIActionStore.recent(accountId: account.id, db: conn)
+            XCTAssertTrue(
+                actions.filter { $0.kind == .markRead }.isEmpty,
+                "merely opening a message must not enter the undo log"
+            )
+        }
+    }
+
+    /// A pin is always deliberate, so it always records — and the kind has to
+    /// say which direction, because "undo" means the opposite of what the user
+    /// just did and the flag alone cannot express that after the fact.
+    func test_postPin_recordsAnUndoableAction_thatUndoReverses() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id, remoteId: "m-\(UUID())", from: "alice@example.com"
+            )
+            try await MessageStore.upsert(message, db: conn)
+            let app = Application(router: makeSendRouter(db: conn, provider: StubMailProvider()))
+            let base = "/api/messages/\(message.remoteId)"
+            let acct = "accountId=\(account.id.uuidString)"
+
+            var pinId: Int64?
+            try await app.test(.router) { client in
+                try await client.execute(uri: "\(base)/pin?\(acct)&pinned=true", method: .post) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    pinId = try Self.iso8601Decoder().decode(
+                        StateChangeResponse.self, from: Data(buffer: response.body)
+                    ).actionId
+                }
+            }
+            let id = try XCTUnwrap(pinId)
+            let pinned = try await MessageStore.pinnedIds(forAccount: account.id, db: conn)
+            XCTAssertTrue(pinned.contains(message.remoteId))
+            let row = (try await AIActionStore.recent(accountId: account.id, db: conn).first { $0.id == id })
+            XCTAssertEqual(row?.kind, .pin, "the kind must record the direction")
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/\(id)/undo?\(acct)", method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let afterUndo = try await MessageStore.pinnedIds(forAccount: account.id, db: conn)
+            XCTAssertFalse(
+                afterUndo.contains(message.remoteId),
+                "undoing a pin must unpin"
+            )
+        }
+    }
+
+    /// The mirror case: undoing an *unpin* must pin again. Recorded as `.unpin`
+    /// so `reverse()` knows which way to go.
+    func test_postUnpin_undoRestoresThePin() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let message = makeHeader(
+                accountId: account.id, remoteId: "m-\(UUID())", from: "alice@example.com"
+            )
+            try await MessageStore.upsert(message, db: conn)
+            try await MessageStore.setPinned(
+                true, remoteId: message.remoteId, accountId: account.id, db: conn
+            )
+            let app = Application(router: makeSendRouter(db: conn, provider: StubMailProvider()))
+            let base = "/api/messages/\(message.remoteId)"
+            let acct = "accountId=\(account.id.uuidString)"
+
+            var unpinId: Int64?
+            try await app.test(.router) { client in
+                try await client.execute(uri: "\(base)/pin?\(acct)&pinned=false", method: .post) { response in
+                    unpinId = try Self.iso8601Decoder().decode(
+                        StateChangeResponse.self, from: Data(buffer: response.body)
+                    ).actionId
+                }
+            }
+            let id = try XCTUnwrap(unpinId)
+            let row = (try await AIActionStore.recent(accountId: account.id, db: conn).first { $0.id == id })
+            XCTAssertEqual(row?.kind, .unpin)
+            let cleared = try await MessageStore.pinnedIds(forAccount: account.id, db: conn)
+            XCTAssertFalse(cleared.contains(message.remoteId))
+
+            try await app.test(.router) { client in
+                try await client.execute(uri: "/api/actions/\(id)/undo?\(acct)", method: .post) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            let restored = try await MessageStore.pinnedIds(forAccount: account.id, db: conn)
+            XCTAssertTrue(
+                restored.contains(message.remoteId),
+                "undoing an unpin must pin the message again"
+            )
+        }
+    }
+
+    /// "Mark all as read" records one row per message. Undoing only the newest
+    /// (what a single ⌘Z does) would leave N-1 changes in place and read to the
+    /// user as "undo did nothing", which is why the bulk endpoint exists.
+    func test_undoBulk_reversesEveryIdInOneCall() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let messages = (0..<3).map {
+                makeHeader(
+                    accountId: account.id, remoteId: "bulk-\($0)-\(UUID())",
+                    from: "alice\($0)@example.com", isRead: false
+                )
+            }
+            for m in messages { try await MessageStore.upsert(m, db: conn) }
+            let app = Application(router: makeSendRouter(db: conn, provider: StubMailProvider()))
+
+            // Simulate the bulk read: one recorded action per message.
+            var ids: [Int64] = []
+            for m in messages {
+                try await app.test(.router) { client in
+                    try await client.execute(
+                        uri: "/api/messages/\(m.remoteId)/read?accountId=\(account.id.uuidString)&record=true",
+                        method: .post
+                    ) { response in
+                        if let id = try? Self.iso8601Decoder().decode(
+                            StateChangeResponse.self, from: Data(buffer: response.body)
+                        ).actionId {
+                            ids.append(id)
+                        }
+                    }
+                }
+            }
+            XCTAssertEqual(ids.count, 3)
+            for m in messages {
+                let stored = try await MessageStore.find(
+                    remoteId: m.remoteId, accountId: account.id, db: conn
+                )
+                XCTAssertEqual(stored?.isRead, true, "all three start read")
+            }
+
+            let body = try JSONEncoder().encode(UndoBulkRequest(actionIds: ids))
+            var undone = -1
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/undo-bulk?accountId=\(account.id.uuidString)",
+                    method: .post,
+                    body: ByteBuffer(data: body)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        UndoBulkResponse.self, from: Data(buffer: response.body)
+                    )
+                    XCTAssertEqual(decoded.items.count, 3)
+                    XCTAssertTrue(decoded.items.allSatisfy(\.ok), "every item must undo")
+                    undone = decoded.undone
+                }
+            }
+            XCTAssertEqual(undone, 3)
+
+            for m in messages {
+                let restored = try await MessageStore.find(
+                    remoteId: m.remoteId, accountId: account.id, db: conn
+                )
+                XCTAssertEqual(
+                    restored?.isRead, false,
+                    "a bulk undo must reverse ALL of them, not just the newest"
+                )
+            }
+        }
+    }
+
+    /// Partial results are reported honestly rather than collapsed into one
+    /// status code: an id that was already undone individually is not a
+    /// failure of the bulk call, and the client has to be able to say so.
+    func test_undoBulk_reportsAlreadyUndonePerItem_andStaysSingleUse() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let messages = (0..<2).map {
+                makeHeader(
+                    accountId: account.id, remoteId: "dup-\($0)-\(UUID())",
+                    from: "alice\($0)@example.com", isRead: false
+                )
+            }
+            for m in messages { try await MessageStore.upsert(m, db: conn) }
+            let app = Application(router: makeSendRouter(db: conn, provider: StubMailProvider()))
+            var ids: [Int64] = []
+            for m in messages {
+                try await app.test(.router) { client in
+                    try await client.execute(
+                        uri: "/api/messages/\(m.remoteId)/read?accountId=\(account.id.uuidString)&record=true",
+                        method: .post
+                    ) { response in
+                        if let id = try? Self.iso8601Decoder().decode(
+                            StateChangeResponse.self, from: Data(buffer: response.body)
+                        ).actionId {
+                            ids.append(id)
+                        }
+                    }
+                }
+            }
+            let acct = "accountId=\(account.id.uuidString)"
+
+            // Undo the first one individually.
+            try await app.test(.router) { client in
+                try await client.execute(uri: "/api/actions/\(ids[0])/undo?\(acct)", method: .post) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+
+            // Now bulk-undo BOTH: the first is already spent, the second is not.
+            let body = try JSONEncoder().encode(UndoBulkRequest(actionIds: ids))
+            var codes: [Int64: String?] = [:]
+            var undone = -1
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/undo-bulk?\(acct)", method: .post,
+                    body: ByteBuffer(data: body)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        UndoBulkResponse.self, from: Data(buffer: response.body)
+                    )
+                    for item in decoded.items { codes[item.actionId] = item.errorCode }
+                    undone = decoded.undone
+                }
+            }
+            XCTAssertEqual(undone, 1, "only the still-undoable one may reverse")
+            XCTAssertEqual(codes[ids[0]] ?? nil, "already-undone")
+            // `codes` is [Int64: String?], so the subscript is a double
+            // optional: a present key holding nil reads as .some(nil) and
+            // XCTAssertNil on that tests the wrong layer. Flatten first.
+            XCTAssertNil(codes[ids[1]] ?? nil, "the item that actually undid must carry no error")
+
+            // Single-use must hold across the bulk path too: a second bulk call
+            // reverses nothing, so the inverse cannot be replayed.
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/undo-bulk?\(acct)", method: .post,
+                    body: ByteBuffer(data: body)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        UndoBulkResponse.self, from: Data(buffer: response.body)
+                    )
+                    XCTAssertEqual(decoded.undone, 0, "no inverse may run twice")
+                }
+            }
+        }
+    }
+
+    /// An unknown id is rejected, and an empty list is a 400 rather than a
+    /// silent success.
+    func test_undoBulk_rejectsMalformedInput() async throws {
+        let account = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(account, db: conn)
+            let app = Application(router: makeSendRouter(db: conn, provider: StubMailProvider()))
+            let acct = "accountId=\(account.id.uuidString)"
+
+            let empty = try JSONEncoder().encode(UndoBulkRequest(actionIds: []))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/undo-bulk?\(acct)", method: .post,
+                    body: ByteBuffer(data: empty)
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                }
+            }
+
+            let unknown = try JSONEncoder().encode(UndoBulkRequest(actionIds: [999_999_999]))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/undo-bulk?\(acct)", method: .post,
+                    body: ByteBuffer(data: unknown)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        UndoBulkResponse.self, from: Data(buffer: response.body)
+                    )
+                    XCTAssertEqual(decoded.undone, 0)
+                    XCTAssertEqual(decoded.items.first?.errorCode, "unknown-action")
+                }
+            }
+        }
+    }
+
+    /// Cross-account: a bulk undo may only touch the caller's own rows.
+    func test_undoBulk_cannotTouchAnotherAccountsActions() async throws {
+        let mine = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "me-\(UUID().uuidString)@example.com"
+        )
+        let theirs = makeAccount(
+            oauthUser: "route-\(UUID().uuidString)",
+            email: "other-\(UUID().uuidString)@example.com"
+        )
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: mine.id)) { conn in
+            try await seedAccount(mine, db: conn)
+            try await seedAccount(theirs, db: conn)
+            let message = makeHeader(
+                accountId: theirs.id, remoteId: "m-\(UUID())",
+                from: "alice@example.com", isRead: false
+            )
+            try await MessageStore.upsert(message, db: conn)
+            // Record a read action owned by THEIRS.
+            let action = try await AIActionStore.record(
+                accountId: theirs.id, kind: .markRead,
+                payload: ["remoteId": message.remoteId, "previousIsRead": "false"],
+                db: conn
+            )
+            let app = Application(router: makeSendRouter(db: conn, provider: StubMailProvider()))
+
+            let body = try JSONEncoder().encode(UndoBulkRequest(actionIds: [action.id]))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/actions/undo-bulk?accountId=\(mine.id.uuidString)",
+                    method: .post, body: ByteBuffer(data: body)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let decoded = try Self.iso8601Decoder().decode(
+                        UndoBulkResponse.self, from: Data(buffer: response.body)
+                    )
+                    XCTAssertEqual(decoded.undone, 0)
+                    XCTAssertEqual(decoded.items.first?.errorCode, "unknown-action")
+                }
+            }
+            let untouched = try await MessageStore.find(
+                remoteId: message.remoteId, accountId: theirs.id, db: conn
+            )
+            XCTAssertEqual(
+                untouched?.isRead, false,
+                "another account's row must not be modified by my undo"
             )
         }
     }

@@ -109,6 +109,42 @@ public struct AIActionListResponse: Codable, Sendable, Equatable {
 
 /// User override on AI classification. The heuristic applies these so future
 /// calls to the same sender land in the group the user actually wanted.
+/// `POST /api/actions/undo-bulk` request.
+///
+/// Bulk operations ("mark all as read", sweep) record one audit row per
+/// message, and a single ⌘Z that reverses only the newest one would leave the
+/// other N-1 changes in place — which reads to the user as "undo did nothing".
+/// The ids are capped server-side the same way `archive-bulk` caps its input.
+public struct UndoBulkRequest: Codable, Sendable, Equatable {
+    public let actionIds: [Int64]
+    public init(actionIds: [Int64]) { self.actionIds = actionIds }
+}
+
+/// One item of a bulk undo. `ok` false with `alreadyUndone` is normal and not
+/// an error: the action may have been undone individually before the bulk
+/// call arrived.
+public struct UndoBulkItem: Codable, Sendable, Equatable {
+    public let actionId: Int64
+    public let ok: Bool
+    public let errorCode: String?
+    public init(actionId: Int64, ok: Bool, errorCode: String? = nil) {
+        self.actionId = actionId
+        self.ok = ok
+        self.errorCode = errorCode
+    }
+}
+
+public struct UndoBulkResponse: Codable, Sendable, Equatable {
+    public let items: [UndoBulkItem]
+    /// How many inverses actually ran. The client shows this so a partially
+    /// successful undo does not claim more than it did.
+    public let undone: Int
+    public init(items: [UndoBulkItem], undone: Int) {
+        self.items = items
+        self.undone = undone
+    }
+}
+
 public struct ClassifyOverrideRequest: Codable, Sendable, Equatable {
     public let remoteId: String
     public let fromGroup: String
