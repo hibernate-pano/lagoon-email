@@ -823,13 +823,25 @@ struct MessageDetailView: View {
     }
 
     /// Manual read/unread toggle from the ⋯ menu. Unlike the automatic
-    /// `markReadOnce` on appear, this is user intent and flips both ways.
+    /// `markReadOnce` on appear, this is user intent and flips both ways —
+    /// and only this one passes `record: true`, because only a deliberate
+    /// toggle belongs in the undo log. If `markReadOnce` recorded too, every
+    /// message the user merely opened would become an action ⌘Z could reverse.
     private func toggleReadState() async {
         let target = !isRead
         isRead = target
         onReadStateChange(remoteId, target)
         do {
-            try await api.markRead(remoteId: remoteId, accountId: accountId, isRead: target)
+            let actionId = try await api.markRead(
+                remoteId: remoteId, accountId: accountId, isRead: target, record: true
+            )
+            if let actionId {
+                undo.show(UndoItem(
+                    id: actionId,
+                    message: target ? l10n.markedAsReadToast : l10n.markedAsUnreadToast,
+                    systemImage: "envelope.open"
+                ))
+            }
         } catch {
             isRead = !target
             onReadStateChange(remoteId, !target)
@@ -870,7 +882,16 @@ struct MessageDetailView: View {
         onPinnedChanged(target)
         isPinBusy = true
         do {
-            try await api.setPinned(remoteId: remoteId, accountId: accountId, pinned: target)
+            let actionId = try await api.setPinned(
+                remoteId: remoteId, accountId: accountId, pinned: target
+            )
+            if let actionId {
+                undo.show(UndoItem(
+                    id: actionId,
+                    message: target ? l10n.pinnedToast : l10n.unpinnedToast,
+                    systemImage: "pin"
+                ))
+            }
         } catch {
             isPinned = !target
             onPinnedChanged(!target)

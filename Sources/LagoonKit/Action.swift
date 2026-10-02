@@ -109,6 +109,25 @@ public struct AIActionListResponse: Codable, Sendable, Equatable {
 
 /// User override on AI classification. The heuristic applies these so future
 /// calls to the same sender land in the group the user actually wanted.
+/// Response for the local-state mutations that joined the undo audit log
+/// (read toggle, pin toggle). Lives in LagoonKit, not in the server's route
+/// file, because the macOS client decodes it — a wire type both sides share
+/// has to sit in the shared module or one of them cannot see it.
+///
+/// `actionId` is nil when the caller did not ask for the change to be
+/// recorded; see the `record` parameter on the read route for why that
+/// distinction has to exist.
+public struct StateChangeResponse: Codable, Sendable, Equatable {
+    public let ok: Bool
+    public let remoteId: String
+    public let actionId: Int64?
+    public init(ok: Bool, remoteId: String, actionId: Int64?) {
+        self.ok = ok
+        self.remoteId = remoteId
+        self.actionId = actionId
+    }
+}
+
 /// `POST /api/actions/undo-bulk` request.
 ///
 /// Bulk operations ("mark all as read", sweep) record one audit row per

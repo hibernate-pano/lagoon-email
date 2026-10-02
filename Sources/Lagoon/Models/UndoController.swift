@@ -56,13 +56,31 @@ public struct UndoItem: Equatable {
     /// (`ActionsRoutes.NotUndoable`), so their toast must not offer Undo —
     /// a button that always errors teaches the user to ignore the toast.
     public let undoable: Bool
+    /// Extra ids to reverse in the same ⌘Z, for bulk operations.
+    ///
+    /// "Mark all as read" writes one audit row per message. Undoing only the
+    /// newest would leave the other N-1 changes in place and read to the user
+    /// as "undo did nothing", which is worse than offering no undo at all.
+    /// When non-empty the controller posts to `undo-bulk` instead of the
+    /// single-action route.
+    public let extraIds: [Int64]
 
-    public init(id: Int64, message: String, systemImage: String, undoable: Bool = true) {
+    public init(
+        id: Int64,
+        message: String,
+        systemImage: String,
+        undoable: Bool = true,
+        extraIds: [Int64] = []
+    ) {
         self.id = id
         self.message = message
         self.systemImage = systemImage
         self.undoable = undoable
+        self.extraIds = extraIds
     }
+
+    /// Every id this toast's Undo button reverses, `id` first.
+    public var allIds: [Int64] { [id] + extraIds }
 }
 
 @MainActor
@@ -111,12 +129,27 @@ public final class UndoController: ObservableObject {
         guard let item = current, let accounts, let accountId = accounts.accountId else { return }
         current = nil
         dismissTask?.cancel()
-        await perform(actionId: item.id, accountId: accountId)
+        if item.extraIds.isEmpty {
+            await perform(actionId: item.id, accountId: accountId)
+        } else {
+            await performBulk(actionIds: item.allIds, accountId: accountId)
+        }
     }
 
     /// Undo the newest still-reversible action, even after the toast expires.
     public func undoLatest() async {
         guard let accounts, let accountId = accounts.accountId else { return }
+        // Prefer the live toast. ⌘Z is bound to this method, but when a toast
+        // is showing it IS the last action — and for a bulk operation the toast
+        // carries the whole set of ids. Falling through to the server's
+        // newest-single lookup here would make ⇧⌘K's toast undo one message
+        // when ⌘Z was pressed and all of them when the toast button was
+        // pressed: the same toast, two different results. Routing through
+        // `undo()` keeps both entry points identical (and honours extraIds).
+        if let item = current, item.undoable {
+            await undo()
+            return
+        }
         do {
             let actions = try await api.fetchActions(
                 accountId: accountId,
@@ -140,6 +173,28 @@ public final class UndoController: ObservableObject {
         do {
             try await api.undoAction(id: actionId, accountId: accountId)
             errorMessage = nil
+            NotificationCenter.default.post(name: .lagoonDidUndo, object: nil)
+        } catch {
+            errorMessage = L10n.current.undoFailed + error.lagoonUIMessage
+        }
+    }
+
+    /// Reverses a whole bulk operation in one call and reports how many
+    /// inverses actually ran.
+    ///
+    /// A partial result is reported honestly rather than as success: the
+    /// server runs each inverse independently (one may already be spent, one
+    /// remote write may fail), and telling the user "undone" when 3 of 50
+    /// reversed would be a lie in the one place the product promises to be
+    /// trustworthy about state.
+    private func performBulk(actionIds: [Int64], accountId: UUID) async {
+        do {
+            let response = try await api.undoBulk(actionIds: actionIds, accountId: accountId)
+            if response.undone == actionIds.count {
+                errorMessage = nil
+            } else {
+                errorMessage = L10n.current.undoPartial(response.undone, actionIds.count)
+            }
             NotificationCenter.default.post(name: .lagoonDidUndo, object: nil)
         } catch {
             errorMessage = L10n.current.undoFailed + error.lagoonUIMessage

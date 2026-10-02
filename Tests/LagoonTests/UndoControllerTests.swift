@@ -46,6 +46,23 @@ final class UndoControllerTests: XCTestCase {
         }
     }
 
+    /// URLSession hands the body to `URLProtocol` as a stream, so body
+    /// assertions read whichever form the request carries.
+    private func bodyData(of request: URLRequest) throws -> Data {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return Data() }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        while stream.hasBytesAvailable {
+            let read = stream.read(&buffer, maxLength: buffer.count)
+            if read <= 0 { break }
+            data.append(buffer, count: read)
+        }
+        return data
+    }
+
     private func makeController() throws -> (UndoController, UUID) {
         let accountId = UUID()
         let store = AccountStore(service: service)
@@ -191,6 +208,129 @@ final class UndoControllerTests: XCTestCase {
         XCTAssertEqual(
             undoCalls.first?.url?.path, "/api/actions/3/undo",
             "newest undoable action wins; a terminal one must be skipped"
+        )
+    }
+
+    /// A bulk toast must post every id it carries to the bulk endpoint in one
+    /// call. If it fell back to the single-action route, ⇧⌘K over an inbox
+    /// would reverse one message and silently leave the rest read — the exact
+    /// "undo did nothing" failure this endpoint exists to prevent.
+    func test_undo_withExtraIds_postsAllOfThemToTheBulkEndpoint() async throws {
+        let body = try JSONEncoder().encode(
+            UndoBulkResponse(items: [1, 2, 3].map { UndoBulkItem(actionId: $0, ok: true) }, undone: 3)
+        )
+        stub(status: 200, body: body)
+        let (controller, accountId) = try makeController()
+        controller.show(UndoItem(
+            id: 1, message: "已将 3 封标为已读", systemImage: "envelope.open",
+            extraIds: [2, 3]
+        ))
+
+        await controller.undo()
+
+        let bulkCalls = StubURLProtocol.capturedRequests.filter {
+            $0.url?.path == "/api/actions/undo-bulk"
+        }
+        XCTAssertEqual(bulkCalls.count, 1, "a bulk toast must hit the bulk endpoint exactly once")
+        XCTAssertEqual(bulkCalls.first?.httpMethod, "POST")
+        XCTAssertEqual(bulkCalls.first?.url?.query, "accountId=\(accountId.uuidString)")
+
+        let request = try XCTUnwrap(bulkCalls.first)
+        let decoded = try JSONDecoder().decode(
+            UndoBulkRequest.self, from: try bodyData(of: request)
+        )
+        XCTAssertEqual(
+            Set(decoded.actionIds), [1, 2, 3],
+            "every id the toast carries must be reversed, not just the newest"
+        )
+        // The single-action route must NOT have been used.
+        XCTAssertTrue(
+            StubURLProtocol.capturedRequests.filter { $0.url?.path.hasSuffix("/undo") == true }.isEmpty,
+            "a bulk undo must not also fire a single-action undo"
+        )
+        XCTAssertNil(controller.errorMessage, "a fully-successful bulk undo reports no error")
+    }
+
+    /// A single-item toast keeps using the single-action route. The bulk path
+    /// is only for operations that genuinely produced several rows, so an
+    /// ordinary archive must not change endpoint.
+    func test_undo_withoutExtraIds_keepsUsingTheSingleActionRoute() async throws {
+        stub(status: 200)
+        let (controller, _) = try makeController()
+        controller.show(UndoItem(id: 7, message: "已归档", systemImage: "tray"))
+
+        await controller.undo()
+
+        XCTAssertTrue(
+            StubURLProtocol.capturedRequests.contains { $0.url?.path == "/api/actions/7/undo" },
+            "a single-action toast must still use the single-action route"
+        )
+        XCTAssertTrue(
+            StubURLProtocol.capturedRequests.filter { $0.url?.path == "/api/actions/undo-bulk" }.isEmpty
+        )
+    }
+
+    /// A partial bulk result must not be reported as success. Saying "undone"
+    /// when 1 of 3 reversed would misstate the mailbox in the one place the
+    /// product promises to be honest about state.
+    func test_undo_partialBulkResultSurfacesAPartialMessage() async throws {
+        let body = try JSONEncoder().encode(
+            UndoBulkResponse(
+                items: [
+                    UndoBulkItem(actionId: 1, ok: true),
+                    UndoBulkItem(actionId: 2, ok: false, errorCode: "already-undone"),
+                    UndoBulkItem(actionId: 3, ok: false, errorCode: "already-undone"),
+                ],
+                undone: 1
+            )
+        )
+        stub(status: 200, body: body)
+        let (controller, _) = try makeController()
+        controller.show(UndoItem(
+            id: 1, message: "已将 3 封标为已读", systemImage: "envelope.open",
+            extraIds: [2, 3]
+        ))
+
+        await controller.undo()
+
+        let message = try XCTUnwrap(
+            controller.errorMessage,
+            "a partial bulk undo must tell the user it only partly worked"
+        )
+        XCTAssertTrue(message.contains("1"), "the message should carry the count that succeeded")
+    }
+
+    /// ⌘Z while a bulk toast is showing must reverse the whole batch, exactly
+    /// like the toast's own Undo button. ⌘Z is bound to `undoLatest()`, which
+    /// otherwise falls back to "undo the newest single action" — so without
+    /// this, pressing ⇧⌘K then ⌘Z (the natural reaction) would undo one
+    /// message of the batch and leave the rest, the same "undo did nothing"
+    /// feeling the bulk endpoint exists to prevent. Two entry points to one
+    /// visible toast must not disagree.
+    func test_undoLatest_withLiveBulkToast_reversesTheWholeBatch() async throws {
+        let body = try JSONEncoder().encode(
+            UndoBulkResponse(items: [1, 2, 3].map { UndoBulkItem(actionId: $0, ok: true) }, undone: 3)
+        )
+        stub(status: 200, body: body)
+        let (controller, _) = try makeController()
+        controller.show(UndoItem(
+            id: 1, message: "已将 3 封标为已读", systemImage: "envelope.open",
+            extraIds: [2, 3]
+        ))
+
+        await controller.undoLatest()
+
+        let bulkCalls = StubURLProtocol.capturedRequests.filter {
+            $0.url?.path == "/api/actions/undo-bulk"
+        }
+        XCTAssertEqual(bulkCalls.count, 1, "⌘Z on a bulk toast must use the bulk endpoint")
+        let decoded = try JSONDecoder().decode(
+            UndoBulkRequest.self, from: try bodyData(of: XCTUnwrap(bulkCalls.first))
+        )
+        XCTAssertEqual(Set(decoded.actionIds), [1, 2, 3])
+        // It must NOT have fallen back to a single-action undo.
+        XCTAssertTrue(
+            StubURLProtocol.capturedRequests.filter { $0.url?.path.hasSuffix("/undo") == true }.isEmpty
         )
     }
 

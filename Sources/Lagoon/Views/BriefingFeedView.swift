@@ -640,11 +640,18 @@ struct BriefingFeedView: View {
 
             do {
 
-                try await api.setPinned(
+                let actionId = try await api.setPinned(
                     remoteId: item.message.remoteId,
                     accountId: accountId,
                     pinned: toPinned
                 )
+                if let actionId {
+                    undo.show(UndoItem(
+                        id: actionId,
+                        message: toPinned ? l10n.pinnedToast : l10n.unpinnedToast,
+                        systemImage: "pin"
+                    ))
+                }
 
                 await refresh()
 
@@ -670,11 +677,19 @@ struct BriefingFeedView: View {
         let target = !item.message.isRead
         setRead(remoteId: item.message.remoteId, isRead: target)
         do {
-            try await api.markRead(
+            let actionId = try await api.markRead(
                 remoteId: item.message.remoteId,
                 accountId: accountId,
-                isRead: target
+                isRead: target,
+                record: true
             )
+            if let actionId {
+                undo.show(UndoItem(
+                    id: actionId,
+                    message: target ? l10n.markedAsReadToast : l10n.markedAsUnreadToast,
+                    systemImage: "envelope.open"
+                ))
+            }
         } catch {
             setRead(remoteId: item.message.remoteId, isRead: !target)
             errorBanner = ErrorBanner(
@@ -892,26 +907,53 @@ struct BriefingFeedView: View {
             items[i] = items[i].withRead(true)
         }
 
-        await withTaskGroup(of: Error?.self) { group in
+        // Each read is recorded with `record: true` so the whole batch can be
+        // reversed by one ⌘Z. Before this, ⇧⌘K over an inbox was
+        // irreversible: no audit rows, no toast, and the newest-action ⌘Z had
+        // nothing of this operation to find. The ids are collected as they
+        // come back so a partially-failed batch still offers to undo what did
+        // land.
+        await withTaskGroup(of: Result<Int64?, Error>.self) { group in
             for item in unread {
                 group.addTask { [api] in
                     do {
-                        try await api.markRead(
+                        let actionId = try await api.markRead(
                             remoteId: item.message.remoteId,
-                            accountId: accountId
+                            accountId: accountId,
+                            record: true
                         )
-                        return nil
+                        return .success(actionId)
                     } catch {
-                        return error
+                        return .failure(error)
                     }
                 }
             }
-            if let firstError = await group.first(where: { $0 != nil }) ?? nil {
+            var actionIds: [Int64] = []
+            var firstError: Error?
+            for await result in group {
+                switch result {
+                case .success(let id):
+                    if let id { actionIds.append(id) }
+                case .failure(let error):
+                    if firstError == nil { firstError = error }
+                }
+            }
+            if let firstError {
                 errorBanner = ErrorBanner(
                     severity: .warning,
                     title: l10n.markAllReadPartial,
                     detail: firstError.lagoonUIMessage
                 )
+            }
+            // Offer undo for whatever actually landed, newest first so a
+            // single-action ⌘Z after this still reverses one of them.
+            if let first = actionIds.first {
+                undo.show(UndoItem(
+                    id: first,
+                    message: l10n.markedAllReadToast(actionIds.count),
+                    systemImage: "envelope.open",
+                    extraIds: Array(actionIds.dropFirst())
+                ))
             }
         }
     }

@@ -9,16 +9,6 @@ import LagoonAI
 /// `POST /api/messages/{remoteId}/send` response.
 struct SendResponse: Codable { let ok: Bool; let providerMessageId: String? }
 
-/// Response for the local-state mutations that joined the undo audit log
-/// (read toggle, pin toggle). `actionId` is nil when the caller did not ask
-/// for the change to be recorded — see the `record` parameter on the read
-/// route for why that distinction has to exist.
-struct StateChangeResponse: Codable {
-    let ok: Bool
-    let remoteId: String
-    let actionId: Int64?
-}
-
 /// Message-level M1 endpoints: full body, read state, pinning and AI summary.
 public enum MessageRoutes {
     public static func register(

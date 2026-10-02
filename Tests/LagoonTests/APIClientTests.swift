@@ -361,11 +361,18 @@ final class APIClientTests: XCTestCase {
 
     func test_setPinned_postsAndSendsPinnedQueryForBothValues() async throws {
         let accountId = UUID()
-        stub(status: 204, body: Data())
+        // A pin is always a deliberate, undoable action, so the route answers
+        // 200 + StateChangeResponse (was a bare 204) and the client surfaces
+        // the action id for the undo toast.
+        stub(status: 200, body: Data(
+            #"{"ok":true,"remoteId":"msg-1","actionId":99}"#.utf8
+        ))
 
         let client = makeClient()
-        try await client.setPinned(remoteId: "msg-1", accountId: accountId, pinned: true)
-        try await client.setPinned(remoteId: "msg-1", accountId: accountId, pinned: false)
+        let pinId = try await client.setPinned(remoteId: "msg-1", accountId: accountId, pinned: true)
+        let unpinId = try await client.setPinned(remoteId: "msg-1", accountId: accountId, pinned: false)
+        XCTAssertEqual(pinId, 99)
+        XCTAssertEqual(unpinId, 99)
 
         let requests = StubURLProtocol.capturedRequests
         XCTAssertEqual(requests.count, 2)
@@ -374,6 +381,36 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(queryValue("accountId", in: requests[0]), accountId.uuidString)
         XCTAssertEqual(queryValue("pinned", in: requests[0]), "true")
         XCTAssertEqual(queryValue("pinned", in: requests[1]), "false")
+    }
+
+    /// The implicit read path stays a bare 204 with no audit row; only
+    /// `record: true` returns an action id. Pinning this down keeps "opening a
+    /// message" out of the undo log, which is the whole reason the flag exists.
+    func test_markRead_recordFlagControlsWhetherAnActionIdComesBack() async throws {
+        let accountId = UUID()
+        let client = makeClient()
+
+        // Implicit (record omitted): 204, empty body, no action id.
+        stub(status: 204, body: Data())
+        let implicit = try await client.markRead(remoteId: "msg-1", accountId: accountId)
+        XCTAssertNil(implicit, "opening a message must not produce an undoable action")
+        XCTAssertNil(
+            queryValue("record", in: StubURLProtocol.capturedRequests[0]),
+            "the implicit path must not send record=true"
+        )
+
+        // Explicit (record: true): 200 + action id.
+        stub(status: 200, body: Data(
+            #"{"ok":true,"remoteId":"msg-1","actionId":42}"#.utf8
+        ))
+        let explicit = try await client.markRead(
+            remoteId: "msg-1", accountId: accountId, record: true
+        )
+        XCTAssertEqual(explicit, 42)
+        XCTAssertEqual(
+            queryValue("record", in: StubURLProtocol.capturedRequests[0]), "true",
+            "a deliberate toggle must ask the server to record it"
+        )
     }
 
     func test_fetchSummary_buildsURLAndDecodesMessageSummary() async throws {

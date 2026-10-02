@@ -595,7 +595,16 @@ struct MessageListView: View {
             messages[index] = m.withRead(target)
         }
         do {
-            try await api.markRead(remoteId: m.remoteId, accountId: m.accountId, isRead: target)
+            let actionId = try await api.markRead(
+                remoteId: m.remoteId, accountId: m.accountId, isRead: target, record: true
+            )
+            if let actionId {
+                undo.show(UndoItem(
+                    id: actionId,
+                    message: target ? l10n.markedAsReadToast : l10n.markedAsUnreadToast,
+                    systemImage: "envelope.open"
+                ))
+            }
         } catch {
             if let index = messages.firstIndex(where: { $0.remoteId == m.remoteId }) {
                 messages[index] = m.withRead(m.isRead)

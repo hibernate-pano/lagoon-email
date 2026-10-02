@@ -662,18 +662,64 @@ public final class APIClient: Sendable {
 
     /// POST /api/messages/{remoteId}/read?accountId=[&isRead=] → 204.
     /// `isRead` defaults to true; pass false to mark unread.
-    public func markRead(remoteId: String, accountId: UUID, isRead: Bool = true) async throws {
+    /// POST /api/messages/{remoteId}/read?accountId=[&isRead=false][&record=true]
+    ///
+    /// `record` is what separates a deliberate read/unread toggle from the
+    /// implicit one that fires when a message is opened. The two are
+    /// indistinguishable on the wire otherwise, and the server may only put
+    /// deliberate ones in the undo log — otherwise ⌘Z would undo "you opened
+    /// this mail". Returns 204 with no audit row when `record` is false (the
+    /// implicit path, unchanged), or 200 with an `actionId` when it is true.
+    @discardableResult
+    public func markRead(
+        remoteId: String, accountId: UUID, isRead: Bool = true, record: Bool = false
+    ) async throws -> Int64? {
         var query = [URLQueryItem(name: "accountId", value: accountId.uuidString)]
         if !isRead { query.append(URLQueryItem(name: "isRead", value: "false")) }
-        try await post(path: ["api", "messages", remoteId, "read"], query: query)
+        if record { query.append(URLQueryItem(name: "record", value: "true")) }
+        let url = try makeURL(path: ["api", "messages", remoteId, "read"], query: query)
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        guard !data.isEmpty else { return nil }
+        return try Self.decode(StateChangeResponse.self, from: data).actionId
     }
 
-    /// POST /api/messages/{remoteId}/pin?accountId=&pinned= → 204.
-    public func setPinned(remoteId: String, accountId: UUID, pinned: Bool) async throws {
-        try await post(path: ["api", "messages", remoteId, "pin"], query: [
+    /// POST /api/messages/{remoteId}/pin?accountId=&pinned= → 200 + actionId.
+    /// A pin is always deliberate, so it always returns an undoable action.
+    @discardableResult
+    public func setPinned(
+        remoteId: String, accountId: UUID, pinned: Bool
+    ) async throws -> Int64? {
+        let url = try makeURL(path: ["api", "messages", remoteId, "pin"], query: [
             .init(name: "accountId", value: accountId.uuidString),
             .init(name: "pinned", value: pinned ? "true" : "false")
         ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(StateChangeResponse.self, from: data).actionId
+    }
+
+    /// POST /api/actions/undo-bulk?accountId= → UndoBulkResponse.
+    ///
+    /// One ⌘Z for a bulk operation. "Mark all as read" records one action per
+    /// message; undoing only the newest would leave the rest in place and read
+    /// to the user as "undo did nothing". `.slow` because each inverse may
+    /// perform a remote IMAP write and they run serially over one connection.
+    public func undoBulk(actionIds: [Int64], accountId: UUID) async throws -> UndoBulkResponse {
+        let url = try makeURL(path: ["api", "actions", "undo-bulk"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = APITimeout.slow.seconds
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(UndoBulkRequest(actionIds: actionIds))
+        let (data, _) = try await send(request, timeout: .slow)
+        return try Self.decode(UndoBulkResponse.self, from: data)
     }
 
     /// GET /api/messages/{remoteId}/summary?accountId=.

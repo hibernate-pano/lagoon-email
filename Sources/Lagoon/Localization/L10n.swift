@@ -421,6 +421,22 @@ public struct L10n: Sendable, Equatable {
     public var undoLastAction: String { pick("撤销上一操作", "Undo last action") }
     public var nothingToUndo: String { pick("没有可撤销的操作", "Nothing to undo") }
     public var undoFailed: String { pick("撤销失败：", "Undo failed: ") }
+    /// A bulk undo that reversed fewer items than it was asked to. Reporting
+    /// this as plain success would misstate the mailbox state in the one place
+    /// the product promises to be honest about it.
+    public func undoPartial(_ undone: Int, _ total: Int) -> String {
+        pick(
+            "已撤销 \(undone)/\(total) 项（其余此前已撤销或不可逆）",
+            "Undid \(undone) of \(total) (the rest were already undone or not reversible)"
+        )
+    }
+    public var markedAsReadToast: String { pick("已标记为已读", "Marked as read") }
+    public var markedAsUnreadToast: String { pick("已标记为未读", "Marked as unread") }
+    public func markedAllReadToast(_ count: Int) -> String {
+        pick("已将 \(count) 封标为已读", "Marked \(count) as read")
+    }
+    public var pinnedToast: String { pick("已置顶", "Pinned") }
+    public var unpinnedToast: String { pick("已取消置顶", "Unpinned") }
     public var undoFailedTitle: String { pick("撤销失败", "Undo failed") }
     public var undoFailedDetail: String {
         pick("操作可能已完成，请刷新确认。", "The action may have already completed — refresh to verify.")
