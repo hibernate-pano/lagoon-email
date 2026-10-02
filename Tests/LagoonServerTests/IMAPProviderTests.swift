@@ -915,9 +915,9 @@ final class IMAPProviderTests: XCTestCase {
 
     /// A read-state flip made on another client is reported as an upsert that
     /// carries the real headers — the store is keyed on the Message-ID and the
-    /// auto-archive rules match on the sender, so neither can be dropped. The
-    /// fetch is batched with the rest of the flips rather than issued one
-    /// message at a time (the session is serial).
+    /// briefing classifier and the user's stack rules match on the sender, so
+    /// neither can be dropped. The fetch is batched with the rest of the flips
+    /// rather than issued one message at a time (the session is serial).
     func test_pullChanges_readStateFlip_reportsFullHeader() async throws {
         try await TokenKeyFixture.withKeyAsync(Self.key) {
             let transport = ScriptedTransport()

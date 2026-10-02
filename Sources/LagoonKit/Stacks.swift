@@ -65,22 +65,3 @@ public struct ArchiveBulkResponse: Codable, Sendable, Equatable {
     public let items: [ArchiveBulkItem]
     public init(items: [ArchiveBulkItem]) { self.items = items }
 }
-
-/// 发件人归档历史驱动的白名单推荐：近 30 天归档次数多、且还没有
-/// auto-archive 规则的发件人。创建动作走既有的 auto-archive 规则路由。
-public struct AutoArchiveSuggestion: Codable, Sendable, Equatable, Identifiable {
-    public let sender: String
-    public let fromName: String?
-    public let archiveCount: Int
-    public var id: String { sender }
-    public init(sender: String, fromName: String?, archiveCount: Int) {
-        self.sender = sender
-        self.fromName = fromName
-        self.archiveCount = archiveCount
-    }
-}
-
-public struct AutoArchiveSuggestionsResponse: Codable, Sendable, Equatable {
-    public let suggestions: [AutoArchiveSuggestion]
-    public init(suggestions: [AutoArchiveSuggestion]) { self.suggestions = suggestions }
-}

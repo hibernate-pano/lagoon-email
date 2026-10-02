@@ -44,7 +44,7 @@ final class SyncEngineTests: XCTestCase {
     private func makeLoop(
         db: LagoonDB,
         account: Account,
-        provider: (any MailProvider)?,
+        provider: (any MailSyncReading)?,
         sleeper: SleepRecorder = SleepRecorder(),
         counter: CallCounter? = nil
     ) -> AccountSyncLoop {
@@ -52,7 +52,7 @@ final class SyncEngineTests: XCTestCase {
             account: account,
             db: db,
             logger: Logger(label: "sync-loop-tests"),
-            makeProvider: { (_: Account) -> (any MailProvider)? in
+            makeProvider: { (_: Account) -> (any MailSyncReading)? in
                 counter?.bump()
                 return provider
             },

@@ -924,7 +924,6 @@ final class APIClientTests: XCTestCase {
                 )
             }),
             ("deleteStack", { try await $0.deleteStack(id: accountId, accountId: accountId) }),
-            ("fetchAutoArchiveSuggestions", { _ = try await $0.fetchAutoArchiveSuggestions(accountId: accountId) }),
             ("overrideClassification", {
                 try await $0.overrideClassification(
                     remoteId: "r", accountId: accountId, from: nil, to: .needsReply
@@ -945,9 +944,6 @@ final class APIClientTests: XCTestCase {
             ("search", { _ = try await $0.search(query: "q", accountId: accountId) }),
             ("fetchUsage", { _ = try await $0.fetchUsage() }),
             ("fetchTimeSaved", { _ = try await $0.fetchTimeSaved(accountId: accountId) }),
-            ("fetchAutoArchiveRules", { _ = try await $0.fetchAutoArchiveRules(accountId: accountId) }),
-            ("addAutoArchiveRule", { _ = try await $0.addAutoArchiveRule(senderAddress: "a@b.com", accountId: accountId) }),
-            ("deleteAutoArchiveRule", { try await $0.deleteAutoArchiveRule(id: 1, accountId: accountId) }),
             ("markRead", { try await $0.markRead(remoteId: "r", accountId: accountId) }),
             ("setPinned", { try await $0.setPinned(remoteId: "r", accountId: accountId, pinned: true) }),
             ("fetchSummary", { _ = try await $0.fetchSummary(remoteId: "r", accountId: accountId) }),

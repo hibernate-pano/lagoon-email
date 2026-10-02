@@ -22,7 +22,6 @@ struct CommandPaletteView: View {
     let onShowAllMessages: () -> Void
     let onShowUsage: () -> Void
     let onShowActionHistory: () -> Void
-    let onShowAutoArchiveRules: () -> Void
     let onShowShortcuts: () -> Void
     let onShowAISettings: () -> Void
     let onRefresh: () -> Void
@@ -59,7 +58,6 @@ struct CommandPaletteView: View {
             Command(id: "usage", title: l10n.budgetThisMonth, shortcut: "⌘B", systemImage: "chart.bar", action: { run(onShowUsage) }),
             Command(id: "ai-settings", title: l10n.aiSettingsTitle, shortcut: nil, systemImage: "sparkles", action: { run(onShowAISettings) }),
             Command(id: "history", title: l10n.actionHistory, shortcut: nil, systemImage: "clock.arrow.circlepath", action: { run(onShowActionHistory) }),
-            Command(id: "rules", title: l10n.autoArchiveRulesTitle, shortcut: nil, systemImage: "list.bullet.indent", action: { run(onShowAutoArchiveRules) }),
             Command(id: "shortcuts", title: l10n.commandPalette, shortcut: "⌘/", systemImage: "questionmark.circle", action: { run(onShowShortcuts) }),
             Command(id: "sound", title: l10n.soundEnabled, shortcut: nil, systemImage: "speaker.wave.2", action: { run(onToggleSound) }),
         ]

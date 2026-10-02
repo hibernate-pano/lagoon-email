@@ -9,15 +9,24 @@ Current state: **V3 "embedded"**. The app is self-contained — the Swift
 `Lagoon.app` process**, on an embedded SQLite store under Application Support.
 There is no Docker, no Postgres, no LaunchAgent, no `.env` on a user machine.
 Mail lives at the provider; the local store is a cache plus user state
-(rules, pins, undo audit), and everything the AI touches is reversible.
+(rules, pins, undo audit).
+
+**Advisory-only AI (non-negotiable).** The AI reads mail, classifies it,
+explains it and drafts reply text. It never writes: no background archiving,
+deleting, unsubscribing, marking read, no rule creation, and above all no
+sending. Every mutation goes through a user-triggered route and is recorded in
+the undo audit. The sync loop is typed against `MailSyncReading`, a read-only
+subset of `MailProvider` that has no write method to call — so "sync cannot
+touch the mailbox" is enforced by the compiler, not by convention. See
+[the constitution](docs/superpowers/specs/2026-10-02-advisory-only-ai-constitution-design.md).
 
 ```
 Lagoon.app（one process）
   ├─ SwiftUI client
   ├─ LagoonRuntime (embedded server, loopback HTTP)
-  │     ├─ Sync Engine — one loop per account (IMAP IDLE / polling)
+  │     ├─ Sync Engine — one read-only loop per account (IMAP IDLE / polling)
   │     └─ SQLite (WAL, GRDB) — ~/Library/Application Support/Lagoon/
-  └─ AI Gateway ──> MiniMax (only AI summary/draft text leaves the machine)
+  └─ AI Gateway ──> MiniMax (advisory only: summary/draft/classify text)
 ```
 
 Docs: [startup runbook (zh)](docs/启动说明.md) ·
@@ -51,8 +60,8 @@ client shows.
 
 One SQLite file (`GRDB`, WAL mode, foreign keys ON) holds everything: accounts
 (credential blobs AES-GCM sealed), message headers + bodies, pins, drafts,
-`ai_actions` audit log (undo + time-saved), usage/budget log, auto-archive
-rules, user-defined stack rules.
+`ai_actions` audit log (undo + time-saved), usage/budget log, user-defined
+stack rules.
 
 - **Schema**: `Sources/LagoonKit/LagoonDatabase.swift` — the final state of
   the historical 19 Postgres migrations, expressed for SQLite as one
@@ -136,7 +145,8 @@ heuristic-only and `/summary` returns 503 — it never crashes.
 - **M1.5**: provider seam (`MailProvider`), QQ Mail, reply send, sync engine,
   batched AI classification.
 - **M1.7**: time-saved status bar, cross-client reply detection, whitelist
-  auto-archive.
+  auto-archive (removed again by the advisory-only constitution — the app has
+  no background write path today).
 - **M1.8 → V2**: concurrent multi-account sync, Sent-folder reply signals,
   bodies + FTS server-side, per-install API token, one-click unsubscribe,
   conversation/sender grouping lenses, user-defined stacks, archive cabinet,

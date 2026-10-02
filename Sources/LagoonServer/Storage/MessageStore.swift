@@ -421,8 +421,9 @@ public enum MessageStore {
     }
 
     /// Local half of an archive/unarchive. The remote move happens through the
-    /// provider first; this only flips the row. The sync loop's whitelist
-    /// autopilot (spec 2026-09-19 §3) uses the same helper as the routes.
+    /// provider first; this only flips the row. Every caller is a
+    /// user-triggered route: the sync loop has no path to this helper and no
+    /// ability to archive at all (`MailSyncReading` has no such method).
     public static func setArchived(
         _ archived: Bool,
         remoteId: String,

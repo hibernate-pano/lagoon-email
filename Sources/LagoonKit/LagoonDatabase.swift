@@ -27,6 +27,9 @@ public enum LagoonDatabase {
     public static let currentVersion = "lagoon-v1"
     /// Index-only follow-up. See `indexReconciliation`.
     public static let indexVersion = "lagoon-v2"
+    /// Drops the whitelist auto-archive table. Advisory-only constitution §2
+    /// rule 5: no rule may execute on its own, so the table has no reader left.
+    public static let advisoryOnlyVersion = "lagoon-v3"
 
     public static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
@@ -37,6 +40,9 @@ public enum LagoonDatabase {
         }
         migrator.registerMigration(indexVersion) { db in
             try db.execute(sql: Self.indexReconciliation)
+        }
+        migrator.registerMigration(advisoryOnlyVersion) { db in
+            try db.execute(sql: Self.advisoryOnlyReconciliation)
         }
         return migrator
     }
@@ -72,6 +78,16 @@ public enum LagoonDatabase {
         DROP INDEX IF EXISTS accounts_provider_idx;
         -- statement
         DROP INDEX IF EXISTS ai_actions_expires_idx;
+    """
+
+    /// Removes the whitelist auto-archive rule table from an already-migrated
+    /// install. Editing `lagoon-v1`'s body would be a silent no-op there (GRDB
+    /// records migrations by identifier), so the removal needs its own
+    /// migration — the same reason `indexReconciliation` exists. `IF EXISTS`
+    /// keeps a fresh install, whose `lagoon-v1` no longer creates the table,
+    /// on the same path.
+    static let advisoryOnlyReconciliation = """
+        DROP TABLE IF EXISTS auto_archive_rules;
     """
 
     /// Opens (creating if needed) and migrates the database at `path`.
@@ -247,14 +263,6 @@ public enum LagoonDatabase {
             FOREIGN KEY (account_id, remote_id)
                 REFERENCES message_headers(account_id, remote_id)
                 ON DELETE CASCADE
-        );
-        -- statement
-        CREATE TABLE auto_archive_rules (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id     BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-            sender_address TEXT NOT NULL,
-            created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
-            UNIQUE (account_id, sender_address)
         );
         -- statement
         CREATE TABLE stack_rules (

@@ -17,7 +17,6 @@ struct RootView: View {
     @State private var showSearch = false
     @State private var showUsage = false
     @State private var showActionHistory = false
-    @State private var showAutoArchiveRules = false
     @State private var showCompose = false
     @State private var showConnect = false
     @State private var showHealthDetail = false
@@ -124,9 +123,6 @@ struct RootView: View {
             .sheet(isPresented: $showActionHistory) {
                 ActionHistorySheet()
             }
-            .sheet(isPresented: $showAutoArchiveRules) {
-                AutoArchiveRulesSheet()
-            }
             .sheet(isPresented: $showCompose) {
                 composeSheet
             }
@@ -184,7 +180,6 @@ struct RootView: View {
             onShowAllMessages: { surface = .allMessages },
             onShowUsage: { showUsage = true },
             onShowActionHistory: { showActionHistory = true },
-            onShowAutoArchiveRules: { showAutoArchiveRules = true },
             onShowShortcuts: { showShortcuts = true },
             onShowAISettings: { showAISettings = true },
             onRefresh: {
@@ -584,7 +579,6 @@ struct RootView: View {
                     .keyboardShortcut("b", modifiers: [.command])
                 Button(l10n.aiSettingsTitle) { Task { @MainActor in showAISettings = true } }
                 Button(l10n.actionHistory) { Task { @MainActor in showActionHistory = true } }
-                Button(l10n.autoArchiveRulesTitle) { Task { @MainActor in showAutoArchiveRules = true } }
                 Divider()
                 // The toggle reads the current value via `SoundEffects.isEnabled`.
                 // Using `Toggle` (not a Button) makes the checkmark reflect the

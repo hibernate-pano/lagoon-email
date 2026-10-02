@@ -471,9 +471,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         //
         // The headers are needed for the identity the store is keyed on (the
         // Message-ID behind `remoteId`) and for `from_address`, which the
-        // auto-archive rules match on. The other columns come back unchanged
-        // and the store protects them on conflict anyway — the flip itself
-        // lands through the monotonic `is_read` OR.
+        // briefing classifier and the user's stack rules match on. The other
+        // columns come back unchanged and the store protects them on conflict
+        // anyway — the flip itself lands through the monotonic `is_read` OR.
         let headers = try await client.fetchHeaders(uids: flipped)
         return headers.map { remoteHeader(from: $0) }
     }

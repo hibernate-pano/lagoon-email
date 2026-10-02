@@ -203,17 +203,37 @@ public protocol ArchiveFolderResolving: Sendable {
     func archiveFolder() async -> String?
 }
 
-/// The one seam every mailbox backend implements. Routes and the sync engine
-/// talk to this, never to IMAP directly.
-public protocol MailProvider: Sendable {
-    var kind: MailProviderKind { get }
-
+/// The read-only subset of a mailbox backend: everything the sync engine is
+/// allowed to touch. It can negotiate capabilities, pull inbound changes and
+/// release its session — and nothing else. No archive, no setRead, no trash,
+/// no send. The sync loop holds `any MailSyncReading`, never `any MailProvider`,
+/// so "sync never writes to the mailbox" is a compile-time guarantee rather
+/// than a convention (advisory-only constitution §2 rule 2).
+public protocol MailSyncReading: Sendable {
     /// Negotiated once after connect and cached on the account row.
     func capabilities() async -> MailCapabilities
 
     /// Fetch changes newer than `cursor`, waiting up to `waitUpTo` for
     /// something to happen (IDLE, bounded by the loop's poll cadence).
     func pullChanges(after cursor: MailSyncState, waitUpTo: Duration) async throws -> MailChangeSet
+
+    /// Release what the provider holds between calls — above all an open IMAP
+    /// session, which QQ counts against a per-account limit. The engine and
+    /// the route pool call this before dropping their last reference; a
+    /// provider that holds nothing does nothing.
+    func shutdown() async
+}
+
+public extension MailSyncReading {
+    func shutdown() async {}
+}
+
+/// The one seam every mailbox backend implements. Routes talk to this; the
+/// sync engine is deliberately narrowed to `MailSyncReading` and cannot reach
+/// the write methods below. Every mutating verb (setRead/archive/trash/send)
+/// lives here, reachable only from a user-triggered route.
+public protocol MailProvider: MailSyncReading {
+    var kind: MailProviderKind { get }
 
     /// Body on demand: plain text, optional HTML, attachment metadata +
     /// decoded bytes, and a truncation flag (M1.6).
@@ -250,16 +270,6 @@ public protocol MailProvider: Sendable {
 
     /// Connectivity + credential check used by the connect flow.
     func probe() async throws
-
-    /// Release what the provider holds between calls — above all an open IMAP
-    /// session, which QQ counts against a per-account limit. The engine and
-    /// the route pool call this before dropping their last reference; a
-    /// provider that holds nothing does nothing.
-    func shutdown() async
-}
-
-public extension MailProvider {
-    func shutdown() async {}
 }
 
 /// Provider-internal body shape (M1.6). `attachments[i].data` is the

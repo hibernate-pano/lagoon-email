@@ -303,21 +303,15 @@ struct BriefingFeedView: View {
                                     Button(readVerbTitle(item.message, l10n: l10n)) {
                                         Task { await toggleRead(item) }
                                     }
-                                    // Whitelist autopilot is offered only on
-                                    // subscription noise: auto-archiving a
-                                    // sender that owes you replies would be
-                                    // an accidental blacklist (spec 2026-09-19 §3).
                                     if item.group == .subscriptionNoise {
                                         Divider()
-                                        Button(l10n.autoArchiveSenderMenuItem) {
-                                            Task { await autoArchiveSender(item) }
-                                        }
-                                        .disabled(!canArchive)
                                         // 一键退订 lives with the noise rows:
                                         // messages carrying List-Unsubscribe
                                         // land in this group, and making the
                                         // user open the mail first defeats
                                         // "one-click". Terminal on the server.
+                                        // It runs only because the user clicked
+                                        // it — nothing here fires on its own.
                                         Button(l10n.unsubscribe, role: .destructive) {
                                             Task { await unsubscribeFrom(item) }
                                         }
@@ -707,33 +701,6 @@ struct BriefingFeedView: View {
         await archiveAndUndo(byId: item.message.remoteId)
 
     }
-
-    /// Whitelist autopilot entry point (spec 2026-09-19 §3): create the rule
-    /// AND archive the message in front of the user — one tap, both effects,
-    /// both reversible (archive via ⌘Z, the rule via the rules sheet).
-    private func autoArchiveSender(_ item: BriefingItem) async {
-        guard canArchive else {
-            errorBanner = ErrorBanner(severity: .error, title: l10n.archiveUnavailable)
-            return
-        }
-        guard let accountId = accounts.accountId else { return }
-        do {
-            _ = try await api.addAutoArchiveRule(
-                senderAddress: item.message.fromAddress,
-                accountId: accountId
-            )
-        } catch {
-            errorBanner = ErrorBanner(
-                severity: .error,
-                title: l10n.autoArchiveRuleFailed,
-                detail: error.lagoonUIMessage
-            )
-            return
-        }
-        await archiveAndUndo(byId: item.message.remoteId)
-    }
-
-
 
     /// One-click unsubscribe (一键退订) from the feed. The server resolves the
     /// List-Unsubscribe header / stored links / body scan, fires the request

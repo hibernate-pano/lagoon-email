@@ -879,7 +879,7 @@ public enum ActionsRoutes {
         do {
             try await reverse(
                 action: claim.action, account: account,
-                makeProvider: makeProvider, db: db, logger: logger
+                makeProvider: makeProvider, db: db
             )
         } catch let error as NotUndoable {
             await releaseClaim(claim, actionId: actionId, db: db, logger: logger)
@@ -950,7 +950,7 @@ public enum ActionsRoutes {
     private static func reverse(
         action: AIAction, account: Account,
         makeProvider: MailProviderFactory.Builder,
-        db: LagoonDB, logger: Logger
+        db: LagoonDB
     ) async throws {
         let remoteId = action.payload["remoteId"] ?? ""
         switch action.kind {
@@ -966,30 +966,6 @@ public enum ActionsRoutes {
                     sql: "UPDATE message_headers SET is_archived = FALSE WHERE remote_id = ? AND account_id = ?",
                     arguments: [remoteId, account.id]
                 )
-            }
-            // Undoing an auto-archive retires its rule (V2 C2): otherwise the
-            // next sync round re-archives the same sender and the undo was a
-            // lie. Sender prefers the action payload and falls back to the
-            // stored header for rows recorded before the payload carried it.
-            if action.payload["autoRule"] == "true" {
-                var sender = action.payload["sender"]
-                if sender == nil {
-                    sender = try? await MessageStore.find(
-                        remoteId: remoteId, accountId: account.id, db: db
-                    )?.fromAddress
-                }
-                if let sender {
-                    // Best-effort: the message already came back, so a rule
-                    // cleanup failure must not fail the undo.
-                    do {
-                        try await AutoArchiveStore.deleteSender(sender, accountId: account.id, db: db)
-                    } catch {
-                        logger.warning("undo.autoRuleCleanupFailed", metadata: [
-                            "actionId": .string("\(action.id)"),
-                            "err": .string("\(error)"),
-                        ])
-                    }
-                }
             }
         case .markRead:
             // Restore the value this action *replaced*, not a hardcoded

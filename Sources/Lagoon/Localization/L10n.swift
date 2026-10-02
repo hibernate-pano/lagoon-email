@@ -84,28 +84,9 @@ public struct L10n: Sendable, Equatable {
              "\(day): ≈ \(minutes) min · \(handled) handled")
     }
 
-    // MARK: - Auto-archive rules (whitelist autopilot, spec 2026-09-19 §3)
-
-    public var autoArchiveSenderMenuItem: String {
-        pick("自动归档此发件人", "Auto-archive this sender")
-    }
-    public var autoArchiveRuleFailed: String {
-        pick("自动归档规则创建失败", "Could not create the auto-archive rule")
-    }
-    public var autoArchiveRulesTitle: String { pick("自动归档规则", "Auto-archive rules") }
-    public var autoArchiveRulesEmpty: String {
-        pick("还没有规则。在简报里右键一封订阅邮件，选「自动归档此发件人」即可创建。",
-             "No rules yet. Right-click a subscription message in the Briefing and choose “Auto-archive this sender”.")
-    }
-    public var autoArchiveRulesHelp: String {
-        pick("命中规则的邮件到达后自动归档，30 天内可撤销。", "Matching mail is archived on arrival and undoable for 30 days.")
-    }
-    public var deleteRule: String { pick("删除规则", "Delete rule") }
-    public var deleteRuleFailed: String { pick("删除规则失败", "Could not delete the rule") }
-    public var done: String { pick("完成", "Done") }
-
     // MARK: - Shared
 
+    public var done: String { pick("完成", "Done") }
     public var refresh: String { pick("刷新", "Refresh") }
     public var retry: String { pick("重试", "Retry") }
     public var noSubject: String { pick("（无主题）", "(no subject)") }
@@ -521,12 +502,6 @@ public struct L10n: Sendable, Equatable {
         pick("\(ok) 封成功，\(failed) 封失败", "\(ok) archived, \(failed) failed")
     }
 
-    // MARK: 白名单规则推荐
-    public var suggestionsHeader: String { pick("推荐（基于近 30 天归档历史）", "Suggested (from 30-day archive history)") }
-    public var suggestionCreate: String { pick("创建规则", "Create rule") }
-    public func suggestionHint(_ count: Int) -> String {
-        pick("30 天内你手动归档了 \(count) 封", "You archived \(count) messages in 30 days")
-    }
     public var pinning: String { pick("正在置顶…", "Pinning…") }
     public var draftVariants: String { pick("AI 草稿（3 个版本）", "AI drafts (3 variants)") }
     public var chooseAndSend: String { pick("选这个 → 发送", "Use this → send") }

@@ -103,6 +103,19 @@ final class SchemaMigrationTests: XCTestCase {
         let versions = try second.read {
             try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations ORDER BY identifier")
         }
-        XCTAssertEqual(versions, ["lagoon-v1", "lagoon-v2"])
+        // Compared as a set against the declared constants, not as a
+        // lexicographically-ordered literal: `ORDER BY identifier` would put a
+        // future `lagoon-v10` before `lagoon-v2`, and every new migration would
+        // otherwise fail here for a reason unrelated to idempotency.
+        XCTAssertEqual(
+            Set(versions),
+            Set([
+                LagoonDatabase.currentVersion,
+                LagoonDatabase.indexVersion,
+                LagoonDatabase.advisoryOnlyVersion,
+            ]),
+            "every registered migration must be recorded exactly once"
+        )
+        XCTAssertEqual(versions.count, Set(versions).count, "a migration must not be recorded twice")
     }
 }

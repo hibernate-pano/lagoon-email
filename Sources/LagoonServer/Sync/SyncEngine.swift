@@ -18,7 +18,7 @@ public actor AccountSyncLoop {
     private let fallbackEmail: String
     private let db: LagoonDB
     private let logger: Logger
-    private let makeProvider: @Sendable (Account) -> (any MailProvider)?
+    private let makeProvider: @Sendable (Account) -> (any MailSyncReading)?
     /// Injected so tests can exercise the backoff state machine without
     /// wall-clock sleeps.
     private let sleep: @Sendable (Duration) async -> Void
@@ -26,16 +26,15 @@ public actor AccountSyncLoop {
     private var consecutiveFailures = 0
     /// The provider is long-lived: an IMAP provider holds an IDLE connection,
     /// so rebuilding one per round would lose it.
-    private var provider: (any MailProvider)?
+    private var provider: (any MailSyncReading)?
     /// Negotiated once per provider; refreshed whenever the provider is rebuilt.
     private var capabilitiesChecked = false
-    private var lastNegotiated: MailCapabilities?
 
     public init(
         account: Account,
         db: LagoonDB,
         logger: Logger,
-        makeProvider: @escaping @Sendable (Account) -> (any MailProvider)?,
+        makeProvider: @escaping @Sendable (Account) -> (any MailSyncReading)?,
         sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
     ) {
         self.accountId = account.id
@@ -88,10 +87,11 @@ public actor AccountSyncLoop {
                 await sleep(.seconds(60))
                 return false
             }
-            // The negotiated capabilities must reach `apply` explicitly. The
-            // row above predates negotiation, so first-round auto-archive would
-            // otherwise see `.unknown` and skip.
-            let capabilities = await ensureCapabilities(for: provider, account: current)
+            // Negotiate once per provider and persist it. The account row read
+            // above predates negotiation, so `ensureCapabilities` is what makes
+            // the stored capabilities true — the user-triggered routes gate
+            // archive and delete on them. The loop itself never acts on them.
+            await ensureCapabilities(for: provider, account: current)
             let changes = try await provider.pullChanges(
                 after: current.syncState,
                 waitUpTo: waitBudget
@@ -99,7 +99,7 @@ public actor AccountSyncLoop {
             // A switch cancels this task while the provider may already have a
             // completed result. Do not let stale mail land after ownership moved.
             try Task.checkCancellation()
-            try await apply(changes, to: current, capabilities: capabilities)
+            try await apply(changes, to: current)
             if consecutiveFailures > 0 {
                 logger.info("sync.recovered", metadata: [
                     "account": .string(current.email),
@@ -130,28 +130,28 @@ public actor AccountSyncLoop {
     // MARK: - Capabilities
 
     /// Negotiated capabilities are account data. Refresh once per provider,
-    /// then keep the negotiated value until that provider is discarded.
+    /// then persist it on the account row so the user-triggered routes (which
+    /// gate archive and delete on it) read the truth. The sync loop itself
+    /// never acts on capabilities: it is read-only by construction.
     private func ensureCapabilities(
-        for provider: any MailProvider,
+        for provider: any MailSyncReading,
         account: Account
-    ) async -> MailCapabilities {
+    ) async {
         guard !capabilitiesChecked else {
-            return lastNegotiated ?? account.capabilities
+            return
         }
         capabilitiesChecked = true
         let capabilities = await provider.capabilities()
-        lastNegotiated = capabilities
         try? await AccountStore.updateCapabilities(
             accountId: account.id,
             capabilities: capabilities,
             db: db
         )
-        return capabilities
     }
 
     /// Long-lived instance, or nil when this build has no implementation for
     /// the account's provider (the round records `no-provider`).
-    private func resolveProvider(for account: Account) -> (any MailProvider)? {
+    private func resolveProvider(for account: Account) -> (any MailSyncReading)? {
         if let provider { return provider }
         guard let made = makeProvider(account) else { return nil }
         provider = made
@@ -168,7 +168,6 @@ public actor AccountSyncLoop {
         let held = provider
         provider = nil
         capabilitiesChecked = false
-        lastNegotiated = nil
         await held?.shutdown()
     }
 
@@ -180,8 +179,7 @@ public actor AccountSyncLoop {
     /// idempotent.
     private func apply(
         _ changes: MailChangeSet,
-        to account: Account,
-        capabilities: MailCapabilities
+        to account: Account
     ) async throws {
         if changes.resetRequired {
             try await MessageStore.deleteAll(accountId: account.id, db: db)
@@ -202,11 +200,6 @@ public actor AccountSyncLoop {
                 db: db
             )
         }
-        try await autoArchiveMatched(
-            upserts: changes.upserts,
-            account: account,
-            capabilities: capabilities
-        )
         try await recordSentReplies(changes.repliedMessageIds, accountId: account.id)
         try await AccountStore.updateSyncState(
             accountId: account.id,
@@ -222,50 +215,6 @@ public actor AccountSyncLoop {
             logger.info("sync.applied", metadata: [
                 "account": .string(account.email),
                 "count": .string("\(changes.upserts.count)"),
-            ])
-        }
-    }
-
-    /// Whitelist autopilot. Mail from a configured sender is archived remotely
-    /// after local persistence but before the cursor advances, preserving the
-    /// existing idempotent remote-first ordering.
-    private func autoArchiveMatched(
-        upserts: [RemoteHeader],
-        account: Account,
-        capabilities: MailCapabilities
-    ) async throws {
-        guard capabilities.archiveFolder else { return }
-        guard !upserts.isEmpty else { return }
-        let rules = try await AutoArchiveStore.senderAddresses(accountId: account.id, db: db)
-        guard !rules.isEmpty else { return }
-        guard let provider else { return }
-
-        for header in upserts where rules.contains(header.fromAddress.lowercased()) {
-            do {
-                try await provider.archive(remoteId: header.remoteId)
-            } catch MailError.messageGone {
-                continue
-            }
-            try await MessageStore.setArchived(
-                true,
-                remoteId: header.remoteId,
-                accountId: account.id,
-                db: db
-            )
-            _ = try await AIActionStore.record(
-                accountId: account.id,
-                kind: .archive,
-                payload: [
-                    "remoteId": header.remoteId,
-                    "autoRule": "true",
-                    "sender": header.fromAddress.lowercased(),
-                ],
-                db: db
-            )
-            logger.info("autoarchive.applied", metadata: [
-                "account": .string(account.email),
-                "from": .string(header.fromAddress),
-                "remoteId": .string(header.remoteId),
             ])
         }
     }
@@ -363,7 +312,7 @@ public actor AccountSyncLoop {
 public actor SyncEngine {
     private let db: LagoonDB
     private let logger: Logger
-    private let makeProvider: @Sendable (Account, LagoonDB) -> (any MailProvider)?
+    private let makeProvider: @Sendable (Account, LagoonDB) -> (any MailSyncReading)?
     private let sleep: @Sendable (Duration) async -> Void
     /// SQLite note: the Postgres build gave every loop its own connection
     /// because a wire connection serves one query at a time. The WAL pool is
@@ -386,7 +335,7 @@ public actor SyncEngine {
     public init(
         db: LagoonDB,
         logger: Logger,
-        makeProvider: @escaping @Sendable (Account, LagoonDB) -> (any MailProvider)?,
+        makeProvider: @escaping @Sendable (Account, LagoonDB) -> (any MailSyncReading)?,
         sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
     ) {
         self.db = db
