@@ -265,7 +265,7 @@ public enum ActionsRoutes {
             return RouteJSON.error(.badRequest, "malformed-accountId")
         }
         let body: Data
-        do { body = try await collectBody(request) } catch {
+        do { body = try await RouteParams.collectBody(request) } catch {
             return RouteJSON.error(.badRequest, "missing-body")
         }
         struct Req: Decodable { let remoteIds: [String] }
@@ -591,7 +591,7 @@ public enum ActionsRoutes {
             return RouteJSON.error(.badRequest, "malformed-remoteId")
         }
         let body: Data
-        do { body = try await collectBody(request) } catch {
+        do { body = try await RouteParams.collectBody(request) } catch {
             return RouteJSON.error(.badRequest, "missing-body")
         }
         struct Req: Decodable {
@@ -919,9 +919,6 @@ public enum ActionsRoutes {
         return RouteJSON.error(status, code)
     }
 
-    private static func collectBody(_ request: Request) async throws -> Data {
-        try await RouteParams.collectBody(request)
-    }
 
     /// Pulls the first usable URL out of a `List-Unsubscribe` header. The header
     /// can contain `<mailto:…>`, `<https://…>`, or bare URLs. We prefer https.

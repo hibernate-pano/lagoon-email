@@ -135,7 +135,7 @@ public enum DraftRoutes {
             return RouteJSON.error(.badRequest, "malformed-draft-id")
         }
         let body: Data
-        do { body = try await collectBody(request) } catch {
+        do { body = try await RouteParams.collectBody(request) } catch {
             return RouteJSON.error(.badRequest, "missing-body")
         }
         struct ChooseReq: Decodable {
@@ -232,9 +232,6 @@ public enum DraftRoutes {
             .filter { !$0.isEmpty }
     }
 
-    private static func collectBody(_ request: Request) async throws -> Data {
-        try await RouteParams.collectBody(request)
-    }
 
     private static func errorResponse(
         _ status: HTTPResponse.Status, _ code: String, logger: Logger, error: Error

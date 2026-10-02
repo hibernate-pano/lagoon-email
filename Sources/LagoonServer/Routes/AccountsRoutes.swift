@@ -85,7 +85,7 @@ public enum AccountsRoutes {
         router.post("api/accounts/imap") { request, _ -> Response in
             let body: Data
             do {
-                body = try await collectBody(request)
+                body = try await RouteParams.collectBody(request)
             } catch {
                 return RouteJSON.error(.badRequest, "missing-body")
             }
@@ -281,7 +281,4 @@ public enum AccountsRoutes {
         }
     }
 
-    private static func collectBody(_ request: Request) async throws -> Data {
-        try await RouteParams.collectBody(request)
-    }
 }
