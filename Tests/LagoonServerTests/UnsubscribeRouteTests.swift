@@ -14,14 +14,14 @@ import LagoonKit
 /// unbracketed header URLs must resolve; a `mailto:` in one stage must not
 /// short-circuit an https link in a later stage) and for the transport
 /// (a 3xx is never a completed unsubscribe). The resolution chain is stubbed
-/// through `ActionsRoutes.hitUnsubscribeProbe`; the transport is driven over a
+/// through `UnsubscribeEndpoint.hitUnsubscribeProbe`; the transport is driven over a
 /// stub `URLProtocol` (status/body classification) and a loopback server
 /// (a real 302 hop), so the suite stays offline.
 final class UnsubscribeRouteTests: XCTestCase {
     private static let logger = Logger(label: "unsubscribe-route-tests")
 
     override func tearDown() {
-        ActionsRoutes.hitUnsubscribeProbe = nil
+        UnsubscribeEndpoint.hitUnsubscribeProbe = nil
         super.tearDown()
     }
 
@@ -201,13 +201,13 @@ final class UnsubscribeRouteTests: XCTestCase {
     /// The production session shape (SSRF-checked redirect hops + body cap)
     /// over a stub protocol: no network, no DNS.
     private static func stubProbeSession(
-        maxBodyBytes: Int = ActionsRoutes.maxUnsubscribeBodyBytes
+        maxBodyBytes: Int = UnsubscribeEndpoint.maxUnsubscribeBodyBytes
     ) -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [StubURLProtocol.self]
         return URLSession(
             configuration: config,
-            delegate: ActionsRoutes.RedirectGuard(maxBodyBytes: maxBodyBytes),
+            delegate: UnsubscribeEndpoint.RedirectGuard(maxBodyBytes: maxBodyBytes),
             delegateQueue: nil
         )
     }
@@ -302,7 +302,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         let provider = StubMailProvider()
         await provider.configureUnsubscribe(rawHeaders: [:], bodyHTML: "<p>hello reader</p>")
         let recorder = URLRecorder()
-        ActionsRoutes.hitUnsubscribeProbe = { url in
+        UnsubscribeEndpoint.hitUnsubscribeProbe = { url in
             recorder.append(url)
             return .failed
         }
@@ -335,7 +335,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         let provider = StubMailProvider()
         await provider.configureUnsubscribe(rawHeaders: [:])
         let recorder = URLRecorder()
-        ActionsRoutes.hitUnsubscribeProbe = { url in
+        UnsubscribeEndpoint.hitUnsubscribeProbe = { url in
             recorder.append(url)
             return .completed
         }
@@ -395,7 +395,7 @@ final class UnsubscribeRouteTests: XCTestCase {
             rawHeaders: ["list-unsubscribe": "https://1.1.1.1/unsubscribe"]
         )
         let recorder = URLRecorder()
-        ActionsRoutes.hitUnsubscribeProbe = { url in
+        UnsubscribeEndpoint.hitUnsubscribeProbe = { url in
             recorder.append(url)
             return .completed
         }
@@ -429,7 +429,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         await provider.configureUnsubscribe(
             rawHeaders: ["list-unsubscribe": "<mailto:bye@example.com>"]
         )
-        ActionsRoutes.hitUnsubscribeProbe = { _ in
+        UnsubscribeEndpoint.hitUnsubscribeProbe = { _ in
             XCTFail("mailto must never be fetched")
             return .failed
         }
@@ -465,7 +465,7 @@ final class UnsubscribeRouteTests: XCTestCase {
             bodyHTML: #"<a href="https://8.8.8.8/unsubscribe?id=1">Unsubscribe</a>"#
         )
         let recorder = URLRecorder()
-        ActionsRoutes.hitUnsubscribeProbe = { url in
+        UnsubscribeEndpoint.hitUnsubscribeProbe = { url in
             recorder.append(url)
             return .completed
         }
@@ -503,7 +503,7 @@ final class UnsubscribeRouteTests: XCTestCase {
             bodyHTML: #"<a href="https://1.1.1.1/optout">stop receiving</a>"#
         )
         let recorder = URLRecorder()
-        ActionsRoutes.hitUnsubscribeProbe = { url in
+        UnsubscribeEndpoint.hitUnsubscribeProbe = { url in
             recorder.append(url)
             return .completed
         }
@@ -543,7 +543,7 @@ final class UnsubscribeRouteTests: XCTestCase {
             ]
         )
         let recorder = URLRecorder()
-        ActionsRoutes.hitUnsubscribeProbe = { url in
+        UnsubscribeEndpoint.hitUnsubscribeProbe = { url in
             recorder.append(url)
             return .completed
         }
@@ -576,7 +576,7 @@ final class UnsubscribeRouteTests: XCTestCase {
     func test_bodyFetchFails_doesNotReportNoLink() async throws {
         let account = makeAccount()
         let provider = BodyFailingProvider()
-        ActionsRoutes.hitUnsubscribeProbe = { _ in
+        UnsubscribeEndpoint.hitUnsubscribeProbe = { _ in
             XCTFail("no candidate may be fetched")
             return .failed
         }
@@ -612,7 +612,7 @@ final class UnsubscribeRouteTests: XCTestCase {
             .init(status: 200, body: Data("You are unsubscribed".utf8)),
             for: "https://8.8.8.8/u"
         )
-        let hit = try await ActionsRoutes.hitUnsubscribe(
+        let hit = try await UnsubscribeEndpoint.hitUnsubscribe(
             url: URL(string: "https://8.8.8.8/u")!, session: Self.stubProbeSession()
         )
         XCTAssertEqual(hit, .completed)
@@ -626,7 +626,7 @@ final class UnsubscribeRouteTests: XCTestCase {
     func test_hitUnsubscribe_3xxIsNotSuccess() async throws {
         StubURLProtocol.reset()
         StubURLProtocol.script(.init(status: 302), for: "https://8.8.8.8/u")
-        let hit = try await ActionsRoutes.hitUnsubscribe(
+        let hit = try await UnsubscribeEndpoint.hitUnsubscribe(
             url: URL(string: "https://8.8.8.8/u")!, session: Self.stubProbeSession()
         )
         XCTAssertEqual(hit, .failed, "a redirect stub must never classify as completed")
@@ -648,8 +648,8 @@ final class UnsubscribeRouteTests: XCTestCase {
         try await entry.start()
         guard let url = entry.url else { throw CancellationError() }
 
-        let hit = try await ActionsRoutes.hitUnsubscribe(
-            url: url, session: ActionsRoutes.makeProbeSession()
+        let hit = try await UnsubscribeEndpoint.hitUnsubscribe(
+            url: url, session: UnsubscribeEndpoint.makeProbeSession()
         )
         XCTAssertEqual(hit, .failed, "a refused redirect must never classify as completed")
         XCTAssertEqual(entry.requestCount, 1, "only the first hop may be requested")
@@ -659,8 +659,8 @@ final class UnsubscribeRouteTests: XCTestCase {
     /// The guard's decision itself, unit-level: an unsafe hop is cancelled and
     /// not followed; a public one is handed on.
     func test_redirectGuard_decidesPerHop() async throws {
-        let guardDelegate = ActionsRoutes.RedirectGuard(
-            maxBodyBytes: ActionsRoutes.maxUnsubscribeBodyBytes
+        let guardDelegate = UnsubscribeEndpoint.RedirectGuard(
+            maxBodyBytes: UnsubscribeEndpoint.maxUnsubscribeBodyBytes
         )
         let task = ProbeTask()
 
@@ -707,7 +707,7 @@ final class UnsubscribeRouteTests: XCTestCase {
     /// conformance.
     func test_redirectGuard_capsStreamedBody() {
         let cap = 1024
-        let delegate: URLSessionDataDelegate = ActionsRoutes.RedirectGuard(maxBodyBytes: cap)
+        let delegate: URLSessionDataDelegate = UnsubscribeEndpoint.RedirectGuard(maxBodyBytes: cap)
         let task = ProbeTask()
         let session = URLSession.shared
 
@@ -732,7 +732,7 @@ final class UnsubscribeRouteTests: XCTestCase {
             .init(status: 200, body: Data("You are unsubscribed".utf8)),
             for: "https://8.8.8.8/u GET"
         )
-        let hit = try await ActionsRoutes.hitUnsubscribe(
+        let hit = try await UnsubscribeEndpoint.hitUnsubscribe(
             url: URL(string: "https://8.8.8.8/u")!, session: Self.stubProbeSession()
         )
         XCTAssertEqual(hit, .completed)
@@ -745,7 +745,7 @@ final class UnsubscribeRouteTests: XCTestCase {
     func test_hitUnsubscribe_oneClickPostsRFCBody() async throws {
         StubURLProtocol.reset()
         StubURLProtocol.script(.init(status: 200), for: "https://8.8.8.8/u POST")
-        let hit = try await ActionsRoutes.hitUnsubscribe(
+        let hit = try await UnsubscribeEndpoint.hitUnsubscribe(
             url: URL(string: "https://8.8.8.8/u")!, oneClick: true,
             session: Self.stubProbeSession()
         )
@@ -768,7 +768,7 @@ final class UnsubscribeRouteTests: XCTestCase {
             .init(status: 200, body: Data("You have been unsubscribed".utf8)),
             for: "https://8.8.8.8/u GET"
         )
-        let hit = try await ActionsRoutes.hitUnsubscribe(
+        let hit = try await UnsubscribeEndpoint.hitUnsubscribe(
             url: URL(string: "https://8.8.8.8/u")!, oneClick: true,
             session: Self.stubProbeSession()
         )
@@ -797,7 +797,7 @@ final class UnsubscribeRouteTests: XCTestCase {
             .init(status: 200, body: Data("You have been unsubscribed".utf8)),
             for: "https://8.8.8.8/confirm?token=abc GET"
         )
-        let hit = try await ActionsRoutes.hitUnsubscribe(
+        let hit = try await UnsubscribeEndpoint.hitUnsubscribe(
             url: URL(string: "https://8.8.8.8/u")!, session: Self.stubProbeSession()
         )
         XCTAssertEqual(hit, .completed, "the server makes the confirm click for the user")
@@ -818,7 +818,7 @@ final class UnsubscribeRouteTests: XCTestCase {
             )),
             for: "https://8.8.8.8/u GET"
         )
-        let hit = try await ActionsRoutes.hitUnsubscribe(
+        let hit = try await UnsubscribeEndpoint.hitUnsubscribe(
             url: URL(string: "https://8.8.8.8/u")!, session: Self.stubProbeSession()
         )
         XCTAssertEqual(hit, .landingPage)
@@ -834,7 +834,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         <a href="https://8.8.8.8/prefs">Manage preferences</a></body></html>
         """#
         XCTAssertEqual(
-            ActionsRoutes.classifyHit(data: Data(confirmation.utf8)),
+            UnsubscribeEndpoint.classifyHit(data: Data(confirmation.utf8)),
             .completed,
             "a success phrase must win over a re-offered preferences link"
         )
@@ -842,7 +842,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         <p>Confirm you want to unsubscribe <a href="https://8.8.8.8/c">here</a></p>
         """#
         XCTAssertEqual(
-            ActionsRoutes.classifyHit(data: Data(ask.utf8)),
+            UnsubscribeEndpoint.classifyHit(data: Data(ask.utf8)),
             .landingPage,
             "a confirmation ASK (no completed tense) is still a landing page"
         )
@@ -855,7 +855,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         let provider = StubMailProvider()
         await provider.configureUnsubscribe(rawHeaders: [:], headerError: .messageGone)
         let recorder = URLRecorder()
-        ActionsRoutes.hitUnsubscribeProbe = { url in
+        UnsubscribeEndpoint.hitUnsubscribeProbe = { url in
             recorder.append(url)
             return .completed
         }
@@ -888,7 +888,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         let account = makeAccount()
         let provider = StubMailProvider()
         await provider.configureUnsubscribe(rawHeaders: [:], headerError: .messageGone)
-        ActionsRoutes.hitUnsubscribeProbe = { _ in
+        UnsubscribeEndpoint.hitUnsubscribeProbe = { _ in
             XCTFail("no candidate may be fetched")
             return .failed
         }
@@ -923,7 +923,7 @@ final class UnsubscribeRouteTests: XCTestCase {
         let provider = StubMailProvider()
         await provider.configureUnsubscribe(rawHeaders: [:])
         let recorder = URLRecorder()
-        ActionsRoutes.hitUnsubscribeProbe = { url in
+        UnsubscribeEndpoint.hitUnsubscribeProbe = { url in
             recorder.append(url)
             return .landingPage
         }
@@ -967,26 +967,26 @@ final class UnsubscribeRouteTests: XCTestCase {
     /// unsubscribe links is only a landing page; non-UTF8 data completes.
     func test_classifyHit_distinguishesConfirmationFromLandingPage() {
         XCTAssertEqual(
-            ActionsRoutes.classifyHit(data: Data()), .completed,
+            UnsubscribeEndpoint.classifyHit(data: Data()), .completed,
             "empty ack (one-click endpoint) is success"
         )
         XCTAssertEqual(
-            ActionsRoutes.classifyHit(data: Data("OK".utf8)), .completed
+            UnsubscribeEndpoint.classifyHit(data: Data("OK".utf8)), .completed
         )
         XCTAssertEqual(
-            ActionsRoutes.classifyHit(
+            UnsubscribeEndpoint.classifyHit(
                 data: Data(#"<p>You have been unsubscribed.</p>"#.utf8)
             ), .completed,
             "confirmation page without a new unsubscribe entry is success"
         )
         XCTAssertEqual(
-            ActionsRoutes.classifyHit(
+            UnsubscribeEndpoint.classifyHit(
                 data: Data(#"<a href="https://ex.com/leave">Find out how to leave the program</a>"#.utf8)
             ), .landingPage,
             "a page that still offers an unsubscribe entry is not a completed unsubscribe"
         )
         XCTAssertEqual(
-            ActionsRoutes.classifyHit(data: Data([0xff, 0xfe, 0x00, 0x80])), .completed,
+            UnsubscribeEndpoint.classifyHit(data: Data([0xff, 0xfe, 0x00, 0x80])), .completed,
             "non-text bodies cannot re-offer links"
         )
     }
