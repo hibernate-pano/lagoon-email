@@ -853,9 +853,21 @@ final class SyncEngineTests: XCTestCase {
                 }
                 XCTAssertTrue(running, "the account's loop must be pulling first")
                 let pullsBeforeDelete = probe.pulls
-                try await Task.sleep(for: .milliseconds(150))
-                XCTAssertGreaterThan(
-                    probe.pulls, pullsBeforeDelete,
+                // Poll for the second pull instead of sleeping a fixed 150ms.
+                // One pull holds the provider for 120ms and then applies its
+                // changes through several DB round-trips, so 150ms left ~30ms
+                // of margin for all of that — enough on a quiet laptop, and
+                // the first thing to break on a preempted runner (it failed
+                // exactly here on CI: "1 is not greater than 1"). The storm
+                // test above already waited on evidence rather than duration;
+                // this one did not.
+                var stillRunning = false
+                for _ in 0..<150 {
+                    if probe.pulls > pullsBeforeDelete { stillRunning = true; break }
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                XCTAssertTrue(
+                    stillRunning,
                     "the loop must still be running before the account is deleted"
                 )
 

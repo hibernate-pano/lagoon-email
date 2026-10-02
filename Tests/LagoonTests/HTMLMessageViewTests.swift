@@ -589,7 +589,18 @@ final class HTMLMessageViewTests: XCTestCase {
             return
         }
         XCTAssertNotNil(filled, "the late-growth injection itself must work")
-        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        // Poll for the growth rather than sleeping a fixed 1.2s and asserting.
+        // The heartbeat runs every 30ms here, so on a quiet machine the sample
+        // lands within ~50ms; a fixed wait is then 24x longer than needed and
+        // still not long enough on a preempted runner, where the WebView's
+        // JavaScript evaluation can be delayed arbitrarily. This is the same
+        // shape as the bug that made test_measurementLoopStops fail on CI.
+        //
+        // 12s, not waitUntil's 5s default: the heartbeat schedule configured
+        // above runs 300 iterations x 30ms, a 9s window, and a sample can only
+        // land inside it. A ceiling shorter than the window would fail the test
+        // for waiting too little rather than for the behaviour being wrong.
+        await waitUntil({ box.value > 500 }, timeout: 12)
         XCTAssertGreaterThan(box.value, 500, "growth after the burst window must still be measured")
         coordinator.cancelMeasurement()
     }
