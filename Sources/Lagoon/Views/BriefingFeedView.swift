@@ -170,6 +170,16 @@ struct BriefingFeedView: View {
         .onReceive(NotificationCenter.default.publisher(for: .lagoonDidChangeData)) { _ in
             Task { await refresh() }
         }
+        // The advice panel asks the feed to reveal a message. The feed owns
+        // its navigation path, so it does the revealing; the switch to the
+        // Briefing surface belongs to RootView, which listens for the same
+        // notification.
+        .onReceive(NotificationCenter.default.publisher(for: .lagoonRevealMessage)) { note in
+            guard let remoteId = note.userInfo?["remoteId"] as? String else { return }
+            // `reveal` refreshes first when the message is not in the current
+            // snapshot, and `onReceive` hands us a synchronous closure.
+            Task { await reveal(remoteId) }
+        }
     }
 
     private func poll() async {
@@ -854,6 +864,35 @@ struct BriefingFeedView: View {
         }
     }
 
+    /// Opens a message the advice panel pointed at.
+    ///
+    /// Refreshes first: the suggestion may be for mail that arrived after the
+    /// last poll, and pushing a remoteId the current snapshot does not contain
+    /// would navigate to a detail view with no header — a blank screen that
+    /// reads as "the app is broken".
+    ///
+    /// A message that is still absent afterwards (archived, or filtered out of
+    /// the feed entirely) is reported rather than silently ignored. This is the
+    /// one place the feed cannot honour a request, and saying so beats a
+    /// button that appears to do nothing.
+    private func reveal(_ remoteId: String) async {
+        if !items.contains(where: { $0.message.remoteId == remoteId }) {
+            await refresh()
+        }
+        guard !isLoading else { return }
+        guard items.contains(where: { $0.message.remoteId == remoteId }) else {
+            errorBanner = ErrorBanner(
+                severity: .warning,
+                title: l10n.adviceMessageGoneTitle,
+                detail: l10n.adviceMessageGoneDetail
+            )
+            return
+        }
+        withAnimation {
+            path = [remoteId]
+        }
+    }
+
     /// Mark every message in the current briefing as read. Runs the per-row
     /// markRead calls in parallel via a TaskGroup so a 50-message briefing
     /// takes ~3-5 round trips' worth of wall time rather than 50 in series.
@@ -998,4 +1037,3 @@ extension BriefingItem {
         )
     }
 }
-

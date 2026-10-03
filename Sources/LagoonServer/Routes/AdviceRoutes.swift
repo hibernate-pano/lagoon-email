@@ -87,7 +87,9 @@ public enum AdviceRoutes {
                     // another account's advice ids.
                     return RouteJSON.error(.notFound, "unknown-advice")
                 }
-                return RouteJSON.response(AdviceDecisionResponse(id: adviceId, decision: decision))
+                return RouteJSON.response(
+                    AdviceDecisionResponse(id: adviceId, decision: decision)
+                )
             } catch {
                 return RouteJSON.failure(
                     .internalServerError, "internal-error",
@@ -100,15 +102,5 @@ public enum AdviceRoutes {
     /// `POST /api/advice/{id}/decision` body.
     private struct DecisionRequest: Decodable {
         let decision: String
-    }
-
-    /// `POST /api/advice/{id}/decision` response.
-    public struct AdviceDecisionResponse: Codable, Sendable, Equatable {
-        public let id: Int64
-        public let decision: AdviceDecision
-        public init(id: Int64, decision: AdviceDecision) {
-            self.id = id
-            self.decision = decision
-        }
     }
 }

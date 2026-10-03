@@ -612,6 +612,58 @@ public final class APIClient: Sendable {
         return try Self.decode(TimeSavedReport.self, from: data)
     }
 
+    /// GET /api/advice?accountId=[&decision=][&limit=] → the suggestion queue.
+    ///
+    /// Read-only by contract (constitution §3): nothing in this call, and
+    /// nothing in the type it returns, can change a message. `decision` omitted
+    /// or blank asks for the pending queue, which is what the panel opens;
+    /// `any` is the audit view.
+    public func fetchAdvice(
+        accountId: UUID,
+        decision: AdviceDecisionQuery? = .pending,
+        limit: Int = 200
+    ) async throws -> [AdviceRecord] {
+        var query = [URLQueryItem(name: "accountId", value: accountId.uuidString)]
+        switch decision {
+        case .none:
+            break
+        case .some(.pending):
+            break
+        case .some(.exactly(let value)):
+            query.append(.init(name: "decision", value: value.rawValue))
+        case .some(.all):
+            query.append(.init(name: "decision", value: "any"))
+        }
+        query.append(.init(name: "limit", value: String(limit)))
+        let url = try makeURL(path: ["api", "advice"], query: query)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(AdviceListResponse.self, from: data).advice
+    }
+
+    /// POST /api/advice/{id}/decision?accountId= `{decision}` → the stored verdict.
+    ///
+    /// The only write the advice surface has, and it writes the `advice` table
+    /// only. It does not archive, delete, unsubscribe or send: recording a
+    /// verdict is not performing the advice.
+    public func setAdviceDecision(
+        id: Int64,
+        decision: AdviceDecision,
+        accountId: UUID
+    ) async throws -> AdviceDecisionResponse {
+        let url = try makeURL(path: ["api", "advice", "\(id)", "decision"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["decision": decision.rawValue])
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(AdviceDecisionResponse.self, from: data)
+    }
+
     /// POST /api/messages/{remoteId}/read?accountId=[&isRead=] → 204.
     /// `isRead` defaults to true; pass false to mark unread.
     /// POST /api/messages/{remoteId}/read?accountId=[&isRead=false][&record=true]

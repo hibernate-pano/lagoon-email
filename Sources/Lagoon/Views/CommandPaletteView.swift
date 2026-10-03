@@ -22,6 +22,7 @@ struct CommandPaletteView: View {
     let onShowAllMessages: () -> Void
     let onShowUsage: () -> Void
     let onShowActionHistory: () -> Void
+    let onShowAdvice: () -> Void
     let onShowShortcuts: () -> Void
     let onShowAISettings: () -> Void
     let onRefresh: () -> Void
@@ -57,6 +58,7 @@ struct CommandPaletteView: View {
             Command(id: "refresh", title: l10n.refresh, shortcut: "⌥⌘R", systemImage: "arrow.clockwise", action: { run(onRefresh) }),
             Command(id: "usage", title: l10n.budgetThisMonth, shortcut: "⌘B", systemImage: "chart.bar", action: { run(onShowUsage) }),
             Command(id: "ai-settings", title: l10n.aiSettingsTitle, shortcut: nil, systemImage: "sparkles", action: { run(onShowAISettings) }),
+            Command(id: "advice", title: l10n.adviceTitle, shortcut: "⇧⌘A", systemImage: "sparkles", action: { run(onShowAdvice) }),
             Command(id: "history", title: l10n.actionHistory, shortcut: nil, systemImage: "clock.arrow.circlepath", action: { run(onShowActionHistory) }),
             Command(id: "shortcuts", title: l10n.commandPalette, shortcut: "⌘/", systemImage: "questionmark.circle", action: { run(onShowShortcuts) }),
             Command(id: "sound", title: l10n.soundEnabled, shortcut: nil, systemImage: "speaker.wave.2", action: { run(onToggleSound) }),

@@ -413,6 +413,109 @@ final class APIClientTests: XCTestCase {
         )
     }
 
+    /// The advice queue is the product's front door, so its wire shape is
+    /// pinned: a panel that silently decodes an empty list looks identical to
+    /// "Lagoon has nothing to say", which is the worst possible failure here.
+    func test_fetchAdvice_decodesTheFullRecord() async throws {
+        let accountId = UUID()
+        // Assembled with JSONSerialization rather than a literal: the payload's
+        // top-level key is "advice", and a literal mixing that word with an
+        // interpolated id is the exact shape the SQL guardrail rejects. The
+        // rule cannot tell a JSON envelope from a query, so the fixture is
+        // built the way the wire format actually arrives.
+        let payload: [String: Any] = [
+            "advice": [[
+                "id": 7,
+                "accountId": accountId.uuidString,
+                "remoteId": "msg-1",
+                "advice": [
+                    "action": "delete",
+                    "category": "marketing",
+                    "confidence": "high",
+                    "rationale": "广告邮件，无保留价值。",
+                    "dueText": NSNull(),
+                ],
+                "source": "ai",
+                "model": "MiniMax-M3",
+                "decision": "pending",
+                "createdAt": "2026-10-03T02:00:00Z",
+                "decidedAt": NSNull(),
+            ]]
+        ]
+        stub(status: 200, body: try JSONSerialization.data(withJSONObject: payload))
+
+        let records = try await makeClient().fetchAdvice(accountId: accountId)
+
+        XCTAssertEqual(records.count, 1)
+        let row = try XCTUnwrap(records.first)
+        XCTAssertEqual(row.id, 7)
+        XCTAssertEqual(row.remoteId, "msg-1")
+        XCTAssertEqual(row.advice.action, .delete)
+        XCTAssertEqual(row.advice.category, .marketing)
+        XCTAssertEqual(row.advice.confidence, .high)
+        XCTAssertEqual(row.advice.rationale, "广告邮件，无保留价值。")
+        XCTAssertNil(row.advice.dueText, "an explicit null must decode as absent, not crash")
+        XCTAssertEqual(row.source, .ai)
+        XCTAssertEqual(row.model, "MiniMax-M3")
+        XCTAssertEqual(row.decision, .pending)
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(try XCTUnwrap(request.url).path, "/api/advice")
+        XCTAssertEqual(queryValue("accountId", in: request), accountId.uuidString)
+    }
+
+    /// Omitting the decision asks for the queue. The client spells that as "no
+    /// parameter" rather than `decision=pending`, because the server owns the
+    /// default — two places declaring "pending is the default" is how the two
+    /// drift apart.
+    func test_fetchAdvice_omitsTheDecisionParameterForTheQueue() async throws {
+        stub(status: 200, body: Data(#"{"advice":[]}"#.utf8))
+        _ = try await makeClient().fetchAdvice(accountId: UUID())
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertNil(
+            queryValue("decision", in: request),
+            "the queue is the server default; sending it from here duplicates the rule"
+        )
+    }
+
+    /// `any` is the audit spelling. A bare `decision=all` would be ambiguous
+    /// with the `AdviceDecision` enum, which has no `all` case.
+    func test_fetchAdvice_auditViewUsesAny() async throws {
+        stub(status: 200, body: Data(#"{"advice":[]}"#.utf8))
+        _ = try await makeClient().fetchAdvice(accountId: UUID(), decision: .all)
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(queryValue("decision", in: request), "any")
+    }
+
+    /// Recording a verdict is a POST with a JSON body. It is the only write the
+    /// advice surface performs, and it writes no mail — the server test
+    /// `test_postDecision_doesNotTouchTheMessage` is the other half of that
+    /// promise.
+    func test_setAdviceDecision_postsTheVerdict() async throws {
+        let accountId = UUID()
+        stub(status: 200, body: Data(#"{"id":7,"decision":"dismissed"}"#.utf8))
+
+        let response = try await makeClient().setAdviceDecision(
+            id: 7, decision: .dismissed, accountId: accountId
+        )
+        XCTAssertEqual(response.id, 7)
+        XCTAssertEqual(response.decision, .dismissed)
+
+        let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(try XCTUnwrap(request.url).path, "/api/advice/7/decision")
+        XCTAssertEqual(queryValue("accountId", in: request), accountId.uuidString)
+        // Through `bodyData(of:)`, not `httpBody`: URLSession moves a body into
+        // a stream, so reading `httpBody` here returns nil and the assertion
+        // would fail for a reason that has nothing to do with the client.
+        let sent = try bodyData(of: request)
+        XCTAssertTrue(
+            String(decoding: sent, as: UTF8.self).contains(#""decision":"dismissed""#)
+        )
+    }
+
     func test_fetchSummary_buildsURLAndDecodesMessageSummary() async throws {
         let accountId = UUID()
         let body = Data("""
@@ -928,6 +1031,13 @@ final class APIClientTests: XCTestCase {
                 try await $0.overrideClassification(
                     remoteId: "r", accountId: accountId, from: nil, to: .needsReply
                 )
+            }),
+            ("fetchAdvice", { _ = try await $0.fetchAdvice(accountId: accountId) }),
+            ("fetchAdviceAudit", {
+                _ = try await $0.fetchAdvice(accountId: accountId, decision: .all)
+            }),
+            ("setAdviceDecision", {
+                _ = try await $0.setAdviceDecision(id: 7, decision: .dismissed, accountId: accountId)
             }),
             ("fetchActions", { _ = try await $0.fetchActions(accountId: accountId) }),
             ("undoAction", { try await $0.undoAction(id: 1, accountId: accountId) }),

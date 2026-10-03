@@ -184,6 +184,18 @@ public struct AdviceListResponse: Codable, Equatable, Sendable {
     public init(advice: [AdviceRecord]) { self.advice = advice }
 }
 
+/// `POST /api/advice/{id}/decision` response. Lives here rather than in the
+/// route file so the client decodes a shared wire type — the same reason
+/// `AdviceListResponse` is not a server-local struct.
+public struct AdviceDecisionResponse: Codable, Equatable, Sendable {
+    public let id: Int64
+    public let decision: AdviceDecision
+    public init(id: Int64, decision: AdviceDecision) {
+        self.id = id
+        self.decision = decision
+    }
+}
+
 /// Which advice rows a query returns. A sum type rather than an optional
 /// because `nil` would have to mean "everything", and that ambiguity is what
 /// made the route need two nested branches.

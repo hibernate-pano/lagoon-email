@@ -1,7 +1,7 @@
 import XCTest
 @testable import Lagoon
 
-/// `CommandPaletteView`'s constructor wires 10 callbacks. If any of them
+/// `CommandPaletteView`'s constructor wires 11 callbacks. If any of them
 /// goes non-optional or gets renamed, this test catches it before the
 /// sheet appears blank in front of the user.
 ///
@@ -17,7 +17,7 @@ final class CommandPaletteFilterTests: XCTestCase {
         CommandPaletteView(
             onNewMessage: {}, onSearch: {}, onShowBriefing: {},
             onShowAllMessages: {}, onShowUsage: {}, onShowActionHistory: {},
-            onShowShortcuts: {}, onShowAISettings: {},
+            onShowAdvice: {}, onShowShortcuts: {}, onShowAISettings: {},
             onRefresh: {}, onToggleSound: {}
         )
     }
@@ -39,6 +39,7 @@ final class CommandPaletteFilterTests: XCTestCase {
             onShowAllMessages: record("show-all"),
             onShowUsage: record("usage"),
             onShowActionHistory: record("history"),
+            onShowAdvice: record("advice"),
             onShowShortcuts: record("shortcuts"),
             onShowAISettings: record("ai-settings"),
             onRefresh: record("refresh"),
@@ -55,10 +56,10 @@ final class CommandPaletteFilterTests: XCTestCase {
 
     /// Pinned verbatim: adding a command means adding a callback *and* a row
     /// here, and removing one is a deliberate act rather than an accident.
-    func test_paletteExposesExactlyTheTenCommands() {
+    func test_paletteExposesExactlyTheElevenCommands() {
         XCTAssertEqual(palette().allCommands.map(\.id), [
             "new-message", "search", "show-briefing", "show-all", "refresh",
-            "usage", "ai-settings", "history", "shortcuts", "sound"
+            "usage", "ai-settings", "advice", "history", "shortcuts", "sound"
         ])
     }
 

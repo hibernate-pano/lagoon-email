@@ -462,6 +462,89 @@ public struct L10n: Sendable, Equatable {
     public var unreadOnly: String { pick("仅未读", "Unread") }
     public var unreadOnlyHelp: String { pick("只显示未读邮件", "Show unread messages only") }
 
+    // MARK: - AI 建议（只读，宪法 §3）
+    //
+    // 措辞的唯一硬规则：任何一句都不得让用户以为 AI 已经动过这封邮件。
+    // 「建议归档」不是「已归档」，「忽略了这条建议」不是「已归档」。
+
+    public var adviceTitle: String { pick("AI 建议", "AI advice") }
+    public var adviceEmpty: String {
+        pick("暂无建议。AI 会在你打开简报时分析新邮件。",
+             "No advice yet. Lagoon analyses new mail while you read the Briefing.")
+    }
+    /// 面板顶部的一句话承诺。这是整个产品最重要的一句 UI 文案。
+    public var adviceAdvisoryOnlyNotice: String {
+        pick("AI 只提供建议，不会自动归档、删除、退订或发送。操作由你决定。",
+             "Lagoon only suggests. It never archives, deletes, unsubscribes or sends on its own — you decide.")
+    }
+    public func adviceCount(_ count: Int) -> String {
+        pick("\(count) 条建议", "\(count) suggestions")
+    }
+    public var adviceOpenMessage: String { pick("查看邮件", "Open message") }
+    public var adviceDismiss: String { pick("忽略这条", "Dismiss") }
+    public var adviceDismissed: String { pick("已忽略", "Dismissed") }
+    public var adviceLoadFailed: String { pick("建议加载失败", "Couldn't load advice") }
+    /// 从建议打开一封邮件、但它已不在简报里时的提示。必须说出来：这封邮件
+    /// 很可能已经被归档或退订，而用户是从一条**旧**建议点进来的。
+    public var adviceMessageGoneTitle: String { pick("这封邮件已不在简报里", "Message no longer in the Briefing") }
+    public var adviceMessageGoneDetail: String {
+        pick("它可能已被归档、删除或退订。建议不会自动更新为已处理。",
+             "It may have been archived, deleted or unsubscribed. Advice is not marked handled on its own.")
+    }
+
+    /// 建议动作。全部是「动词原形」，因为它描述的是 AI 认为你该做的事，
+    /// 不是已经发生的事。
+    public func adviceAction(_ action: AdvisedAction) -> String {
+        switch action {
+        case .reply: pick("建议回复", "Suggest replying")
+        case .wait: pick("建议等待", "Suggest waiting")
+        case .archive: pick("建议归档", "Suggest archiving")
+        case .delete: pick("建议删除", "Suggest deleting")
+        case .unsubscribe: pick("建议退订", "Suggest unsubscribing")
+        case .remind: pick("建议提醒", "Suggest a reminder")
+        case .nothing: pick("无需处理", "No action needed")
+        }
+    }
+
+    public func adviceCategory(_ category: ContentCategory) -> String {
+        switch category {
+        case .personal: pick("私人", "Personal")
+        case .work: pick("工作", "Work")
+        case .marketing: pick("营销推广", "Marketing")
+        case .spam: pick("垃圾邮件", "Spam")
+        case .notification: pick("通知", "Notification")
+        case .transactional: pick("交易通知", "Transactional")
+        case .financial: pick("财务", "Financial")
+        case .logistics: pick("物流", "Logistics")
+        case .newsletter: pick("订阅资讯", "Newsletter")
+        case .other: pick("其他", "Other")
+        }
+    }
+
+    /// 置信度。措辞刻意保守：`.low` 不叫「大概」，叫「不太确定」——
+    /// 前者像概率，后者像承认这只是猜测。
+    public func adviceConfidence(_ confidence: AdviceConfidence) -> String {
+        switch confidence {
+        case .high: pick("判断明确", "Confident")
+        case .medium: pick("较有把握", "Fairly sure")
+        case .low: pick("不太确定", "Unsure")
+        }
+    }
+
+    /// 来源。区分模型判断与离线规则，因为两者值得不同程度的信任，
+    /// 隐藏这个差异会让启发式看起来和模型一样确定。
+    public func adviceSource(_ source: AdviceSource, model: String?) -> String {
+        switch source {
+        case .ai:
+            guard let model, !model.isEmpty else {
+                return pick("来自 AI", "From AI")
+            }
+            return pick("来自 \(model)", "From \(model)")
+        case .heuristic:
+            return pick("来自本机规则", "From local rules")
+        }
+    }
+
     // MARK: 删除
     public var deleteContext: String { pick("删除", "Delete") }
     public var deleted: String { pick("已移入废纸篓", "Moved to Trash") }

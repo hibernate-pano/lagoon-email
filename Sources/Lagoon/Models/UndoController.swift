@@ -207,4 +207,9 @@ public extension Notification.Name {
     static let lagoonDidUndo = Notification.Name("lagoon.didUndo")
     /// Posted when a non-undo action changes feed grouping or local state.
     static let lagoonDidChangeData = Notification.Name("lagoon.didChangeData")
+    /// Carries a message remoteId when a surface outside the Briefing asks it
+    /// to reveal one — the advice panel's "open message" button. The feed owns
+    /// its navigation state, so this is how a sibling surface reaches it
+    /// without that state having to become shared.
+    static let lagoonRevealMessage = Notification.Name("lagoon.revealMessage")
 }

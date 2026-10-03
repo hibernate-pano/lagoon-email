@@ -17,6 +17,7 @@ struct RootView: View {
     @State private var showSearch = false
     @State private var showUsage = false
     @State private var showActionHistory = false
+    @State private var showAdvice = false
     @State private var showCompose = false
     @State private var showConnect = false
     @State private var showHealthDetail = false
@@ -123,6 +124,9 @@ struct RootView: View {
             .sheet(isPresented: $showActionHistory) {
                 ActionHistorySheet()
             }
+            .sheet(isPresented: $showAdvice) {
+                AdviceSheet()
+            }
             .sheet(isPresented: $showCompose) {
                 composeSheet
             }
@@ -147,6 +151,14 @@ struct RootView: View {
             }
             .sheet(isPresented: $showAbout) {
                 AboutSheet()
+            }
+            // Both surfaces stay alive (the Briefing and the raw list are kept
+            // mounted so their scroll position and poll loops survive a
+            // switch), which means a message revealed from the advice panel
+            // would be pushed onto a NavigationStack the user cannot see. The
+            // switch has to happen here, where the surface lives.
+            .onReceive(NotificationCenter.default.publisher(for: .lagoonRevealMessage)) { _ in
+                surface = .briefing
             }
     }
 
@@ -180,6 +192,7 @@ struct RootView: View {
             onShowAllMessages: { surface = .allMessages },
             onShowUsage: { showUsage = true },
             onShowActionHistory: { showActionHistory = true },
+            onShowAdvice: { showAdvice = true },
             onShowShortcuts: { showShortcuts = true },
             onShowAISettings: { showAISettings = true },
             onRefresh: {
@@ -578,6 +591,11 @@ struct RootView: View {
                 Button(l10n.budgetThisMonth) { Task { @MainActor in showUsage = true } }
                     .keyboardShortcut("b", modifiers: [.command])
                 Button(l10n.aiSettingsTitle) { Task { @MainActor in showAISettings = true } }
+                // First in the menu: the advice queue is the surface this app
+                // exists for, and burying it under settings would hide the
+                // product behind its own configuration.
+                Button(l10n.adviceTitle) { Task { @MainActor in showAdvice = true } }
+                    .keyboardShortcut("a", modifiers: [.command, .shift])
                 Button(l10n.actionHistory) { Task { @MainActor in showActionHistory = true } }
                 Divider()
                 // The toggle reads the current value via `SoundEffects.isEnabled`.

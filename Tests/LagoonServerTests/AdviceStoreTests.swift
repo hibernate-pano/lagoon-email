@@ -314,7 +314,10 @@ final class AdviceStoreTests: XCTestCase {
                 )
                 // Removed the way the sync loop's reconcile removes it, so the
                 // foreign key cascade is what is under test.
-                try await conn.write { db in
+                // No `await`: `LagoonDB.write` is synchronous by design (it
+                // wraps GRDB's blocking API), and a stray one is a warning the
+                // gate fails on.
+                try conn.write { db in
                     try db.execute(
                         sql: "DELETE FROM message_headers WHERE account_id = ? AND remote_id = ?",
                         arguments: [account.id, "m1"]
