@@ -470,8 +470,8 @@ public struct L10n: Sendable, Equatable {
         pick("把该发件人的所有未读邮件标记为已读？", "Mark all unread mail from this sender as read?")
     }
     public var senderAllArchiveConfirm: String {
-        pick("把该发件人的所有未读邮件归档？（可在 30 天内撤销）",
-             "Archive all unread mail from this sender? (Undoable for 30 days)")
+        pick("把该发件人的所有邮件归档？（可在 30 天内撤销）",
+             "Archive all mail from this sender? (Undoable for 30 days)")
     }
     public var senderWorking: String { pick("处理中…", "Working…") }
     public var senderBulkPartial: String {

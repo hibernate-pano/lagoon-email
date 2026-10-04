@@ -124,11 +124,16 @@ struct SenderSheet: View {
 
     // MARK: - Bulk actions
 
-    /// Scope note: these verbs operate on every unread mail this sender has,
-    /// which may be more than the 200 rows the list shows. The buttons say
-    /// what they hit; the count row keeps the number honest.
+    /// Scope note: mark-read fans out over every unread mail this sender has;
+    /// archive fans out over every mail this sender has that is not already
+    /// archived. Either set may be more than the 200 rows the list shows —
+    /// the count row keeps the number honest.
     private var unreadIds: [String] {
         messages.filter { !$0.isRead }.map(\.remoteId)
+    }
+
+    private var archivableIds: [String] {
+        messages.map(\.remoteId)
     }
 
     private var bulkBar: some View {
@@ -137,14 +142,22 @@ struct SenderSheet: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer()
-                if bulkInFlight {
+            if bulkInFlight {
                 ProgressView().controlSize(.small)
                 Text(l10n.senderWorking).font(.caption).foregroundStyle(.secondary)
             } else {
+                // Mark-read is only meaningful while unread mail exists, so it
+                // hides when there is none. Archive is NOT gated on unread:
+                // the natural flow is "mark all read, then archive all", and
+                // hiding archive once the mail is read cut that flow in half —
+                // the bug this fixed. It shows whenever there is anything to
+                // archive.
                 if !unreadIds.isEmpty {
                     Button(l10n.senderAllRead) { pendingConfirm = .markRead }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                }
+                if !archivableIds.isEmpty {
                     Button(l10n.senderAllArchive) { pendingConfirm = .archive }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
@@ -207,7 +220,10 @@ struct SenderSheet: View {
     /// that keeps reconcile from deleting a row mid-move, plus per-message
     /// audit rows for undo.
     private func archiveAll() async {
-        let ids = unreadIds
+        // The whole sender, not just unread mail: "mark all read, then
+        // archive all" is the natural flow, and gating on unread made the
+        // second half a no-op right after the first.
+        let ids = archivableIds
         guard !ids.isEmpty else { return }
         bulkInFlight = true
         defer { bulkInFlight = false }

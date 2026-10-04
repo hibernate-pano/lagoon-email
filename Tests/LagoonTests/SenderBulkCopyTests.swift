@@ -19,19 +19,17 @@ final class SenderBulkCopyTests: XCTestCase {
         XCTAssertEqual(en.senderCount(9), "9 messages")
     }
 
-    /// Both verbs name the scope in their confirmation copy. "全部" is the
-    /// load-bearing word: the fan-out is over every unread mail from the
-    /// sender, which can be far more than the 200 rows the sheet lists.
+    /// The read confirmation names the unread scope; the archive confirmation
+    /// names the whole-sender scope. They differ on purpose: mark-read only
+    /// means anything for unread mail, while archive must survive "mark all
+    /// read, then archive all" — the flow whose first half used to hide the
+    /// second half's button.
     func test_confirmCopy_statesTheScope() {
-        for text in [zh.senderAllReadConfirm, zh.senderAllArchiveConfirm] {
-            XCTAssertTrue(text.contains("所有未读邮件"), "zh confirmation must name the scope: \(text)")
-        }
-        for text in [en.senderAllReadConfirm, en.senderAllArchiveConfirm] {
-            XCTAssertTrue(
-                text.lowercased().contains("all unread"),
-                "en confirmation must name the scope: \(text)"
-            )
-        }
+        XCTAssertTrue(zh.senderAllReadConfirm.contains("所有未读邮件"))
+        XCTAssertTrue(en.senderAllReadConfirm.lowercased().contains("all unread"))
+        // Archive covers everything from this sender — unread or not.
+        XCTAssertTrue(zh.senderAllArchiveConfirm.contains("所有邮件"))
+        XCTAssertTrue(en.senderAllArchiveConfirm.lowercased().contains("all mail"))
     }
 
     /// The archive confirmation must say the action is undoable — that is the
