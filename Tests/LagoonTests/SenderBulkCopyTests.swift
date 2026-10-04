@@ -82,7 +82,7 @@ final class SenderBulkCopyTests: XCTestCase {
         let zhText = zh.senderAllDeleteConfirm(9)
         let enText = en.senderAllDeleteConfirm(9)
         XCTAssertTrue(zhText.contains("9"), "count must be visible: \(zhText)")
-        XCTAssertTrue(zhText.contains("废纸篓"), "delete means Trash: \(zhText)")
+        XCTAssertTrue(zhText.contains("废纸篓"), "the destination must be Trash: \(zhText)")
         XCTAssertTrue(zhText.contains("撤销"))
         XCTAssertTrue(enText.contains("9"))
         XCTAssertTrue(enText.lowercased().contains("trash"))
