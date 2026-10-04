@@ -473,6 +473,17 @@ public struct L10n: Sendable, Equatable {
         pick("把该发件人的所有邮件归档？（可在 30 天内撤销）",
              "Archive all mail from this sender? (Undoable for 30 days)")
     }
+    public var senderAllDelete: String { pick("全部删除", "Delete all") }
+    /// Names the destination and the count. "移入废纸篓" is the honest verb —
+    /// delete means Trash, not annihilation — and the number makes the blast
+    /// radius visible before the user commits.
+    public func senderAllDeleteConfirm(_ count: Int) -> String {
+        pick("把该发件人的 \(count) 封邮件移入废纸篓？（30 天内可撤销）",
+             "Move all \(count) messages from this sender to Trash? (Undoable for 30 days)")
+    }
+    public func senderAllDeleteDone(_ count: Int) -> String {
+        pick("已删除 \(count) 封", "Deleted \(count) messages")
+    }
     public var senderWorking: String { pick("处理中…", "Working…") }
     public var senderBulkPartial: String {
         pick("部分邮件处理失败", "Some messages failed")

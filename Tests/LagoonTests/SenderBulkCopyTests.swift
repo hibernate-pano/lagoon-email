@@ -75,6 +75,27 @@ final class SenderBulkCopyTests: XCTestCase {
         }
     }
 
+    /// The delete confirmation is the highest-stakes copy in the sheet: it
+    /// must carry the exact count (blast radius) and the honest destination
+    /// ("废纸篓"/Trash — delete means recoverable, not annihilation).
+    func test_deleteConfirm_carriesCountAndTrashDestination() {
+        let zhText = zh.senderAllDeleteConfirm(9)
+        let enText = en.senderAllDeleteConfirm(9)
+        XCTAssertTrue(zhText.contains("9"), "count must be visible: \(zhText)")
+        XCTAssertTrue(zhText.contains("废纸篓"), "delete means Trash: \(zhText)")
+        XCTAssertTrue(zhText.contains("撤销"))
+        XCTAssertTrue(enText.contains("9"))
+        XCTAssertTrue(enText.lowercased().contains("trash"))
+        XCTAssertTrue(enText.lowercased().contains("undo"))
+    }
+
+    func test_deleteVerbLabels_existInBothLanguages() {
+        XCTAssertEqual(zh.senderAllDelete, "全部删除")
+        XCTAssertEqual(en.senderAllDelete, "Delete all")
+        XCTAssertEqual(zh.senderAllDeleteDone(5), "已删除 5 封")
+        XCTAssertEqual(en.senderAllDeleteDone(5), "Deleted 5 messages")
+    }
+
     /// Verb labels are short and imperative: they sit in a toolbar-sized row.
     func test_verbLabels_existInBothLanguages() {
         for (zhV, enV) in [(zh.senderAllRead, en.senderAllRead),

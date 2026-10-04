@@ -168,23 +168,36 @@ struct SenderSheet: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                 }
+                if !archivableIds.isEmpty {
+                    Button(l10n.senderAllDelete, role: .destructive) {
+                        pendingConfirm = .deleteAll
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(.quaternary.opacity(0.35))
         .confirmationDialog(
-            pendingConfirm == .archive
-                ? l10n.senderAllArchiveConfirm
-                : l10n.senderAllReadConfirm,
+            // The delete confirmation carries the live count: the blast radius
+            // should be visible before the user commits, and Trash is the
+            // honest destination name.
+            pendingConfirm == .deleteAll
+                ? l10n.senderAllDeleteConfirm(archivableIds.count)
+                : (pendingConfirm == .archive
+                    ? l10n.senderAllArchiveConfirm
+                    : l10n.senderAllReadConfirm),
             isPresented: Binding(
                 get: { pendingConfirm != nil },
                 set: { if !$0 { pendingConfirm = nil } }
             ),
             titleVisibility: .visible
         ) {
-            Button(pendingConfirm == .archive ? l10n.senderAllArchive : l10n.senderAllRead,
-                   role: pendingConfirm == .archive ? .destructive : nil) {
+            // The confirm button mirrors the verb being confirmed: destructive
+            // for the delete path (red), plain for read/archive.
+            Button(confirmTitle, role: confirmRole) {
                 let verb = pendingConfirm
                 pendingConfirm = nil
                 Task { await run(verb) }
@@ -193,9 +206,23 @@ struct SenderSheet: View {
         }
     }
 
+    private var confirmTitle: String {
+        switch pendingConfirm {
+        case .markRead: l10n.senderAllRead
+        case .archive: l10n.senderAllArchive
+        case .deleteAll: l10n.senderAllDelete
+        case nil: ""
+        }
+    }
+
+    private var confirmRole: ButtonRole? {
+        pendingConfirm == .deleteAll ? .destructive : nil
+    }
+
     private enum BulkVerb {
         case markRead
         case archive
+        case deleteAll
     }
 
     /// Fan-out over the existing per-message markRead route with
@@ -205,7 +232,67 @@ struct SenderSheet: View {
         switch verb {
         case .markRead: await markAllRead()
         case .archive: await archiveAll()
+        case .deleteAll: await deleteAll()
         case nil: break
+        }
+    }
+
+    /// Delete via the single-message delete route: mail moves to the server's
+    /// Trash, one undoable audit row per message. The fan-out mirrors
+    /// markAllRead. There is no bulk-delete endpoint, but at the volumes a
+    /// single sender accumulates (dozens, not thousands) the concurrent calls
+    /// finish in seconds.
+    private func deleteAll() async {
+        let ids = archivableIds
+        guard !ids.isEmpty else { return }
+        bulkInFlight = true
+        defer { bulkInFlight = false }
+        var deleted: [String] = []
+        var actionIds: [Int64] = []
+        var firstError: Error?
+        await withTaskGroup(of: (String, Result<Int64?, Error>)?.self) { group in
+            for id in ids {
+                group.addTask { [api, accountId] in
+                    do {
+                        let response = try await api.deleteMessage(
+                            remoteId: id, accountId: accountId
+                        )
+                        return (id, .success(response.actionId))
+                    } catch {
+                        return (id, .failure(error))
+                    }
+                }
+            }
+            for await result in group {
+                guard let (id, outcome) = result else { continue }
+                switch outcome {
+                case .success(let actionId):
+                    deleted.append(id)
+                    if let actionId { actionIds.append(actionId) }
+                case .failure(let error):
+                    if firstError == nil { firstError = error }
+                }
+            }
+        }
+        if let firstError {
+            errorBanner = ErrorBanner(
+                severity: .warning,
+                title: l10n.senderBulkPartial,
+                detail: firstError.lagoonUIMessage
+            )
+        }
+        let removed = Set(deleted)
+        messages.removeAll { removed.contains($0.remoteId) }
+        if messages.isEmpty, !deleted.isEmpty {
+            archivedEmptyState = deleted.count
+        }
+        if let first = actionIds.first {
+            undo.show(UndoItem(
+                id: first,
+                message: l10n.senderAllDeleteDone(deleted.count),
+                systemImage: "trash",
+                extraIds: Array(actionIds.dropFirst())
+            ))
         }
     }
 
