@@ -26,6 +26,10 @@ struct SenderSheet: View {
     /// unread mail from a sender is exactly the kind of operation that needs
     /// one explicit tap between "I clicked the button" and "my mailbox moved".
     @State private var pendingConfirm: BulkVerb?
+    /// Set when a bulk archive emptied the sheet. The empty state then shows
+    /// a success view instead of "no mail from this sender" — the user just
+    /// archived everything, and that action deserves the screen's response.
+    @State private var archivedEmptyState: Int?
     private let api = APIClient.shared
 
     var body: some View {
@@ -54,6 +58,8 @@ struct SenderSheet: View {
                 }
                 if isLoading {
                     ProgressView().padding(20)
+                } else if messages.isEmpty, let archived = archivedEmptyState {
+                    emptiedView(archived)
                 } else if messages.isEmpty {
                     Text(l10n.senderMailEmpty)
                         .foregroundStyle(.secondary)
@@ -203,6 +209,29 @@ struct SenderSheet: View {
         }
     }
 
+    /// The sheet after a full archive: success, the number, the undo window,
+    /// and the way out. Centered like the empty state it replaces, but with
+    /// the checkmark and tint that say "this worked".
+    private func emptiedView(_ count: Int) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: "checkmark.circle")
+                .font(.system(size: 40, weight: .light))
+                .foregroundStyle(.green)
+            Text(l10n.senderAllArchivedEmptyTitle(count))
+                .font(.headline)
+            Text(l10n.senderAllArchivedEmptyDetail)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button(l10n.done) { dismiss() }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .padding(.top, 6)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(30)
+    }
+
     private func markAllRead() async {
         await bulk { remoteId in
             _ = try await api.markRead(
@@ -247,6 +276,11 @@ struct SenderSheet: View {
             }
             let archived = Set(ok.map(\.remoteId))
             messages.removeAll { archived.contains($0.remoteId) }
+            // A full archive leaves the sheet empty; the empty state below
+            // names what happened instead of reading as "there was nothing".
+            if messages.isEmpty {
+                archivedEmptyState = ok.count
+            }
         } catch {
             errorBanner = ErrorBanner(
                 severity: .error,

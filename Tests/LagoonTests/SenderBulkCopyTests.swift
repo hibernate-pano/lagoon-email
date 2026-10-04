@@ -51,6 +51,30 @@ final class SenderBulkCopyTests: XCTestCase {
         XCTAssertEqual(en.senderAllArchiveDone(9), "Archived 9 messages")
     }
 
+    /// The emptied sheet must name the action, not read as "there was never
+    /// anything here". The title carries the count; the detail names the undo
+    /// window; both languages agree.
+    func test_emptiedState_copyNamesTheActionAndUndo() {
+        for count in [0, 1, 23] {
+            XCTAssertTrue(
+                zh.senderAllArchivedEmptyTitle(count).contains("\(count)"),
+                "zh title must carry the count: \(zh.senderAllArchivedEmptyTitle(count))"
+            )
+            XCTAssertTrue(
+                en.senderAllArchivedEmptyTitle(count).contains("\(count)"),
+                "en title must carry the count: \(en.senderAllArchivedEmptyTitle(count))"
+            )
+        }
+        XCTAssertTrue(zh.senderAllArchivedEmptyTitle(9).contains("已归档"))
+        XCTAssertTrue(en.senderAllArchivedEmptyTitle(9).lowercased().contains("archived"))
+        for text in [zh.senderAllArchivedEmptyDetail, en.senderAllArchivedEmptyDetail] {
+            XCTAssertTrue(
+                text.lowercased().contains("30"),
+                "the undo window is the concrete promise: \(text)"
+            )
+        }
+    }
+
     /// Verb labels are short and imperative: they sit in a toolbar-sized row.
     func test_verbLabels_existInBothLanguages() {
         for (zhV, enV) in [(zh.senderAllRead, en.senderAllRead),

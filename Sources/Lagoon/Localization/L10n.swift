@@ -483,6 +483,16 @@ public struct L10n: Sendable, Equatable {
     public func senderAllArchiveDone(_ count: Int) -> String {
         pick("已归档 \(count) 封", "Archived \(count) messages")
     }
+    /// The sheet after a full archive emptied it. An empty-list line here
+    /// reads as "there was never anything", which erases the action the user
+    /// just took — this names the action, the undo window, and the way out.
+    public func senderAllArchivedEmptyTitle(_ count: Int) -> String {
+        pick("已归档 \(count) 封邮件", "Archived \(count) messages")
+    }
+    public var senderAllArchivedEmptyDetail: String {
+        pick("来自此发件人的邮件已全部归档，30 天内可撤销。",
+             "All mail from this sender is archived and undoable for 30 days.")
+    }
     public var loadFailed: String { pick("加载失败", "Couldn't load") }
     public var close: String { pick("关闭", "Close") }
     public var groupingLabel: String { pick("归集", "Grouping") }
