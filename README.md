@@ -161,8 +161,14 @@ heuristic-only and `/summary` returns 503 — it never crashes.
   bodies + FTS server-side, per-install API token, one-click unsubscribe,
   conversation/sender grouping lenses, user-defined stacks, archive cabinet,
   trash delete, sweep, rule suggestions (v2.2.0).
-- **V3 (this)**: embedded runtime — SQLite replaces Docker Postgres, the
+- **V3**: embedded runtime — SQLite replaces Docker Postgres, the
   server becomes a library inside the app, secrets move to the Keychain.
+- **V3.1 (this)**: advisory-only AI — the sync loop is typed read-only
+  (`MailSyncReading`), the whitelist autopilot is gone, and one classifier
+  call now yields both the feed group and a read-only suggestion stored in
+  the `advice` table (30-day window, 500-row cap, overflow reported). The
+  sender sheet gains bulk mark-read / archive / delete, each confirmed,
+  each undoable.
 
 ## Known limitations (by design)
 

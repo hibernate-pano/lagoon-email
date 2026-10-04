@@ -96,6 +96,27 @@ final class SenderBulkCopyTests: XCTestCase {
         XCTAssertEqual(en.senderAllDeleteDone(5), "Deleted 5 messages")
     }
 
+    /// A full delete must not report "archived": the emptied sheet is the
+    /// only feedback the user gets, and naming the wrong destination sends
+    /// them looking in the archive cabinet for mail that is in the Trash.
+    func test_emptiedState_distinguishesDeleteFromArchive() {
+        let archivedZh = zh.senderAllArchivedEmptyTitle(5)
+        let deletedZh = zh.senderAllDeletedEmptyTitle(5)
+        XCTAssertNotEqual(archivedZh, deletedZh, "the two outcomes must not share a title")
+        XCTAssertTrue(deletedZh.contains("删除"), "the title must name the verb: \(deletedZh)")
+        XCTAssertTrue(deletedZh.contains("5"))
+        XCTAssertTrue(
+            zh.senderAllDeletedEmptyDetail.contains("废纸篓"),
+            "delete detail names Trash, not the archive cabinet"
+        )
+        XCTAssertFalse(
+            zh.senderAllDeletedEmptyDetail.contains("归档"),
+            "a deleted batch must never be described as archived"
+        )
+        XCTAssertTrue(en.senderAllDeletedEmptyTitle(5).lowercased().contains("deleted"))
+        XCTAssertTrue(en.senderAllDeletedEmptyDetail.lowercased().contains("trash"))
+    }
+
     /// Verb labels are short and imperative: they sit in a toolbar-sized row.
     func test_verbLabels_existInBothLanguages() {
         for (zhV, enV) in [(zh.senderAllRead, en.senderAllRead),

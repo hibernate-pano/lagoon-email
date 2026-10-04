@@ -26,10 +26,17 @@ struct SenderSheet: View {
     /// unread mail from a sender is exactly the kind of operation that needs
     /// one explicit tap between "I clicked the button" and "my mailbox moved".
     @State private var pendingConfirm: BulkVerb?
-    /// Set when a bulk archive emptied the sheet. The empty state then shows
-    /// a success view instead of "no mail from this sender" — the user just
-    /// archived everything, and that action deserves the screen's response.
-    @State private var archivedEmptyState: Int?
+    /// Which bulk verb emptied the sheet, and how many rows it moved. The empty
+    /// state then shows a success view instead of "no mail from this sender" —
+    /// and it names the right destination, because a delete that reported
+    /// "archived" would send the user looking in the archive cabinet for mail
+    /// that is actually in the Trash.
+    @State private var emptiedBy: EmptiedOutcome?
+
+    private struct EmptiedOutcome {
+        let verb: BulkVerb
+        let count: Int
+    }
     private let api = APIClient.shared
 
     var body: some View {
@@ -58,8 +65,8 @@ struct SenderSheet: View {
                 }
                 if isLoading {
                     ProgressView().padding(20)
-                } else if messages.isEmpty, let archived = archivedEmptyState {
-                    emptiedView(archived)
+                } else if messages.isEmpty, let outcome = emptiedBy {
+                    emptiedView(outcome)
                 } else if messages.isEmpty {
                     Text(l10n.senderMailEmpty)
                         .foregroundStyle(.secondary)
@@ -284,7 +291,7 @@ struct SenderSheet: View {
         let removed = Set(deleted)
         messages.removeAll { removed.contains($0.remoteId) }
         if messages.isEmpty, !deleted.isEmpty {
-            archivedEmptyState = deleted.count
+            emptiedBy = EmptiedOutcome(verb: .deleteAll, count: deleted.count)
         }
         if let first = actionIds.first {
             undo.show(UndoItem(
@@ -299,14 +306,23 @@ struct SenderSheet: View {
     /// The sheet after a full archive: success, the number, the undo window,
     /// and the way out. Centered like the empty state it replaces, but with
     /// the checkmark and tint that say "this worked".
-    private func emptiedView(_ count: Int) -> some View {
-        VStack(spacing: 12) {
-            Image(systemName: "checkmark.circle")
+    private func emptiedView(_ outcome: EmptiedOutcome) -> some View {
+        let wasDelete = outcome.verb == .deleteAll
+        return VStack(spacing: 12) {
+            Image(systemName: wasDelete ? "trash.circle" : "checkmark.circle")
                 .font(.system(size: 40, weight: .light))
                 .foregroundStyle(.green)
-            Text(l10n.senderAllArchivedEmptyTitle(count))
+            Text(
+                wasDelete
+                    ? l10n.senderAllDeletedEmptyTitle(outcome.count)
+                    : l10n.senderAllArchivedEmptyTitle(outcome.count)
+            )
                 .font(.headline)
-            Text(l10n.senderAllArchivedEmptyDetail)
+            Text(
+                wasDelete
+                    ? l10n.senderAllDeletedEmptyDetail
+                    : l10n.senderAllArchivedEmptyDetail
+            )
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -366,7 +382,7 @@ struct SenderSheet: View {
             // A full archive leaves the sheet empty; the empty state below
             // names what happened instead of reading as "there was nothing".
             if messages.isEmpty {
-                archivedEmptyState = ok.count
+                emptiedBy = EmptiedOutcome(verb: .archive, count: ok.count)
             }
         } catch {
             errorBanner = ErrorBanner(

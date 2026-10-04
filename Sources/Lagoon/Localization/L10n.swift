@@ -504,6 +504,16 @@ public struct L10n: Sendable, Equatable {
         pick("来自此发件人的邮件已全部归档，30 天内可撤销。",
              "All mail from this sender is archived and undoable for 30 days.")
     }
+    /// The delete twin of the two above. Without it a full delete emptied the
+    /// sheet into "已归档 N 封邮件" — telling the user their mail went to the
+    /// archive cabinet when it actually went to the Trash.
+    public func senderAllDeletedEmptyTitle(_ count: Int) -> String {
+        pick("已删除 \(count) 封邮件", "Deleted \(count) messages")
+    }
+    public var senderAllDeletedEmptyDetail: String {
+        pick("来自此发件人的邮件已移入废纸篓，30 天内可撤销。",
+             "All mail from this sender is in the Trash and undoable for 30 days.")
+    }
     public var loadFailed: String { pick("加载失败", "Couldn't load") }
     public var close: String { pick("关闭", "Close") }
     public var groupingLabel: String { pick("归集", "Grouping") }
