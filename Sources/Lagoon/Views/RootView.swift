@@ -464,7 +464,12 @@ struct RootView: View {
                 Text(directory.active?.email ?? l10n.accountsMenuHelp)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .frame(maxWidth: 180, alignment: .leading)
+                    // Kept short on purpose. The email is decoration here —
+                    // the menu itself lists every account in full — while the
+                    // toolbar budget it consumes is real: macOS overflows
+                    // trailing items into "»" silently when the row does not
+                    // fit, so a long address costs the user a button.
+                    .frame(maxWidth: 140, alignment: .leading)
             }
         }
         .help(l10n.accountsMenuHelp)
@@ -554,10 +559,19 @@ struct RootView: View {
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        ToolbarItem(placement: .navigation) {
+        // Deliberately NOT `.navigation`. On macOS that placement is where the
+        // system puts the back/forward buttons for a pushed NavigationStack,
+        // and this window has one: opening a message inserts a back button
+        // into that exact region. Parking the account menu and the surface
+        // picker there put three controls in one ~117pt slot, and the back
+        // button — the one control the user cannot reach any other way — was
+        // the one that lost. `.automatic` lets AppKit place these app-level
+        // controls outside the navigation region, so the back button keeps
+        // its own space.
+        ToolbarItem(placement: .automatic) {
             accountMenu
         }
-        ToolbarItem(placement: .navigation) {
+        ToolbarItem(placement: .automatic) {
             Picker(l10n.surface, selection: $surface) {
                 ForEach(Surface.allCases) { item in
                     Text(item == .briefing ? l10n.briefing : l10n.allMessages).tag(item)

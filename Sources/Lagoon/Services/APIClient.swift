@@ -325,11 +325,20 @@ public final class APIClient: Sendable {
     /// classify, tagged with its `BriefingGroup`. `.interactive` because
     /// the briefing endpoint waits for AI classification on the first call
     /// after each sync, which can stretch past 10s.
-    public func fetchBriefing(accountId: UUID, limit: Int = 100) async throws -> BriefingResponse {
-        let url = try makeURL(path: ["api", "briefing"], query: [
-            .init(name: "accountId", value: accountId.uuidString),
-            .init(name: "limit", value: String(limit))
-        ])
+    ///
+    /// `limit` is omitted by default so the server owns the window and the
+    /// cap. Sending a client-side default would silently re-impose the old
+    /// 100-row ceiling on top of the server's 30-day rule — two places
+    /// declaring the same policy is how they drift apart.
+    public func fetchBriefing(
+        accountId: UUID,
+        limit: Int? = nil
+    ) async throws -> BriefingResponse {
+        var query = [URLQueryItem(name: "accountId", value: accountId.uuidString)]
+        if let limit {
+            query.append(.init(name: "limit", value: String(limit)))
+        }
+        let url = try makeURL(path: ["api", "briefing"], query: query)
         var request = URLRequest(url: url)
         request.timeoutInterval = APITimeout.interactive.seconds
         let (data, _) = try await send(request, timeout: .interactive)

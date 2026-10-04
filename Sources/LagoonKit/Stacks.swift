@@ -63,5 +63,18 @@ public struct ArchiveBulkItem: Codable, Sendable, Equatable {
 
 public struct ArchiveBulkResponse: Codable, Sendable, Equatable {
     public let items: [ArchiveBulkItem]
-    public init(items: [ArchiveBulkItem]) { self.items = items }
+    /// Ids the request asked for beyond the server's per-call cap, which were
+    /// silently dropped before this field existed.
+    ///
+    /// The server caps one call at 500 ids and used to just `prefix(500)` the
+    /// request. A caller archiving 800 messages got 500 successes and no
+    /// indication the other 300 were never attempted — the same "looks
+    /// complete while part is missing" failure the briefing window was fixed
+    /// for. Non-nil only when truncation actually happened; callers must
+    /// either page through the remainder or tell the user.
+    public let truncatedCount: Int?
+    public init(items: [ArchiveBulkItem], truncatedCount: Int? = nil) {
+        self.items = items
+        self.truncatedCount = truncatedCount
+    }
 }

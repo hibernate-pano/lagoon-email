@@ -11,6 +11,21 @@ import LagoonKit
 /// returns; if it throws, the heuristics stand and the briefing still returns
 /// 200 (a classifier outage must never 500 the whole feed).
 public enum BriefingRoutes {
+    /// The briefing's window: mail received in the last 30 days.
+    ///
+    /// A time window rather than a row count, because "recent" is what the
+    /// user means and a fixed count answers a different question — it drops
+    /// mail on a busy week and pads the feed with stale mail on a quiet one.
+    public static let windowDays = 30
+    /// Hard cap on rows in one response.
+    ///
+    /// The window is the product rule; this is a safety valve for a mailbox
+    /// that receives thousands of messages a month, where one response would
+    /// mean a ~1 MB payload, thousands of `List` rows, and a proportional LLM
+    /// classification bill in a single pass. When it bites, the response says
+    /// how many rows were left out — see `omittedCount`.
+    public static let maxItems = 500
+
     public enum ClassificationMode: Sendable {
         case synchronous
         case background
@@ -28,8 +43,12 @@ public enum BriefingRoutes {
             guard let accountId = RouteParams.accountId(from: request) else {
                 return RouteJSON.error(.badRequest, "malformed-accountId")
             }
-            let requested = Int(request.uri.queryParameters["limit"] ?? "100") ?? 100
-            let limit = max(1, min(requested, 500))
+            let requested = Int(request.uri.queryParameters["limit"] ?? "\(Self.maxItems)")
+                ?? Self.maxItems
+            let limit = max(1, min(requested, Self.maxItems))
+            let windowStart = Date().addingTimeInterval(
+                -Double(Self.windowDays) * 24 * 60 * 60
+            )
 
             let account: Account
             do {
@@ -46,12 +65,27 @@ public enum BriefingRoutes {
             }
 
             let messages: [MessageHeader]
+            let omitted: Int
             let pinned: Set<String>
             let listUnsubscribe: Set<String>
             let replied: Set<String>
             let userOverrides: [String: BriefingGroup]
             do {
-                messages = try await MessageStore.recent(forAccount: accountId, limit: limit, db: db)
+                messages = try await MessageStore.recent(
+                    forAccount: accountId,
+                    limit: limit,
+                    receivedAfter: windowStart,
+                    db: db
+                )
+                // Only needed when the cap actually truncated the window;
+                // counting is a second query, so it is skipped on the common
+                // path where the feed came back short of the limit.
+                let inWindow = try await MessageStore.count(
+                    forAccount: accountId,
+                    receivedAfter: windowStart,
+                    db: db
+                )
+                omitted = max(0, inWindow - messages.count)
                 pinned = try await MessageStore.pinnedIds(forAccount: accountId, db: db)
                 listUnsubscribe = try await MessageStore.listUnsubscribeIds(forAccount: accountId, db: db)
                 replied = try await AIActionStore.repliedRemoteIds(accountId: accountId, db: db)
@@ -161,7 +195,12 @@ public enum BriefingRoutes {
                     reasonCode: result.reason.rawValue
                 )
             }
-            return RouteJSON.response(BriefingResponse(items: items))
+            // `nil` rather than 0 on the common path: the field's presence
+            // means "the window overflowed", and a client that only checks
+            // for a non-nil value must not show an "0 more" line.
+            return RouteJSON.response(
+                BriefingResponse(items: items, omittedCount: omitted > 0 ? omitted : nil)
+            )
         }
     }
 

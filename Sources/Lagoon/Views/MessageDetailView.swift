@@ -190,6 +190,10 @@ struct MessageDetailView: View {
                 senderAddress: senderEmail,
                 senderName: senderName
             )
+            // Sheets are their own window on macOS and do not inherit the
+            // environment from the presenting view's toolbar chain, so the
+            // undo controller is passed explicitly.
+            .environmentObject(undo)
         }
         .sheet(isPresented: $showComposer) {
             switch composerMode {

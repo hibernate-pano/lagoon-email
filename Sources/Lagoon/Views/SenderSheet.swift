@@ -13,10 +13,19 @@ struct SenderSheet: View {
 
     @Environment(\.l10n) private var l10n
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var undo: UndoController
     @State private var messages: [MessageHeader] = []
+    /// Total rows matching this sender, ignoring LIMIT. The bulk verbs hit
+    /// *all* of them, so this number is what the buttons must promise.
+    @State private var totalCount: Int?
     @State private var isLoading = true
     @State private var errorBanner: ErrorBanner?
+    @State private var bulkInFlight = false
     @State private var path: [String] = []
+    /// Which bulk verb is waiting for confirmation. A bulk action over every
+    /// unread mail from a sender is exactly the kind of operation that needs
+    /// one explicit tap between "I clicked the button" and "my mailbox moved".
+    @State private var pendingConfirm: BulkVerb?
     private let api = APIClient.shared
 
     var body: some View {
@@ -40,6 +49,9 @@ struct SenderSheet: View {
                 }
                 .padding(12)
                 Divider()
+                if !messages.isEmpty {
+                    bulkBar
+                }
                 if isLoading {
                     ProgressView().padding(20)
                 } else if messages.isEmpty {
@@ -104,8 +116,165 @@ struct SenderSheet: View {
                 accountId: accountId, limit: 200, sender: senderAddress
             )
             messages = response.messages
+            totalCount = response.totalCount ?? response.messages.count
         } catch {
             errorBanner = ErrorBanner(severity: .error, title: l10n.loadFailed, detail: error.lagoonUIMessage)
+        }
+    }
+
+    // MARK: - Bulk actions
+
+    /// Scope note: these verbs operate on every unread mail this sender has,
+    /// which may be more than the 200 rows the list shows. The buttons say
+    /// what they hit; the count row keeps the number honest.
+    private var unreadIds: [String] {
+        messages.filter { !$0.isRead }.map(\.remoteId)
+    }
+
+    private var bulkBar: some View {
+        HStack(spacing: 10) {
+            Text(l10n.senderCount(totalCount ?? messages.count))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+                if bulkInFlight {
+                ProgressView().controlSize(.small)
+                Text(l10n.senderWorking).font(.caption).foregroundStyle(.secondary)
+            } else {
+                if !unreadIds.isEmpty {
+                    Button(l10n.senderAllRead) { pendingConfirm = .markRead }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    Button(l10n.senderAllArchive) { pendingConfirm = .archive }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.quaternary.opacity(0.35))
+        .confirmationDialog(
+            pendingConfirm == .archive
+                ? l10n.senderAllArchiveConfirm
+                : l10n.senderAllReadConfirm,
+            isPresented: Binding(
+                get: { pendingConfirm != nil },
+                set: { if !$0 { pendingConfirm = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(pendingConfirm == .archive ? l10n.senderAllArchive : l10n.senderAllRead,
+                   role: pendingConfirm == .archive ? .destructive : nil) {
+                let verb = pendingConfirm
+                pendingConfirm = nil
+                Task { await run(verb) }
+            }
+            Button(l10n.cancel, role: .cancel) { pendingConfirm = nil }
+        }
+    }
+
+    private enum BulkVerb {
+        case markRead
+        case archive
+    }
+
+    /// Fan-out over the existing per-message markRead route with
+    /// `record: true`, so the whole batch joins the undo audit and one ⌘Z
+    /// reverses it — the same contract the Briefing's ⇧⌘K already ships.
+    private func run(_ verb: BulkVerb?) async {
+        switch verb {
+        case .markRead: await markAllRead()
+        case .archive: await archiveAll()
+        case nil: break
+        }
+    }
+
+    private func markAllRead() async {
+        await bulk { remoteId in
+            _ = try await api.markRead(
+                remoteId: remoteId, accountId: accountId, record: true
+            )
+        }
+        // Optimistic flip after success; the list reloads from the server on
+        // the next open, so this only needs to keep the rows consistent now.
+        for i in messages.indices where !messages[i].isRead {
+            messages[i] = messages[i].withRead(true)
+        }
+    }
+
+    /// Archive via the sweep route, which owns the flag-then-MOVE ordering
+    /// that keeps reconcile from deleting a row mid-move, plus per-message
+    /// audit rows for undo.
+    private func archiveAll() async {
+        let ids = unreadIds
+        guard !ids.isEmpty else { return }
+        bulkInFlight = true
+        defer { bulkInFlight = false }
+        do {
+            let response = try await api.archiveBulk(remoteIds: ids, accountId: accountId)
+            let ok = response.items.filter(\.ok)
+            if let truncated = response.truncatedCount, truncated > 0 {
+                errorBanner = ErrorBanner(
+                    severity: .warning,
+                    title: l10n.senderBulkPartial,
+                    detail: l10n.senderCount(truncated)
+                )
+            }
+            if let first = ok.first, let actionId = first.actionId {
+                undo.show(UndoItem(
+                    id: actionId,
+                    message: l10n.senderAllArchiveDone(ok.count),
+                    systemImage: "tray.and.arrow.down",
+                    extraIds: ok.dropFirst().compactMap(\.actionId)
+                ))
+            }
+            let archived = Set(ok.map(\.remoteId))
+            messages.removeAll { archived.contains($0.remoteId) }
+        } catch {
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.senderBulkPartial,
+                detail: error.lagoonUIMessage
+            )
+        }
+    }
+
+    /// Shared fan-out for the markRead path: per-item errors are captured so
+    /// a partial batch is reported, and the actionIds feed the undo toast.
+    private func bulk(_ body: @escaping (String) async throws -> Void) async {
+        let ids = unreadIds
+        guard !ids.isEmpty else { return }
+        bulkInFlight = true
+        defer { bulkInFlight = false }
+        var failures = 0
+        var firstError: Error?
+        await withTaskGroup(of: Error?.self) { group in
+            for id in ids {
+                group.addTask {
+                    do {
+                        try await body(id)
+                        return nil
+                    } catch {
+                        return error
+                    }
+                }
+            }
+            for await result in group {
+                if let result {
+                    failures += 1
+                    if firstError == nil { firstError = result }
+                }
+            }
+        }
+        if let firstError {
+            errorBanner = ErrorBanner(
+                severity: .warning,
+                title: l10n.senderBulkPartial,
+                detail: firstError.lagoonUIMessage
+            )
+        } else if failures > 0 {
+            errorBanner = ErrorBanner(severity: .warning, title: l10n.senderBulkPartial)
         }
     }
 }

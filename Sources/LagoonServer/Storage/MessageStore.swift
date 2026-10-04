@@ -174,7 +174,8 @@ public enum MessageStore {
         accountId: UUID,
         sender: String?,
         archived: Bool,
-        stackMatch: StackMatch?
+        stackMatch: StackMatch?,
+        receivedAfter: Date? = nil
     ) -> (String, [DatabaseValueConvertible?]) {
         var clause = "WHERE h.account_id = ? AND h.is_deleted = FALSE AND h.is_archived = "
         clause += archived ? "TRUE" : "FALSE"
@@ -193,6 +194,14 @@ public enum MessageStore {
             clause += "\n            AND h.from_address = ?"
             arguments.append(sender)
         }
+        // A lower time bound, not a row cap. The briefing's window is "the
+        // last N days", which is what the user actually means by "recent" —
+        // a fixed row count silently drops mail on a busy week and pads the
+        // feed with stale mail on a quiet one.
+        if let receivedAfter {
+            clause += "\n            AND h.received_at >= ?"
+            arguments.append(receivedAfter)
+        }
         return (clause, arguments)
     }
 
@@ -202,10 +211,12 @@ public enum MessageStore {
         sender: String? = nil,
         archived: Bool = false,
         stackMatch: StackMatch? = nil,
+        receivedAfter: Date? = nil,
         db: LagoonDB
     ) async throws -> [MessageHeader] {
         let (whereClause, filterArgs) = filterSQL(
-            accountId: accountId, sender: sender, archived: archived, stackMatch: stackMatch
+            accountId: accountId, sender: sender, archived: archived,
+            stackMatch: stackMatch, receivedAfter: receivedAfter
         )
         // Assembled with joined() rather than interpolation: the SQL
         // guardrail rejects `\()` inside a SELECT literal, and `+`
@@ -457,10 +468,12 @@ public enum MessageStore {
         sender: String? = nil,
         archived: Bool = false,
         stackMatch: StackMatch? = nil,
+        receivedAfter: Date? = nil,
         db: LagoonDB
     ) async throws -> Int {
         let (whereClause, arguments) = filterSQL(
-            accountId: accountId, sender: sender, archived: archived, stackMatch: stackMatch
+            accountId: accountId, sender: sender, archived: archived,
+            stackMatch: stackMatch, receivedAfter: receivedAfter
         )
         // Joined, not interpolated — see recent() above.
         let sql = [

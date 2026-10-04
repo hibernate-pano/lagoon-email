@@ -285,7 +285,13 @@ public enum ActionsRoutes {
         do { req = try JSONDecoder().decode(Req.self, from: body) } catch {
             return RouteJSON.error(.badRequest, "invalid-body")
         }
-        let ids = Array(req.remoteIds.prefix(500))
+        // The cap protects one remote round trip per message from becoming an
+        // unbounded request. The overflow is now *reported* rather than
+        // silently dropped: a caller archiving 800 messages used to get 500
+        // successes and no way to know the rest were never attempted.
+        let cap = 500
+        let ids = Array(req.remoteIds.prefix(cap))
+        let truncated = max(0, req.remoteIds.count - ids.count)
         guard !ids.isEmpty else {
             return RouteJSON.error(.badRequest, "empty-remoteIds")
         }
@@ -379,7 +385,9 @@ public enum ActionsRoutes {
                 items.append(ArchiveBulkItem(remoteId: remoteId, ok: false, errorCode: "internal-error"))
             }
         }
-        return RouteJSON.response(ArchiveBulkResponse(items: items))
+        return RouteJSON.response(
+            ArchiveBulkResponse(items: items, truncatedCount: truncated > 0 ? truncated : nil)
+        )
     }
 
     // MARK: - Unsubscribe

@@ -112,6 +112,13 @@ public struct L10n: Sendable, Equatable {
         pick("返回上一级（⌘[）", "Back one level (⌘[)")
     }
     public var loadingBriefing: String { pick("正在加载简报…", "Loading briefing…") }
+    /// Shown only when the 30-day window held more mail than the response cap
+    /// allows. The point is to make the boundary visible: without it the feed
+    /// silently looks complete while some of the window is missing.
+    public func briefingOmitted(_ count: Int) -> String {
+        pick("另有 \(count) 封在近 30 天内，未纳入简报",
+             "\(count) more arrived in the last 30 days and are not in this Briefing")
+    }
     public var noBriefingYet: String { pick("还没有简报", "No briefing yet") }
     public var noBriefingYetDescription: String {
         pick(
@@ -452,6 +459,30 @@ public struct L10n: Sendable, Equatable {
     }
     public var senderMailContext: String { pick("来自此发件人的邮件…", "Mail from this sender…") }
     public var senderMailEmpty: String { pick("没有来自此发件人的邮件", "No mail from this sender") }
+    /// Bulk actions on one sender. Every label states the scope: these verbs
+    /// hit *all* mail from this sender, not just the rows on screen.
+    public func senderCount(_ count: Int) -> String {
+        pick("\(count) 封邮件", "\(count) messages")
+    }
+    public var senderAllRead: String { pick("全部已读", "Mark all read") }
+    public var senderAllArchive: String { pick("全部归档", "Archive all") }
+    public var senderAllReadConfirm: String {
+        pick("把该发件人的所有未读邮件标记为已读？", "Mark all unread mail from this sender as read?")
+    }
+    public var senderAllArchiveConfirm: String {
+        pick("把该发件人的所有未读邮件归档？（可在 30 天内撤销）",
+             "Archive all unread mail from this sender? (Undoable for 30 days)")
+    }
+    public var senderWorking: String { pick("处理中…", "Working…") }
+    public var senderBulkPartial: String {
+        pick("部分邮件处理失败", "Some messages failed")
+    }
+    public func senderAllReadDone(_ count: Int) -> String {
+        pick("已标记 \(count) 封为已读", "Marked \(count) messages as read")
+    }
+    public func senderAllArchiveDone(_ count: Int) -> String {
+        pick("已归档 \(count) 封", "Archived \(count) messages")
+    }
     public var loadFailed: String { pick("加载失败", "Couldn't load") }
     public var close: String { pick("关闭", "Close") }
     public var groupingLabel: String { pick("归集", "Grouping") }

@@ -838,7 +838,12 @@ final class RouteTests: XCTestCase {
                 remoteId: "r-\(UUID())",
                 from: "bob@example.com",
                 isRead: true,
-                daysAgo: 30
+                // 10 days, not 30: the heuristic rule under test is "read and
+                // older than 7 days → safe to archive", and 30 days now sits
+                // outside the briefing's 30-day window — the row would be
+                // filtered before grouping, so the test would fail for a
+                // reason that has nothing to do with the classifier.
+                daysAgo: 10
             )
             let pinned = makeHeader(accountId: account.id, remoteId: "p-\(UUID())", from: "carol@example.com")
             for header in [needsReply, subscription, awaiting, archive, pinned] {

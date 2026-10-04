@@ -73,9 +73,22 @@ public struct BriefingItem: Codable, Equatable, Sendable, Identifiable {
 /// renders in `BriefingGroup.allCases` order.
 public struct BriefingResponse: Codable, Equatable, Sendable {
     public let items: [BriefingItem]
+    /// Messages inside the window that did not fit under the hard cap.
+    ///
+    /// Non-zero only on a mailbox busy enough to exceed `maxItems` in the
+    /// window — the case where the feed would otherwise silently pretend it
+    /// had shown everything. The client renders this as an explicit "N more
+    /// not included" line so the boundary is visible instead of inferred.
+    /// Optional so a v0.4.x client talking to this server still decodes.
+    public let omittedCount: Int?
 
-    public init(items: [BriefingItem]) {
+    public init(items: [BriefingItem], omittedCount: Int? = nil) {
         self.items = items
+        self.omittedCount = omittedCount
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case items, omittedCount
     }
 }
 

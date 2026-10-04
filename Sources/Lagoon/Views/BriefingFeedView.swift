@@ -18,6 +18,10 @@ struct BriefingFeedView: View {
     @State private var path: [String] = []
     @State private var scrollProxy: ScrollViewProxy?
     @State private var selectedMessageId: String? = nil
+    /// Rows inside the 30-day window that did not fit under the server's cap.
+    /// nil on the normal path; a non-nil value means the feed is a truncated
+    /// view of the window and says so rather than looking complete.
+    @State private var omittedCount: Int?
     /// Stamped by every `refresh()` so a slow poll that started before the
     /// user archived a row cannot write the server's pre-archive snapshot
     /// back over the removal. Only the newest generation may commit.
@@ -332,6 +336,19 @@ struct BriefingFeedView: View {
                     } header: {
                         groupHeader(group, count: groupItems.count)
                     }
+                }
+            }
+            // Only present when the server truncated the window. Rendered as
+            // a real row rather than an overlay so it scrolls with the feed
+            // and cannot be mistaken for a transient toast — the user should
+            // be able to find this statement again after dismissing it from
+            // their attention.
+            if let omittedCount {
+                Section {
+                    Label(l10n.briefingOmitted(omittedCount), systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel(l10n.briefingOmitted(omittedCount))
                 }
             }
         }
@@ -838,6 +855,7 @@ struct BriefingFeedView: View {
             guard generation == refreshGate.generation else { return }
 
             items = response.items
+            omittedCount = response.omittedCount
             errorBanner = nil
         } catch {
             guard generation == refreshGate.generation else { return }
