@@ -54,4 +54,45 @@ final class APIAuthTests: XCTestCase {
             }
         }
     }
+
+    /// Regression: gating used to be `path.hasPrefix("/api/")`, which the
+    /// router happily contradicts — `//api/ping` matches the `api/ping`
+    /// handler but does not start with `/api/`, so it reached a gated route
+    /// with no token at all (observed 200 vs 401 for the single-slash form).
+    /// Every path spelling the router can still match must be gated. Revert
+    /// the middleware to the prefix check and this fails.
+    func test_configured_gatesPathSpellingsTheRouterStillMatches() async throws {
+        let app = Application(router: makeRouter(token: "s3cret"))
+        try await app.test(.router) { client in
+            for path in ["//api/ping", "/api//ping", "/api/ping/../ping"] {
+                try await client.execute(uri: path, method: .get) { response in
+                    XCTAssertNotEqual(
+                        response.status, .ok,
+                        "\(path) reached the handler without a token"
+                    )
+                }
+            }
+            // And with the token, the canonical path still works.
+            try await client.execute(
+                uri: "/api/ping", method: .get,
+                headers: [.authorization: "Bearer s3cret"]
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+    }
+
+    /// The ungated list is exact-match, so a misspelled diagnostics path is
+    /// gated rather than skipped — the safe direction.
+    func test_configured_gatesMisspelledUngatedPaths() async throws {
+        let app = Application(router: makeRouter(token: "s3cret"))
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/healthz", method: .get) { response in
+                XCTAssertEqual(response.status, .ok, "/healthz stays ungated")
+            }
+            try await client.execute(uri: "//healthz", method: .get) { response in
+                XCTAssertNotEqual(response.status, .ok)
+            }
+        }
+    }
 }

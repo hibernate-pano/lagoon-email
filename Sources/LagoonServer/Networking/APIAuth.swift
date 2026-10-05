@@ -6,16 +6,26 @@ import Crypto
 /// Per-install bearer token for `/api/*` (V2 A5).
 ///
 /// The token comes from `LAGOON_API_TOKEN`. Unset/empty → the middleware is
-/// open (legacy loopback posture, unchanged behavior). Set → every `/api/`
-/// request needs `Authorization: Bearer <token>`; anything else gets 401
-/// `api-unauthorized`. Non-API paths (health, OAuth browser flow, webhook —
-/// which has its own secret) are never gated.
+/// open (legacy loopback posture, unchanged behavior). Set → every request
+/// needs `Authorization: Bearer <token>` EXCEPT the explicitly ungated
+/// diagnostics path; anything else gets 401 `api-unauthorized`.
+///
+/// Gating is **fail-closed**: it skips only the paths listed in
+/// `ungatedPaths` and gates everything else. The previous shape — "gate iff
+/// `path.hasPrefix("/api/")`" — was fail-open against path spelling: the
+/// router matches `//api/ping` to the `api/ping` handler, but that raw path
+/// does not start with `/api/`, so the middleware waved it through and an
+/// unauthenticated caller reached a gated route (probed: `//api/ping` → 200
+/// while `/api/ping` → 401). Inverting the default means any spelling the
+/// router can still match is gated unless it is exactly `/healthz`.
 ///
 /// Deliberately one install token, not per-device credentials: rotation is
 /// "change the env and restart both ends". Per-device pairing when iOS lands.
 public struct APIAuthMiddleware<Context: RequestContext>: RouterMiddleware {
-    /// `/api/` prefix (with slash, so `/apifoo` is not gated).
-    public static var gatedPrefix: String { "/api/" }
+    /// Paths that stay reachable without a token. Exact-match on the raw
+    /// request path, so a misspelling (`//healthz`) is gated, not skipped —
+    /// the safe direction for a diagnostics endpoint.
+    public static var ungatedPaths: Set<String> { ["/healthz"] }
 
     public let token: String?
 
@@ -32,7 +42,10 @@ public struct APIAuthMiddleware<Context: RequestContext>: RouterMiddleware {
         guard let token else {
             return try await next(request, context)
         }
-        guard request.uri.path.hasPrefix(Self.gatedPrefix) else {
+        // Fail-closed: only the exact ungated diagnostics paths pass without
+        // a token. Every other spelling — including router-matched variants
+        // like `//api/ping` — must carry the bearer.
+        guard !Self.ungatedPaths.contains(request.uri.path) else {
             return try await next(request, context)
         }
         guard Self.timingSafeEqual(request.headers[.authorization], "Bearer \(token)") else {
