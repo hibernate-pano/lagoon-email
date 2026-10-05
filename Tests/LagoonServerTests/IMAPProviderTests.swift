@@ -251,14 +251,18 @@ final class IMAPProviderTests: XCTestCase {
                 (name: "INBOX", attribute: nil),
                 (name: "Archive", attribute: "\\Archive"),
             ])
-            await scriptSelect(transport, number: 5, uidValidity: 42, uidNext: 1000)
-            await scriptHeaderFetch(transport, sequence: 1, uid: 900, flags: "\\Seen", headers: [
+            // 600 messages, UIDNEXT 1000: a sparse UID space on purpose. The
+            // window is the newest `backfillWindow` *messages*, so it starts at
+            // sequence 101 — not at UID 500, which is what measuring the same
+            // window in UID slots produced.
+            await scriptSelect(transport, number: 5, exists: 600, uidValidity: 42, uidNext: 1000)
+            await scriptHeaderFetch(transport, sequence: 101, uid: 900, flags: "\\Seen", headers: [
                 ("From", "\"Zhang San\" <zhangsan@qq.com>"),
                 ("Subject", "=?UTF-8?B?5rWL6K+V?="),
                 ("Message-ID", "<m900@qq.com>"),
                 ("References", "<root@qq.com> <parent@qq.com>"),
             ])
-            await scriptHeaderFetch(transport, sequence: 2, uid: 901, flags: "", headers: [
+            await scriptHeaderFetch(transport, sequence: 102, uid: 901, flags: "", headers: [
                 ("From", "lisi@qq.com"),
                 ("Subject", "第二封"),
             ])
@@ -267,11 +271,11 @@ final class IMAPProviderTests: XCTestCase {
             // FETCH blocks answer A0007): a backfill must not pay one round
             // trip per message.
             await scriptSnippet(
-                transport, sequence: 1, uid: 900,
+                transport, sequence: 101, uid: 900,
                 message: "Content-Type: text/plain; charset=UTF-8\r\n\r\nHello from QQ"
             )
             await scriptSnippet(
-                transport, sequence: 2, uid: 901,
+                transport, sequence: 102, uid: 901,
                 message: "Content-Type: text/plain; charset=UTF-8\r\n"
                     + "Content-Transfer-Encoding: base64\r\n\r\nSGVsbG8gd29ybGQhIHN0dWZm"
             )
@@ -282,13 +286,17 @@ final class IMAPProviderTests: XCTestCase {
             let lines = await wire(transport)
             XCTAssertTrue(
                 lines.contains(
-                    "A0006 UID FETCH 500:* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (\(headerFields))])"
+                    "A0006 FETCH 101:* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (\(headerFields))])"
                 ),
-                "the first pull backfills a bounded window instead of the whole mailbox"
+                "the first pull asks for the newest N messages by sequence, never a UID range"
             )
             XCTAssertEqual(change.upserts.count, 2)
             XCTAssertEqual(change.cursor.lastUid, 901)
             XCTAssertEqual(change.cursor.uidValidity, 42)
+            XCTAssertEqual(
+                change.cursor.historyFloorUid, 900,
+                "the round records how far back it reached, or the gap is never revisited"
+            )
             XCTAssertFalse(change.resetRequired)
 
             let first = try XCTUnwrap(change.upserts.first)
@@ -342,8 +350,11 @@ final class IMAPProviderTests: XCTestCase {
 
             await transport.enqueue("A0008 OK FETCH completed")
 
+            // A floor in the cursor means the history window already ran, so
+            // this round takes the forward path — which is what reconciliation
+            // is written against.
             let change = try await provider.pullChanges(
-                after: MailSyncState(uidValidity: 42, lastUid: 0),
+                after: MailSyncState(uidValidity: 42, lastUid: 0, historyFloorUid: 1),
                 waitUpTo: .zero
             )
 
@@ -896,7 +907,7 @@ final class IMAPProviderTests: XCTestCase {
             await transport.enqueue("A0007 OK FETCH completed")
 
             let change = try await provider.pullChanges(
-                after: MailSyncState(uidValidity: 7, lastUid: 5),
+                after: MailSyncState(uidValidity: 7, lastUid: 5, historyFloorUid: 5),
                 waitUpTo: .zero
             )
 
@@ -910,6 +921,199 @@ final class IMAPProviderTests: XCTestCase {
                 )
             )
             XCTAssertTrue(lines.contains("A0007 UID FETCH 1:5 (UID FLAGS)"))
+        }
+    }
+
+    /// The 2026-10-04 incident, pinned as a wire assertion.
+    ///
+    /// A real QQ mailbox: 265 messages, `UIDNEXT` 13734 — a UID space that is
+    /// 98% holes, because IMAP burns a UID forever on every expunge, move and
+    /// append. The window used to be `UID FETCH (uidNext - 500):*`, which on
+    /// this mailbox reached the newest ~43 messages and left 222 unfetched
+    /// forever, while the cursor parked at the top and health read `ok`. The
+    /// user-visible symptom was "the client shows fewer messages than I have",
+    /// which reads like a pagination bug and is not one: those rows were never
+    /// on the machine.
+    func test_pullChanges_sparseUidSpace_historyWindowIsAMessageCount() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let transport = ScriptedTransport()
+            let (provider, _) = try makeProvider(transport: transport)
+            await scriptHandshake(transport)
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+                (name: "Archive", attribute: "\\Archive"),
+            ])
+            await scriptSelect(transport, number: 5, exists: 265, uidValidity: 1384787035, uidNext: 13734)
+            for (sequence, uid) in [(sequence: 1, uid: Int64(13700)), (2, 13720), (3, 13733)] {
+                await scriptHeaderFetch(
+                    transport, sequence: sequence, uid: uid, flags: "",
+                    headers: [("Message-ID", "<m\(uid)@qq.com>")]
+                )
+            }
+            await transport.enqueue("A0006 OK FETCH completed")
+            for (sequence, uid) in [(sequence: 1, uid: Int64(13700)), (2, 13720), (3, 13733)] {
+                await scriptSnippet(
+                    transport, sequence: sequence, uid: uid,
+                    message: "Content-Type: text/plain; charset=UTF-8\r\n\r\nbody"
+                )
+            }
+            await transport.enqueue("A0007 OK FETCH completed")
+
+            let change = try await provider.pullChanges(after: MailSyncState(), waitUpTo: .zero)
+
+            XCTAssertEqual(change.upserts.count, 3, "every message in the mailbox, not only the newest UIDs")
+            XCTAssertEqual(change.cursor.historyFloorUid, 13700)
+            XCTAssertEqual(change.cursor.lastUid, 13733)
+
+            let lines = await wire(transport)
+            XCTAssertTrue(
+                lines.contains { $0.hasPrefix("A0006 FETCH 1:* ") },
+                "265 messages fit inside the window, so the fetch starts at sequence 1"
+            )
+            XCTAssertFalse(
+                lines.contains { $0.contains("UID FETCH 13234:*") },
+                "the window must not be expressed as UID slots behind UIDNEXT"
+            )
+            XCTAssertFalse(
+                lines.contains { $0.contains("BODY.PEEK[HEADER.FIELDS") && $0.hasPrefix("A0006 UID") },
+                "header fetches in a history round are sequence-addressed"
+            )
+        }
+    }
+
+    /// The upgrade path for an install that already synced under the old window.
+    ///
+    /// Its stored cursor has `lastUid` at the top of the mailbox and no
+    /// `historyFloorUid`, because the field did not exist — that combination is
+    /// the signature of a truncated history, and the next round must refill it
+    /// without the user reconnecting. The round after that must go back to the
+    /// cheap forward path instead of re-reading the whole window forever.
+    func test_pullChanges_legacyCursorWithoutFloor_refillsHistoryThenGoesForward() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let transport = ScriptedTransport()
+            let (provider, _) = try makeProvider(transport: transport)
+            await scriptHandshake(transport)
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+                (name: "Archive", attribute: "\\Archive"),
+            ])
+
+            // Round 1: the stored cursor a pre-fix install left behind.
+            await scriptSelect(transport, number: 5, exists: 265, uidValidity: 1384787035, uidNext: 13734)
+            for (sequence, uid) in [(sequence: 1, uid: Int64(13700)), (2, 13720), (3, 13733)] {
+                await scriptHeaderFetch(
+                    transport, sequence: sequence, uid: uid, flags: "",
+                    headers: [("Message-ID", "<m\(uid)@qq.com>")]
+                )
+            }
+            await transport.enqueue("A0006 OK FETCH completed")
+            for (sequence, uid) in [(sequence: 1, uid: Int64(13700)), (2, 13720), (3, 13733)] {
+                await scriptSnippet(
+                    transport, sequence: sequence, uid: uid,
+                    message: "Content-Type: text/plain; charset=UTF-8\r\n\r\nbody"
+                )
+            }
+            await transport.enqueue("A0007 OK FETCH completed")
+            // `readStateFlips` runs because the legacy cursor has a `lastUid`.
+            await transport.enqueue("A0008 OK FETCH completed")
+
+            let legacy = MailSyncState(
+                uidValidity: 1384787035,
+                lastUid: 13733,
+                archiveFolder: "Archive"
+            )
+            let refilled = try await provider.pullChanges(after: legacy, waitUpTo: .zero)
+
+            XCTAssertEqual(refilled.upserts.count, 3, "the gap below the old cursor is fetched")
+            XCTAssertEqual(refilled.cursor.historyFloorUid, 13700)
+            XCTAssertEqual(refilled.cursor.lastUid, 13733, "refilling must not walk the cursor back")
+
+            // Round 2: the same cursor, now carrying a floor. Nothing new.
+            // No LIST here — the archive folder resolved in round 1 is cached,
+            // so the sequence is SELECT, forward FETCH, flag rescan.
+            await scriptSelect(transport, number: 9, exists: 265, uidValidity: 1384787035, uidNext: 13734)
+            await transport.enqueue("A0010 OK FETCH completed")
+            await transport.enqueue("A0011 OK FETCH completed")
+
+            let forward = try await provider.pullChanges(after: refilled.cursor, waitUpTo: .zero)
+
+            XCTAssertTrue(forward.upserts.isEmpty)
+            let lines = await wire(transport)
+            XCTAssertTrue(
+                lines.contains("A0010 UID FETCH 13734:* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (\(headerFields))])"),
+                "with a floor recorded, a steady round reads only above the high-water mark"
+            )
+            XCTAssertFalse(
+                lines.contains { $0.hasPrefix("A0010 FETCH ") },
+                "the history window must not re-run every round"
+            )
+        }
+    }
+
+    /// The empty-mailbox half of the history window. Two separate facts, both
+    /// worth pinning because they are easy to conflate:
+    ///
+    /// * `exists = 0` records floor 0, not `uidNext`. Nothing was skipped, so
+    ///   the cursor must not claim a boundary that does not exist — a floor
+    ///   invented from `uidNext` would silently assert "we deliberately did not
+    ///   fetch below UID 7" about a folder that was simply empty.
+    /// * The forward start comes from `lastUid`, which is still nil here, so
+    ///   the next round reads from UID 1 and the mailbox's first arrival is
+    ///   picked up. This is deliberately *not* caused by the floor being 0 —
+    ///   deriving the forward start from the floor instead would make an
+    ///   empty new mailbox skip straight to `uidNext` and miss that arrival
+    ///   forever, which is the shape of the bug this whole change fixes.
+    func test_pullChanges_emptyMailbox_recordsFloorZeroAndSeesTheFirstArrival() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let transport = ScriptedTransport()
+            let (provider, _) = try makeProvider(transport: transport)
+            await scriptHandshake(transport)
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+                (name: "Archive", attribute: "\\Archive"),
+            ])
+            // Empty mailbox, but UIDNEXT already above 1 — exactly what a
+            // freshly provisioned folder looks like.
+            await scriptSelect(transport, number: 5, exists: 0, uidValidity: 42, uidNext: 7)
+            // No FETCH completion is scripted here on purpose: an empty mailbox
+            // issues no header command at all, and a stale tagged OK left in the
+            // queue would be consumed by the *next* round's SELECT, silently
+            // shifting every tag after it.
+
+            let empty = try await provider.pullChanges(after: MailSyncState(), waitUpTo: .zero)
+
+            XCTAssertTrue(empty.upserts.isEmpty)
+            XCTAssertEqual(empty.cursor.historyFloorUid, 0, "an empty window skipped nothing, so the floor is 0")
+            XCTAssertNil(empty.cursor.lastUid, "nothing arrived; the high-water mark stays unset")
+            let lines = await wire(transport)
+            XCTAssertFalse(
+                lines.contains { $0.contains("BODY.PEEK[HEADER.FIELDS") },
+                "an empty mailbox must not issue a header FETCH at all"
+            )
+
+            // Round 2: one message arrives. The floor says read from UID 1.
+            // Tags continue at A0006 — round 1 ended at its SELECT.
+            await scriptSelect(transport, number: 6, exists: 1, uidValidity: 42, uidNext: 8)
+            await scriptHeaderFetch(
+                transport, sequence: 1, uid: 7, flags: "",
+                headers: [("Message-ID", "<first@qq.com>")]
+            )
+            await transport.enqueue("A0007 OK FETCH completed")
+            await scriptSnippet(
+                transport, sequence: 1, uid: 7,
+                message: "Content-Type: text/plain; charset=UTF-8\r\n\r\nhello"
+            )
+            await transport.enqueue("A0008 OK FETCH completed")
+
+            let arrival = try await provider.pullChanges(after: empty.cursor, waitUpTo: .zero)
+
+            XCTAssertEqual(arrival.upserts.count, 1, "the first arrival of a new mailbox is never skipped")
+            XCTAssertEqual(arrival.cursor.lastUid, 7)
+            let lines2 = await wire(transport)
+            XCTAssertTrue(
+                lines2.contains("A0007 UID FETCH 1:* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (\(headerFields))])"),
+                "with lastUid unset and floor 0, the forward round starts at UID 1"
+            )
         }
     }
 
@@ -1222,6 +1426,233 @@ final class IMAPProviderTests: XCTestCase {
                 #"A0007 UID STORE 7 +FLAGS (\Deleted)"#,
                 "A0008 EXPUNGE",
             ])
+        }
+    }
+
+    // MARK: - 彻底删除 / 清空废纸篓（唯一不可逆的操作）
+
+    /// 彻底删除: flag `\Deleted` on that one uid, then `UID EXPUNGE` it.
+    ///
+    /// ## Why this test exists at all
+    ///
+    /// This is the only irreversible operation in the product, and until now
+    /// **nothing drove it at the IMAP layer** — `PurgeRoutesTests` exercises the
+    /// route with a `StubMailProvider` whose `permanentlyDelete` always
+    /// succeeds, so the whole `UID EXPUNGE` path was untested. Every assertion
+    /// about "permanent delete works" in this project was really an assertion
+    /// about a stub.
+    ///
+    /// `UID EXPUNGE <uid>` rather than plain `EXPUNGE` is the point of the
+    /// implementation: plain `EXPUNGE` removes **every** `\Deleted`-flagged
+    /// message in the folder, including ones other clients flagged and this
+    /// account never touched. For "delete this one message" that is equivalent
+    /// to "delete whatever the server thinks is pending deletion".
+    func test_permanentlyDelete_flagsThenUidExpungesExactlyOneUID() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let transport = ScriptedTransport()
+            let (provider, _) = try makeProvider(transport: transport)
+            await scriptHandshake(transport, capabilities: "IMAP4rev1 ID IDLE UIDPLUS AUTH=PLAIN")
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+                (name: "已删除", attribute: "\\Trash"),
+            ])
+            await scriptSelect(transport, number: 5, uidValidity: 42, uidNext: 9)
+            await transport.enqueue("A0006 OK STORE completed")
+            await transport.enqueue("A0007 OK EXPUNGE completed")
+
+            try await provider.permanentlyDelete(remoteId: "7")
+
+            let lines = await wire(transport)
+            XCTAssertTrue(
+                lines.contains(#"A0005 SELECT "已删除""#),
+                "it must act inside the Trash, not the inbox: \(lines)"
+            )
+            XCTAssertEqual(Array(lines.suffix(2)), [
+                #"A0006 UID STORE 7 +FLAGS (\Deleted)"#,
+                "A0007 UID EXPUNGE 7",
+            ])
+            XCTAssertFalse(
+                lines.contains { $0.hasSuffix("EXPUNGE") && !$0.contains("UID EXPUNGE") },
+                "a bare EXPUNGE takes every \\Deleted message in the folder, "
+                    + "including other clients' pending deletions: \(lines)"
+            )
+        }
+    }
+
+    /// No UIDPLUS ⇒ refuse, and **emit no deletion command at all**.    ///
+    /// The implementation's own comment states the trade: a slightly larger
+    /// Trash beats a wrong deletion of someone else's pending deletions. That
+    /// trade is only real if the refusal happens *before* any `STORE
+    /// \Deleted` — a version that flagged first and checked second would leave
+    /// the message flagged (and thus one plain `EXPUNGE` away from vanishing)
+    /// while still reporting failure.
+    func test_permanentlyDelete_withoutUIDPLUS_refusesAndSendsNoExpunge() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let transport = ScriptedTransport()
+            let (provider, _) = try makeProvider(transport: transport)
+            await scriptHandshake(transport, capabilities: "IMAP4rev1 ID IDLE AUTH=PLAIN")
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+                (name: "已删除", attribute: "\\Trash"),
+            ])
+            await scriptSelect(transport, number: 5, uidValidity: 42, uidNext: 9)
+
+            do {
+                try await provider.permanentlyDelete(remoteId: "7")
+                XCTFail("without UIDPLUS the operation must be refused, not approximated")
+            } catch let error as MailError {
+                guard case .protocolError(let message) = error else {
+                    return XCTFail("expected protocolError, got \(error)")
+                }
+                XCTAssertTrue(
+                    message.contains("UIDPLUS"),
+                    "the refusal must name the missing capability: \(message)"
+                )
+            }
+
+            let lines = await wire(transport)
+            XCTAssertFalse(
+                lines.contains { $0.contains("EXPUNGE") },
+                "nothing may be expunged on a server without UIDPLUS: \(lines)"
+            )
+            XCTAssertFalse(
+                lines.contains { $0.contains("STORE") },
+                "and nothing may be flagged \\Deleted either — a flag without an "
+                    + "expunge leaves it one plain EXPUNGE from gone: \(lines)"
+            )
+        }
+    }
+
+    /// 清空废纸篓: flag every uid the Trash holds, then one batched
+    /// `UID EXPUNGE` over the whole set.
+    ///
+    /// The uid set comes from *this* folder under *this* session's view, so a
+    /// message another client trashed a moment ago is not swept up by
+    /// implication. The batched form is also asserted because the per-message
+    /// loop that precedes it is the easy shape to regress into.
+    func test_emptyTrash_flagsAllThenExpungesTheWholeSetAtOnce() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let transport = ScriptedTransport()
+            let (provider, _) = try makeProvider(transport: transport)
+            await scriptHandshake(transport, capabilities: "IMAP4rev1 ID IDLE UIDPLUS AUTH=PLAIN")
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+                (name: "已删除", attribute: "\\Trash"),
+            ])
+            await scriptSelect(transport, number: 5, uidValidity: 42, uidNext: 9)
+            await transport.enqueue("* SEARCH 3 5 9")
+            await transport.enqueue("A0006 OK SEARCH completed")
+            for number in 7...9 {
+                await transport.enqueue("A000\(number) OK STORE completed")
+            }
+            await transport.enqueue("A0010 OK EXPUNGE completed")
+
+            try await provider.emptyTrash()
+
+            let lines = await wire(transport)
+            XCTAssertTrue(lines.contains("A0006 UID SEARCH ALL"), "the uid set comes from the folder: \(lines)")
+
+            // Every uid in the folder is flagged, in *some* order: `allUIDs()`
+            // returns a `Set<Int64>`, so both the uid sequence and its pairing to
+            // response tags are unordered by construction. Asserting `3,5,9` —
+            // or which tag answered which uid — would be asserting an
+            // implementation detail that a legitimate `Set` change would break
+            // for no behavioural reason; the uid order in `UID EXPUNGE` is not
+            // semantically meaningful. So: the *set* of flagged uids, and the
+            // *set* of expunged uids, which is what the protocol actually means.
+            let storedUIDs = Set(lines.compactMap { line -> Int64? in
+                let parts = line.split(separator: " ").map(String.init)
+                guard line.contains("UID STORE"),
+                      let index = parts.firstIndex(of: "STORE"),
+                      parts.count > index + 1 else { return nil }
+                return Int64(parts[index + 1])
+            })
+            XCTAssertEqual(
+                storedUIDs, [3, 5, 9],
+                "every uid in the Trash must be flagged before the expunge: \(lines)"
+            )
+            XCTAssertEqual(
+                lines.filter { $0.contains("UID STORE") }.count, 3,
+                "one flag per uid, no duplicates: \(lines)"
+            )
+
+            // The expunge itself is one command over the whole set.
+            let expunges = lines.filter { $0.contains("EXPUNGE") }
+            XCTAssertEqual(
+                expunges.count, 1,
+                "one batched command, not a loop: \(lines)"
+            )
+            let expungedUIDs = expunges.first.flatMap { line -> Set<Int64>? in
+                let payload = line.split(separator: " ").last.map(String.init) ?? ""
+                let parts = payload.split(separator: ",").compactMap { Int64($0) }
+                return parts.isEmpty ? nil : Set(parts)
+            }
+            XCTAssertEqual(
+                expungedUIDs, [3, 5, 9],
+                "and it must name every flagged uid: \(lines)"
+            )
+            XCTAssertFalse(
+                lines.contains { $0.hasSuffix("EXPUNGE") && !$0.contains("UID EXPUNGE") },
+                "a bare EXPUNGE here would take the whole folder with it: \(lines)"
+            )
+        }
+    }
+
+    /// An empty Trash must send **no** expunge at all.
+    ///
+    /// `UID EXPUNGE` with an empty sequence set is at best a server error and at
+    /// worst, on a server that treats it loosely, an unfiltered expunge — which
+    /// is the exact catastrophe the UIDPLUS requirement exists to prevent. The
+    /// empty case is also the one a user hits on their first "empty trash",
+    /// where nothing is actually there.
+    func test_emptyTrash_onAnEmptyFolder_sendsNoExpunge() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let transport = ScriptedTransport()
+            let (provider, _) = try makeProvider(transport: transport)
+            await scriptHandshake(transport, capabilities: "IMAP4rev1 ID IDLE UIDPLUS AUTH=PLAIN")
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+                (name: "已删除", attribute: "\\Trash"),
+            ])
+            await scriptSelect(transport, number: 5, exists: 0, uidValidity: 42, uidNext: 9)
+            await transport.enqueue("* SEARCH")
+            await transport.enqueue("A0006 OK SEARCH completed")
+
+            try await provider.emptyTrash()
+
+            let lines = await wire(transport)
+            XCTAssertFalse(
+                lines.contains { $0.contains("EXPUNGE") },
+                "nothing to empty means nothing to expunge: \(lines)"
+            )
+            XCTAssertFalse(
+                lines.contains { $0.contains("STORE") },
+                "and nothing to flag: \(lines)"
+            )
+        }
+    }
+
+    /// No Trash folder at all ⇒ refuse, and touch nothing.
+    func test_emptyTrash_withoutATrashFolder_refuses() async throws {
+        try await TokenKeyFixture.withKeyAsync(Self.key) {
+            let transport = ScriptedTransport()
+            let (provider, _) = try makeProvider(transport: transport)
+            await scriptHandshake(transport, capabilities: "IMAP4rev1 ID IDLE UIDPLUS AUTH=PLAIN")
+            await scriptList(transport, number: 4, mailboxes: [
+                (name: "INBOX", attribute: nil),
+            ])
+
+            do {
+                try await provider.emptyTrash()
+                XCTFail("an account with no Trash must refuse rather than sweep the inbox")
+            } catch let error as MailError {
+                XCTAssertTrue(
+                  error == .trashUnavailable,
+                    "expected trashUnavailable, got \(error)"
+                )
+            }
+            let lines = await wire(transport)
+            XCTAssertFalse(lines.contains { $0.contains("EXPUNGE") }, "\(lines)")
         }
     }
 

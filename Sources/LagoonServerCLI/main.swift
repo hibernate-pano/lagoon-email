@@ -70,6 +70,27 @@ struct LagoonServerCLIMain {
                 die("mailbox listing failed: \(error)")
             }
         }
+        // Read-only coverage report (LIST + SELECT per folder): the provider's
+        // per-folder counts next to the local store's. No mail is sent and
+        // nothing is written.
+        // One real pull round against the live mailbox, reported and discarded
+        // (no writes, cursor not advanced, session handed back).
+        if args.contains("--dry-run-pull") {
+            do {
+                try await LagoonSelfTest.dryRunPull(db: diagnosticsDB, logger: logger)
+                return
+            } catch {
+                die("dry-run pull failed: \(error)")
+            }
+        }
+        if args.contains("--mailbox-stats") {
+            do {
+                try await LagoonSelfTest.mailboxStats(db: diagnosticsDB, logger: logger)
+                return
+            } catch {
+                die("mailbox stats failed: \(error)")
+            }
+        }
         if let flag = args.firstIndex(of: "--find-subject") {
             guard args.index(after: flag) < args.endIndex else { die("--find-subject requires a subject") }
             do {

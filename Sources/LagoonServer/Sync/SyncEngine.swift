@@ -237,7 +237,15 @@ public actor AccountSyncLoop {
         }
     }
 
-    static func message(from header: RemoteHeader, accountId: UUID) -> MessageHeader {
+    /// `isSent` is a parameter rather than always-false because the Sent
+    /// listing (R1) builds rows through this same function. Sharing it is the
+    /// point: a second conversion path would be a second place for the
+    /// RFC 2047 decoding and threading rules to drift.
+    static func message(
+        from header: RemoteHeader,
+        accountId: UUID,
+        isSent: Bool = false
+    ) -> MessageHeader {
         MessageHeader(
             id: UUID(),
             accountId: accountId,
@@ -250,6 +258,7 @@ public actor AccountSyncLoop {
             receivedAt: header.receivedAt,
             isRead: header.isRead,
             isArchived: false,
+            isSent: isSent,
             messageIdHeader: header.messageIdHeader,
             inReplyTo: header.inReplyTo,
             references: header.references

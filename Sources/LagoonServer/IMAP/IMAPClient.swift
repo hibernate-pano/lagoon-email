@@ -34,6 +34,33 @@ public struct IMAPSelected: Equatable, Sendable {
     }
 }
 
+/// One folder's counters as the server reports them (diagnostics only).
+///
+/// `exists` is the message count the *provider* sees; comparing it against
+/// the local store separates "the list window is too small" from "the sync
+/// never fetched that far back" — two failures with the same on-screen
+/// symptom (missing mail) and completely different fixes.
+public struct IMAPMailboxStats: Equatable, Sendable {
+    public var name: String
+    public var attributes: [String]
+    public var exists: Int
+    public var uidValidity: Int64
+    public var uidNext: Int64
+    /// Messages whose UID sits below the first-sync backfill window, i.e. the
+    /// mail a fresh connect would never fetch. Measured with `UID SEARCH`, so
+    /// it costs one command and no header transfer.
+    public var olderThanBackfillWindow: Int
+
+    public init(name: String, attributes: [String], exists: Int, uidValidity: Int64, uidNext: Int64) {
+        self.name = name
+        self.attributes = attributes
+        self.exists = exists
+        self.uidValidity = uidValidity
+        self.uidNext = uidNext
+        self.olderThanBackfillWindow = 0
+    }
+}
+
 /// A FETCHed header block. `rawHeaders` keys are lowercased and continuation
 /// lines are unfolded; values stay RFC 2047-encoded — decoding belongs to the
 /// provider, which decides what to do with broken input.
@@ -213,6 +240,32 @@ public actor IMAPClient {
         let fieldList = fields.joined(separator: " ")
         let responses = try await connection.execute(
             "UID FETCH \(fromUid):* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (\(fieldList))])"
+        )
+        return Self.parseHeaders(responses)
+    }
+
+    /// Headers for the newest `count` messages, addressed by *sequence number*.
+    ///
+    /// Sequence numbers are dense (1…EXISTS) while UIDs are not: every expunge,
+    /// move and append burns UIDs forever, so on a mailbox that has been
+    /// archived from for years the last 500 *UIDs* can hold a couple of dozen
+    /// messages. A bounded history window is a statement about how much mail the
+    /// user sees, which is a message count — and measuring it in message counts
+    /// requires this form rather than `fetchHeaders(fromUid:)`.
+    ///
+    /// `exists` is the caller's SELECT result: it makes the range well-defined
+    /// without a second round trip, and an empty mailbox answers empty instead
+    /// of issuing `FETCH 1:*` over nothing.
+    public func fetchNewestHeaders(
+        count: Int,
+        exists: Int,
+        fields: [String] = IMAPClient.defaultHeaderFields
+    ) async throws -> [IMAPFetchedHeader] {
+        guard exists > 0, count > 0 else { return [] }
+        let first = max(1, Int64(exists) - Int64(count) + 1)
+        let fieldList = fields.joined(separator: " ")
+        let responses = try await connection.execute(
+            "FETCH \(first):* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (\(fieldList))])"
         )
         return Self.parseHeaders(responses)
     }
@@ -415,8 +468,31 @@ public actor IMAPClient {
 
     /// Removes every `\Deleted`-flagged message from the selected mailbox —
     /// the last step of the no-MOVE archiving fallback (spec §4.3).
+    ///
+    /// ## Do not use this to delete a specific message
+    ///
+    /// Plain `EXPUNGE` is folder-wide: it removes everything the *server*
+    /// considers pending deletion, including messages another client flagged.
+    /// For "delete exactly this one" use `uidExpunge(uid:)` — see
+    /// `IMAPProvider.permanentlyDelete`, which refuses to run without UIDPLUS
+    /// for this reason.
     public func expunge() async throws {
         _ = try await connection.execute("EXPUNGE")
+    }
+
+    /// Removes exactly one message (RFC 4315, UIDPLUS).
+    ///
+    /// The message must already carry `\Deleted`; this call is what makes the
+    /// removal real.
+    public func uidExpunge(uid: Int64) async throws {
+        _ = try await connection.execute("UID EXPUNGE \(uid)")
+    }
+
+    /// Removes a set of messages in one round trip (RFC 4315 sequence form).
+    public func uidExpunge(uids: [Int64]) async throws {
+        guard !uids.isEmpty else { return }
+        let list = uids.map(String.init).joined(separator: ",")
+        _ = try await connection.execute("UID EXPUNGE \(list)")
     }
 
     public func createMailbox(_ name: String) async throws {
@@ -462,7 +538,12 @@ public actor IMAPClient {
     static func isMessageVerdict(_ error: Error) -> Bool {
         guard let mail = error as? MailError else { return false }
         switch mail {
-        case .protocolError, .messageGone, .archiveUnavailable, .trashUnavailable:
+        case .protocolError, .messageGone, .archiveUnavailable, .trashUnavailable,
+            .sentUnavailable:
+            // A verdict about the *message or folder*, not the connection, so
+            // the caller stops rather than retrying. `sentUnavailable` belongs
+            // here for the same reason as `trashUnavailable`: the account has no
+            // such folder, and retrying will not conjure one.
             return true
         case .authFailed, .unreachable, .notConfigured:
             return false

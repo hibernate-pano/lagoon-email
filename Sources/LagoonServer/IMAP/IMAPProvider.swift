@@ -12,9 +12,17 @@ import GRDB
 /// resolved archive folder and the read-state baseline all survive between
 /// ticks.
 public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
-    /// First pull backfills `UIDNEXT - window` … end, so a freshly connected
-    /// mailbox shows recent mail instead of its whole history (spec §3.2).
-    static let backfillWindow: Int64 = 500
+    /// How many *messages* a first pull covers (spec §3.2: "recent mail
+    /// instead of the whole history").
+    ///
+    /// A message count, never a UID range. The implementation this replaced
+    /// read the same rule as `UID FETCH (uidNext - 500):*`, i.e. 500 UID
+    /// *slots* — and IMAP burns a UID forever on every expunge, move and
+    /// append, so a mailbox archived from for years has a sparse UID space
+    /// where 500 slots hold far fewer messages. Measured against a real QQ
+    /// mailbox: 13733 UID slots, 265 messages, and the window reached only the
+    /// newest ~43 — the rest was silently never fetched while health read `ok`.
+    static let backfillWindow = 500
     /// Read-state rescan window: one round costs at most this many UID flags
     /// (spec §3.2 step 3).
     static let flagRescanWindow: Int64 = 200
@@ -178,6 +186,54 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         }
     }
 
+    /// Per-mailbox counters: the server's own view of how much mail exists.
+    ///
+    /// This exists because "the client shows fewer messages than I have" has
+    /// two different causes with different fixes — the list window is too
+    /// small (a pagination fact), or the sync never fetched that far back (a
+    /// backfill-window fact). `EXISTS`/`UIDNEXT` are the server's numbers, so
+    /// comparing them against the local store tells the two apart instead of
+    /// guessing. Read-only: LIST + SELECT, no FETCH, no writes.
+    public func diagnosticMailboxStats() async throws -> [IMAPMailboxStats] {
+        try await withClient { client in
+            var stats: [IMAPMailboxStats] = []
+            for mailbox in try await client.listMailboxes() {
+                guard !mailbox.attributes.contains(where: {
+                    $0.caseInsensitiveCompare("\\NoSelect") == .orderedSame
+                }) else { continue }
+                do {
+                    let state = try await client.select(mailbox.name)
+                    var stat = IMAPMailboxStats(
+                        name: mailbox.name,
+                        attributes: mailbox.attributes,
+                        exists: state.exists,
+                        uidValidity: state.uidValidity,
+                        uidNext: state.uidNext
+                    )
+                    // Only INBOX is measured against the window, and only
+                    // from numbers this SELECT already returned: coverage is
+                    // `EXISTS` minus what one history window reaches, so no
+                    // extra command is worth spending.
+                    if mailbox.name == Self.inboxName {
+                        stat.olderThanBackfillWindow = max(
+                            0, state.exists - Self.backfillWindow
+                        )
+                    }
+                    stats.append(stat)
+                } catch {
+                    // One unreadable folder must not hide the rest: the point
+                    // of the diagnostic is the INBOX count.
+                    logger.debug("imap.statsMailboxSkipped", metadata: [
+                        "mailbox": .string(mailbox.name),
+                        "label": .string(Self.label(error)),
+                    ])
+                }
+            }
+            selected = nil
+            return stats
+        }
+    }
+
     public func diagnosticFind(subject: String, perMailboxLimit: Int = 100) async throws -> [(String, Int64)] {
         try await withClient { client in
             var matches: [(String, Int64)] = []
@@ -279,17 +335,57 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                 )
             }
 
-            let fromUid = cursor.lastUid.map { $0 + 1 }
-                ?? max(1, inbox.uidNext - Self.backfillWindow)
-            let fetched = try await client.fetchHeaders(fromUid: fromUid)
+            // Two different questions, deliberately not one:
+            //
+            // * history — the newest `backfillWindow` *messages* the store
+            //   should cover. Answered by sequence number, because a message
+            //   count is what the product rule means. The old form
+            //   (`UID FETCH uidNext-500:*`) measured the same window in *UID
+            //   slots*, and a UID is burned forever by every expunge, move and
+            //   append: on a mailbox archived from for years, 500 slots can
+            //   hold a couple of dozen messages. The window then looked
+            //   satisfied while most of the mailbox was never fetched, and the
+            //   cursor parked at the top so no later round ever looked back —
+            //   sync reported `ok` over mail it had not read.
+            // * forward — everything above the cursor's high-water mark.
+            //
+            // A pending history window is the product rule itself ("the newest
+            // N messages"), so it is fetched on its own and the forward delta
+            // is not additionally read. In every reachable state where the two
+            // can coincide — a first connect or a post-UIDVALIDITY reset, both
+            // of which leave `lastUid` nil, and a pre-floor legacy cursor,
+            // whose `lastUid` is already the mailbox high-water mark — the
+            // window covers the delta. A mailbox that took more than N
+            // arrivals while the app was closed would keep only the newest N,
+            // which is what the rule asks for anyway.
+            let historyPending = cursor.historyFloorUid == nil
+            let forwardFrom: Int64? = historyPending ? nil : (cursor.lastUid ?? 0) + 1
+            let fetched: [IMAPFetchedHeader]
+            if historyPending {
+                fetched = try await client.fetchNewestHeaders(
+                    count: Self.backfillWindow,
+                    exists: inbox.exists
+                )
+            } else if let fromUid = forwardFrom {
+                fetched = try await client.fetchHeaders(fromUid: fromUid)
+            } else {
+                fetched = []
+            }
             if !loggedFirstRound {
                 loggedFirstRound = true
+                // Coverage is in the log on purpose. The failure this window
+                // semantics replaced was invisible in every other signal —
+                // health `ok`, cursor parked at the top of the mailbox — so
+                // `exists` next to `fetched` is the only place a gap can be
+                // seen at all. That is the same lesson as
+                // .memory/imap-pull-path-must-log-a-round.
                 logger.info("imap.round", metadata: [
                     "account": .string(account.email),
                     "exists": .string("\(inbox.exists)"),
                     "uidValidity": .string("\(inbox.uidValidity)"),
                     "uidNext": .string("\(inbox.uidNext)"),
-                    "fromUid": .string("\(fromUid)"),
+                    "mode": .string(historyPending ? "history" : "forward"),
+                    "fromUid": .string(forwardFrom.map { "\($0)" } ?? "window"),
                     "fetched": .string("\(fetched.count)"),
                 ])
             }
@@ -337,6 +433,13 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             // nothing newer to resume from.
             let nextLastUid = fetched.map(\.uid).max().map { max(cursor.lastUid ?? 0, $0) }
                 ?? cursor.lastUid
+            // Records that the history window has run, so later rounds take
+            // the cheap forward path instead of re-reading N messages forever.
+            // The value is the lowest UID the window reached; `0` when the
+            // mailbox was empty, meaning "nothing below was skipped" — a
+            // truthful record rather than a placeholder. Note the forward
+            // start comes from `lastUid`, not from this floor.
+            let nextHistoryFloor = cursor.historyFloorUid ?? (fetched.map(\.uid).min() ?? 0)
             if let ids = inboxRemoteIds {
                 inboxRemoteIds = ids.union(upserts.map(\.remoteId))
             }
@@ -359,12 +462,13 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                 upserts: upserts,
                 resetRequired: false,
                 cursor: MailSyncState(
-                            uidValidity: inbox.uidValidity,
+                    uidValidity: inbox.uidValidity,
                     lastUid: nextLastUid,
                     archiveFolder: archiveFolder,
                     sentUidValidity: sentValidity,
                     sentLastUid: sentLastUid,
-                    sentFolder: sent.folder ?? cursor.sentFolder
+                    sentFolder: sent.folder ?? cursor.sentFolder,
+                    historyFloorUid: nextHistoryFloor
                 ),
                 inboxRemoteIds: inboxRemoteIds,
                 repliedMessageIds: sent.ids
@@ -837,7 +941,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         }
     }
 
-    public func restoreFromTrash(remoteId: String) async throws {
+        public func restoreFromTrash(remoteId: String) async throws {
         try await withClient { client in
             guard let folder = try await resolveTrashFolder(client: client) else {
                 throw MailError.trashUnavailable
@@ -845,6 +949,70 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             selected = try await client.select(folder)
             let trashedUID = try await resolveUID(remoteId, client: client)
             try await move(client: client, uid: trashedUID, to: Self.inboxName)
+            selected = nil
+        }
+    }
+
+    /// 彻底删除 one message from the Trash.
+    ///
+    /// ## Why `UID EXPUNGE` and not `EXPUNGE`
+    ///
+    /// Plain `EXPUNGE` removes **every** `\Deleted`-flagged message in the
+    /// selected folder. In a Trash that other clients also write to, that is
+    /// not "delete this one" — it is "delete whatever the server thinks is
+    /// pending deletion", which can include messages this account never flagged
+    /// and cannot bring back. `UID EXPUNGE <uid>` (RFC 4315, the UIDPLUS
+    /// extension) removes exactly the one message.
+    ///
+    /// So UIDPLUS is **required**, not preferred: without it the operation is
+    /// refused rather than approximated. A slightly larger Trash is a far better
+    /// outcome than a wrong deletion of someone else's pending deletions.
+    ///
+    /// The two-step is the IMAP dance for "delete exactly this": flag
+    /// `\Deleted`, then UID-EXPUNGE that one uid. The flag alone does nothing —
+    /// it is the EXPUNGE that removes.
+    public func permanentlyDelete(remoteId: String) async throws {
+        try await withClient { client in
+            guard let folder = try await resolveTrashFolder(client: client) else {
+                throw MailError.trashUnavailable
+            }
+            selected = try await client.select(folder)
+            let trashedUID = try await resolveUID(remoteId, client: client)
+            guard try await client.capability().contains("UIDPLUS") else {
+                selected = nil
+                throw MailError.protocolError("UIDPLUS not supported")
+            }
+            try await client.store(uid: trashedUID, add: ["\\Deleted"])
+            try await client.uidExpunge(uid: trashedUID)
+            selected = nil
+        }
+    }
+
+    /// 清空废纸篓: flag every UID in the Trash, then UID-EXPUNGE them as a set.
+    ///
+    /// Two round trips rather than a per-message loop, and — like the
+    /// single-message path — never a blanket `EXPUNGE`. The uid set is read
+    /// from *this* folder with *this* session's view, so a message another
+    /// client trashed a second ago is not swept up by accident.
+    public func emptyTrash() async throws {
+        try await withClient { client in
+            guard let folder = try await resolveTrashFolder(client: client) else {
+                throw MailError.trashUnavailable
+            }
+            selected = try await client.select(folder)
+            guard try await client.capability().contains("UIDPLUS") else {
+                selected = nil
+                throw MailError.protocolError("UIDPLUS not supported")
+            }
+            let uids = try await client.allUIDs()
+            guard !uids.isEmpty else {
+                selected = nil
+                return
+            }
+            for uid in uids {
+                try await client.store(uid: uid, add: ["\\Deleted"])
+            }
+            try await client.uidExpunge(uids: Array(uids))
             selected = nil
         }
     }
@@ -932,6 +1100,189 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         }
         return Set(currentUIDs.compactMap { inboxRemoteIdByUID[$0] })
     }
+
+    /// The folders a message can be filed into (R2).
+    ///
+    /// ## What gets filtered out, and why each exclusion is deliberate
+    ///
+    /// * **INBOX** — the destination is the absence of a move, and offering it
+    ///   as a choice makes "移动到收件箱" look like a distinct action.
+    /// * **Trash** — it has its own verb (`trash`) with its own confirmation.
+    ///   Reaching it through the move menu would be a second, quieter path to a
+    ///   destructive action.
+    /// * **Sent** — same reason. R1 gave it a dedicated surface; a folder entry
+    ///   would let the user file a message into their own Sent folder and have
+    ///   it vanish from every list, which is a support question we should not be
+    ///   designing answers for.
+    /// * **Archive** — the app's own 档案柜 already has a one-keystroke verb.
+    ///   A folder entry would duplicate it with an extra dialog in between.
+    ///
+    /// What remains is the user's **own** folders: the things they made. That is
+    /// exactly the set that had no way to reach a message before R2.
+    public func listFolders() async throws -> [MailFolder] {
+        let mailboxes = try await withClient { client in
+            try await client.listMailboxes()
+        }
+        // A child path implies its parent exists, so the parent set is derived
+        // from the children rather than trusted to be listed — some servers
+        // omit `\Noselect` parents from LIST entirely.
+        var childPaths = Set<String>()
+        for box in mailboxes {
+            guard let slash = box.name.lastIndex(of: "/") else { continue }
+            childPaths.insert(String(box.name[box.name.startIndex ..< slash]))
+        }
+        let folders = mailboxes.compactMap { box -> MailFolder? in
+            guard !Self.isReservedFolder(box) else { return nil }
+            guard let leaf = box.name.split(separator: "/").last, !leaf.isEmpty else {
+                return nil
+            }
+            return MailFolder(
+                name: String(leaf),
+                // The server's own string, verbatim. See `normalizedPath`.
+                path: box.name,
+                hasChildren: childPaths.contains(box.name)
+            )
+        }
+        // Sorted by path so the tree is stable across calls: the UI must not
+        // reshuffle the menu every time the user opens it.
+        return folders.sorted {
+            $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending
+        }
+    }
+
+    /// Files a message into `folder` (R2).
+    ///
+    /// `createIfMissing` is a parameter rather than always-on because the two
+    /// callers want different things: the folder picker only offers folders
+    /// that exist, while a typed name may legitimately mean a folder the user
+    /// wants made.
+    @discardableResult
+    public func move(remoteId: String, to folder: String, createIfMissing: Bool) async throws -> Bool {
+        let target = folder.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return false }
+
+        return try await withClient { client in
+            selected = try await client.select(Self.inboxName)
+            let inboxUID: Int64
+            do {
+                inboxUID = try await resolveUID(remoteId, client: client)
+            } catch {
+                // Not in the INBOX — it may be in 档案柜 or 废纸篓, where the UID
+                // space belongs to a *different* folder. A UID is mailbox-local,
+                // so reusing one here would move whatever message happens to
+                // hold that UID in the INBOX. That is the worst outcome a move
+                // can have, and it is why this throws instead of guessing.
+                throw MailError.messageGone
+            }
+
+            if try await client.capability().contains("MOVE") {
+                do {
+                    try await client.move(uid: inboxUID, to: target)
+                    return true
+                } catch {
+                    // Advertised but refused; fall through to copy+delete rather
+                    // than reporting a failure the fallback can still handle.
+                    guard IMAPClient.isMessageVerdict(error) else { throw error }
+                }
+            }
+
+            do {
+                try await client.copy(uid: inboxUID, to: target)
+            } catch {
+                // §4.3: no MOVE, and COPY to a folder that does not exist yet
+                // fails too. Only *now* is creating the folder worth trying, and
+                // only when the caller asked for it.
+                guard createIfMissing, IMAPClient.isMessageVerdict(error) else {
+                    return false
+                }
+                do {
+                    try await client.createMailbox(target)
+                } catch {
+                    guard IMAPClient.isMessageVerdict(error) else { throw error }
+                    return false
+                }
+                try await client.copy(uid: inboxUID, to: target)
+            }
+            // Copy landed; the INBOX copy has to go or the message is in two
+            // places. The flag alone does nothing — `expunge` is what removes.
+            try await client.store(uid: inboxUID, add: ["\\Deleted"])
+            try await client.expunge()
+            return true
+        }
+    }
+
+    /// Folders the app already owns a dedicated verb or surface for.
+    ///
+    /// Compared on the **leaf**, case-insensitively, because that is the segment
+    /// that identifies the role: QQ nests 废纸篓 under the account root in some
+    /// locales and at the top level in others, so a prefix match would miss half
+    /// of them. SPECIAL-USE attributes are checked first because they are the
+    /// server stating the role outright.
+    private static func isReservedFolder(_ box: IMAPMailbox) -> Bool {
+        let specials = ["\\Trash", "\\Sent", "\\Archive", "\\Drafts", "\\Junk"]
+        for attribute in specials {
+            if box.attributes.contains(where: {
+                $0.caseInsensitiveCompare(attribute) == .orderedSame
+            }) {
+                return true
+            }
+        }
+        guard let leaf = box.name.split(separator: "/").last else { return true }
+        return [
+            "inbox", "sent", "sent items", "sent mail", "已发送", "已发送邮件",
+            "trash", "deleted items", "deleted mail", "废纸篓", "已删除",
+            "archive", "archived", "归档", "drafts", "草稿",
+            "junk", "spam", "垃圾邮件",
+        ].contains(leaf.trimmingCharacters(in: .whitespaces).lowercased())
+    }
+
+    /// 已发送：the newest headers in the account's Sent folder (R1).
+    ///
+    /// ## Why this SELECTs outside the sync loop
+    ///
+    /// The engine pulls the INBOX only, and `collectSentReplies` documents that
+    /// "sent mail is never stored as rows". This method is the one place that
+    /// changes: it fetches on demand, when the user opens 已发送, and the
+    /// caller (`SentRoutes`) upserts what comes back and marks it `is_sent`.
+    ///
+    /// It deliberately has **no cursor**. A cursor would mean reconciliation —
+    /// and reconciling the Sent folder would delete rows the user can see in
+    /// another client, which is precisely the class of bug the INBOX sync was
+    /// rewritten to avoid. A read-only listing cannot delete anything.
+    ///
+    /// `limit` is honoured on the *server* (`UID SEARCH` then a windowed
+    /// FETCH), so opening 已发送 on a 5,000-message Sent folder costs two round
+    /// trips rather than downloading all of it.
+    public func listSent(limit: Int) async throws -> [MessageHeader] {
+        guard let folder = try await resolveSentFolder() else {
+            throw MailError.sentUnavailable
+        }
+        let capped = max(1, min(limit, Self.maxSentWindow))
+        return try await withClient { client in
+            let state = try await client.select(folder)
+            selected = nil
+            let exists = state.exists
+            guard exists > 0 else { return [] }
+            let fetched = try await client.fetchNewestHeaders(
+                count: capped, exists: exists
+            )
+            return fetched.map { header in
+                // `isSent: true` here, and the route marks the stored row too.
+                // Setting it on the returned value is what lets the Sent list
+                // render correctly on the very first response, before any
+                // reconcile could have run.
+                AccountSyncLoop.message(
+                    from: remoteHeader(from: header, snippet: nil),
+                    accountId: account.id,
+                    isSent: true
+                )
+            }
+        }
+    }
+
+    /// The most Sent messages a single listing will return. Matches the list
+    /// route's `maxListRows` so the UI and the provider agree on one page size.
+    private static let maxSentWindow = 500
 
     /// One wire header block → the provider-neutral row. RFC 2047 runs first:
     /// QQ encodes Chinese subjects and display names as encoded-words.
