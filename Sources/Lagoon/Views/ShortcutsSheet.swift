@@ -27,14 +27,16 @@ struct ShortcutsSheet: View {
             // Navigation
             Entry(id: "back", keys: "⌘[", description: l10n.backHelp),
             Entry(id: "briefing", keys: "⌘0", description: l10n.surfaceHelp),
+            Entry(id: "groupJump", keys: "⌘1–⌘9", description: l10n.shortcutGroupJump),
             Entry(id: "search", keys: "⌘F", description: l10n.shortcutSearch),
             Entry(id: "palette", keys: "⌘K", description: l10n.commandPalette),
-            Entry(id: "shortcuts", keys: "⌘/", description: l10n.shortcutHelp),
+            Entry(id: "shortcuts", keys: "⌘/", description: l10n.keyboardShortcuts),
+            Entry(id: "budget", keys: "⌘B", description: l10n.shortcutBudget),
+            Entry(id: "advice", keys: "⇧⌘A", description: l10n.shortcutAdvice),
 
             // Briefing feed
             Entry(id: "next", keys: "J", description: l10n.shortcutJ),
             Entry(id: "prev", keys: "K", description: l10n.shortcutK),
-            Entry(id: "open", keys: "↩", description: l10n.openSelected),
             Entry(id: "markAllRead", keys: "⇧⌘K", description: l10n.markAllReadHelp),
 
             // Compose / actions
@@ -48,6 +50,13 @@ struct ShortcutsSheet: View {
             Entry(id: "draft", keys: "⇧⌘D", description: l10n.shortcutDraft),
             Entry(id: "archiveNext", keys: "⌘E", description: l10n.shortcutArchiveNext),
 
+            // List-surface gestures. Bound via `onDeleteCommand`, not
+            // `keyboardShortcut`, so they are invisible to a grep of the
+            // latter — which is exactly how they went undocumented.
+            Entry(id: "selectAll", keys: "⌘A", description: l10n.shortcutSelectAll),
+            Entry(id: "archiveSelected", keys: "⌫", description: l10n.shortcutArchiveSelected),
+            Entry(id: "deleteSelected", keys: "⌘⌫", description: l10n.shortcutDeleteSelected),
+
             // Global
             Entry(id: "undo", keys: "⌘Z", description: l10n.shortcutZ),
             Entry(id: "refresh", keys: "⌥⌘R", description: l10n.shortcutRefresh),
@@ -57,7 +66,7 @@ struct ShortcutsSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text(l10n.shortcutHelp).font(.headline)
+                Text(l10n.keyboardShortcuts).font(.headline)
                 Spacer()
                 Button(l10n.done) { dismiss() }
                     .keyboardShortcut(.defaultAction)

@@ -5,6 +5,15 @@ import GRDB
 import LagoonKit
 
 struct ArchiveResponse: Encodable { let ok: Bool; let remoteId: String; let remote: Bool; let actionId: Int64 }
+
+/// 彻底删除 response.
+///
+/// No `actionId`, and that absence is deliberate: the client shows no undo
+/// toast for a purge because there is nothing to undo, and returning an id here
+/// would invite a ⌘Z that the undo route would (correctly) reject. `purged` is
+/// the count of local rows removed — 1 for the single-message route, N for
+/// 清空废纸篓, 0 for a trash that was already empty.
+struct PurgeResponse: Encodable { let ok: Bool; let remoteId: String; let purged: Int }
 struct ClassifyResponse: Encodable {
     let ok: Bool
     let actionId: Int64
@@ -54,6 +63,76 @@ public enum ActionsRoutes {
             return await deleteHandler(
                 request: request, context: context, db: db,
                 makeProvider: makeProvider, logger: logger
+            )
+        }
+
+        // POST /api/messages/{remoteId}/unarchive?accountId=
+        // 取消归档：把邮件从档案柜移回收件箱。
+        //
+        // Why this route exists when `unarchive` was already reachable through
+        // undo: undo is an 8-second toast. Archive is not a 8-second decision —
+        // a user files a newsletter away in March and wants it back in
+        // September. Without this route, archiving is a one-way door and the
+        // 档案柜 is a place mail goes to be forgotten, which is the opposite of
+        // what an archive is for.
+        //
+        // Audited and undoable like every other verb, so moving a message back
+        // is itself reversible (⌘Z re-archives it).
+        router.post("api/messages/:remoteId/unarchive") { request, context -> Response in
+            return await unarchiveHandler(
+                request: request, context: context, db: db,
+                makeProvider: makeProvider, logger: logger
+            )
+        }
+
+        // POST /api/messages/{remoteId}/restore?accountId=
+        // 从废纸篓恢复。同上：undo 的 8 秒窗口不等于"可恢复"。
+        router.post("api/messages/:remoteId/restore") { request, context -> Response in
+            return await restoreHandler(
+                request: request, context: context, db: db,
+                makeProvider: makeProvider, logger: logger
+            )
+        }
+
+        // POST /api/messages/{remoteId}/purge?accountId=
+        // 彻底删除：把邮件从服务器 Trash 永久抹掉。**不可撤销。**
+        //
+        // 规则约束按用户 2026-10-05 的决定放宽：早先的宪法 §2 要求所有变更
+        // 可撤销，而这一条天然违反。放宽后仍然保留三道闸门，因为「不可撤销」
+        // 说的是**没有撤销路径**，不是**可以随便触发**：
+        //
+        //   1. 必须先在废纸篓里（软删除是本路由的前置条件）
+        //   2. 只能由用户显式点击触发，绝无自动路径
+        //   3. 远端 UID EXPUNGE 成功后才删本地行，失败则本地完全不动
+        //
+        // 第 3 条是唯一真正防止数据损失的那道：先动远端、后删本地，中途失败
+        // 只会留下一条孤儿记录（可重试），反过来则会永久丢失且无法恢复。
+        router.post("api/messages/:remoteId/purge") { request, context -> Response in
+            return await purgeHandler(
+                request: request, context: context, db: db,
+                makeProvider: makeProvider, logger: logger
+            )
+        }
+
+        // POST /api/trash/empty?accountId=
+        // 清空废纸篓。逐封本地硬删除，远端一次 UID EXPUNGE 批量。
+        router.post("api/trash/empty") { request, _ -> Response in
+            return await emptyTrashHandler(
+                request: request, db: db, makeProvider: makeProvider, logger: logger
+            )
+        }
+
+        // POST /api/delete-bulk?accountId=  {remoteIds: [...]} | {allMatching: true, lens}
+        // 批量删除：the counterpart to `/api/archive-bulk`. Its absence was the
+        // reason deleting 50 messages meant firing 50 single-message requests.
+        //
+        // `allMatching` is what makes Gmail's two-stage select-all possible from
+        // the client side: the list is a window, so "everything" is a *query*,
+        // not a list of ids the client never received. The server resolves it
+        // against the same filter the list uses, so the two cannot disagree.
+        router.post("api/delete-bulk") { request, _ -> Response in
+            return await deleteBulkHandler(
+                request: request, db: db, makeProvider: makeProvider, logger: logger
             )
         }
 
@@ -195,6 +274,385 @@ public enum ActionsRoutes {
         ))
     }
 
+    // MARK: - Unarchive / Restore
+    //
+    // These two are the mirror images of `archiveHandler` / `deleteHandler`,
+    // and deliberately so: same capability gate, same remote-then-local order,
+    // same compensation on local failure, same audit row. Writing them as a
+    // separate shape would be how a restore ends up "mostly working" — remote
+    // move but no local flag, or a local flag with no audit row so ⌘Z silently
+    // does nothing.
+
+    /// 取消归档：远端移回收件箱，本地翻 `is_archived = FALSE`。
+    private static func unarchiveHandler(
+        request: Request, context: BasicRequestContext, db: LagoonDB,
+        makeProvider: MailProviderFactory.Builder, logger: Logger
+    ) async -> Response {
+        guard let accountId = RouteParams.accountId(from: request) else {
+            return RouteJSON.error(.badRequest, "malformed-accountId")
+        }
+        guard let remoteId = RouteParams.remoteId(from: context) else {
+            return RouteJSON.error(.badRequest, "malformed-remoteId")
+        }
+        let account: Account
+        do {
+            guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                return RouteJSON.error(.notFound, "unknown-account")
+            }
+            account = found
+        } catch {
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+        // Same gate as archive, and for the same reason: if the provider cannot
+        // find an archive folder there is nothing to move out of, and a 409
+        // leaves both sides untouched.
+        guard account.capabilities.archiveFolder else {
+            return RouteJSON.error(.conflict, "archive-unavailable")
+        }
+        guard let provider = makeProvider(account) else {
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        }
+        do {
+            try await provider.unarchive(remoteId: remoteId)
+        } catch let error as MailError {
+            return MessageRoutes.providerError(error, logger: logger, remoteId: remoteId)
+        } catch {
+            logger.warning("unarchive.remoteFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "label": .string(MessageRoutes.providerLabel(error)),
+            ])
+            return RouteJSON.error(.badGateway, "provider-unreachable")
+        }
+
+        let action: AIAction
+        do {
+            action = try db.write { raw in
+                try MessageStore.setArchivedSync(
+                    false, remoteId: remoteId, accountId: accountId, db: raw
+                )
+                return try AIActionStore.recordSync(
+                    accountId: accountId,
+                    kind: .archive,
+                    payload: [
+                        "remoteId": remoteId,
+                        "remoteWrite": "true",
+                        // The inverse of this action is "archive again", which
+                        // is the same kind with the opposite local flag. Without
+                        // the marker, undo would restore the flag to whatever the
+                        // default is rather than to the state this action
+                        // replaced.
+                        "restoreTo": "archived",
+                    ],
+                    db: raw
+                )
+            }
+        } catch {
+            // Compensation: the remote MOVE already happened. Put it back
+            // rather than leaving the message archived in the server and live
+            // in the list — the exact split-brain the archive path guards.
+            do {
+                try await provider.archive(remoteId: remoteId)
+            } catch {
+                logger.error("unarchive.compensationFailed", metadata: [
+                    "remoteId": .string(remoteId),
+                    "err": .string("\(error)"),
+                ])
+            }
+            logger.error("unarchive.localUpdateFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "err": .string("\(error)"),
+            ])
+            return RouteJSON.error(.internalServerError, "internal-error")
+        }
+        return RouteJSON.response(ArchiveResponse(
+            ok: true,
+            remoteId: remoteId,
+            remote: true,
+            actionId: action.id
+        ))
+    }
+
+    /// 从废纸篓恢复：远端移回收件箱，本地翻 `is_deleted = FALSE`。
+    ///
+    /// Deliberately *not* recorded as an undoable action in the same way delete
+    /// is: the toast from the original delete already covers the "I deleted
+    /// this by accident" case, and this route exists for the case it does not
+    /// cover — "I deleted this a week ago and need it back". The audit row is
+    /// still written, so the action history stays a complete record of what
+    /// Lagoon did to the mailbox (constitution §3).
+    private static func restoreHandler(
+        request: Request, context: BasicRequestContext, db: LagoonDB,
+        makeProvider: MailProviderFactory.Builder, logger: Logger
+    ) async -> Response {
+        guard let accountId = RouteParams.accountId(from: request) else {
+            return RouteJSON.error(.badRequest, "malformed-accountId")
+        }
+        guard let remoteId = RouteParams.remoteId(from: context) else {
+            return RouteJSON.error(.badRequest, "malformed-remoteId")
+        }
+        let account: Account
+        do {
+            guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                return RouteJSON.error(.notFound, "unknown-account")
+            }
+            account = found
+        } catch {
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+        guard let provider = makeProvider(account) else {
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        }
+        do {
+            try await provider.restoreFromTrash(remoteId: remoteId)
+        } catch let error as MailError {
+            return MessageRoutes.providerError(error, logger: logger, remoteId: remoteId)
+        } catch {
+            logger.warning("restore.remoteFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "label": .string(MessageRoutes.providerLabel(error)),
+            ])
+            return RouteJSON.error(.badGateway, "provider-unreachable")
+        }
+
+        let action: AIAction
+        do {
+            action = try db.write { raw in
+                try MessageStore.setDeletedSync(
+                    remoteId: remoteId, accountId: accountId, deleted: false, db: raw
+                )
+                return try AIActionStore.recordSync(
+                    accountId: accountId,
+                    kind: .delete,
+                    payload: [
+                        "remoteId": remoteId,
+                        "remoteWrite": "true",
+                        "restoreTo": "live",
+                    ],
+                    db: raw
+                )
+            }
+        } catch {
+            // Compensation: the message is already back in the inbox remotely.
+            // Re-trash it so the server and the local flag still agree.
+            do {
+                try await provider.trash(remoteId: remoteId)
+            } catch {
+                logger.error("restore.compensationFailed", metadata: [
+                    "remoteId": .string(remoteId),
+                    "err": .string("\(error)"),
+                ])
+            }
+            logger.error("restore.localUpdateFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "err": .string("\(error)"),
+            ])
+            return RouteJSON.error(.internalServerError, "internal-error")
+        }
+        return RouteJSON.response(ArchiveResponse(
+            ok: true,
+            remoteId: remoteId,
+            remote: true,
+            actionId: action.id
+        ))
+    }
+
+    // MARK: - 彻底删除
+
+    /// 彻底删除 one message. 远端先 UID EXPUNGE，本地再抹掉全部痕迹。
+    ///
+    /// ## 为什么远端先、且失败时不删本地
+    ///
+    /// 顺序反过来会永久丢数据：先删本地再动远端，远端失败时本地已经没有了，
+    /// 用户既看不到邮件也无法重试。反过来最坏情况是留下一条孤儿本地行，
+    /// 可以重试、可以在下一次同步被reconcile 清掉——**可恢复的错比不可恢复
+    /// 的错好得多**。
+    ///
+    /// ## 为什么需要审计行
+    ///
+    /// 邮件本身没了，但"Lagoon 在何时彻底删除了它"必须留下。这是宪法 §3 对
+    /// 这个产品最硬的要求：可以什么都不做，但做过的事必须说得清。
+    private static func purgeHandler(
+        request: Request, context: BasicRequestContext, db: LagoonDB,
+        makeProvider: MailProviderFactory.Builder, logger: Logger
+    ) async -> Response {
+        guard let accountId = RouteParams.accountId(from: request) else {
+            return RouteJSON.error(.badRequest, "malformed-accountId")
+        }
+        guard let remoteId = RouteParams.remoteId(from: context) else {
+            return RouteJSON.error(.badRequest, "malformed-remoteId")
+        }
+        let account: Account
+        do {
+            guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                return RouteJSON.error(.notFound, "unknown-account")
+            }
+            account = found
+        } catch {
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+        guard let provider = makeProvider(account) else {
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        }
+
+        // Gate: the message must already be in the Trash.
+        //
+        // This is what keeps 彻底删除 from becoming a second, quieter delete.
+        // Without it, a single API call would permanently remove a message the
+        // user still has in their inbox and could still restore from the undo
+        // toast — the irreversibility would arrive before the intent.
+        let isTrashed: Bool
+        do {
+            isTrashed = try db.read { raw in
+                let row = try Row.fetchOne(
+                    raw,
+                    sql: """
+                        SELECT is_deleted FROM message_headers
+                        WHERE account_id = ? AND remote_id = ?
+                        """,
+                    arguments: [accountId, remoteId]
+                )
+                return row.map { ($0["is_deleted"] as Bool?) ?? false } ?? false
+            }
+        } catch {
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+        guard isTrashed else {
+            // 409, not 404: the message exists, the request just does not make
+            // sense yet. A 404 would tell the user it is gone when it is not.
+            return RouteJSON.error(.conflict, "not-in-trash")
+        }
+
+        do {
+            try await provider.permanentlyDelete(remoteId: remoteId)
+        } catch let error as MailError {
+            return MessageRoutes.providerError(error, logger: logger, remoteId: remoteId)
+        } catch {
+            logger.warning("purge.remoteFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "label": .string(MessageRoutes.providerLabel(error)),
+            ])
+            return RouteJSON.error(.badGateway, "provider-unreachable")
+        }
+
+        // Remote is gone; now the local trace. Deliberately no undo toast on
+        // the client — an action id here would invite a ⌘Z that cannot work.
+        do {
+            try db.write { raw in
+                try MessageStore.hardDeleteSync(
+                    remoteId: remoteId, accountId: accountId, db: raw
+                )
+                // Discarded on purpose: a purge audit row exists to record
+                // that the app did this, not to be undone — there is no ⌘Z
+                // for an irreversible act (see the handler's own note above).
+                _ = try AIActionStore.recordSync(
+                    accountId: accountId,
+                    kind: .purge,
+                    // remoteId is kept in the audit row even though the message
+                    // it refers to no longer exists — that is the point of an
+                    // audit row, and nothing reads it as a live foreign key.
+                    payload: ["remoteId": remoteId, "permanent": "true"],
+                    db: raw
+                )
+            }
+        } catch {
+            // The remote deletion already happened. Log loudly rather than
+            // pretending to compensate: there is nothing to compensate *to*.
+            // The leftover local row is inert (nothing lists it) and the next
+            // sync's reconcile will not find it on the server.
+            logger.error("purge.localCleanupFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "err": .string("\(error)"),
+            ])
+            return RouteJSON.error(.internalServerError, "internal-error")
+        }
+        return RouteJSON.response(PurgeResponse(ok: true, remoteId: remoteId, purged: 1))
+    }
+
+    /// 清空废纸篓。
+    ///
+    /// The count reported is the number of **local** rows that were removed and
+    /// the remote expunge is a single call, so "deleted 12" is a claim about
+    /// this app's records rather than a count the server returned. That
+    /// asymmetry is stated here because it is the one place the number the user
+    /// sees is not a number the provider confirmed.
+    private static func emptyTrashHandler(
+        request: Request, db: LagoonDB,
+        makeProvider: MailProviderFactory.Builder, logger: Logger
+    ) async -> Response {
+        guard let accountId = RouteParams.accountId(from: request) else {
+            return RouteJSON.error(.badRequest, "malformed-accountId")
+        }
+        let account: Account
+        do {
+            guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                return RouteJSON.error(.notFound, "unknown-account")
+            }
+            account = found
+        } catch {
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+        guard let provider = makeProvider(account) else {
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        }
+
+        let remoteIds: [String]
+        do {
+            remoteIds = try await MessageStore.trashedRemoteIds(
+                forAccount: accountId, db: db
+            )
+        } catch {
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+        // Empty is a success, not an error: the user asked for the trash to be
+        // empty and it is. A 409 here would train people to click through
+        // warnings for a no-op.
+        guard !remoteIds.isEmpty else {
+            return RouteJSON.response(PurgeResponse(ok: true, remoteId: "", purged: 0))
+        }
+
+        do {
+            try await provider.emptyTrash()
+        } catch let error as MailError {
+            return MessageRoutes.providerError(error, logger: logger, remoteId: "")
+        } catch {
+            logger.warning("emptyTrash.remoteFailed", metadata: [
+                "label": .string(MessageRoutes.providerLabel(error)),
+            ])
+            return RouteJSON.error(.badGateway, "provider-unreachable")
+        }
+
+        do {
+            try db.write { raw in
+                for remoteId in remoteIds {
+                    try MessageStore.hardDeleteSync(
+                        remoteId: remoteId, accountId: accountId, db: raw
+                    )
+                }
+                // One audit row for the whole sweep; see the single-message
+                // purge handler for why its id is deliberately discarded.
+                _ = try AIActionStore.recordSync(
+                    accountId: accountId,
+                    kind: .purge,
+                    payload: [
+                        "permanent": "true",
+                        "count": String(remoteIds.count),
+                        "scope": "trash",
+                    ],
+                    db: raw
+                )
+            }
+        } catch {
+            logger.error("emptyTrash.localCleanupFailed", metadata: [
+                "count": .stringConvertible(remoteIds.count),
+                "err": .string("\(error)"),
+            ])
+            return RouteJSON.error(.internalServerError, "internal-error")
+        }
+        return RouteJSON.response(PurgeResponse(
+            ok: true, remoteId: "", purged: remoteIds.count
+        ))
+    }
+
     // MARK: - Delete
 
     /// 删除：远端先移入废纸篓，本地再翻旗标。与归档同一套审计/撤销。
@@ -269,6 +727,203 @@ public enum ActionsRoutes {
     /// audit row each so undo stays per-message. Cap 500 so a runaway client
     /// cannot one-shot the provider's rate budget; per-item errors are
     /// reported, not thrown — a sweep that half-succeeded must say so.
+    // MARK: - 批量删除
+
+    /// 批量删除：逐封移入服务器废纸篓，每封一条审计行，逐项回报。
+    ///
+    /// ## `allMatching` 为什么必须由服务端解析
+    ///
+    /// 客户端的列表是一扇**窗**：它只加载了前 N 封。当用户说「全选」时，他们
+    /// 指的是筛选条件下的**全部**，而客户端根本拿不到那些 id。所以
+    /// `allMatching: true` 把「全部」表达成一个**查询**，由服务端用与列表
+    /// 完全相同的 filter 解析——两处若各写一套筛选，出现「批量删了 800 封但
+    /// 列表里还有 3 封没删」这种事时，就无法判断是 bug 还是用户的预期。
+    ///
+    /// 这也是 Gmail 两段式全选的实现基础：第一步选已加载的（客户端做），
+    /// 第二步选服务器上的全部（服务端做）。
+    private static func deleteBulkHandler(
+        request: Request, db: LagoonDB,
+        makeProvider: MailProviderFactory.Builder, logger: Logger
+    ) async -> Response {
+        guard let accountId = RouteParams.accountId(from: request) else {
+            return RouteJSON.error(.badRequest, "malformed-accountId")
+        }
+        let body: Data
+        do { body = try await RouteParams.collectBody(request) } catch {
+            return RouteJSON.error(.badRequest, "missing-body")
+        }
+        struct Req: Decodable {
+            let remoteIds: [String]?
+            /// 选服务器上的全部。`lens` 限定在哪个视图内。
+            let allMatching: Bool?
+            let archived: Bool?
+            let deleted: Bool?
+            /// 已发送 is the third axis (R1), and it must be decoded here for
+            /// the same reason `archived`/`deleted` are: this is a **second,
+            /// hand-written** copy of the filter vocabulary, and the shared
+            /// `filterSQL` only sees what this struct forwards.
+            ///
+            /// It was missing, and `MessageStore` defaults `sent` to false —
+            /// so "select every 已发送 message and delete" resolved to the
+            /// **inbox** and trashed up to 500 inbox rows instead. The client's
+            /// `DeleteBulkRequest` has carried `sent` since R1; only the server
+            /// was cutting it. `DeleteBulkTests` and
+            /// `TwoStageSelectTests.test_lensScope_coversEverySidebarDestination`
+            /// now both cover the sent scope.
+            let sent: Bool?
+            let stackId: UUID?
+        }
+        let req: Req
+        do { req = try JSONDecoder().decode(Req.self, from: body) } catch {
+            return RouteJSON.error(.badRequest, "invalid-body")
+        }
+        let account: Account
+        do {
+            guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                return RouteJSON.error(.notFound, "unknown-account")
+            }
+            account = found
+        } catch {
+            return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
+        }
+        guard let provider = makeProvider(account) else {
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        }
+
+        // Cap first, then resolve. The cap is on *remote round trips*, which is
+        // the real cost, so it must bound whichever path produced the ids.
+        let cap = 500
+        var ids: [String] = []
+        var truncated = 0
+        if req.allMatching == true {
+            var stackMatch: MessageStore.StackMatch?
+            if let stackId = req.stackId {
+                let rule: StackRule?
+                do {
+                    rule = try await StackStore.listStackRule(
+                        id: stackId, accountId: accountId, db: db
+                    )
+                } catch {
+                    return errorResponse(
+                        .internalServerError, "internal-error", logger: logger, error: error
+                    )
+                }
+                guard let rule else {
+                    return RouteJSON.error(.notFound, "unknown-stack")
+                }
+                stackMatch = rule.kind == .sender ? .sender(rule.value) : .keyword(rule.value)
+            }
+            let all: [String]
+            var liveTotal: Int
+            do {
+                // Two queries, and the second one is the point. Fetching only
+                // `cap + 1` ids can prove "there is more than 500" but can never
+                // say *how much* more — so `truncatedCount` would always read 1
+                // whether 5 messages or 5,000 were left behind. A bulk delete
+                // that reports "moved 500, 1 more skipped" for a 5,000-message
+                // mailbox is the "looks complete while part is missing" failure
+                // this field exists to prevent, so the real total is counted.
+                all = try await MessageStore.remoteIds(
+                    forAccount: accountId,
+                    sender: nil,
+                    archived: req.archived ?? false,
+                    deleted: req.deleted ?? false,
+                    sent: req.sent ?? false,
+                    stackMatch: stackMatch,
+                    limit: cap + 1,
+                    db: db
+                )
+                liveTotal = try await MessageStore.count(
+                    forAccount: accountId,
+                    sender: nil,
+                    archived: req.archived ?? false,
+                    deleted: req.deleted ?? false,
+                    sent: req.sent ?? false,
+                    stackMatch: stackMatch,
+                    db: db
+                )
+            } catch {
+                return errorResponse(
+                    .internalServerError, "internal-error", logger: logger, error: error
+                )
+            }
+            // The *true* number of messages the filter matches, minus the ones
+            // this call actually handled. Using `liveTotal` (not
+            // `all.count - cap`) is what lets the user be told "3,000 more" as
+            // opposed to a meaningless "1 more".
+            ids = Array(all.prefix(cap))
+            truncated = max(0, liveTotal - ids.count)
+        } else {
+            let requested = req.remoteIds ?? []
+            truncated = max(0, requested.count - cap)
+            ids = Array(requested.prefix(cap))
+        }
+        guard !ids.isEmpty else {
+            return RouteJSON.error(.badRequest, "empty-remoteIds")
+        }
+
+        var items: [ArchiveBulkItem] = []
+        for remoteId in ids {
+            do {
+                // Local flag first, remote second — the same ordering
+                // `archiveBulkHandler` uses, for the same reconcile reason: the
+                // flag is the claim `reconcileInbox` respects, so it has to be
+                // committed before the await that lets reconcile run.
+                let claimed = try db.write { raw -> Bool in
+                    let wasDeleted = try Bool.fetchOne(
+                        raw,
+                        sql: "SELECT is_deleted FROM message_headers WHERE account_id = ? AND remote_id = ?",
+                        arguments: [accountId, remoteId]
+                    ) ?? false
+                    try MessageStore.setDeletedSync(
+                        remoteId: remoteId, accountId: accountId, deleted: true, db: raw
+                    )
+                    return !wasDeleted
+                }
+                do {
+                    try await provider.trash(remoteId: remoteId)
+                } catch {
+                    if claimed {
+                        try? db.write {
+                            try MessageStore.setDeletedSync(
+                                remoteId: remoteId, accountId: accountId, deleted: false, db: $0
+                            )
+                        }
+                    }
+                    throw error
+                }
+                let action = try db.write { raw in
+                    try MessageStore.setDeletedSync(
+                        remoteId: remoteId, accountId: accountId, deleted: true, db: raw
+                    )
+                    return try AIActionStore.recordSync(
+                        accountId: accountId,
+                        kind: .delete,
+                        payload: ["remoteId": remoteId, "remoteWrite": "true"],
+                        db: raw
+                    )
+                }
+                items.append(ArchiveBulkItem(remoteId: remoteId, ok: true, actionId: action.id))
+            } catch {
+                // Per-item, honestly: a partial success is reported, never
+                // thrown away. A bulk bar that says "done" while 30 of 200
+                // failed is the failure mode this shape exists to prevent.
+                items.append(ArchiveBulkItem(
+                    remoteId: remoteId, ok: false,
+                    errorCode: MessageRoutes.providerLabel(error)
+                ))
+            }
+        }
+        // `truncatedCount` is non-nil only when truncation actually happened,
+        // matching `archiveBulkHandler`. The client must either page through the
+        // remainder or tell the user — a partial bulk delete reported as
+        // complete is the exact failure this field was added for.
+        return RouteJSON.response(ArchiveBulkResponse(
+            items: items,
+            truncatedCount: truncated > 0 ? truncated : nil
+        ))
+    }
+
     private static func archiveBulkHandler(
         request: Request, db: LagoonDB,
         makeProvider: MailProviderFactory.Builder, logger: Logger
@@ -1021,6 +1676,13 @@ public enum ActionsRoutes {
             try await MessageStore.setDeleted(
                 remoteId: remoteId, accountId: account.id, deleted: false, db: db
             )
+        case .purge:
+            // 彻底删除 is the one branch with no inverse at all: the message is
+            // gone from the server and from every local table, so there is
+            // nothing left to restore. It is recorded in the audit stream
+            // precisely so that this is a *known* irreversible action rather
+            // than a silent gap in the history.
+            throw NotUndoable(kind: action.kind)
         case .unsubscribe, .draftCreate, .send, .undo:
             // Terminal: we can't take back an unsubscribe, an undraft, or a
             // reply that has already left the building. Tell the user why.

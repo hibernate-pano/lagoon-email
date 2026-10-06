@@ -273,4 +273,51 @@ final class DomainCodableTests: XCTestCase {
         XCTAssertEqual(accounts.first?.capabilities.idle, true)
         XCTAssertEqual(accounts.first?.capabilities.archiveFolder, false)
     }
+
+    /// R1 回归：`isSent` 的线上键名必须是 camelCase。
+    ///
+    /// ## 为什么这个测试不能靠 roundtrip 抓到
+    ///
+    /// `test_message_header_roundtrip` 编码再解码同一个对象，两边用**同一个**
+    /// CodingKeys，所以键名写错时它照样通过。真正的问题在线上：服务端编码出
+    /// `is_sent`，客户端按 `isSent` 去找，`decodeIfPresent` 返回 nil，属性落到
+    /// `?? false`——**没有报错、没有警告，只是这个标记永远是错的**。
+    ///
+    /// 所以这里断言的是**键名字符串本身**，而不是「编码再解码能还原」。这才是
+    /// 线上格式的契约。
+    func test_messageHeader_isSentUsesTheCamelCaseWireKey() throws {
+        let header = MessageHeader(
+            id: UUID(), accountId: UUID(), remoteId: "r1", threadId: "t1",
+            fromAddress: "me@example.com", fromName: "Me", subject: "已发送",
+            snippet: nil, receivedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            isRead: true, isArchived: false, isSent: true
+        )
+        let data = try makeEncoder().encode(header)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let keys = try XCTUnwrap(json).keys
+
+        XCTAssertTrue(
+            keys.contains("isSent"),
+            "the wire key must be `isSent` like every other key on this type; got \(keys.sorted())"
+        )
+        XCTAssertFalse(
+            keys.contains("is_sent"),
+            "`is_sent` is the *database column*, not the wire key. Emitting it makes the client read nil."
+        )
+    }
+
+    /// 旧载荷没有 `isSent` 时必须解出 false，而不是让整个解码失败。
+    ///
+    /// Mirrors the real deployment: every message stored before R1 has no such
+    /// field, and a sync response full of them must still decode.
+    func test_messageHeader_decodesPayloadWithoutTheSentKey() throws {
+        let legacy = """
+            {"id":"\(UUID().uuidString)","accountId":"\(UUID().uuidString)",
+             "remoteId":"r1","threadId":"t1","fromAddress":"a@example.com",
+             "fromName":null,"subject":"旧邮件","snippet":null,
+             "receivedAt":"2023-11-14T22:13:20Z","isRead":true,"isArchived":false}
+            """
+        let decoded = try makeDecoder().decode(MessageHeader.self, from: Data(legacy.utf8))
+        XCTAssertFalse(decoded.isSent, "a pre-R1 payload means \"not sent\", not a decode failure")
+    }
 }

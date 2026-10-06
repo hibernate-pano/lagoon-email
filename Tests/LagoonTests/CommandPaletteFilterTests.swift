@@ -1,7 +1,7 @@
 import XCTest
 @testable import Lagoon
 
-/// `CommandPaletteView`'s constructor wires 11 callbacks. If any of them
+/// `CommandPaletteView`'s constructor wires 12 callbacks. If any of them
 /// goes non-optional or gets renamed, this test catches it before the
 /// sheet appears blank in front of the user.
 ///
@@ -15,9 +15,10 @@ import XCTest
 final class CommandPaletteFilterTests: XCTestCase {
     private func palette() -> CommandPaletteView {
         CommandPaletteView(
-            onNewMessage: {}, onSearch: {}, onShowBriefing: {},
-            onShowAllMessages: {}, onShowUsage: {}, onShowActionHistory: {},
-            onShowAdvice: {}, onShowShortcuts: {}, onShowAISettings: {},
+            onNewMessage: {}, onSearch: {}, onToggleSurface: {},
+            onShowUsage: {}, onShowActionHistory: {},
+            onShowAdvice: {}, onShowSenderRanking: {},
+            onCycleDensity: {}, onShowShortcuts: {}, onShowAISettings: {},
             onRefresh: {}, onToggleSound: {}
         )
     }
@@ -35,11 +36,12 @@ final class CommandPaletteFilterTests: XCTestCase {
         let view = CommandPaletteView(
             onNewMessage: record("new-message"),
             onSearch: record("search"),
-            onShowBriefing: record("show-briefing"),
-            onShowAllMessages: record("show-all"),
+            onToggleSurface: record("toggle-surface"),
             onShowUsage: record("usage"),
             onShowActionHistory: record("history"),
             onShowAdvice: record("advice"),
+            onShowSenderRanking: record("senders"),
+            onCycleDensity: record("density"),
             onShowShortcuts: record("shortcuts"),
             onShowAISettings: record("ai-settings"),
             onRefresh: record("refresh"),
@@ -56,12 +58,41 @@ final class CommandPaletteFilterTests: XCTestCase {
 
     /// Pinned verbatim: adding a command means adding a callback *and* a row
     /// here, and removing one is a deliberate act rather than an accident.
-    func test_paletteExposesExactlyTheElevenCommands() {
+    func test_paletteExposesExactlyTheTwelveCommands() {
         XCTAssertEqual(palette().allCommands.map(\.id), [
-            "new-message", "search", "show-briefing", "show-all", "refresh",
-            "usage", "ai-settings", "advice", "history", "shortcuts", "sound"
+            "new-message", "search", "toggle-surface", "refresh",
+            "usage", "ai-settings", "advice", "senders", "density", "history", "shortcuts", "sound"
         ])
     }
+
+    /// ⌘0 toggles. Two rows each labelled ⌘0 — one saying "Briefing", one
+    /// saying "All messages" — told the user to press ⌘0 to reach a surface,
+    /// and pressing it while already there sent them the other way. Exactly
+    /// one row may claim the key.
+    func test_command0IsAdvertisedOnceAsAToggle() {
+        let claiming = palette().allCommands.filter { $0.shortcut == "⌘0" }
+        XCTAssertEqual(claiming.map(\.id), ["toggle-surface"])
+    }
+
+    /// No two rows may advertise the same key: the palette is the user's map
+    /// of what a key does, and a collision makes one of the two entries a lie.
+    func test_noTwoCommandsClaimTheSameShortcut() {
+        let keys = palette().allCommands.compactMap(\.shortcut)
+        XCTAssertEqual(Set(keys).count, keys.count, "duplicate shortcut in \(keys)")
+    }
+
+    /// The ⌘/ row must not be titled "command palette" — that is the ⌘K row.
+    /// The mislabel made searching the palette for "命令面板" return two hits
+    /// that open different sheets.
+    func test_shortcutsRowIsNotTitledCommandPalette() {
+        let commands = palette().allCommands
+        let shortcuts = commands.first { $0.id == "shortcuts" }
+        XCTAssertNil(commands.first { $0.id == "palette" }, "the palette does not list itself as a row")
+        XCTAssertNotEqual(shortcuts?.title, l10n.commandPalette)
+        XCTAssertEqual(shortcuts?.title, l10n.keyboardShortcuts)
+    }
+
+    private var l10n: L10n { L10n(language: .zhHans) }
 
     /// `ForEach(..., id: \.element.id)` drops duplicate keys silently, and
     /// `highlightedIndex` indexes the filtered array — a repeated id
@@ -98,10 +129,14 @@ final class CommandPaletteFilterTests: XCTestCase {
     /// Every action is undoable (spec's core promise) and ⌘Z is bound in
     /// `RootView`'s hidden background — if the cheatsheet drops the row,
     /// the promise becomes undiscoverable. Same for ⌫/⌘⌫, which are
-    /// bound as zero-width buttons rather than menu items.
+    /// bound as zero-width buttons rather than menu items and were in fact
+    /// missing from the sheet until this test started demanding them.
     func test_shortcutSheetAdvertisesTheGlobalGestures() {
         let ids = Set(ShortcutsSheet().entries.map(\.id))
-        for expected in ["undo", "refresh", "back", "palette", "briefing"] {
+        for expected in [
+            "undo", "refresh", "back", "palette", "briefing",
+            "archiveSelected", "deleteSelected", "groupJump", "budget", "advice",
+        ] {
             XCTAssertTrue(ids.contains(expected), "cheatsheet is missing '\(expected)'")
         }
     }

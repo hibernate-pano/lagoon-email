@@ -32,6 +32,22 @@ public enum LagoonDatabase {
     public static let advisoryOnlyVersion = "lagoon-v3"
     /// Adds the read-only advice store (constitution §3).
     public static let adviceVersion = "lagoon-v4"
+    /// Adds `is_sent` so the Sent folder can be listed (R1).
+    ///
+    /// ## Why a column and not a separate table
+    ///
+    /// A sent message is still a message: it has headers, a body, a thread, and
+    /// it belongs in the same store so search, thread walk and the detail view
+    /// work on it unchanged. A separate `sent_messages` table would duplicate
+    /// every one of those and create a second thing to keep in sync — the exact
+    /// shape that produced the "orphaned mail in no list" bug when 废纸篓 and
+    /// 档案柜 each filtered on their own axis.
+    ///
+    /// The alternative — treating Sent as "messages whose from_address is me" —
+    /// was rejected: it cannot distinguish a reply I sent from a message *to*
+    /// me from the same person, and it breaks the moment the account has a
+    /// second identity.
+    public static let sentFolderVersion = "lagoon-v5"
 
     public static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
@@ -49,8 +65,27 @@ public enum LagoonDatabase {
         migrator.registerMigration(adviceVersion) { db in
             try db.execute(sql: Self.adviceReconciliation)
         }
+        migrator.registerMigration(sentFolderVersion) { db in
+            try db.execute(sql: Self.sentFolderReconciliation)
+        }
         return migrator
     }
+
+    /// R1: `is_sent` plus the index the Sent list reads through.
+    ///
+    /// `is_sent` is deliberately **absent from `schema`**, so this migration is
+    /// the only thing that ever adds it — which is what makes it safe on both
+    /// paths. SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so a
+    /// column present in `schema` would make this statement fail with
+    /// "duplicate column name" on every fresh install while succeeding on every
+    /// existing one. Absent from `schema`, a fresh database simply has not run
+    /// `lagoon-v5` yet, so the ALTER is the first and only time it executes.
+    public static let sentFolderReconciliation = """
+        ALTER TABLE message_headers ADD COLUMN is_sent INTEGER NOT NULL DEFAULT FALSE;
+        -- statement
+        CREATE INDEX IF NOT EXISTS message_headers_account_sent_idx
+            ON message_headers (account_id, received_at DESC) WHERE is_sent = TRUE;
+    """
 
     /// GRDB records applied migrations by *identifier*, not by content, so
     /// editing `lagoon-v1`'s body does nothing for a database that already

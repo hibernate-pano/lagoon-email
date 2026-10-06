@@ -294,6 +294,20 @@ public enum SearchRoutes {
         // arm already covers the same text, so the arm is gone rather than
         // emulated. Optional sender/since filters are appended as static
         // fragments (never user text) so binding stays positional.
+        //
+        // What replaced it is cheaper and more honest: the `advice` arm. Lagoon
+        // has already paid a model to classify every message it has seen, and
+        // that verdict is stored in columns rather than prose. Matching on it
+        // means searching "marketing" or "archive" finds mail by what the AI
+        // *concluded* about it — which is the question a user asking "show me
+        // the marketing" is really asking — with no extra inference, no
+        // embedding index, and no per-query token spend.
+        //
+        // It deliberately does **not** match `a.rationale`: the rationale is the
+        // model's own English/Chinese sentence, so a LIKE against it would be
+        // accidental translation rather than a real filter. Only the enum-
+        // shaped columns participate, and the UI labels them as AI-derived so
+        // the user knows why the hit appeared.
         var sql = """
             SELECT m.id, m.account_id, m.remote_id, m.thread_id,
                    m.from_address,
@@ -305,14 +319,24 @@ public enum SearchRoutes {
             FROM message_headers m
             LEFT JOIN message_bodies b
               ON b.account_id = m.account_id AND b.remote_id = m.remote_id
+            -- The advice table joins in for recall only. Nothing here reads the
+            -- model's own words: it matches on the *structured* fields Lagoon
+            -- already derived (category, action), so a search for "营销" or
+            -- "archive" finds mail by what the AI concluded about it rather than
+            -- only by what it happened to write. `rationale` is deliberately
+            -- excluded — see the note below.
+            LEFT JOIN advice a
+              ON a.account_id = m.account_id AND a.remote_id = m.remote_id
             WHERE m.account_id = ?
               AND m.is_deleted = FALSE
               AND (m.subject LIKE ? ESCAPE '\\' OR m.snippet LIKE ? ESCAPE '\\'
                    OR m.from_name LIKE ? ESCAPE '\\' OR m.from_address LIKE ? ESCAPE '\\'
-                   OR b.body_text LIKE ? ESCAPE '\\')
+                   OR b.body_text LIKE ? ESCAPE '\\'
+                   OR a.category LIKE ? ESCAPE '\\'
+                   OR a.action LIKE ? ESCAPE '\\')
         """
         var arguments: [DatabaseValueConvertible?] = [
-            accountId, pattern, pattern, pattern, pattern, pattern
+            accountId, pattern, pattern, pattern, pattern, pattern, pattern, pattern
         ]
         if let sender {
             sql += "\n              AND m.from_address = ?"

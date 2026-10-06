@@ -95,6 +95,24 @@ struct SenderSheet: View {
                         }
                     }
                     .listStyle(.inset)
+                    // The header already reports the true total ("312 封邮件"),
+                    // so this row is not about counting — it is about saying that
+                    // the *list* is a window. Without it the user reads 312 in
+                    // the bar, scrolls to the end at 500, and concludes the sheet
+                    // is broken rather than capped.
+                    .safeAreaInset(edge: .bottom) {
+                        if let truncationNotice {
+                            Label(truncationNotice, systemImage: "info.circle")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(.bar)
+                                .overlay(alignment: .top) { Divider() }
+                                .accessibilityLabel(truncationNotice)
+                        }
+                    }
                 }
             }
             .navigationDestination(for: String.self) { remoteId in
@@ -125,8 +143,11 @@ struct SenderSheet: View {
         isLoading = true
         defer { isLoading = false }
         do {
+            // No client-side limit: the server owns the window, and this
+            // sheet's bulk verbs operate over "every mail from this sender",
+            // so a truncated list would make them quietly partial.
             let response = try await api.fetchMessages(
-                accountId: accountId, limit: 200, sender: senderAddress
+                accountId: accountId, sender: senderAddress
             )
             messages = response.messages
             totalCount = response.totalCount ?? response.messages.count
@@ -147,6 +168,15 @@ struct SenderSheet: View {
 
     private var archivableIds: [String] {
         messages.map(\.remoteId)
+    }
+
+    /// Non-nil when the server held more rows than the response carried.
+    ///
+    /// Distinct from the bulk bar's count on purpose: that one answers "how many
+    /// does this sender have" (and is right), this one answers "how many am I
+    /// about to see" — which is the number the bulk verbs actually act on.
+    private var truncationNotice: String? {
+        ListTruncationNotice.text(shown: messages.count, total: totalCount, l10n: l10n)
     }
 
     private var bulkBar: some View {

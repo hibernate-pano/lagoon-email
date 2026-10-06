@@ -749,7 +749,8 @@ public enum MessageRoutes {
             return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
         case .messageGone:
             return RouteJSON.error(.gone, "message-gone")
-        case .unreachable, .protocolError, .archiveUnavailable, .trashUnavailable:
+        case .unreachable, .protocolError, .archiveUnavailable, .trashUnavailable,
+            .sentUnavailable:
             return RouteJSON.error(.badGateway, "smtp-send-failed")
         }
     }
@@ -976,6 +977,11 @@ public enum MessageRoutes {
             return RouteJSON.error(.conflict, "archive-unavailable")
         case .trashUnavailable:
             return RouteJSON.error(.conflict, "delete-unavailable")
+        case .sentUnavailable:
+            // 404, not an empty list: "this account has no Sent folder" and
+            // "you have sent nothing" are different answers, and only one of
+            // them is true here.
+            return RouteJSON.error(.notFound, "sent-unavailable")
         case .unreachable, .protocolError:
             return RouteJSON.error(.badGateway, "provider-unreachable")
         }

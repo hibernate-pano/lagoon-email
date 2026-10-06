@@ -141,11 +141,19 @@ public final class APIClient: Sendable {
     /// `sender` narrows to one exact `from_address` (发件人归集); nil keeps
     /// the unfiltered recent list. `archived = true` serves the 档案柜;
     /// `stackId` narrows to one user-defined 聚合规则.
+    ///
+    /// `limit` is nil by default so the server owns the window, exactly like
+    /// `fetchBriefing`. The old `limit: Int = 50` was a second declaration of
+    /// the same policy on the client side, and it was the smaller one: a
+    /// mailbox with 52 live rows came back with 50 and the list looked like it
+    /// had stopped loading. Every response carries `totalCount`, which ignores
+    /// LIMIT, so a caller that wants only a count passes `limit: 1` explicitly.
     public func fetchMessages(
         accountId: UUID,
-        limit: Int = 50,
+        limit: Int? = nil,
         sender: String? = nil,
         archived: Bool = false,
+        deleted: Bool = false,
         stackId: UUID? = nil
     ) async throws -> SyncResponse {
         guard var c = URLComponents(url: baseURL.appendingPathComponent("api/messages"), resolvingAgainstBaseURL: false) else {
@@ -153,9 +161,16 @@ public final class APIClient: Sendable {
         }
         var items: [URLQueryItem] = [
             .init(name: "accountId", value: accountId.uuidString),
-            .init(name: "limit", value: String(limit)),
-            .init(name: "archived", value: archived ? "true" : "false")
+            .init(name: "archived", value: archived ? "true" : "false"),
+            // Always sent, always explicit, alongside `archived`. The server
+            // reads both as booleans off the same filter clause, so leaving one
+            // implicit would mean "absent" and "false" are different things —
+            // and that is exactly the ambiguity that made the trash unreachable.
+            .init(name: "deleted", value: deleted ? "true" : "false")
         ]
+        if let limit {
+            items.append(.init(name: "limit", value: String(limit)))
+        }
         if let sender {
             items.append(.init(name: "sender", value: sender))
         }
@@ -373,6 +388,124 @@ public final class APIClient: Sendable {
         return try Self.decode(ArchiveResponse.self, from: data)
     }
 
+    /// POST /api/messages/{remoteId}/unarchive?accountId= → {ok, actionId}.
+    ///
+    /// 取消归档. Exists because ⌘Z is an 8-second window and archiving is not an
+    /// 8-second decision: a user files a newsletter away in March and wants it
+    /// back in September. The toast cannot cover that, so the verb needs a
+    /// first-class route rather than an undo of a months-old audit row.
+    ///
+    /// Returns the action id so the caller can offer ⌘Z on *this* move too —
+    /// re-archiving is the exact inverse, and a user who moved the wrong message
+    /// out should not have to wait for a sync to notice.
+    @discardableResult
+    public func unarchiveMessage(
+        remoteId: String, accountId: UUID
+    ) async throws -> ArchiveResponse {
+        let url = try makeURL(path: ["api", "messages", remoteId, "unarchive"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(ArchiveResponse.self, from: data)
+    }
+
+    /// POST /api/messages/{remoteId}/restore?accountId= → {ok, actionId}.
+    ///
+    /// 从废纸篓恢复. The counterpart to `deleteMessage` for the case its undo
+    /// toast cannot reach: "I deleted this last week and need it back".
+    @discardableResult
+    public func restoreMessage(
+        remoteId: String, accountId: UUID
+    ) async throws -> ArchiveResponse {
+        let url = try makeURL(path: ["api", "messages", remoteId, "restore"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(ArchiveResponse.self, from: data)
+    }
+
+    /// GET /api/sent?accountId=[&limit=] → 已发送列表 (R1).
+    ///
+    /// Goes to the server on every call, unlike `fetchMessages`: the sync loop
+    /// pulls the INBOX only, so the local table can only know about sent mail
+    /// if something asked for it. That is why this is not a `?sent=true` on the
+    /// inbox route — the Sent folder has to be SELECTed.
+    ///
+    /// `staleReason` is surfaced rather than thrown: a user opening 已发送 to
+    /// read an old reply is served whatever is stored, with a note. Turning a
+    /// flaky connection into a blank screen would be the worse answer.
+    public func fetchSent(accountId: UUID, limit: Int? = nil) async throws -> SentResponse {
+        var components = URLComponents(
+            url: baseURL.appendingPathComponent("api/sent"),
+            resolvingAgainstBaseURL: false
+        )
+        var items: [URLQueryItem] = [
+            .init(name: "accountId", value: accountId.uuidString)
+        ]
+        if let limit {
+            items.append(.init(name: "limit", value: String(limit)))
+        }
+        components?.queryItems = items
+        guard let url = components?.url else {
+            throw APIError.invalidURL(baseURL.absoluteString + "/api/sent")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        // Slower than the inbox list: this one opens a second IMAP session and
+        // SELECTs another folder, so the 10s fast timeout is not enough on a
+        // large mailbox over a slow link.
+        request.timeoutInterval = APITimeout.slow.seconds
+        let (data, _) = try await send(request, timeout: .slow)
+        return try Self.decode(SentResponse.self, from: data)
+    }
+
+    /// POST /api/messages/{remoteId}/purge?accountId= → {ok, remoteId, purged}.
+    ///
+    /// 彻底删除. **Irreversible** — there is no undo path and the response
+    /// carries no `actionId`, deliberately, so a caller cannot wire an undo
+    /// affordance to a request that has nothing to undo.
+    ///
+    /// The server refuses with 409 `not-in-trash` unless the message is already
+    /// in the Trash, so this cannot be used to bypass the soft-delete step.
+    public func permanentlyDelete(
+        remoteId: String, accountId: UUID
+    ) async throws -> PurgeResponse {
+        let url = try makeURL(path: ["api", "messages", remoteId, "purge"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        // A permanent delete can take longer than a normal verb: the IMAP side
+        // is a STORE plus a UID EXPUNGE, and a large Trash makes the set form
+        // slower. The default fast timeout would abort halfway, which is the
+        // worst moment to fail.
+        request.timeoutInterval = APITimeout.slow.seconds
+        let (data, _) = try await send(request, timeout: .slow)
+        return try Self.decode(PurgeResponse.self, from: data)
+    }
+
+    /// POST /api/trash/empty?accountId= → {ok, remoteId, purged}.
+    ///
+    /// 清空废纸篓. `purged` is the number of local rows removed; 0 means the
+    /// Trash was already empty, which is a success and not an error.
+    @discardableResult
+    public func emptyTrash(accountId: UUID) async throws -> PurgeResponse {
+        let url = try makeURL(path: ["api", "trash", "empty"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = APITimeout.slow.seconds
+        let (data, _) = try await send(request, timeout: .slow)
+        return try Self.decode(PurgeResponse.self, from: data)
+    }
+
     /// POST /api/messages/{remoteId}/unsubscribe?accountId= → {ok, unsubscribed, publisher}.
     public func unsubscribeMessage(remoteId: String, accountId: UUID) async throws -> UnsubscribeResponse {
         let url = try makeURL(path: ["api", "messages", remoteId, "unsubscribe"], query: [
@@ -412,7 +545,76 @@ public final class APIClient: Sendable {
         return try Self.decode(ArchiveBulkResponse.self, from: data)
     }
 
+    /// POST /api/delete-bulk → 批量删除.
+    ///
+    /// Two call shapes, matching `DeleteBulkRequest`: an explicit id list, or
+    /// `allMatchingIn:` which lets the **server** resolve "everything this
+    /// filter matches". The second exists because the list is a window — the
+    /// client cannot name ids it was never sent, so "select all" has to be a
+    /// query rather than a longer array.
+    ///
+    /// Same per-item reporting as `archiveBulk`: partial success comes back as
+    /// failed items, never as a silent partial success.
+    public func deleteBulk(_ request: DeleteBulkRequest, accountId: UUID) async throws -> ArchiveBulkResponse {
+        let url = try makeURL(path: ["api", "delete-bulk"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        // One remote round trip per message, so this is the slowest verb in the
+        // product by a wide margin. The fast timeout would abort mid-sweep and
+        // leave a partially-deleted mailbox.
+        req.timeoutInterval = APITimeout.slow.seconds
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(request)
+        let (data, _) = try await send(req, timeout: .slow)
+        return try Self.decode(ArchiveBulkResponse.self, from: data)
+    }
+
     // MARK: - 聚合规则 (Stacks)
+
+    /// GET /api/senders?accountId=[&limit=][&q=] → who writes to this mailbox,
+    /// ranked by volume.
+    ///
+    /// Read-only. The panel this feeds offers two follow-ups — open the sender's
+    /// mail, or file them into a 聚合规则 — and both go through their own
+    /// user-triggered routes. Nothing here can change a message.
+    public func fetchSenders(
+        accountId: UUID,
+        limit: Int? = nil,
+        query: String? = nil
+    ) async throws -> [SenderSummary] {
+        var items = [URLQueryItem(name: "accountId", value: accountId.uuidString)]
+        if let limit {
+            items.append(.init(name: "limit", value: String(limit)))
+        }
+        if let query, !query.isEmpty {
+            items.append(.init(name: "q", value: query))
+        }
+        let url = try makeURL(path: ["api", "senders"], query: items)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(SenderListResponse.self, from: data).senders
+    }
+
+    /// GET /api/folder-counts?accountId= → the sidebar's tallies.
+    ///
+    /// Read-only, and deliberately separate from `fetchStacks`: the rule
+    /// counts ride along with the rules (each `StackSummary` carries its own
+    /// `count`), so this call only has to answer for the fixed buckets that no
+    /// other endpoint covers. Keeping them apart means adding a sidebar row is
+    /// one key here and one row in the sidebar, not a new query.
+    public func fetchFolderCounts(accountId: UUID) async throws -> [String: Int] {
+        let url = try makeURL(path: ["api", "folder-counts"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        let counts = try Self.decode(FolderCountsResponse.self, from: data).counts
+        return Dictionary(uniqueKeysWithValues: counts.map { ($0.id, $0.count) })
+    }
 
     public func fetchStacks(accountId: UUID) async throws -> StackRuleListResponse {
         let url = try makeURL(path: ["api", "stacks"], query: [

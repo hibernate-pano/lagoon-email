@@ -91,35 +91,42 @@ public enum StackStore {
         }
     }
 
-    /// How many live (non-deleted) messages the rule currently matches.
-    /// Archived mail counts: a stack is a lens over everything related,
-    /// including what already sits in the cabinet.
+    /// How many messages the rule currently matches **in the list the user sees**.
+    ///
+    /// Routed through `MessageStore.count` — i.e. through the shared
+    /// `filterSQL` — rather than hand-rolling a WHERE clause here. That is the
+    /// whole point: this badge sits next to a list, and a badge whose number
+    /// disagrees with the list it labels is the "quiet wrong number" class of
+    /// bug this project has already paid for twice (`totalCount`, then
+    /// `unreadCount` silently skipping the `is_sent` axis).
+    ///
+    /// The previous version hand-wrote `is_deleted = FALSE AND <match>`, which
+    /// counted **archived and sent** rows. Both the rule listing
+    /// (`/api/messages?stackId=`) and the rule sweep (`archive-bulk` /
+    /// `delete-bulk` with `allMatching`) go through `filterSQL`, which excludes
+    /// both — so the badge was larger than the list by exactly the
+    /// archived-plus-sent mail matching the rule, and 清扫 would move a
+    /// different set than the number promised.
+    ///
+    /// Archived mail is excluded for the same reason it is excluded from the
+    /// rule's own list: the archive cabinet already has its own surface, and a
+    /// rule is a lens over the inbox. What a rule matches is what the user can
+    /// act on from that lens.
     public static func messageCount(
         rule: StackRule,
         db: LagoonDB
     ) async throws -> Int {
-        let sql: String
-        let args: [DatabaseValueConvertible?]
-        switch rule.kind {
-        case .sender:
-            sql = """
-                SELECT COUNT(*) AS count FROM message_headers
-                WHERE account_id = ? AND is_deleted = FALSE AND from_address = ?
-                """
-            args = [rule.accountId, rule.value]
-        case .keyword:
-            sql = """
-                SELECT COUNT(*) AS count FROM message_headers
-                WHERE account_id = ? AND is_deleted = FALSE AND subject LIKE ? ESCAPE '\\'
-                """
-            args = [
-                rule.accountId,
-                MessageStore.likePattern(containing: rule.value),
-            ]
-        }
-        return try db.read { db in
-            try Row.fetchOne(db, sql: sql, arguments: StatementArguments(args))?["count"] ?? 0
-        }
+        try await MessageStore.count(
+            forAccount: rule.accountId,
+            sender: nil,
+            archived: false,
+            deleted: false,
+            sent: false,
+            stackMatch: rule.kind == .sender
+                ? .sender(rule.value)
+                : .keyword(rule.value),
+            db: db
+        )
     }
 
     private static func decode(_ row: Row) -> StackRule {

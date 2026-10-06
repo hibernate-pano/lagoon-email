@@ -157,6 +157,41 @@ public struct L10n: Sendable, Equatable {
     public var noMessagesYet: String {
         pick("还没有邮件 —— 服务器仍在同步。", "No messages yet — the server is still syncing.")
     }
+    /// The reading pane's placeholder, shown until a row is selected. It
+    /// states the affordance rather than apologising for emptiness: in a split
+    /// layout the right column being blank before the first click is the
+    /// expected state, and the copy is what teaches that clicking a row fills
+    /// it.
+    public var selectMessageToRead: String {
+        pick("从左侧选择一封邮件开始阅读", "Select a message on the left to read it")
+    }
+    /// Title of the reader pane's placeholder. Kept separate from the
+    /// description so the pane states the affordance ("no message selected")
+    /// rather than apologising for being empty.
+    public var nothingSelectedTitle: String {
+        pick("未选择邮件", "No message selected")
+    }
+    /// Several rows highlighted at once. The pane reports the count instead of
+    /// previewing one of them: the verbs that apply to a multi-selection (⌫
+    /// archive, ⌘⌫ delete) are about to act on all of them, so showing a
+    /// single message would describe the wrong scope.
+    public func messagesSelected(_ count: Int) -> String {
+        pick("已选择 \(count) 封邮件", "\(count) messages selected")
+    }
+    public var multiSelectionHint: String {
+        pick("按 ⌫ 归档，⌘⌫ 删除", "Press ⌫ to archive, ⌘⌫ to delete")
+    }
+    /// The list's own honesty line: the response was capped, so what is on
+    /// screen is the newest part of the mailbox and not all of it.
+    ///
+    /// Without this the surface reads as complete — which is exactly how a
+    /// truncated list gets reported as "it stopped loading my mail". The
+    /// server has always returned `totalCount` (it ignores LIMIT); the client
+    /// simply never said anything with it.
+    public func listTruncated(_ shown: Int, _ total: Int) -> String {
+        pick("已显示最新 \(shown) 封，共 \(total) 封",
+             "Showing the newest \(shown) of \(total) messages")
+    }
     public var syncFailed: String { pick("同步失败：", "Sync failed: ") }
     public var isServerRunning: String { pick("服务器在运行吗？", "Is the server running?") }
     public var lastSyncAt: String { pick("上次同步", "Last sync") }
@@ -226,7 +261,6 @@ public struct L10n: Sendable, Equatable {
     public var overrideGroupFailedDetail: String {
         pick("请重试，或检查网络。", "Retry or check your network.")
     }
-    public var openOriginal: String { pick("打开原邮件", "Open original email") }
     public var attachments: String { pick("附件", "Attachments") }
     public var download: String { pick("下载", "Download") }
     public var downloadFailed: String { pick("下载失败", "Download failed") }
@@ -401,6 +435,13 @@ public struct L10n: Sendable, Equatable {
             "This publisher requires confirmation on the web. Open the original email and follow its instructions."
         )
     }
+    /// Title for the informational (not failure) banner raised when a
+    /// publisher wants a web confirmation. Titled "退订" before, which read
+    /// as "we tried to unsubscribe and it is your turn" when the truth is
+    /// "this one needs a human, here is where to finish it".
+    public var unsubscribeWebConfirmationTitle: String {
+        pick("需要你在网页上确认退订", "Unsubscribe needs your confirmation")
+    }
     public var overrideFailed: String { pick("改分组失败：", "Could not change group: ") }
     public var searchFailed: String { pick("搜索失败：", "Search failed: ") }
 
@@ -446,6 +487,10 @@ public struct L10n: Sendable, Equatable {
         case .send: pick("发送邮件", "Sent message")
         case .undo: pick("撤销操作", "Undid an action")
         case .delete: pick("删除邮件", "Deleted message")
+        // 彻底删除. The wording says what happened, not what can be done about
+        // it — this entry exists so the history never reads as though a
+        // permanent deletion was a reversible one.
+        case .purge: pick("彻底删除邮件", "Permanently deleted")
         }
     }
     public var archived: String { pick("已归档", "Archived") }
@@ -607,6 +652,170 @@ public struct L10n: Sendable, Equatable {
         }
     }
 
+    // MARK: 搜索
+    /// 说明搜索也匹配 AI 已给出的结构化判断（分类 / 建议动作）。
+    /// 必须常驻而非只在无结果时出现：用户输入「营销」却拿到正文里从没有
+    /// 这个词的邮件时，他需要知道原因，否则会以为搜索坏了。
+    public var searchIncludesAdvice: String {
+        pick("搜索也匹配 AI 给出的分类与建议（如「营销」「newsletter」）",
+             "Search also matches the AI's category and advice (e.g. “marketing”, “newsletter”)")
+    }
+
+    // MARK: 行内AI 建议条
+    /// 「不可撤销」角标。只贴在退订上——退订一旦发出就已告知发布方，
+    /// 删除会离开本地索引，两者都不是「点错了可以⌘Z 回来」。
+    public var adviceIrreversibleBadge: String {
+        pick("不可撤销", "Irreversible")
+    }
+    /// 行内建议条的展开提示。点它问「为什么」，所以文案是邀请而非说明。
+    public var adviceWhyHelp: String {
+        pick("点开看 AI 为什么这么建议", "Tap to see why the AI suggests this")
+    }
+    /// 行内忽略建议失败。刻意不复用 adviceLoadFailed：用户刚点了「忽略」，
+    /// 告诉他「建议加载失败」会让他以为建议没加载出来，而不是没保存。
+    public var adviceDismissFailedTitle: String {
+        pick("忽略建议失败", "Couldn't dismiss the suggestion")
+    }
+
+    // MARK: 侧边导航栏
+    public var sidebarSmartViews: String { pick("智能视图", "Smart views") }
+    public var sidebarPlaces: String { pick("位置", "Places") }
+    public var sidebarUnread: String { pick("未读", "Unread") }
+    public var sidebarPinned: String { pick("置顶", "Pinned") }
+    public var sidebarDeleted: String { pick("废纸篓", "Trash") }
+    public var sidebarNavigation: String { pick("邮件位置导航", "Mail locations") }
+    public var sidebarDestinationMissing: String {
+        pick("这条聚合规则已不存在", "That group no longer exists")
+    }
+
+    // MARK: 列表密度
+    public var densityComfortable: String { pick("舒适（三行）", "Comfortable (3 lines)") }
+    public var densityCompact: String { pick("紧凑（两行）", "Compact (2 lines)") }
+    public var densityDense: String { pick("密集（一行）", "Dense (1 line)") }
+    public var densityTitle: String { pick("列表密度", "List density") }
+
+    // MARK: 多选批量操作条
+    public var selectionCount: String { pick("已选择", "Selected") }
+    public var markReadSelected: String { pick("标为已读", "Mark read") }
+    public var markUnreadSelected: String { pick("标为未读", "Mark unread") }
+    public var archiveSelectedTitle: String { pick("归档选中", "Archive selected") }
+    public var deleteSelectedTitle: String { pick("删除选中", "Delete selected") }
+    public var clearSelection: String { pick("取消选择", "Clear selection") }
+
+    // MARK: 发件人排行
+    public var senderRankingTitle: String { pick("发件人排行", "Sender ranking") }
+    /// One line stating the panel's thesis. Without it the numbers below are a
+    /// table; with it they are a decision.
+    public var senderRankingBlurb: String {
+        pick("谁写来的邮件最多。数量多但一封未读的，往往是可以归档的订阅。",
+             "Who writes the most. A lot of mail with nothing unread is often a subscription you can file.")
+    }
+    public var senderRankingSearch: String { pick("搜索发件人或地址", "Search sender or address") }
+    public var senderRankingEmpty: String {
+        pick("还没有可统计的邮件——服务器仍在同步。", "No mail to rank yet — the server is still syncing.")
+    }
+    public var senderRankingNoMatch: String { pick("没有匹配的发件人", "No sender matches") }
+    public var senderRankingFailed: String { pick("读取发件人排行失败", "Couldn't load the sender ranking") }
+    public func senderMailCount(_ n: Int) -> String { pick("\(n) 封", "\(n) messages") }
+    public func senderUnreadCount(_ n: Int) -> String { pick("\(n) 封未读", "\(n) unread") }
+    public var senderViewMail: String { pick("查看邮件", "View mail") }
+    public var senderFile: String { pick("归档为聚合", "File into a group") }
+    public var senderFiled: String { pick("已建立聚合", "Group created") }
+
+    // MARK: 恢复与取消归档
+    public var restoreFromTrash: String { pick("恢复到收件箱", "Restore to inbox") }
+    public var unarchive: String { pick("取消归档", "Unarchive") }
+    public var restoredToast: String { pick("已恢复到收件箱", "Restored to inbox") }
+    public var movedToInboxToast: String { pick("已移回收件箱", "Moved to inbox") }
+    public var unarchiveFailedTitle: String { pick("取消归档失败", "Couldn't unarchive") }
+    public var restoreFailedTitle: String { pick("恢复失败", "Couldn't restore") }
+
+    // MARK: 两段式全选
+    /// ⌘A 的说明必须写明它只选已加载的——快捷键表是用户判断"这个键有多危险"
+    /// 的唯一地方，泛泛的"全选"会让人以为它清空整个邮箱。
+    public var shortcutSelectAll: String {
+        pick("全选已加载的邮件（不包含未加载的）", "Select loaded messages (not the ones past the limit)")
+    }
+    /// 已选中的数量。Always states the *loaded* count, because that is what the
+    /// user can see and verify.
+    public func selectedCount(_ n: Int) -> String {
+        pick("已选 \(n) 封", "\(n) selected")
+    }
+    /// 「选择全部 N 封」——只在已加载数 < 服务器总数时出现。
+    ///
+    /// The whole point of the two-stage design: Gmail never lets "全选" silently
+    /// mean "everything", because the list is a window. This string is the
+    /// explicit second step that crosses the window.
+    public func selectAllOnServer(_ n: Int) -> String {
+        pick("选择服务器上的全部 \(n) 封", "Choose all \(n) on the server")
+    }
+    public func selectAllLoaded(_ n: Int) -> String {
+        pick("已加载 \(n) 封", "\(n) loaded")
+    }
+    public var selectAll: String { pick("全选", "Select all") }
+    public func bulkDeletedToast(_ n: Int) -> String {
+        pick("已将 \(n) 封邮件移入废纸篓", "Moved \(n) messages to Trash")
+    }
+    /// 截断必须说出来。The cap is 500 per call; saying "moved 500" and letting
+    /// the user believe the sweep finished is the failure this wording exists
+    /// to prevent.
+    public func bulkDeleteTruncated(_ moved: Int, _ remaining: Int) -> String {
+        pick(
+            "已移入废纸篓 \(moved) 封，还有 \(remaining) 封未处理（单次上限 500）。",
+            "Moved \(moved) to Trash; \(remaining) more were not processed (500 per call)."
+        )
+    }
+    public func allSelected(_ n: Int) -> String {
+        pick("已选中服务器上的全部 \(n) 封", "All \(n) on the server selected")
+    }
+    /// 批量操作会作用在比列表更多的邮件上时显示。Shown whenever the selection
+    /// reaches past what is loaded — the user is about to act on mail they
+    /// cannot see, and has to be told.
+    public var selectionReachesUnloaded: String {
+        pick("批量操作将作用于未在列表中显示的邮件", "Bulk actions will also affect messages not shown in this list")
+    }
+
+    // MARK: 已发送（R1）
+    public var sidebarSent: String { pick("已发送", "Sent") }
+    public var sentEmpty: String { pick("还没有已发送的邮件", "No sent messages yet") }
+    public var sentEmptyHint: String {
+        pick(
+            "从 Lagoon 发出的邮件会自动出现在这里。",
+            "Messages you send from Lagoon will show up here."
+        )
+    }
+    /// 拉不到服务器时的提示。**不是**空列表状态——是「这些可能不是最新的」。
+    public var sentStale: String {
+        pick("未能连接服务器，以下内容可能不是最新", "Couldn't reach the server — this may be out of date")
+    }
+    public var sentUnavailable: String {
+        pick("这个账户没有已发送文件夹", "This account has no Sent folder")
+    }
+
+    // MARK: 彻底删除
+    public var purgeForever: String { pick("彻底删除", "Delete forever") }
+    public var emptyTrash: String { pick("清空废纸篓", "Empty Trash") }
+    public var emptyTrashTitle: String { pick("清空废纸篓？", "Empty Trash?") }
+    /// 确认文案必须写清后果与数量。「不可撤销」四个字是这条文案存在的全部理由。
+    public func emptyTrashConfirm(_ n: Int) -> String {
+        pick(
+            "将彻底删除 \(n) 封邮件。此操作无法撤销——邮件将从服务器和本机一并抹去，不占用任何空间。",
+            "This will remove \(n) messages for good. This cannot be undone — they will be erased from both the server and this Mac."
+        )
+    }
+    public func emptyTrashDone(_ n: Int) -> String {
+        pick("已彻底删除 \(n) 封邮件", "Permanently deleted \(n) messages")
+    }
+    public var purgeForeverTitle: String { pick("彻底删除这封邮件？", "Delete this message forever?") }
+    public func purgeForeverConfirm(_ subject: String) -> String {
+        pick(
+            "「\(subject)」将被从服务器和本机彻底抹去，无法撤销。",
+            "“\(subject)” will be erased from the server and this Mac. This cannot be undone."
+        )
+    }
+    public var purgeNotInTrash: String { pick("这封邮件不在废纸篓里", "This message is not in the Trash") }
+    public var purgeFailedTitle: String { pick("彻底删除失败", "Couldn't delete forever") }
+
     // MARK: 删除
     public var deleteContext: String { pick("删除", "Delete") }
     public var deleted: String { pick("已移入废纸篓", "Moved to Trash") }
@@ -722,7 +931,6 @@ public struct L10n: Sendable, Equatable {
     public var older: String { pick("更早的", "Older") }
     public var nextInGroup: String { pick("下一封", "Next") }
     public var previousInGroup: String { pick("上一封", "Previous") }
-    public var openSelected: String { pick("打开选中的邮件", "Open selected message") }
     public var archiveAndNext: String { pick("归档并跳到下一封", "Archive & next") }
     public var markUnread: String { pick("标为未读", "Mark unread") }
     public var mailArchivedLocally: String { pick("归档未完成", "Archive did not complete") }
@@ -755,6 +963,21 @@ public struct L10n: Sendable, Equatable {
     public var shortcutDraft: String { pick("⌘⇧D = 起草回复", "⌘⇧D = draft reply") }
     public var shortcutSearch: String { pick("⌘F = 搜索", "⌘F = search") }
     public var shortcutHelp: String { pick("? = 快捷键", "? = shortcuts") }
+    /// Title of the ⌘/ cheatsheet, and the label of the command-palette row
+    /// and the hidden ⌘/ button that open it. Distinct from `shortcutHelp`,
+    /// which is a toolbar tooltip ("? = 快捷键") and reads wrong as a title.
+    /// Distinct from `commandPalette`, which is the ⌘K palette itself.
+    public var keyboardShortcuts: String { pick("快捷键表", "Keyboard shortcuts") }
+    public var shortcutBudget: String { pick("⌘B = 本月用量", "⌘B = this month's usage") }
+    public var shortcutAdvice: String { pick("⇧⌘A = AI 建议", "⇧⌘A = AI advice") }
+    public var shortcutDeleteSelected: String { pick("⌘⌫ = 删除选中", "⌘⌫ = delete selected") }
+    public var shortcutArchiveSelected: String { pick("⌫ = 归档选中", "⌫ = archive selected") }
+    public var shortcutGroupJump: String {
+        pick("⌘1–⌘9 = 跳到简报分组", "⌘1–⌘9 = jump to a briefing group")
+    }
+    public var toggleSurface: String {
+        pick("切换简报 / 全部邮件", "Toggle Briefing / All messages")
+    }
 
     // MARK: - Reply composer
 

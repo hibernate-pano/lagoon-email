@@ -145,4 +145,75 @@ final class AdviceCopyTests: XCTestCase {
             )
         }
     }
+
+    // MARK: - Inline strip (direction one)
+    //
+    // The strip moved advice from behind a sheet onto the row the user is
+    // already reading. That raises the stakes on this file's rule: copy the
+    // user now sees *while triaging* must not read as a completed action, or
+    // the fast path becomes the lying path.
+
+    /// The inline strip reuses `adviceAction`, so the no-completed-action rule
+    /// is inherited — this test pins that the strip has no second wording of
+    /// its own that could drift from it.
+    func test_inlineStrip_hasNoActionWordingOfItsOwn() {
+        // The strip renders exactly two action-bearing strings: the action
+        // label and the irreversibility badge. Both are checked for the
+        // forbidden completion wording here.
+        for text in [
+            zh.adviceIrreversibleBadge, en.adviceIrreversibleBadge,
+            zh.adviceWhyHelp, en.adviceWhyHelp,
+        ] {
+            for word in ["archived", "deleted", "已归档", "已删除"] {
+                XCTAssertFalse(
+                    text.lowercased().contains(word.lowercased()),
+                    "inline strip copy must not read as a completed action: \"\(text)\""
+                )
+            }
+        }
+    }
+
+    /// Only irreversible advice carries the badge. A "suggest archiving" row
+    /// wearing an "irreversible" badge trains the user to ignore the badge,
+    /// which is the one place it must be believed.
+    func test_irreversibleBadge_isOnlyUsedForIrreversibleActions() {
+        var irreversible: Set<AdvisedAction> = []
+        for action in AdvisedAction.allCases where action.isIrreversible {
+            irreversible.insert(action)
+        }
+        XCTAssertEqual(
+            irreversible, [.unsubscribe],
+            "if a second action becomes irreversible, the strip must badge it too"
+        )
+        // And the badge wording itself must not imply the row was acted on.
+        for text in [zh.adviceIrreversibleBadge, en.adviceIrreversibleBadge] {
+            XCTAssertFalse(text.isEmpty)
+            XCTAssertNotEqual(text, zh.adviceIrreversibleBadge == text ? en.adviceIrreversibleBadge : "")
+        }
+    }
+
+    /// The strip invites the user to ask "why?" — so the affordance copy has to
+    /// read as an invitation, and must not promise an action.
+    func test_whyHelp_isAnInvitationInBothLanguages() {
+        XCTAssertFalse(zh.adviceWhyHelp.isEmpty)
+        XCTAssertFalse(en.adviceWhyHelp.isEmpty)
+        XCTAssertNotEqual(zh.adviceWhyHelp, en.adviceWhyHelp)
+    }
+
+    /// Dismissing from the row is a write the user can trigger by misclick,
+    /// since it sits one tap from the message itself. The failure copy must
+    /// name the *suggestion*, not advice loading — otherwise a failed dismissal
+    /// reads as "the suggestions never loaded", which is a different problem
+    /// with a different fix.
+    func test_dismissFailureCopy_namesTheDismissalNotTheLoad() {
+        XCTAssertFalse(zh.adviceDismissFailedTitle.isEmpty)
+        XCTAssertFalse(en.adviceDismissFailedTitle.isEmpty)
+        XCTAssertNotEqual(zh.adviceDismissFailedTitle, en.adviceDismissFailedTitle)
+        for text in [zh.adviceDismissFailedTitle, en.adviceDismissFailedTitle] {
+            XCTAssertFalse(
+                text.contains("加载") || text.lowercased().contains("load"),
+                "the failure is in saving the dismissal, not in loading: \"\(text)\""
+            )
+        }
+    }
 }

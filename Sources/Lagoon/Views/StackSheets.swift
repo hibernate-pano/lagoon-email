@@ -179,6 +179,13 @@ struct StackMailSheet: View {
     @Environment(\.l10n) private var l10n
     @Environment(\.dismiss) private var dismiss
     @State private var messages: [MessageHeader] = []
+    /// Rows the filter matches on the server, ignoring the response cap.
+    ///
+    /// This sheet's 清扫 verb archives everything it matched, so a truncated
+    /// list would make the sweep quietly partial — and archiving is remote and
+    /// not the kind of failure the undo toast covers well in bulk. `nil` until
+    /// the server answers, and non-nil means "we know the full size".
+    @State private var serverTotalCount: Int?
     @State private var isLoading = true
     @State private var isSweeping = false
     @State private var errorBanner: ErrorBanner?
@@ -249,6 +256,22 @@ struct StackMailSheet: View {
                         }
                     }
                     .listStyle(.inset)
+                    // A real row at the end of the list, not a toast: it scrolls
+                    // with the content so the caveat is still there when the
+                    // user comes back to sweep.
+                    .safeAreaInset(edge: .bottom) {
+                        if let truncatedNotice {
+                            Label(truncatedNotice, systemImage: "info.circle")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(.bar)
+                                .overlay(alignment: .top) { Divider() }
+                                .accessibilityLabel(truncatedNotice)
+                        }
+                    }
                 }
             }
             .navigationDestination(for: String.self) { remoteId in
@@ -259,11 +282,11 @@ struct StackMailSheet: View {
                     initiallyPinned: messages.first { $0.remoteId == remoteId }?.isPinned ?? false,
                     siblings: messages.map(\.remoteId),
                     onArchived: { id, _ in
-                        messages.removeAll { $0.remoteId == id }
+                        removeRows(matching: id)
                     },
                     onAdvanceTo: { next in path = next.map { [$0] } ?? [] },
                     onDelete: { id in
-                        messages.removeAll { $0.remoteId == id }
+                        removeRows(matching: id)
                         path = []
                     }
                 )
@@ -279,14 +302,53 @@ struct StackMailSheet: View {
         isLoading = true
         defer { isLoading = false }
         do {
+            // No client-side limit (see APIClient.fetchMessages): this sheet's
+            // 清扫 verb archives everything it matched, so the list it sweeps
+            // has to be the list it shows. `totalCount` comes back regardless of
+            // LIMIT, which is what lets the sheet say when the two differ.
+            let response: SyncResponse
             switch source {
             case .archived:
-                messages = try await api.fetchMessages(accountId: accountId, limit: 200, archived: true).messages
+                response = try await api.fetchMessages(accountId: accountId, archived: true)
             case .rule(let stack):
-                messages = try await api.fetchMessages(accountId: accountId, limit: 200, stackId: stack.rule.id).messages
+                response = try await api.fetchMessages(
+                    accountId: accountId, stackId: stack.rule.id
+                )
             }
+            messages = response.messages
+            serverTotalCount = response.totalCount
         } catch {
             errorBanner = ErrorBanner(severity: .error, title: l10n.loadFailed, detail: error.lagoonUIMessage)
+        }
+    }
+
+    /// Non-nil when the server held more rows than the response could carry.
+    ///
+    /// Rendered as a row at the end of the list rather than as a toast: it
+    /// scrolls with the content, so it stays findable after the user has read
+    /// past it — and a one-line caveat that dismisses itself is exactly how a
+    /// partial list comes to look like a complete one.
+    private var truncatedNotice: String? {
+        ListTruncationNotice.text(shown: messages.count, total: serverTotalCount, l10n: l10n)
+    }
+
+    /// The one way a row leaves this list, so the count moves with it.
+    ///
+    /// Without this, archiving one row from the detail pane leaves the total
+    /// where it was — and a list that is now *complete* goes on claiming to be
+    /// truncated, which is the mirror image of the bug this notice exists to
+    /// fix. Same invariant `MessageListView.removeRows` keeps, for the same
+    /// reason.
+    private func removeRows(matching remoteId: String) {
+        removeRow(id: remoteId)
+    }
+
+    private func removeRow(id remoteId: String) {
+        let removed = messages.filter { $0.remoteId == remoteId }.count
+        guard removed > 0 else { return }
+        messages.removeAll { $0.remoteId == remoteId }
+        if let total = serverTotalCount {
+            serverTotalCount = max(0, total - removed)
         }
     }
 
@@ -301,8 +363,8 @@ struct StackMailSheet: View {
             )
             let okCount = response.items.filter(\.ok).count
             let failed = response.items.filter { !$0.ok }
-            messages.removeAll { m in
-                response.items.contains { $0.remoteId == m.remoteId && $0.ok }
+            for item in response.items where item.ok {
+                removeRow(id: item.remoteId)
             }
             if failed.isEmpty {
                 ErrorCenter.shared.report(.init(

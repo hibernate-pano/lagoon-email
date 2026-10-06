@@ -12,7 +12,6 @@ struct RootView: View {
     @StateObject private var directory = DirectoryStore()
     @StateObject private var errorCenter = ErrorCenter.shared
     @StateObject private var undo = UndoController()
-    @State private var surface: Surface = .briefing
     @AppStorage(LanguagePreference.defaultsKey) private var languageTag = AppLanguage.zhHans.rawValue
     @State private var showSearch = false
     @State private var showUsage = false
@@ -25,6 +24,22 @@ struct RootView: View {
     @State private var showShortcuts = false
     @State private var showAISettings = false
     @State private var showAbout = false
+    /// 发件人排行. Opened from the toolbar overflow and from the sidebar's
+    /// 发件人 section.
+    @State private var showSenderRanking = false
+    /// The sender the user chose to file from the ranking panel.
+    ///
+    /// Held here rather than passed straight into the list because the two live
+    /// on different surfaces: the panel is a sheet above everything, and the
+    /// stack editor it opens belongs to the raw list. Routing through one
+    /// pending value means the panel never has to know which surface is mounted.
+    @State private var senderToFile: SenderSummary?
+    /// A sender handed *in* by the ranking panel, for the list to present.
+    ///
+    /// The mirror of `senderToFile`: the panel cannot open a sheet that belongs
+    /// to a surface it does not own, so it hands the value over and the mounted
+    /// list picks it up.
+    @State private var senderFocusRequest: SenderFocus?
     /// Seeded by the "Reconnect" banner so the QQ form comes up pre-filled;
     /// "Add account" deliberately leaves it nil.
     @State private var connectPrefillEmail: String?
@@ -49,6 +64,100 @@ struct RootView: View {
         var id: String { rawValue }
     }
 
+    /// Where the sidebar sends the user. The single source of truth for "what
+    /// am I looking at" — `surface` is now derived from it rather than tracked
+    /// separately, which is what keeps a sidebar click and the ⌘0 toggle from
+    /// ever disagreeing about which surface is showing.
+    @State private var destination: SidebarDestination = .briefing
+    /// Fixed-bucket tallies for the sidebar. Empty until the first load; the
+    /// sidebar renders a row without a badge rather than a wrong "0".
+    @State private var folderCounts: [String: Int] = [:]
+    /// The user's own aggregation rules with their live counts.
+    @State private var sidebarRules: [StackSummary] = []
+
+    /// Moves to the next density, in the order comfortable → compact → dense.
+    ///
+    /// The cycle order runs widest-to-narrowest so a single ⌘K press always
+    /// packs the list *more*, which is the direction a user reaching for this
+    /// wants; the reverse is one more press. The preference is written through
+    /// `ListDensityPreference` rather than a `@State` here, because the list and
+    /// the feed each hold their own `@AppStorage` view of it and a third copy
+    /// in RootView would be a fourth thing to keep in sync.
+    private func cycleDensity() {
+        let current = ListDensityPreference.current()
+        let all = ListDensity.allCases
+        guard let index = all.firstIndex(of: current) else { return }
+        let next = all[(index + 1) % all.count]
+        ListDensityPreference.set(next)
+        errorCenter.report(.init(
+            severity: .info,
+            title: "\(l10n.densityTitle)：\(densityTitle(next))",
+            autoDismissAfter: .seconds(2)
+        ))
+    }
+
+    private func densityTitle(_ density: ListDensity) -> String {
+        switch density {
+        case .comfortable: return l10n.densityComfortable
+        case .compact: return l10n.densityCompact
+        case .dense: return l10n.densityDense
+        }
+    }
+
+    /// Which surface the current destination belongs to.
+    ///
+    /// Only `.briefing` shows the feed; every other destination is a lens on
+    /// the raw list. Deriving this is what stops "click 未读 while reading the
+    /// Briefing" from being a silent no-op.
+    private var surface: Surface {
+        destination.showsBriefing ? .briefing : .allMessages
+    }
+
+    /// Moves to a surface, from ⌘0 or the toolbar picker.
+    ///
+    /// A function rather than a settable `surface` because the sidebar's
+    /// destination is now the single source of truth — the surface is derived
+    /// from it. Assigning the surface directly would let the two disagree, and
+    /// the disagreement shows up as "I pressed ⌘0 and the same feed is still
+    /// there".
+    ///
+    /// Leaving the feed keeps whichever lens the user had already chosen, so
+    /// ⌘0 round-trips do not silently drop them back to the unfiltered list.
+    private func go(to target: Surface) {
+        switch target {
+        case .briefing:
+            destination = .briefing
+        case .allMessages:
+            destination = destination.showsBriefing ? .allMessages : destination
+        }
+    }
+
+    /// Loads the sidebar's tallies and rules.
+    ///
+    /// Both are read-only, and both are allowed to fail quietly: a sidebar with
+    /// no numbers is still a working navigation column, whereas a red banner
+    /// over the mail for a decorative count would be a worse trade than the
+    /// count. The rule list is separate because `/api/stacks` carries its own
+    /// per-rule counts — one endpoint cannot answer for both without one of
+    /// them being wrong.
+    private func refreshSidebarData() async {
+        guard let accountId = accounts.accountId else {
+            folderCounts = [:]
+            sidebarRules = []
+            return
+        }
+        async let counts = api.fetchFolderCounts(accountId: accountId)
+        async let stacks = api.fetchStacks(accountId: accountId)
+        folderCounts = (try? await counts) ?? folderCounts
+        sidebarRules = (try? await stacks.stacks) ?? sidebarRules
+        // A rule the user deleted in another window must not leave the sidebar
+        // pointing at a destination that no longer resolves.
+        if case .rule(let id) = destination,
+           !sidebarRules.contains(where: { $0.rule.id == id }) {
+            destination = .allMessages
+        }
+    }
+
     private var language: AppLanguage { AppLanguage(rawValue: languageTag) ?? .zhHans }
     private var l10n: L10n { L10n(language: language) }
 
@@ -56,7 +165,7 @@ struct RootView: View {
     // Swift type-checker's time limit, and any upstream change (e.g. a new
     // ConnectView parameter) tips it over into an unreasonable-time error.
     @ViewBuilder private var briefingSurface: some View {
-        BriefingFeedView(isVisible: surface == .briefing, onShowAllMessages: { surface = .allMessages })
+        BriefingFeedView(isVisible: surface == .briefing, onShowAllMessages: { go(to: .allMessages) })
             .opacity(surface == .briefing ? 1 : 0)
             .disabled(surface != .briefing)
             .allowsHitTesting(surface == .briefing)
@@ -64,32 +173,45 @@ struct RootView: View {
     }
 
     @ViewBuilder private var messagesSurface: some View {
-        MessageListView(isVisible: surface == .allMessages, onShowBriefing: { surface = .briefing })
+        MessageListView(
+            isVisible: surface == .allMessages,
+            lens: MessageListView.Lens(destination),
+            onShowBriefing: { go(to: .briefing) },
+            onClearLens: { destination = .allMessages },
+            senderFocusRequest: $senderFocusRequest,
+            senderToFile: $senderToFile
+        )
             .opacity(surface == .allMessages ? 1 : 0)
             .disabled(surface != .allMessages)
             .allowsHitTesting(surface == .allMessages)
             .accessibilityHidden(surface != .allMessages)
+            // A lens change has to re-query: `未读` and a rule are server-side
+            // filters, so re-filtering the rows already in memory would show a
+            // list the server never sent. Keyed on the destination, which
+            // changes whenever the sidebar selection changes.
+            .id(destination)
     }
 
     // `body` used to be one giant SwiftUI expression that sat right at the
     // type-checker's time limit; adding a ConnectView parameter tipped it
     // over into "unable to type-check in reasonable time". The three computed
     // properties below keep each chain small enough to check quickly.
+    /// Two columns so far (list + reader). The navigation column lives in
+    /// `withSidebar` rather than here, so the layout that ships without an
+    /// account — which has nothing to navigate — stays a plain two-pane split
+    /// instead of an empty sidebar strip.
     private var decorated: some View {
         VStack(spacing: 0) {
             if let banner = priorityBanner {
                 NoticeBannerView(banner: banner, onDismiss: { dismissPriorityBanner(banner) })
             }
-            // Both surfaces stay alive across switches (ZStack, not a Group
-            // switch): scroll position, selection and navigation path survive
-            // a ⌘0 round-trip. The hidden surface is inert (no hit testing,
-            // no shortcuts, hidden from VoiceOver) and its poller sleeps via
-            // `isVisible`, so keep-alive costs no traffic.
-            ZStack {
-                briefingSurface
-                messagesSurface
+            Group {
+                if let accountId = accounts.accountId {
+                    withSidebar(accountId: accountId)
+                } else {
+                    twoColumnSurfaces
+                }
             }
-            .id(accounts.accountId)
         }
         // The global `ErrorCenter` banner — used for failures raised outside
         // the view layer (undo, polling errors, etc.) and for transient
@@ -111,6 +233,40 @@ struct RootView: View {
                 TimeSavedBar()
             }
         }
+    }
+
+    /// The two surfaces and their keep-alive ZStack, unchanged.
+    private var twoColumnSurfaces: some View {
+        ZStack {
+            briefingSurface
+            messagesSurface
+        }
+        .id(accounts.accountId)
+    }
+
+    /// Three columns: navigation / list / reader.
+    ///
+    /// The sidebar is *outside* the ZStack on purpose. It is a control, not a
+    /// surface: only one surface is ever mounted-visible, and putting the
+    /// sidebar inside it would have to unmount one surface to show it. As a
+    /// sibling it costs one small list view regardless of which surface is up.
+    @ViewBuilder
+    private func withSidebar(accountId: UUID) -> some View {
+        NavigationSplitView {
+            Sidebar(
+                selection: $destination,
+                rules: sidebarRules,
+                counts: folderCounts
+            )
+            .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 300)
+        } detail: {
+            twoColumnSurfaces
+        }
+        // The sidebar's own disclosure button is the affordance; AppKit's
+        // automatic one would duplicate it (same reason
+        // `MessageSplitLayout` removes the toggle it inherits).
+        .toolbar(removing: .sidebarToggle)
+        .task(id: accountId) { await refreshSidebarData() }
     }
 
     private var sheetStack: some View {
@@ -152,13 +308,16 @@ struct RootView: View {
             .sheet(isPresented: $showAbout) {
                 AboutSheet()
             }
+            .sheet(isPresented: $showSenderRanking) {
+                senderRankingSheet
+            }
             // Both surfaces stay alive (the Briefing and the raw list are kept
             // mounted so their scroll position and poll loops survive a
             // switch), which means a message revealed from the advice panel
             // would be pushed onto a NavigationStack the user cannot see. The
             // switch has to happen here, where the surface lives.
             .onReceive(NotificationCenter.default.publisher(for: .lagoonRevealMessage)) { _ in
-                surface = .briefing
+                go(to: .briefing)
             }
     }
 
@@ -171,6 +330,34 @@ struct RootView: View {
                     autoDismissAfter: .seconds(4)
                 ))
             }
+        }
+    }
+
+    /// The ranking panel, wired to the two flows it can hand a sender to.
+    ///
+    /// Both callbacks stop at this level rather than reaching into a surface:
+    /// "file" becomes a `senderToFile` value that the list consumes, and "view
+    /// mail" opens the existing `SenderSheet`. So the panel never has to know
+    /// which surface is mounted, and neither surface grows a branch for it.
+    @ViewBuilder
+    private var senderRankingSheet: some View {
+        if let accountId = accounts.accountId {
+            SenderRankingSheet(
+                accountId: accountId,
+                onFileSender: { sender in
+                    senderToFile = sender
+                    // The list has to be mounted for its stack editor to exist;
+                    // picking a sender from a panel while reading the Briefing
+                    // would otherwise drop the request on the floor.
+                    go(to: .allMessages)
+                    Task { await directory.refresh() }
+                },
+                onOpenSender: { sender in
+                    senderFocusRequest = SenderFocus(
+                        from: sender.address, name: sender.displayName
+                    )
+                }
+            )
         }
     }
 
@@ -188,11 +375,18 @@ struct RootView: View {
         CommandPaletteView(
             onNewMessage: { showCompose = true },
             onSearch: { showSearch = true },
-            onShowBriefing: { surface = .briefing },
-            onShowAllMessages: { surface = .allMessages },
+            // ⌘0 is a toggle on both surfaces (BriefingFeedView:226 /
+            // MessageListView:112), so the palette row must be a toggle too.
+            // Two rows each claiming ⌘0 told the user "press ⌘0 to reach the
+            // Briefing" — and pressing it there sent them the other way.
+            onToggleSurface: {
+                go(to: surface == .briefing ? .allMessages : .briefing)
+            },
             onShowUsage: { showUsage = true },
             onShowActionHistory: { showActionHistory = true },
             onShowAdvice: { showAdvice = true },
+            onShowSenderRanking: { showSenderRanking = true },
+            onCycleDensity: { cycleDensity() },
             onShowShortcuts: { showShortcuts = true },
             onShowAISettings: { showAISettings = true },
             onRefresh: {
@@ -284,7 +478,7 @@ struct RootView: View {
                 .focusable(false)
                 .accessibilityHidden(true)
             // ⌘/ — keyboard shortcuts cheatsheet
-            Button(l10n.commandPalette) { showShortcuts = true }
+            Button(l10n.keyboardShortcuts) { showShortcuts = true }
                 .keyboardShortcut("/", modifiers: .command)
                 .frame(width: 0, height: 0)
                 .opacity(0)
@@ -572,7 +766,14 @@ struct RootView: View {
             accountMenu
         }
         ToolbarItem(placement: .automatic) {
-            Picker(l10n.surface, selection: $surface) {
+            // Bound through `go(to:)` rather than to a stored surface: the
+            // picker shows which *surface* is up, and writing the surface
+            // directly is exactly the assignment that used to be able to
+            // disagree with the sidebar's destination.
+            Picker(l10n.surface, selection: Binding(
+                get: { surface },
+                set: { go(to: $0) }
+            )) {
                 ForEach(Surface.allCases) { item in
                     Text(item == .briefing ? l10n.briefing : l10n.allMessages).tag(item)
                 }
@@ -611,6 +812,10 @@ struct RootView: View {
                 Button(l10n.adviceTitle) { Task { @MainActor in showAdvice = true } }
                     .keyboardShortcut("a", modifiers: [.command, .shift])
                 Button(l10n.actionHistory) { Task { @MainActor in showActionHistory = true } }
+                // 发件人排行: the one question a per-message classifier cannot
+                // answer — who writes the most. Placed next to the advice queue
+                // because both are "look before you act", not settings.
+                Button(l10n.senderRankingTitle) { Task { @MainActor in showSenderRanking = true } }
                 Divider()
                 // The toggle reads the current value via `SoundEffects.isEnabled`.
                 // Using `Toggle` (not a Button) makes the checkmark reflect the

@@ -35,6 +35,18 @@ struct SearchSheet: View {
                 }
                 .padding(12)
                 Divider()
+                // One line, always visible rather than only on an empty result:
+                // search now matches what the AI *concluded* about a message
+                // (its category and advised action), not just its text. A user
+                // who types "marketing" and gets hits on mails that never use
+                // the word needs to know why — otherwise the result looks wrong
+                // and they stop trusting the box.
+                Text(l10n.searchIncludesAdvice)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 6)
                 if isLoading { ProgressView().padding(20) }
                 else if results.isEmpty { Text(l10n.noResults).foregroundStyle(.secondary).padding(20) }
                 else {

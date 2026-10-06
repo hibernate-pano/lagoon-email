@@ -39,6 +39,15 @@ struct MessageDetailView: View {
 
     @State private var isRead: Bool
     @State private var didMarkRead = false
+    /// Set once the user expresses an opinion about read state on this
+    /// message, which cancels the automatic dwell-based mark-read.
+    ///
+    /// Without it the two paths fight: mark "unread" from the ⋯ menu inside
+    /// the dwell window and the pending `markReadOnce` fires a second later
+    /// and writes `\Seen` back to the server. The user's explicit act loses to
+    /// a timer they cannot see — and the write is remote, so scrolling away
+    /// does not undo it.
+    @State private var userSetReadState = false
     @State private var actionBanner: ErrorBanner?
 
     @State private var isPinned: Bool
@@ -128,6 +137,25 @@ struct MessageDetailView: View {
     /// the body fill the full window like a stretched banner.
     private static let readingColumnWidth: CGFloat = 900
 
+    /// How long a message must stay on screen before it is marked read.
+    ///
+    /// Marking read is a **remote write**: `api.markRead` flips `\Seen` on the
+    /// IMAP server, so it cannot be walked back by scrolling and it is visible
+    /// in every other client. Before the split layout, reaching a message took
+    /// an explicit ↩, so "opened it" and "read it" were the same gesture and
+    /// firing the write on arrival was safe. With a reading pane, j/k now
+    /// previews every row it passes over — a 30-row scan would have marked 30
+    /// messages read on the server, permanently, as a side effect of *looking*.
+    /// That contradicts this product's core promise (every mutation is a
+    /// user-triggered act, recorded and undoable) while feeling like a bug the
+    /// user cannot avoid.
+    ///
+    /// Dwell is what Mail.app uses and what resolves the two cases: reading
+    /// takes longer than a second, scanning does not. Deliberately a duration
+    /// and not a scroll or focus signal — the pane has no scroll event to hook
+    /// and focus does not move as the selection walks.
+    static let markReadDwell: Duration = .seconds(1)
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -173,11 +201,20 @@ struct MessageDetailView: View {
             }
             #endif
         }
-        .task {
+        // `.task(id:)` rather than `.task`: the body loads on arrival as
+        // before, but the `\Seen` write waits out a dwell, and moving to the
+        // next message cancels this task mid-dwell — that cancellation is the
+        // whole mechanism, so there is no timer to own or leak.
+        .task(id: remoteId) {
             await loadBody()
-            if bodyError == nil {
-                await markReadOnce()
-            }
+            guard bodyError == nil else { return }
+            // See `Self.markReadDwell`. Guarding on cancellation explicitly
+            // rather than trusting `try?`: a swallowed CancellationError must
+            // not fall through into a remote write for a message the user has
+            // already walked past.
+            try? await Task.sleep(for: Self.markReadDwell)
+            guard !Task.isCancelled else { return }
+            await markReadOnce()
         }
         .sheet(isPresented: $showDraftPicker) {
             if let draft = draftPick {
@@ -832,6 +869,10 @@ struct MessageDetailView: View {
     /// toggle belongs in the undo log. If `markReadOnce` recorded too, every
     /// message the user merely opened would become an action ⌘Z could reverse.
     private func toggleReadState() async {
+        // The user has now spoken about this message's read state, so the
+        // automatic dwell mark-read must not overwrite them (see
+        // `userSetReadState`).
+        userSetReadState = true
         let target = !isRead
         isRead = target
         onReadStateChange(remoteId, target)
@@ -862,6 +903,10 @@ struct MessageDetailView: View {
     private func markReadOnce(force: Bool = false) async {
         if !force && didMarkRead { return }
         didMarkRead = true
+        // User intent has final authority, including over a retry of the
+        // automatic path: `force` bypasses the once-only latch, not the
+        // user's own choice.
+        guard !userSetReadState else { return }
         guard !isRead else { return }
         isRead = true
         onReadStateChange(remoteId, true)
@@ -1057,13 +1102,9 @@ struct MessageDetailView: View {
                     // confirmation is a normal outcome of one-click
                     // unsubscribe, so the banner is informational and the
                     // original mail is the place to finish it.
-                    // # ponytail: the title reuses `l10n.unsubscribe`
-                    // because L10n.swift is outside this change's scope.
-                    // Add a `unsubscribeWebConfirmationTitle` key (zh + en)
-                    // there and use it; LocalizationTests covers both.
                     actionBanner = ErrorBanner(
                         severity: .info,
-                        title: l10n.unsubscribe,
+                        title: l10n.unsubscribeWebConfirmationTitle,
                         detail: l10n.unsubscribePageRequired
                     )
                 } else if code == "unsubscribe-unavailable" {

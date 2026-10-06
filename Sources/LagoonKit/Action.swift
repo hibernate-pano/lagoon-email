@@ -34,12 +34,22 @@ public enum AIActionKind: String, Codable, Sendable, CaseIterable {
     case undo
     /// Moved to the server's Trash; undo restores it to the INBOX.
     case delete
+    /// 彻底删除：the message is gone from the server and from every local
+    /// table. Recorded so the history still says what Lagoon did (constitution
+    /// §3), and explicitly **not** undoable — there is nothing left to undo.
+    ///
+    /// This is the one place the product's "every change is reversible" rule is
+    /// deliberately broken, by the user's decision on 2026-10-05. It is recorded
+    /// here as an enum case with `isUndoable == false` rather than left out of
+    /// the audit stream, because "Lagoon did nothing" and "Lagoon did something
+    /// irreversible" must be distinguishable in the history.
+    case purge
 
     public var isUndoable: Bool {
         switch self {
         case .archive, .markRead, .pin, .unpin, .classifyOverride, .delete:
             true
-        case .unsubscribe, .draftCreate, .send, .undo:
+        case .unsubscribe, .draftCreate, .send, .undo, .purge:
             false
         }
     }

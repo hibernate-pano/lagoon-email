@@ -193,6 +193,7 @@ final class AdvisoryOnlySyncTests: XCTestCase {
                 LagoonDatabase.indexVersion,
                 LagoonDatabase.advisoryOnlyVersion,
                 LagoonDatabase.adviceVersion,
+                LagoonDatabase.sentFolderVersion,
             ]
         )
     }

@@ -971,6 +971,20 @@ actor SlowProbeProvider: MailProvider {
     func unarchive(remoteId: String) async throws { throw Self.unsupported }
     func trash(remoteId: String) async throws { throw Self.unsupported }
     func restoreFromTrash(remoteId: String) async throws { throw Self.unsupported }
+    func permanentlyDelete(remoteId: String) async throws { throw Self.unsupported }
+    func emptyTrash() async throws { throw Self.unsupported }
+    /// R2: folders `listFolders` returns and moves the stub recorded.
+    var folderRows: [MailFolder] = []
+    var moveCalls: [(remoteId: String, folder: String, createIfMissing: Bool)] = []
+    var moveFailure: MailError?
+    func listFolders() async throws -> [MailFolder] { folderRows }
+    @discardableResult
+    func move(remoteId: String, to folder: String, createIfMissing: Bool) async throws -> Bool {
+        moveCalls.append((remoteId, folder, createIfMissing))
+        if let moveFailure { throw moveFailure }
+        return true
+    }
+    func listSent(limit: Int) async throws -> [MessageHeader] { throw Self.unsupported }
     func send(_ outbound: OutboundMessage) async throws -> String? { throw Self.unsupported }
     func probe() async throws { throw Self.unsupported }
 
@@ -1029,3 +1043,4 @@ final class CallCounter: @unchecked Sendable {
         value += 1
     }
 }
+

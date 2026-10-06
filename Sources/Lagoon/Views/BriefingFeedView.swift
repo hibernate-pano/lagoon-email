@@ -15,9 +15,27 @@ struct BriefingFeedView: View {
     @State private var isMarkingAllRead = false
     @State private var errorBanner: ErrorBanner?
     @State private var collapsedGroups: Set<BriefingGroup> = Set(BriefingGroup.allCases.filter(\.collapsedByDefault))
-    @State private var path: [String] = []
     @State private var scrollProxy: ScrollViewProxy?
     @State private var selectedMessageId: String? = nil
+    /// Pending suggestions keyed by the message they are about, so a row can
+    /// render its own judgement without a lookup layer of its own.
+    ///
+    /// Loaded together with the feed rather than on demand: the whole point of
+    /// putting advice on the row is that it is *already there* when the user
+    /// arrives — a second round trip would flash the list without it.
+    @State private var adviceByRemoteId: [String: AdviceRecord] = [:]
+    /// Which suggestion is expanded. At most one, and it is a row-local concern
+    /// that survives the feed re-sorting because it names a row id, not an index.
+    @State private var expandedAdviceId: Int64?
+    /// The suggestion whose dismissal is in flight, so only that row's button
+    /// disables and a double-click cannot record two verdicts.
+    @State private var busyAdviceId: Int64?
+    /// Row density, shared with the raw list through `UserDefaults`.
+    @AppStorage(ListDensityPreference.key) private var densityRaw = ListDensity.compact.rawValue
+    private var density: ListDensity {
+        get { ListDensity(rawValue: densityRaw) ?? .compact }
+        nonmutating set { densityRaw = newValue.rawValue }
+    }
     /// Rows inside the 30-day window that did not fit under the server's cap.
     /// nil on the normal path; a non-nil value means the feed is a truncated
     /// view of the window and says so rather than looking complete.
@@ -85,88 +103,79 @@ struct BriefingFeedView: View {
     )
     #endif
 
-    var body: some View {
-        NavigationStack(path: $path) {
-            ScrollViewReader { proxy in
-                VStack(alignment: .leading, spacing: 0) {
-                    headerBar
-                    // Only render the inline banner when the feed itself is
-                    // already on screen: if `items` is empty the `errorState`
-                    // (ContentUnavailableView) is already showing, and RootView
-                    // covers sync-health concerns. Without this guard the
-                    // briefing page would stack a banner on top of the
-                    // empty-state copy.
-                    if let errorBanner, !items.isEmpty {
-                        NoticeBannerView(banner: errorBanner) { self.errorBanner = nil }
-                    }
-                    content
+    /// The left column: header bar plus the classified feed.
+    ///
+    /// Split out of `body` on purpose — the surface used to be one giant
+    /// SwiftUI expression, and this project has already shipped an
+    /// "unable to type-check in reasonable time" regression from adding a
+    /// single parameter to a chain that large.
+    private var sidebar: some View {
+        ScrollViewReader { proxy in
+            VStack(alignment: .leading, spacing: 0) {
+                headerBar
+                // Only render the inline banner when the feed itself is
+                // already on screen: if `items` is empty the `errorState`
+                // (ContentUnavailableView) is already showing, and RootView
+                // covers sync-health concerns. Without this guard the
+                // briefing page would stack a banner on top of the
+                // empty-state copy.
+                if let errorBanner, !items.isEmpty {
+                    NoticeBannerView(banner: errorBanner) { self.errorBanner = nil }
                 }
-                .onAppear { scrollProxy = proxy }
+                content
             }
-            .navigationDestination(for: String.self) { remoteId in
+            .onAppear { scrollProxy = proxy }
+        }
+        .background {
+            groupJumpShortcuts
+            keyboardNavigationShortcuts
+        }
+    }
+
+    var body: some View {
+        // Selection drives the reading pane; nothing is pushed any more. The
+        // `NavigationStack(path:)` this replaced replaced the whole window with
+        // the message, so triage meant committing to one row at a time and
+        // pressing back to see the list again. The split keeps both on screen.
+        //
+        // `MessageSplitLayout` carries the `.toolbar(removing: .sidebarToggle)`
+        // the split view would otherwise leak into the window toolbar, where
+        // RootView's ZStack shows it twice (see that file's doc comment).
+        MessageSplitLayout(detailId: readerId) {
+            sidebar
+        } detail: {
+            if let remoteId = readerId {
                 destination(for: remoteId)
-            }
-            .background {
-                groupJumpShortcuts
-                keyboardNavigationShortcuts
             }
         }
         .frame(minWidth: 720, minHeight: 480)
         .onAppear {
-            // Debug hook: LAGOON_OPEN_MESSAGE=<remoteId> pushes a message
-            // detail at launch — headless repro for the toolbar-insert
-            // (NSCalendarDate) crash without needing to click through the UI.
+            // Debug hook: LAGOON_OPEN_MESSAGE=<remoteId> opens a message at
+            // launch by selecting it. In the split layout this just moves the
+            // reader pane — there is no longer a push to seed, and the toolbar
+            // swap the old torture mode chased no longer happens (see
+            // .memory/lagoon-app-nscalendardate-toolbar-crash: the fix was to
+            // take the detail actions off the window toolbar entirely).
             let seed = ProcessInfo.processInfo.environment["LAGOON_OPEN_MESSAGE"]
             #if DEBUG
             if seed != nil {
-                BriefingFeedView.debugLog("onAppear seed=\(seed ?? "nil") pathCount=\(path.count)")
+                BriefingFeedView.debugLog("onAppear seed=\(seed ?? "nil")")
             }
             #endif
-            if path.isEmpty,
-               let remoteId = seed,
-               !remoteId.isEmpty {
-                // Delayed so the window's toolbar settles on the root
-                // (list) content first — the push then exercises the LIVE
-                // toolbar swap, which is where the NSCalendarDate decode
-                // fires in the field crashes.
+            if let remoteId = seed, !remoteId.isEmpty {
+                // Delayed so the first feed refresh has landed and the row
+                // exists to select.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-                    guard self.path.isEmpty else { return }
-                    self.path = [remoteId]
+                    self.selectedMessageId = remoteId
                     #if DEBUG
-                    BriefingFeedView.debugLog("seeded path with \(remoteId)")
+                    BriefingFeedView.debugLog("seeded selection \(remoteId)")
                     #endif
                 }
-                // Torture mode: repeated pop/push cycles — every swap
-                // re-serializes and re-inserts the detail toolbar items,
-                // which is where the NSCalendarDate decode fires in the
-                // field crashes.
-                #if DEBUG
-                if ProcessInfo.processInfo.environment["LAGOON_DEBUG_TORTURE"] == "1" {
-                    func cycle(_ n: Int) {
-                        guard n > 0 else { return }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
-                            self.path = []
-                            BriefingFeedView.debugLog("torture pop \(n)")
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-                                self.path = [remoteId]
-                                BriefingFeedView.debugLog("torture push \(n)")
-                                cycle(n - 1)
-                            }
-                        }
-                    }
-                    cycle(5)
-                }
-                #endif
             }
         }
         .task {
             await refresh()
             await poll()
-        }
-        .onChange(of: path) { old, new in
-            if !old.isEmpty, new.isEmpty {
-                Task { await refresh() }
-            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .lagoonDidUndo)) { _ in
             Task { await refresh() }
@@ -175,9 +184,8 @@ struct BriefingFeedView: View {
             Task { await refresh() }
         }
         // The advice panel asks the feed to reveal a message. The feed owns
-        // its navigation path, so it does the revealing; the switch to the
-        // Briefing surface belongs to RootView, which listens for the same
-        // notification.
+        // its selection, so it does the revealing; the switch to the Briefing
+        // surface belongs to RootView, which listens for the same notification.
         .onReceive(NotificationCenter.default.publisher(for: .lagoonRevealMessage)) { note in
             guard let remoteId = note.userInfo?["remoteId"] as? String else { return }
             // `reveal` refreshes first when the message is not in the current
@@ -194,9 +202,12 @@ struct BriefingFeedView: View {
             guard await sleepForPoll(
                 fast ? Self.emptyPollInterval : Self.refreshInterval
             ) else { return }
-            // Never reorder the feed underneath an open message. The next
-            // refresh happens when the user returns to the feed.
-            if path.isEmpty, shouldPoll(isVisible: isVisible, scenePhase: scenePhase) {
+            // The old `path.isEmpty` gate stopped the feed refreshing while a
+            // message was pushed, so a poll could not reorder the list
+            // underneath the reader. In the split layout the reader is keyed on
+            // `selectedMessageId`, not on list order, so the list can stay live;
+            // `readerId` retracts the pane if a refresh drops the selected row.
+            if shouldPoll(isVisible: isVisible, scenePhase: scenePhase) {
                 await refresh()
             }
         }
@@ -206,7 +217,15 @@ struct BriefingFeedView: View {
 
     private var headerBar: some View {
         HStack(spacing: 8) {
-            Text(l10n.briefing).font(.headline)
+            Text(l10n.briefing)
+                .font(.headline)
+                // Same reason as the raw list's title: a surface heading that
+                // wraps one glyph per line is noise, and the list surface proved
+                // it happens under real width pressure. This row has a Spacer so
+                // it is not currently squeezed, but the cost of `fixedSize` is
+                // zero and the cost of the bug is a broken-looking toolbar.
+                .fixedSize()
+                .layoutPriority(1)
             Spacer()
             Button {
                 Task { await markAllRead() }
@@ -226,8 +245,8 @@ struct BriefingFeedView: View {
             .keyboardShortcut("0", modifiers: .command)
             .help(l10n.showRawListHelp)
             // Refresh is ⌥⌘R so it never collides with ⌘R = reply on the
-            // open message. No path.isEmpty guard needed: the modifiers
-            // are disjoint, so both bindings stay live in the same stack.
+            // open message. The modifiers are disjoint, so both bindings stay
+            // live at once.
             refreshControl
                 .keyboardShortcut("r", modifiers: [.command, .option])
         }
@@ -272,9 +291,26 @@ struct BriefingFeedView: View {
                     Section {
                         if !collapsedGroups.contains(group) {
                             ForEach(groupItems) { item in
-                            NavigationLink(value: item.message.remoteId) {
-                                BriefingRow(item: item)
-                            }
+                            // No `NavigationLink`: the row is selected, not
+                            // pushed. `List(selection:)` writes the tap into
+                            // `selectedMessageId`, which drives the split view's
+                            // reading pane. A link here would push inside the
+                            // sidebar column's implicit stack and hide the list —
+                            // the silent failure recorded in
+                            // .memory/sheet-is-its-own-navigation-root.
+                            BriefingRow(
+                                item: item,
+                                advice: adviceByRemoteId[item.message.remoteId],
+                                showsSnippet: density.showsSnippet,
+                                expandedAdviceId: $expandedAdviceId,
+                                busyAdviceId: $busyAdviceId,
+                                onOpenAdvice: { remoteId in
+                                    Task { await reveal(remoteId) }
+                                },
+                                onDismissAdvice: { record in
+                                    Task { await dismissAdvice(record) }
+                                }
+                            )
                             .swipeActions(edge: .leading, allowsFullSwipe: true) {
                                 // Leading swipe = archive (the destructive
                                 // gesture Mail.app puts on the left).
@@ -353,6 +389,10 @@ struct BriefingFeedView: View {
             }
         }
         .listStyle(.inset)
+        // Shares the density preference with the raw list: they are two views
+        // of one mailbox, and a user who packs one row wants the other packed
+        // too. `compact` is the default there and here for the same reason.
+        .listDensity(density)
         // Drive every list-row transition with the same easing curve so a
         // swipe-to-archive feels identical to a ⌫-to-archive. Spring with a
         // light damping reads as "the row slid into the tray" — closer to
@@ -494,14 +534,15 @@ struct BriefingFeedView: View {
                 .keyboardShortcut("j", modifiers: [])
             Button(l10n.previousInGroup) { moveSelection(direction: .up) }
                 .keyboardShortcut("k", modifiers: [])
-            Button(l10n.openSelected) {
-                if let selectedMessageId { path = [selectedMessageId] }
-            }
-            .keyboardShortcut(.return, modifiers: [])
-            // Mail.app's back gesture: ⌘[ pops one level off the
-            // NavigationStack. No-op when the user is already at the root.
+            // No ↩ binding: selection already previews in the reading pane,
+            // so an explicit "open" step has nothing left to do. (The cheatsheet
+            // `open` row goes with it — a documented key bound nowhere is a
+            // ghost the ShortcutSheet tests fail on.)
+            // ⌘[ keeps Mail.app's "back" muscle memory, re-pointed at the one
+            // thing it can still mean here: deselect, returning the reader pane
+            // to its placeholder. No-op with nothing selected.
             Button(l10n.back) {
-                if !path.isEmpty { path.removeLast() }
+                selectedMessageId = nil
             }
             .keyboardShortcut("[", modifiers: .command)
         }
@@ -522,6 +563,22 @@ struct BriefingFeedView: View {
     }
 
 
+
+    /// The message the reading pane shows, or nil when the selection has gone
+    /// stale.
+    ///
+    /// `selectedMessageId` is the list's own selection and can outlive the row:
+    /// a poll that drops the selected message (archived from another client,
+    /// or reclassified out of the window) would otherwise leave the pane
+    /// rendering a detail view with no header — a blank reader that reads as a
+    /// broken app. Guarding here retracts it to the placeholder instead, and is
+    /// the split-layout twin of `MessageListView.previewId`.
+    private var readerId: String? {
+        guard let id = selectedMessageId,
+              items.contains(where: { $0.message.remoteId == id })
+        else { return nil }
+        return id
+    }
 
     // MARK: - Detail destination
 
@@ -557,11 +614,11 @@ struct BriefingFeedView: View {
 
                 },
 
-                onAdvanceTo: { next in path = next.map { [$0] } ?? [] },
+                onAdvanceTo: { next in selectedMessageId = next },
 
                 onDelete: { id in
                     dropItem(id)
-                    path = []
+                    selectedMessageId = nil
                 },
 
                 onReadStateChange: { id, isRead in
@@ -821,6 +878,68 @@ struct BriefingFeedView: View {
         refreshGate.invalidate()
     }
 
+    /// Loads the pending suggestion queue and indexes it by message.
+    ///
+    /// Only `pending` rows are fetched: a dismissed suggestion must never come
+    /// back (constitution §3 — that is what makes the queue trustworthy), and
+    /// an accepted one has already been acted on. Only messages currently on
+    /// screen are indexed, so the dictionary stays the size of the feed rather
+    /// than the size of the mailbox.
+    ///
+    /// Failure is deliberately silent and non-fatal: no banner, no retry loop.
+    /// The advice table is a derived convenience — losing it costs the user the
+    /// suggestion, not any mail — and a red banner here would read as "your mail
+    /// failed to load", which is both untrue and alarming.
+    private func loadAdvice() async {
+        guard let accountId = accounts.accountId else {
+            adviceByRemoteId = [:]
+            return
+        }
+        do {
+            let records = try await api.fetchAdvice(accountId: accountId)
+            let visible = Set(items.map(\.message.remoteId))
+            adviceByRemoteId = Dictionary(
+                uniqueKeysWithValues: records
+                    .filter { visible.contains($0.remoteId) }
+                    .map { ($0.remoteId, $0) }
+            )
+            // A row that disappeared must not keep the expanded body on screen.
+            expandedAdviceId = expandedAdviceId.flatMap { id in
+                adviceByRemoteId.values.contains { $0.id == id } ? id : nil
+            }
+        } catch {
+            adviceByRemoteId = [:]
+        }
+    }
+
+    /// Records a `dismissed` verdict for one suggestion.
+    ///
+    /// This is the *only* write the advice surface performs, and it writes the
+    /// `advice` table only — no mailbox is touched, so it needs no undo entry
+    /// (constitution §2 rule 6). The row drops its strip immediately on success
+    /// because a dismissed suggestion must not be re-surfaced on the next poll.
+    private func dismissAdvice(_ record: AdviceRecord) async {
+        guard let accountId = accounts.accountId else { return }
+        guard busyAdviceId == nil else { return }
+        busyAdviceId = record.id
+        defer { busyAdviceId = nil }
+        do {
+            _ = try await api.setAdviceDecision(
+                id: record.id, decision: .dismissed, accountId: accountId
+            )
+            adviceByRemoteId.removeValue(forKey: record.remoteId)
+            if expandedAdviceId == record.id { expandedAdviceId = nil }
+        } catch {
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.adviceDismissFailedTitle,
+                detail: error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                action: { Task { await dismissAdvice(record) } }
+            )
+        }
+    }
+
     private func refresh() async {
 
         guard let accountId = accounts.accountId else { return }
@@ -857,6 +976,12 @@ struct BriefingFeedView: View {
             items = response.items
             omittedCount = response.omittedCount
             errorBanner = nil
+            // Advice rides along with the feed but is a separate table, so a
+            // failure here must not fail the refresh: the rows stay, they just
+            // carry no suggestion. Loading it after committing the items keeps
+            // that ordering explicit — the list is never blocked on the advice
+            // queue, and a slow/absent LLM cannot delay the mail.
+            await loadAdvice()
         } catch {
             guard generation == refreshGate.generation else { return }
             // Spec §6.2: a `.timedOut` from the briefing endpoint (LLM
@@ -907,7 +1032,7 @@ struct BriefingFeedView: View {
             return
         }
         withAnimation {
-            path = [remoteId]
+            selectedMessageId = remoteId
         }
     }
 
@@ -990,11 +1115,35 @@ private struct BriefingRow: View {
 
     let item: BriefingItem
 
+    /// The AI's suggestion for this message, when one exists.
+    ///
+    /// Passed in rather than looked up inside the row: the feed owns the advice
+    /// table (it loads it, refreshes it, records verdicts), so this view stays
+    /// a pure renderer — it cannot fetch, and it cannot record a dismissal
+    /// without going back through the feed.
+    let advice: AdviceRecord?
+    /// Whether the row shows its third line (reason or snippet).
+    ///
+    /// Driven by the shared density preference rather than hardcoded, so the
+    /// feed and the raw list pack identically — they are two views of the same
+    /// mailbox and a user who sets one dense expects the other to follow.
+    let showsSnippet: Bool
+    /// Which suggestion is expanded, across all rows.
+    ///
+    /// One id rather than a `Set`: two rows open at once is not a state the
+    /// user can act on, and a per-row `@State` would leave the first row's
+    /// body on screen when a second opens.
+    @Binding var expandedAdviceId: Int64?
+    /// The suggestion whose dismissal is in flight.
+    @Binding var busyAdviceId: Int64?
+    let onOpenAdvice: (String) -> Void
+    let onDismissAdvice: (AdviceRecord) -> Void
+
     @Environment(\.l10n) private var l10n
 
-
-
     var body: some View {
+
+        VStack(alignment: .leading, spacing: 0) {
 
         HStack(alignment: .top, spacing: 10) {
             // Avatar — initials in a colour derived from the email hash.
@@ -1025,18 +1174,43 @@ private struct BriefingRow: View {
 
                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
 
-            if let reason = l10n.reasonText(item.reasonCode) {
+            if showsSnippet, let reason = l10n.reasonText(item.reasonCode) {
 
                 Text(reason).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
 
-            } else if let snippet = item.message.snippet {
+            } else if showsSnippet, let snippet = item.message.snippet {
 
                 Text(snippet).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
 
             }
 
+            // The AI's judgement, on the row the user is already looking at.
+            // Placed *after* the static reason so the two never compete for the
+            // same visual weight: the deterministic "why this group" is a fact
+            // about the mail, the suggestion is an opinion about what to do.
+            //
+            // Omitted when the message has no suggestion — and the strip itself
+            // hides `.nothing`, so a row only grows when there is a judgement
+            // worth reading.
+            if let advice {
+                RowAdviceStrip(
+                    record: advice,
+                    onOpen: { onOpenAdvice(advice.remoteId) },
+                    onDismiss: { onDismissAdvice(advice) },
+                    isExpanded: Binding(
+                        get: { expandedAdviceId == advice.id },
+                        set: { expanded in
+                            expandedAdviceId = expanded ? advice.id : nil
+                        }
+                    ),
+                    isBusy: busyAdviceId == advice.id
+                )
+            }
+
             }
         }.padding(.vertical, 2)
+
+        }
 
     }
 

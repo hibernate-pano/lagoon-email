@@ -1360,6 +1360,10 @@ final class RouteTests: XCTestCase {
         private(set) var unarchivedRemoteIds: [String] = []
         private(set) var trashedRemoteIds: [String] = []
         private(set) var restoredRemoteIds: [String] = []
+        private(set) var purgedRemoteIds: [String] = []
+        private(set) var emptyTrashCount = 0
+        /// R1: rows the 已发送 listing returns.
+        var sentRows: [MessageHeader] = []
         private var trashError: MailError?
         func setTrashError(_ error: MailError?) { trashError = error }
         private(set) var readCalls: [String] = []
@@ -1441,6 +1445,29 @@ final class RouteTests: XCTestCase {
 
         func restoreFromTrash(remoteId: String) async throws {
             restoredRemoteIds.append(remoteId)
+        }
+
+        func permanentlyDelete(remoteId: String) async throws {
+            purgedRemoteIds.append(remoteId)
+        }
+
+        func emptyTrash() async throws {
+            emptyTrashCount += 1
+        }
+
+        /// R2: folders `listFolders` returns and moves the stub recorded.
+        var folderRows: [MailFolder] = []
+        var moveCalls: [(remoteId: String, folder: String, createIfMissing: Bool)] = []
+        var moveFailure: MailError?
+        func listFolders() async throws -> [MailFolder] { folderRows }
+        @discardableResult
+        func move(remoteId: String, to folder: String, createIfMissing: Bool) async throws -> Bool {
+            moveCalls.append((remoteId, folder, createIfMissing))
+            if let moveFailure { throw moveFailure }
+            return true
+        }
+        func listSent(limit: Int) async throws -> [MessageHeader] {
+            sentRows
         }
 
         func send(_ outbound: OutboundMessage) async throws -> String? {

@@ -195,6 +195,44 @@ actor PooledMailProvider: MailProvider, ArchiveFolderResolving {
         try await provider.restoreFromTrash(remoteId: remoteId)
     }
 
+    func permanentlyDelete(remoteId: String) async throws {
+        guard let provider = await resolved() else {
+            throw MailError.notConfigured("provider unavailable")
+        }
+        try await provider.permanentlyDelete(remoteId: remoteId)
+    }
+
+    func emptyTrash() async throws {
+        guard let provider = await resolved() else {
+            throw MailError.notConfigured("provider unavailable")
+        }
+        try await provider.emptyTrash()
+    }
+
+    func listFolders() async throws -> [MailFolder] {
+        guard let provider = await resolved() else {
+            throw MailError.notConfigured("provider unavailable")
+        }
+        return try await provider.listFolders()
+    }
+
+    @discardableResult
+    func move(remoteId: String, to folder: String, createIfMissing: Bool) async throws -> Bool {
+        guard let provider = await resolved() else {
+            throw MailError.notConfigured("provider unavailable")
+        }
+        return try await provider.move(
+            remoteId: remoteId, to: folder, createIfMissing: createIfMissing
+        )
+    }
+
+    func listSent(limit: Int) async throws -> [MessageHeader] {
+        guard let provider = await resolved() else {
+            throw MailError.notConfigured("provider unavailable")
+        }
+        return try await provider.listSent(limit: limit)
+    }
+
     func send(_ outbound: OutboundMessage) async throws -> String? {
         guard let provider = await resolved() else {
             throw MailError.notConfigured("provider unavailable")

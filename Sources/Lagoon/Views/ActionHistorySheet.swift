@@ -141,6 +141,10 @@ struct ActionHistorySheet: View {
         case .send: "paperplane"
         case .undo: "arrow.uturn.backward"
         case .delete: "trash"
+        // 彻底删除 gets its own icon, not a variant of the trash can. In a
+        // history list the two rows sit next to each other, and a user must be
+        // able to tell at a glance which one is the irreversible one.
+        case .purge: "trash.slash"
         }
     }
 }

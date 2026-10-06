@@ -213,6 +213,21 @@ final class BodyStoreTests: XCTestCase {
         func unarchive(remoteId: String) async throws {}
         func trash(remoteId: String) async throws {}
         func restoreFromTrash(remoteId: String) async throws {}
+        func permanentlyDelete(remoteId: String) async throws {}
+        func emptyTrash() async throws {}
+        /// R2: both stubs in this type share these — they are the same
+        /// provider from the store's point of view.
+        var folderRows: [MailFolder] = []
+        var moveCalls: [(remoteId: String, folder: String, createIfMissing: Bool)] = []
+        var moveFailure: MailError?
+        func listFolders() async throws -> [MailFolder] { folderRows }
+        @discardableResult
+        func move(remoteId: String, to folder: String, createIfMissing: Bool) async throws -> Bool {
+            moveCalls.append((remoteId, folder, createIfMissing))
+            if let moveFailure { throw moveFailure }
+            return true
+        }
+        func listSent(limit: Int) async throws -> [MessageHeader] { [] }
 
         func send(_ outbound: OutboundMessage) async throws -> String? { nil }
 
@@ -357,6 +372,21 @@ final class BodyStoreTests: XCTestCase {
         func unarchive(remoteId: String) async throws {}
         func trash(remoteId: String) async throws {}
         func restoreFromTrash(remoteId: String) async throws {}
+        func permanentlyDelete(remoteId: String) async throws {}
+        func emptyTrash() async throws {}
+        /// R2: the second stub records the same way. It is a *separate* type
+        /// from the first one above, so it needs its own state.
+        var folderRows: [MailFolder] = []
+        var moveCalls: [(remoteId: String, folder: String, createIfMissing: Bool)] = []
+        var moveFailure: MailError?
+        func listFolders() async throws -> [MailFolder] { folderRows }
+        @discardableResult
+        func move(remoteId: String, to folder: String, createIfMissing: Bool) async throws -> Bool {
+            moveCalls.append((remoteId, folder, createIfMissing))
+            if let moveFailure { throw moveFailure }
+            return true
+        }
+        func listSent(limit: Int) async throws -> [MessageHeader] { [] }
 
         func send(_ outbound: OutboundMessage) async throws -> String? { nil }
 

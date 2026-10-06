@@ -172,6 +172,28 @@ public struct OutboundMessage: Sendable {
 
 /// Typed provider failures. `.authFailed` is special: the sync loop stops
 /// retrying and asks the user to re-enter credentials.
+/// A folder the user can file a message into (R2).
+public struct MailFolder: Equatable, Sendable, Codable {
+    /// The leaf name, for display: `Projects` out of `INBOX/Projects`.
+    public let name: String
+    /// Path as the server spells it, e.g. `INBOX/Projects/Lagoon`.
+    ///
+    /// Preserved verbatim because IMAP folder names belong to the server, not to
+    /// us: we send back exactly the string it handed us rather than a
+    /// reconstruction. QQ and Gmail disagree on the delimiter (`/` vs `.`), and
+    /// a "helpful" normalisation is how a move ends up in the wrong place.
+    public let path: String
+    /// Whether this folder has sub-folders, so the UI can build a real tree
+    /// instead of a flat list of indented strings.
+    public let hasChildren: Bool
+
+    public init(name: String, path: String, hasChildren: Bool) {
+        self.name = name
+        self.path = path
+        self.hasChildren = hasChildren
+    }
+}
+
 public enum MailError: Error, Equatable {
     case authFailed
     case unreachable(String)
@@ -179,6 +201,9 @@ public enum MailError: Error, Equatable {
     case messageGone
     case archiveUnavailable
     case trashUnavailable
+    /// 没有 Sent 文件夹。Distinct from "an empty Sent folder" — see
+    /// `listSent`, which reports the latter as an empty list.
+    case sentUnavailable
     case notConfigured(String)
 
     /// Stable, log-safe label (never interpolate payloads into user-facing text).
@@ -190,6 +215,7 @@ public enum MailError: Error, Equatable {
         case .messageGone: return "message-gone"
         case .archiveUnavailable: return "archive-unavailable"
         case .trashUnavailable: return "trash-unavailable"
+        case .sentUnavailable: return "sent-unavailable"
         case .notConfigured: return "not-configured"
         }
     }
@@ -265,8 +291,79 @@ public protocol MailProvider: MailSyncReading {
     /// Move the message back from Trash to the INBOX (delete 的撤销).
     func restoreFromTrash(remoteId: String) async throws
 
+    /// 彻底删除：permanently remove one message. **Irreversible.**
+    ///
+    /// The only irreversible verb in the protocol, and the only one that
+    /// destroys data rather than moving it. It is here — rather than left as a
+    /// future idea — because a Trash the user can never empty is a Trash that
+    /// silently grows forever, and "delete the email I already deleted" is a
+    /// request every mail client eventually has to answer.
+    ///
+    /// Callers must gate it on the message already being in the Trash, and must
+    /// never reach it from a rule, a sweep, or any other automatic path.
+    func permanentlyDelete(remoteId: String) async throws
+
+    /// 彻底删除 the whole Trash. Same irreversibility, wider blast radius.
+    ///
+    /// Separate from a loop over `permanentlyDelete` on purpose: the Trash is
+    /// the one folder where "delete everything" is a normal user action, and it
+    /// lets an implementation do it in one round trip. Implementations that
+    /// cannot do it in one pass may loop internally.
+    func emptyTrash() async throws
+
     /// Returns the provider-assigned Message-ID when it reports one.
     func send(_ outbound: OutboundMessage) async throws -> String?
+
+    /// The account's folders a message can be filed into (R2).
+    ///
+    /// ## Why this is a separate verb and not a field on `capabilities`
+    ///
+    /// Because it is **per-account and changes while the app runs** — the user
+    /// creates a folder in another client and it should show up here. Latching
+    /// it at connect time (which is what `MailCapabilities` does, and rightly,
+    /// for `archiveFolder`) would mean a refresh round trip to see a folder the
+    /// user just made.
+    ///
+    /// ## What is deliberately excluded
+    ///
+    /// INBOX, Trash and anything else the app already owns a dedicated surface
+    /// for. Surfacing them here would offer the user a way to file a message
+    /// "into the trash" from a menu that also offers 归档 and 已发送 — three
+    /// routes to the same outcome, two of which bypass the confirmation.
+    ///
+    /// Throws nothing: an account whose LIST fails yields an empty list, and the
+    /// UI simply shows no move option rather than an error the user can do
+    /// nothing about.
+    func listFolders() async throws -> [MailFolder]
+
+    /// Files a message into `folder`, creating it when `createIfMissing`.
+    ///
+    /// Returns false when the server refused and the message is **still where it
+    /// was** — the caller must not claim success. Throws only for transport
+    /// errors, which are a different thing and are retried.
+    @discardableResult
+    func move(remoteId: String, to folder: String, createIfMissing: Bool) async throws -> Bool
+
+    /// The newest headers in the account's **Sent** folder (R1).
+    ///
+    /// ## Why this is a separate verb rather than a `pullChanges` variant
+    ///
+    /// The sync engine is narrowed to `MailSyncReading` and pulls the INBOX
+    /// only; the comment on `collectSentReplies` says outright that "sent mail
+    /// is never stored as rows". That was a defensible call for a
+    /// reply-detection feature that only needed threading references, but it
+    /// left the user with no way to see what they sent — the single most
+    /// missing basic feature in a mail client.
+    ///
+    /// So Sent becomes a **read-only listing**: it does not join the sync loop,
+    /// does not get a cursor, and does not reconcile. It is fetched when the
+    /// user opens 已发送, and it writes `is_sent = TRUE` on the rows it finds
+    /// (see `MessageStore.markSent` for why that flag is not set by `upsert`).
+    ///
+    /// Throws `MailError.sentUnavailable` when the account exposes no Sent
+    /// folder — the route answers 404 rather than showing an empty list that
+    /// looks like "you have sent nothing".
+    func listSent(limit: Int) async throws -> [MessageHeader]
 
     /// Connectivity + credential check used by the connect flow.
     func probe() async throws

@@ -156,7 +156,15 @@ public enum LagoonRuntime {
         SearchRoutes.register(on: router, db: db, logger: logger)
         TimeSavedRoutes.register(on: router, db: db, logger: logger)
         AdviceRoutes.register(on: router, db: db, logger: logger)
+        // Sidebar tallies. Read-only; registered next to the other read routes
+        // so the whole navigation layer is one glance at this file.
+        FolderCountsRoutes.register(on: router, db: db, logger: logger)
+        // 发件人排行. Read-only, same as the counts above it.
+        SenderRoutes.register(on: router, db: db, logger: logger)
         StackRoutes.register(on: router, db: db, logger: logger)
+        // R1 已发送. Registered next to the stacks because both need a provider
+        // builder and both are folder-shaped listings rather than inbox reads.
+        SentRoutes.register(on: router, db: db, logger: logger)
         BudgetRoutes.register(
             on: router,
             budget: usageBudget,

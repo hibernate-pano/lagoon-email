@@ -8,9 +8,9 @@ import LagoonKit
 ///
 /// The palette is deliberately a separate view (not a menu inside the
 /// toolbar) because a single-character text filter is faster than a menu
-/// for the 20+ actions a power user wants to keep reachable. Mail.app
-/// doesn't have one; Superhuman does; Linear / Things have it as the
-/// primary navigation surface. We're closer to the latter.
+/// for the actions a power user wants to keep reachable. Mail.app doesn't
+/// have one; Superhuman does; Linear / Things have it as the primary
+/// navigation surface. We're closer to the latter.
 struct CommandPaletteView: View {
     @Environment(\.l10n) private var l10n
     @Environment(\.dismiss) private var dismiss
@@ -18,11 +18,17 @@ struct CommandPaletteView: View {
     /// Callers wire these up so the palette can navigate the outer shell.
     let onNewMessage: () -> Void
     let onSearch: () -> Void
-    let onShowBriefing: () -> Void
-    let onShowAllMessages: () -> Void
+    /// ⌘0 toggles between the two surfaces — it is not "go to briefing"
+    /// and not "go to all messages". One callback, one row, one key.
+    let onToggleSurface: () -> Void
     let onShowUsage: () -> Void
     let onShowActionHistory: () -> Void
     let onShowAdvice: () -> Void
+    /// 发件人排行 — who writes the most, ranked.
+    let onShowSenderRanking: () -> Void
+    /// Advances to the next density and reports which one, so the palette row
+    /// shows the action's result rather than just its name.
+    let onCycleDensity: () -> Void
     let onShowShortcuts: () -> Void
     let onShowAISettings: () -> Void
     let onRefresh: () -> Void
@@ -53,20 +59,26 @@ struct CommandPaletteView: View {
         [
             Command(id: "new-message", title: l10n.newMessage, shortcut: "⌘N", systemImage: "square.and.pencil", action: { run(onNewMessage) }),
             Command(id: "search", title: l10n.search, shortcut: "⌘F", systemImage: "magnifyingglass", action: { run(onSearch) }),
-            Command(id: "show-briefing", title: l10n.briefing, shortcut: "⌘0", systemImage: "rectangle.grid.2x2", action: { run(onShowBriefing) }),
-            Command(id: "show-all", title: l10n.allMessages, shortcut: "⌘0", systemImage: "list.bullet", action: { run(onShowAllMessages) }),
+            Command(id: "toggle-surface", title: l10n.toggleSurface, shortcut: "⌘0", systemImage: "rectangle.grid.2x2", action: { run(onToggleSurface) }),
             Command(id: "refresh", title: l10n.refresh, shortcut: "⌥⌘R", systemImage: "arrow.clockwise", action: { run(onRefresh) }),
             Command(id: "usage", title: l10n.budgetThisMonth, shortcut: "⌘B", systemImage: "chart.bar", action: { run(onShowUsage) }),
             Command(id: "ai-settings", title: l10n.aiSettingsTitle, shortcut: nil, systemImage: "sparkles", action: { run(onShowAISettings) }),
             Command(id: "advice", title: l10n.adviceTitle, shortcut: "⇧⌘A", systemImage: "sparkles", action: { run(onShowAdvice) }),
+            Command(id: "senders", title: l10n.senderRankingTitle, shortcut: nil, systemImage: "person.2", action: { run(onShowSenderRanking) }),
+            // Density lives here rather than in the list's own toolbar row: that
+            // row was already at the point where the surface title wrapped to
+            // one glyph per line, and the density control was the control that
+            // pushed it over. The palette has room, and ⌘K is already the
+            // power-user path for everything that does not fit on a bar.
+            Command(id: "density", title: l10n.densityTitle, shortcut: nil, systemImage: "line.3.horizontal.decrease", action: { run(onCycleDensity) }),
             Command(id: "history", title: l10n.actionHistory, shortcut: nil, systemImage: "clock.arrow.circlepath", action: { run(onShowActionHistory) }),
-            Command(id: "shortcuts", title: l10n.commandPalette, shortcut: "⌘/", systemImage: "questionmark.circle", action: { run(onShowShortcuts) }),
+            Command(id: "shortcuts", title: l10n.keyboardShortcuts, shortcut: "⌘/", systemImage: "questionmark.circle", action: { run(onShowShortcuts) }),
             Command(id: "sound", title: l10n.soundEnabled, shortcut: nil, systemImage: "speaker.wave.2", action: { run(onToggleSound) }),
         ]
     }
 
     /// Substring match, case-insensitive. The palette is small enough
-    /// (11 commands) that we don't need a real fuzzy matcher — a prefix
+    /// (12 commands) that we don't need a real fuzzy matcher — a prefix
     /// or substring hit is faster and predictable.
     private var filtered: [Command] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
