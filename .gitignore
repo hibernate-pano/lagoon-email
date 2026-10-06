@@ -39,3 +39,6 @@ Support/Lagoon.iconset/
 # ZCode session scratch (same convention as .mimosa/.pi/.v2c/.video_agent)
 .zcode/
 .zcodeignore
+
+# WorkBuddy agent workspace (memory + task scratch; never part of the product)
+.workbuddy/
