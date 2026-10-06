@@ -74,9 +74,14 @@ One SQLite file (`GRDB`, WAL mode, foreign keys ON) holds everything: accounts
 stack rules.
 
 - **Schema**: `Sources/LagoonKit/LagoonDatabase.swift` — the final state of
-  the historical 19 Postgres migrations, expressed for SQLite as one
-  `lagoon-v1` migration applied automatically at startup. Nothing migrates
-  from an old Postgres install: remote mail re-syncs from the provider.
+  the historical 19 Postgres migrations, expressed for SQLite and applied
+  automatically at startup as **five** registered migrations, not one:
+  `lagoon-v1` (the schema itself), `lagoon-v2` (index reconciliation),
+  `lagoon-v3` (drop `auto_archive_rules`, per the advisory-only constitution),
+  `lagoon-v4` (the `advice` table) and `lagoon-v5` (the `is_sent` column).
+  The constants are named after what they *added*, so `currentVersion` means
+  "the baseline" (v1), not "the newest". Nothing migrates from an old Postgres
+  install: remote mail re-syncs from the provider.
 - **Concurrency**: one `DatabasePool` shared by every sync loop, route and
   store (`LagoonDB` seam in LagoonKit). The Postgres build needed one
   connection per loop because a wire connection serves one query at a time;
