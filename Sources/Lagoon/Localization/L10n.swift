@@ -1035,6 +1035,61 @@ public struct L10n: Sendable, Equatable {
     }
 }
 
+// MARK: - Column width
+
+public extension L10n {
+    /// What a separator is called in the accessibility tree.
+    ///
+    /// A noun the user can act on rather than a position they have to infer —
+    /// "adjustable" with no subject announces a control that adjusts nothing.
+    func columnWidthNoun(_ noun: String) -> String {
+        switch noun {
+        case "navigation":
+            return pick("调整左侧栏宽度", "Adjust the sidebar width")
+        case "list":
+            return pick("调整邮件列表宽度", "Adjust the message list width")
+        default:
+            return pick("调整阅读区宽度", "Adjust the reading pane width")
+        }
+    }
+
+    /// The spoken width. The unit is included because a bare number is read as
+    /// a count rather than a measurement.
+    func columnWidthPoints(_ points: Int) -> String {
+        pick("\(points) 点", "\(points) points")
+    }
+
+    /// Home / End, as accessibility action names.
+    var columnWidthToMin: String {
+        pick("移到最小宽度", "Move to the minimum width")
+    }
+
+    var columnWidthToMax: String {
+        pick("移到最大宽度", "Move to the maximum width")
+    }
+
+    /// The separator's tooltip.
+    ///
+    /// Names the column the drag moves *and* teaches the ⌥ inversion, because
+    /// neither is discoverable otherwise: the handle is a 1pt line with no label
+    /// until the pointer is already on it, and a modifier nobody has been told
+    /// about is a feature that does not exist. Both halves are needed — "drag to
+    /// resize" alone leaves the user guessing which column, and naming the column
+    /// without the modifier leaves the wider reader unreachable.
+    func columnResizeTooltip(_ noun: String) -> String {
+        // The first separator cannot invert: ⌥ there would target the list,
+        // which is already the column to its left, so there would be nothing
+        // left to say.
+        guard noun != "navigation" else {
+            return pick("拖动调整左侧栏宽", "Drag to resize the sidebar")
+        }
+        return pick(
+            "拖动调整左侧栏宽，按住 ⌥ 改为调整阅读区宽度",
+            "Drag to resize the column, or hold ⌥ to resize the reading pane"
+        )
+    }
+}
+
 // MARK: - SwiftUI environment
 
 private struct L10nEnvironmentKey: EnvironmentKey {

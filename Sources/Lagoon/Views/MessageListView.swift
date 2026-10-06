@@ -207,6 +207,13 @@ struct MessageListView: View {
     /// The poll loop sleeps instead of refreshing — keep-alive costs no
     /// traffic. Hidden shortcuts are disabled by the parent.
     var isVisible: Bool = true
+
+    /// The window's shared column widths, handed down by `RootView`.
+    ///
+    /// Injected rather than created here so the navigation column beside this
+    /// surface solves against the same numbers: one drag moves all three columns,
+    /// and a surface switch does not reset the layout the user just set.
+    let columnStore: ColumnWidthStore
     private let api = APIClient.shared
 
     /// Which slice of the mailbox the sidebar is pointing at.
@@ -556,6 +563,7 @@ struct MessageListView: View {
         // message, which is what made triage feel like a horizontal bar of
         // subjects you had to commit to one at a time.
         MessageSplitLayout(
+            store: columnStore,
             detailId: previewId,
             multiSelectionCount: multiSelectionCount
         ) {
@@ -566,7 +574,7 @@ struct MessageListView: View {
             }
         }
         .noticeBanner($errorBanner)
-        .frame(minWidth: 720, minHeight: 480)
+        .frame(minHeight: ColumnLayoutMetrics.windowMinimumHeight)
         // 彻底删除 confirmation. `.alert` rather than a sheet, deliberately:
         // a sheet reads as a settings panel and gets dismissed reflexively,
         // whereas an alert has to be answered. It is the only irreversible

@@ -165,7 +165,11 @@ struct RootView: View {
     // Swift type-checker's time limit, and any upstream change (e.g. a new
     // ConnectView parameter) tips it over into an unreasonable-time error.
     @ViewBuilder private var briefingSurface: some View {
-        BriefingFeedView(isVisible: surface == .briefing, onShowAllMessages: { go(to: .allMessages) })
+        BriefingFeedView(
+            isVisible: surface == .briefing,
+            columnStore: columnStore,
+            onShowAllMessages: { go(to: .allMessages) }
+        )
             .opacity(surface == .briefing ? 1 : 0)
             .disabled(surface != .briefing)
             .allowsHitTesting(surface == .briefing)
@@ -175,6 +179,7 @@ struct RootView: View {
     @ViewBuilder private var messagesSurface: some View {
         MessageListView(
             isVisible: surface == .allMessages,
+            columnStore: columnStore,
             lens: MessageListView.Lens(destination),
             onShowBriefing: { go(to: .briefing) },
             onClearLens: { destination = .allMessages },
@@ -196,21 +201,93 @@ struct RootView: View {
     // type-checker's time limit; adding a ConnectView parameter tipped it
     // over into "unable to type-check in reasonable time". The three computed
     // properties below keep each chain small enough to check quickly.
-    /// Two columns so far (list + reader). The navigation column lives in
-    /// `withSidebar` rather than here, so the layout that ships without an
-    /// account — which has nothing to navigate — stays a plain two-pane split
-    /// instead of an empty sidebar strip.
+    /// The window's shared widths.
+    ///
+    /// A `@StateObject` on `RootView` rather than on either surface, so a surface
+    /// switch cannot reset the layout the user just set, and so the sidebar and
+    /// the list/reader pair solve as one system. See `ColumnWidthStore` for the
+    /// one-authority rule this exists to keep.
+    @StateObject private var columnStore = ColumnWidthStore()
+
+    /// The window's columns, for a known content width.
+    ///
+    /// `GeometryReader` is the one honest source of the window's width, and it is
+    /// read here rather than passed down: the three columns' widths are a function
+    /// of the window, so the place that knows the window is the place that tells
+    /// the store.
+    ///
+    /// The window's floor is stated here and not on either surface, because it
+    /// depends on all three columns: `sum(min) + separators`. A per-surface
+    /// minimum is what previously sat at 720 while the three columns needed 820,
+    /// guaranteeing a breach on every narrow window
+    /// (`docs/三栏宽度求解器-实测结论.md`, conclusion 2).
+    @ViewBuilder
+    private func windowColumns(width: CGFloat) -> some View {
+        // The window's geometry is handed to the store here, in `body`, rather
+        // than from `.onChange` or `.task` on this view.
+        //
+        // Both of those attach to the *HStack*, and a width that arrives before
+        // the HStack has settled never reaches them: the first `width` they see
+        // can be the placeholder 0 `GeometryReader` hands out before the window
+        // is sized, and if the view does not rebuild afterwards, no real width
+        // ever arrives. The symptom was a window whose columns laid out
+        // correctly but whose separators reported 0pt — the store had solved,
+        // but against a container it believed was empty.
+        //
+        // Reading it in `body` is the deterministic version: any change to
+        // `width` re-runs this function, so the store is told before a single
+        // `.frame(width:)` below reads its answer.
+        let _ = columnStore.window(width: width, columns: visibleColumns)
+
+        HStack(spacing: 0) {
+            if visibleColumns.contains(.navigation) {
+                NavigationColumnView(store: columnStore) {
+                    Sidebar(
+                        selection: $destination,
+                        rules: sidebarRules,
+                        counts: folderCounts
+                    )
+                }
+                ColumnDivider(
+                    column: .navigation,
+                    invertedColumn: nil,
+                    store: columnStore,
+                )
+                .frame(width: ColumnLayoutMetrics.dividerHitWidth)
+            }
+            twoColumnSurfaces
+        }
+        .frame(minWidth: minimumWindowWidth, minHeight: ColumnLayoutMetrics.windowMinimumHeight)
+        .onAppear {
+            // One write per settled drag, not one per frame. Wired here rather
+            // than inside the store so `UserDefaults` stays behind an explicit
+            // call, and a window nobody ever dragged in never writes.
+            columnStore.installPersistence()
+        }
+    }
+
+    /// The columns this window has. Two without a connected account — there is
+    /// nothing to navigate — and three with one.
+    ///
+    /// Declared here rather than inferred inside the layout so the solve and the
+    /// draw are provably about the same set.
+    private var visibleColumns: [LagoonColumn] {
+        accounts.accountId == nil ? [.list, .reader] : [.navigation, .list, .reader]
+    }
+
+    /// `sum(min) + separators` over the columns actually present.
+    private var minimumWindowWidth: CGFloat {
+        visibleColumns.reduce(0) { $0 + CGFloat(ColumnLayoutMetrics.spec(for: $1).min) }
+            + CGFloat(Double(max(0, visibleColumns.count - 1)) * ColumnLayoutMetrics.dividerThickness)
+    }
+
     private var decorated: some View {
         VStack(spacing: 0) {
             if let banner = priorityBanner {
                 NoticeBannerView(banner: banner, onDismiss: { dismissPriorityBanner(banner) })
             }
-            Group {
-                if let accountId = accounts.accountId {
-                    withSidebar(accountId: accountId)
-                } else {
-                    twoColumnSurfaces
-                }
+            GeometryReader { proxy in
+                windowColumns(width: proxy.size.width)
             }
         }
         // The global `ErrorCenter` banner — used for failures raised outside
@@ -242,31 +319,6 @@ struct RootView: View {
             messagesSurface
         }
         .id(accounts.accountId)
-    }
-
-    /// Three columns: navigation / list / reader.
-    ///
-    /// The sidebar is *outside* the ZStack on purpose. It is a control, not a
-    /// surface: only one surface is ever mounted-visible, and putting the
-    /// sidebar inside it would have to unmount one surface to show it. As a
-    /// sibling it costs one small list view regardless of which surface is up.
-    @ViewBuilder
-    private func withSidebar(accountId: UUID) -> some View {
-        NavigationSplitView {
-            Sidebar(
-                selection: $destination,
-                rules: sidebarRules,
-                counts: folderCounts
-            )
-            .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 300)
-        } detail: {
-            twoColumnSurfaces
-        }
-        // The sidebar's own disclosure button is the affordance; AppKit's
-        // automatic one would duplicate it (same reason
-        // `MessageSplitLayout` removes the toggle it inherits).
-        .toolbar(removing: .sidebarToggle)
-        .task(id: accountId) { await refreshSidebarData() }
     }
 
     private var sheetStack: some View {

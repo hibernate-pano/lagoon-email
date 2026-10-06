@@ -49,6 +49,13 @@ struct BriefingFeedView: View {
     /// are disabled by the parent — keep-alive without traffic or hotkeys.
     var isVisible: Bool = true
 
+    /// The window's shared column widths, handed down by `RootView`.
+    ///
+    /// Injected rather than created here so the navigation column beside this
+    /// surface solves against the same numbers: one drag moves all three columns,
+    /// and a surface switch does not reset the layout the user just set.
+    let columnStore: ColumnWidthStore
+
     private let api = APIClient.shared
     private static let refreshInterval: Duration = .seconds(30)
     /// Fast cadence while the feed is empty (fresh connect, backfill still
@@ -141,14 +148,14 @@ struct BriefingFeedView: View {
         // `MessageSplitLayout` carries the `.toolbar(removing: .sidebarToggle)`
         // the split view would otherwise leak into the window toolbar, where
         // RootView's ZStack shows it twice (see that file's doc comment).
-        MessageSplitLayout(detailId: readerId) {
+        MessageSplitLayout(store: columnStore, detailId: readerId) {
             sidebar
         } detail: {
             if let remoteId = readerId {
                 destination(for: remoteId)
             }
         }
-        .frame(minWidth: 720, minHeight: 480)
+        .frame(minHeight: ColumnLayoutMetrics.windowMinimumHeight)
         .onAppear {
             // Debug hook: LAGOON_OPEN_MESSAGE=<remoteId> opens a message at
             // launch by selecting it. In the split layout this just moves the
