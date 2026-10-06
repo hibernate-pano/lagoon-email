@@ -120,7 +120,7 @@ final class PurgeRoutesTests: XCTestCase {
         // their FK points at `accounts(id)` rather than `message_headers`.
         // Without a row here the "delete is complete" assertion would pass on an
         // empty table and prove nothing.
-        try db.write { raw in
+        try await db.write { raw in
             try raw.execute(
                 sql: """
                     INSERT OR REPLACE INTO message_pins (account_id, remote_id)
@@ -181,7 +181,7 @@ final class PurgeRoutesTests: XCTestCase {
     private func rowExists(
         _ remoteId: String, _ accountId: UUID, _ db: LagoonDB
     ) async throws -> Bool {
-        try db.read { raw in
+        try await db.read { raw in
             try Row.fetchOne(
                 raw,
                 sql: "SELECT 1 FROM message_headers WHERE account_id = ? AND remote_id = ?",
@@ -193,7 +193,7 @@ final class PurgeRoutesTests: XCTestCase {
     private func dependentCounts(
         _ remoteId: String, _ accountId: UUID, _ db: LagoonDB
     ) async throws -> (bodies: Int, advice: Int, pins: Int, drafts: Int, overrides: Int) {
-        try db.read { raw in
+        try await db.read { raw in
             // One static statement per table, joined rather than interpolated.
             // `ci-guardrails` rightly refuses a SQL literal that carries an
             // interpolation — a table name cannot be a bound parameter in

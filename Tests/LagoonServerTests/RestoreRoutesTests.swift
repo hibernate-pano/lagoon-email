@@ -144,7 +144,7 @@ private func makeAccount(
     private func flags(
         _ remoteId: String, _ accountId: UUID, _ db: LagoonDB
     ) async throws -> (archived: Bool, deleted: Bool)? {
-        try db.read { raw in
+        try await db.read { raw in
             let row = try Row.fetchOne(
                 raw,
                 sql: """

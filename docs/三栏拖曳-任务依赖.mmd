@@ -1,7 +1,0 @@
-graph LR
-    T01[T01 求解器<br/>纯函数 + 常量] --> T02[T02 状态源与持久化<br/>ColumnResizeStore]
-    T02 --> T03[T03 手柄与三栏容器<br/>DividerHandle + ThreeColumnLayout]
-    T03 --> T04[T04 接入 RootView<br/>拆嵌套 + 宽度下限 832]
-    T04 --> T05[T05 无障碍/风险收口<br/>测试 + 逐项验证 + 守卫]
-    T01 -.-> T05
-    T04 -.-> T05

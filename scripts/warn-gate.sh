@@ -213,14 +213,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   # is the whole diagnostic — the OSC-8 form warn_diagnostic_name also accepts
   # only appears with colour enabled. The flag is kept because it makes the
   # rest of the line plain and the log stable to grep.
-  #
-  # `--disable-sandbox` is not optional on this machine. Without it SwiftPM dies
-  # in the *manifest* step — before a single line of the product is compiled —
-  # with `sandbox-exec: sandbox_apply: Operation not permitted`, so the gate
-  # could not run at all and the warnings it exists to catch were unchecked.
-  # CI is unaffected (its runners permit the sandbox); the flag is simply
-  # ignored there, which is why it is unconditional rather than probed for.
-  if ! swift build --disable-sandbox --build-tests --scratch-path "$scratch" -Xswiftc -no-color-diagnostics > "$build_log" 2>&1; then
+  if ! swift build --build-tests --scratch-path "$scratch" -Xswiftc -no-color-diagnostics > "$build_log" 2>&1; then
     cat "$build_log" >&2
     echo "❌ build failed" >&2
     exit 1

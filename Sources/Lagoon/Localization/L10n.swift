@@ -1033,64 +1033,6 @@ public struct L10n: Sendable, Equatable {
             "Keychain error: stored account id is not a valid UUID."
         )
     }
-
-    // MARK: - Column resizing
-
-    /// The separator handle's accessibility label, naming the column it
-    /// resizes.
-    ///
-    /// An exhaustive `switch` over the noun rather than a lookup table, so a
-    /// fourth column without a name is a compile error here instead of a
-    /// handle that VoiceOver announces as "adjustable" with nothing to adjust.
-    public func adjustColumnWidth(_ noun: String) -> String {
-        switch noun {
-        case "navigation": return pick("调整导航栏宽度", "Adjust the sidebar width")
-        case "list": return pick("调整邮件列表宽度", "Adjust the message list width")
-        case "reader": return pick("调整阅读区宽度", "Adjust the reading pane width")
-        default: return pick("调整列宽度", "Adjust the column width")
-        }
-    }
-
-    /// The spoken width. The unit is included because a bare number is read as
-    /// a count rather than a measurement.
-    public func columnWidthPoints(_ points: Int) -> String {
-        pick("\(points) 点", "\(points) points")
-    }
-
-    /// The separator's VoiceOver help: what the arrow keys do.
-    ///
-    /// Spoken rather than left implicit, because the step sizes are otherwise
-    /// invisible — a VoiceOver user would have to press increment repeatedly to
-    /// discover that one press is 16pt.
-    public var columnResizeHelp: String {
-        pick(
-            "使用上下方向键调整宽度，Page Up / Page Down 大幅调整，Home / End 跳到最小或最大宽度。",
-            "Use the up and down arrows to adjust, Page Up and Page Down for large steps, Home and End for the minimum and maximum."
-        )
-    }
-
-    /// The separator's tooltip.
-    ///
-    /// Names the column the drag moves *and* teaches the ⌥ inversion, because
-    /// neither is discoverable otherwise: the handle is a 1pt line with no label
-    /// until the pointer is already on it, and a modifier nobody has been told
-    /// about is a feature that does not exist. Both halves are needed — "drag to
-    /// resize" alone leaves the user guessing which column, and naming the column
-    /// without the modifier leaves the wider reader unreachable.
-    ///
-    /// `noun` is the column on the handle's left, as `adjustColumnWidth` takes it.
-    public func columnResizeTooltip(_ noun: String) -> String {
-        // The first separator cannot invert: ⌥ there would target the list,
-        // which is already the column to its left, so there would be nothing
-        // left to say.
-        guard noun != "navigation" else {
-            return pick("拖动调整左侧栏宽", "Drag to resize the left column")
-        }
-        return pick(
-            "拖动调整左侧栏宽，按住 ⌥ 改为调整阅读区宽度",
-            "Drag to resize the left column, or hold ⌥ to resize the reading pane"
-        )
-    }
 }
 
 // MARK: - SwiftUI environment

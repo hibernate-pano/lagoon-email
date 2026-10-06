@@ -74,7 +74,7 @@ final class SenderRouteTests: XCTestCase {
         // Same for `is_sent`: it records which folder a row was synced from, so
         // only the sent route sets it.
         if sent {
-            try db.write { raw in
+            try await db.write { raw in
                 try MessageStore.markSent(
                     remoteId: remoteId, accountId: accountId, db: raw
                 )
