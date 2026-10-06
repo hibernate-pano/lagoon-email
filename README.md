@@ -64,14 +64,28 @@ client shows.
 | Classify / summarize | same in-process pipeline (heuristics + optional LLM) |
 | Reply (send) | SMTP implicit TLS 465, `MIMEBuilder` output |
 | Archive | `UID MOVE` into the server's archive role folder (creates it if absent; falls back to COPY+EXPUNGE); gated on `capabilities.archiveFolder` |
-| Undo | remote move back (`unarchive`) then local flip; sent/unsubscribed/drafted are explicitly not undoable |
+| Un-archive | `UID MOVE` back to INBOX — a reverse path, not just the undo toast |
+| Trash | `UID MOVE` into the server's Trash (delete is a move, never a hard expunge); `?deleted=true` lists it |
+| Permanent delete | `UID EXPUNGE <uid>` (RFC 4315). **Requires UIDPLUS** — without it the operation is refused rather than degraded to plain `EXPUNGE`, which would remove every `\Deleted`-flagged message in the folder including other clients' pending deletions. Gated on already being in the Trash |
+| Sent | read-only listing over `/api/sent`; no cursor, no reconcile |
+| Undo | remote move back then local flip; permanent delete, sent/unsubscribed/drafted are explicitly not undoable |
 
 ## Storage (V3: embedded SQLite)
 
 One SQLite file (`GRDB`, WAL mode, foreign keys ON) holds everything: accounts
 (credential blobs AES-GCM sealed), message headers + bodies, pins, drafts,
 `ai_actions` audit log (undo + time-saved), usage/budget log, user-defined
-stack rules.
+stack rules, and the read-only `advice` table.
+
+Note on foreign keys: they **are** on (`LagoonDatabase.open` sets
+`foreignKeysEnabled = true`), so `ON DELETE CASCADE` fires for the two tables
+whose FK points at `message_headers` (`message_bodies`, `advice`). It does
+**not** fire for the three that reference `accounts(id)` instead
+(`message_pins`, `draft_replies`, `ai_overrides`) — those need explicit
+deletion, which is why `hardDeleteSync` does it by hand. Do not check this
+with the `sqlite3` CLI: it opens its own connection, and the pragma is
+per-connection and defaults to OFF there, so it reports 0 regardless of what
+the app does.
 
 - **Schema**: `Sources/LagoonKit/LagoonDatabase.swift` — the final state of
   the historical 19 Postgres migrations, expressed for SQLite and applied
@@ -168,12 +182,32 @@ heuristic-only and `/summary` returns 503 — it never crashes.
   trash delete, sweep, rule suggestions (v2.2.0).
 - **V3**: embedded runtime — SQLite replaces Docker Postgres, the
   server becomes a library inside the app, secrets move to the Keychain.
-- **V3.1 (this)**: advisory-only AI — the sync loop is typed read-only
+- **V3.1**: advisory-only AI — the sync loop is typed read-only
   (`MailSyncReading`), the whitelist autopilot is gone, and one classifier
   call now yields both the feed group and a read-only suggestion stored in
   the `advice` table (30-day window, 500-row cap, overflow reported). The
   sender sheet gains bulk mark-read / archive / delete, each confirmed,
   each undoable.
+- **V3.2 (this)**: the management verbs and the list surfaces that were
+  missing after them — archive/unarchive, a listable Trash (its rows were
+  never queryable before: `is_deleted = FALSE` was hardcoded into the shared
+  filter), restore, permanent delete and empty-trash behind three gates
+  (must already be in the Trash, user-initiated only, local delete strictly
+  after remote success), bulk delete, and Gmail-style two-stage select-all
+  where ⌘A deliberately means *loaded rows only*. Sent mail becomes a real
+  listing (`/api/sent`, no cursor by design — reconciling a folder the user
+  can also write to from another client would delete mail they can see).
+  `is_sent` is a third axis, mutually exclusive with archived/deleted.
+  Three-column navigation, AI advice inline on rows, list density, hover
+  preview, bulk bar, sender ranking, and search that recalls the classifier's
+  own verdicts (reusing the `advice` table — no extra model calls).
+  Four defects fixed along the way, one of them data loss: `/api/delete-bulk`
+  dropped the `sent` field, so "select all sent, then delete" resolved to the
+  inbox; `hardDeleteSync` left `draft_replies` / `ai_overrides` orphaned
+  (their FK points at `accounts`, so SQLite never cascades them); API auth
+  was fail-open on a path spelling like `//api/ping`; and the IMAP backfill
+  window counted UID *slots* rather than messages, which on a sparse-UID
+  mailbox covered ~43 of 500 intended messages while reporting healthy.
 
 ## Known limitations (by design)
 
