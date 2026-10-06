@@ -164,27 +164,97 @@ struct RootView: View {
     // Extracted from `body`: the combined expression sits right at the
     // Swift type-checker's time limit, and any upstream change (e.g. a new
     // ConnectView parameter) tips it over into an unreasonable-time error.
+    /// Three columns: navigation / list / reader, for the whole window.
+    ///
+    /// One layout for the window, not one per surface — that is the whole
+    /// point. The previous shape was an outer `NavigationSplitView` here
+    /// wrapping an inner one inside each surface, so two independent constraint
+    /// systems both answered "how wide is the list?" and the list column's width
+    /// was their *intersection*, which is why dragging to either end hit an
+    /// invisible wall. Now the three columns solve together through one
+    /// `ColumnLayoutStore`, and dragging any one of them moves the other two by
+    /// weight.
+    ///
+    /// The sidebar is *outside* the keep-alive ZStack on purpose. It is a
+    /// control, not a surface: only one surface is ever mounted-visible, and
+    /// putting the sidebar inside it would have to unmount one surface to show
+    /// it. As a sibling it costs one small list view regardless of which
+    /// surface is up.
+    @ViewBuilder
+    private func threeColumnLayout(accountId: UUID) -> some View {
+        HStack(spacing: 0) {
+            NavigationColumnView(store: columnStore) {
+                Sidebar(
+                    selection: $destination,
+                    rules: sidebarRules,
+                    counts: folderCounts
+                )
+            }
+            .frame(width: CGFloat(columnWidths[.navigation] ?? 0))
+            keepAliveSurfaces
+        }
+        .frame(minWidth: CGFloat(ColumnLayoutMetrics.windowMinimumWidth))
+        .task(id: accountId) { await refreshSidebarData() }
+        .onAppear {
+            // One write per settled drag, not one per frame. Wired here rather
+            // than inside the store so `UserDefaults` stays behind an explicit
+            // call, and a window nobody ever dragged in never writes.
+            columnStore.onSettle = { [columnStore] widths in columnStore.persist(widths) }
+        }
+    }
+
+    /// The two surfaces' keep-alive ZStack: the list and reader columns.
+    ///
+    /// The ZStack is the *only* place the two surfaces coexist, and it exists so
+    /// their scroll positions and poll loops survive a switch. Each surface
+    /// brings its own `MessageSplitLayout`, and both are handed this same
+    /// `columnStore` — which is why switching surfaces does not reset the
+    /// layout the user just set, and why one drag moves the sidebar too.
+    private var keepAliveSurfaces: some View {
+        ZStack {
+            briefingSurface
+            messagesSurface
+        }
+        .id(accounts.accountId)
+    }
+
+    /// The widths the *navigation* column's region is told to draw.
+    ///
+    /// The only place SwiftUI reads a width, and it reads `settledWidths` — the
+    /// tier that publishes on a settle, a resize, a keyboard step or a reset,
+    /// and **not** on drag motion. A drag therefore never schedules a SwiftUI
+    /// transaction; the three columns are moved entirely in the AppKit layer by
+    /// `ColumnLayoutStore.redrawAll()`.
+    private var columnWidths: [LagoonColumn: Double] { columnStore.settledWidths }
+
+    /// The window's shared layout state.
+    ///
+    /// A `@StateObject` on `RootView` rather than on the surfaces, so it
+    /// survives a surface switch and is shared by every region. See
+    /// `ColumnLayoutStore` for the two-tier width design and why the drag tier
+    /// does not publish.
+    @StateObject private var columnStore = ColumnLayoutStore()
+
     @ViewBuilder private var briefingSurface: some View {
-        BriefingFeedView(isVisible: surface == .briefing, onShowAllMessages: { go(to: .allMessages) })
-            .opacity(surface == .briefing ? 1 : 0)
-            .disabled(surface != .briefing)
-            .allowsHitTesting(surface == .briefing)
-            .accessibilityHidden(surface != .briefing)
+        BriefingFeedView(
+            isVisible: surface == .briefing,
+            columnStore: columnStore,
+            onShowAllMessages: { go(to: .allMessages) }
+        )
+            .modifier(SurfaceVisibility(isActive: surface == .briefing))
     }
 
     @ViewBuilder private var messagesSurface: some View {
         MessageListView(
             isVisible: surface == .allMessages,
+            columnStore: columnStore,
             lens: MessageListView.Lens(destination),
             onShowBriefing: { go(to: .briefing) },
             onClearLens: { destination = .allMessages },
             senderFocusRequest: $senderFocusRequest,
             senderToFile: $senderToFile
         )
-            .opacity(surface == .allMessages ? 1 : 0)
-            .disabled(surface != .allMessages)
-            .allowsHitTesting(surface == .allMessages)
-            .accessibilityHidden(surface != .allMessages)
+            .modifier(SurfaceVisibility(isActive: surface == .allMessages))
             // A lens change has to re-query: `未读` and a rule are server-side
             // filters, so re-filtering the rows already in memory would show a
             // list the server never sent. Keyed on the destination, which
@@ -192,14 +262,31 @@ struct RootView: View {
             .id(destination)
     }
 
+    /// Hides the surface that is not showing, without unmounting it.
+    ///
+    /// Extracted so both surfaces hide identically. The four modifiers are a
+    /// set: `opacity` alone leaves the hidden surface clickable,
+    /// `allowsHitTesting` alone leaves its keyboard shortcuts live, and
+    /// `accessibilityHidden` alone leaves it in the VoiceOver rotor. See
+    /// `.memory/toolbar-items-escape-hidden-zstack-surfaces` for the channel
+    /// this does *not* cover — window-level toolbar items — and why the layout
+    /// no longer produces any.
+    private struct SurfaceVisibility: ViewModifier {
+        let isActive: Bool
+
+        func body(content: Content) -> some View {
+            content
+                .opacity(isActive ? 1 : 0)
+                .disabled(!isActive)
+                .allowsHitTesting(isActive)
+                .accessibilityHidden(!isActive)
+        }
+    }
+
     // `body` used to be one giant SwiftUI expression that sat right at the
     // type-checker's time limit; adding a ConnectView parameter tipped it
     // over into "unable to type-check in reasonable time". The three computed
     // properties below keep each chain small enough to check quickly.
-    /// Two columns so far (list + reader). The navigation column lives in
-    /// `withSidebar` rather than here, so the layout that ships without an
-    /// account — which has nothing to navigate — stays a plain two-pane split
-    /// instead of an empty sidebar strip.
     private var decorated: some View {
         VStack(spacing: 0) {
             if let banner = priorityBanner {
@@ -207,9 +294,13 @@ struct RootView: View {
             }
             Group {
                 if let accountId = accounts.accountId {
-                    withSidebar(accountId: accountId)
+                    threeColumnLayout(accountId: accountId)
                 } else {
+                    // No account, so nothing to navigate: a plain two-pane
+                    // layout rather than an empty sidebar strip. The window
+                    // floor is lower here for the same reason.
                     twoColumnSurfaces
+                        .frame(minWidth: CGFloat(twoColumnMinimumWidth))
                 }
             }
         }
@@ -235,38 +326,20 @@ struct RootView: View {
         }
     }
 
-    /// The two surfaces and their keep-alive ZStack, unchanged.
+    /// `sum(min) + separators` for the list and reader alone.
+    private var twoColumnMinimumWidth: Double {
+        [LagoonColumn.list, .reader].reduce(0) { $0 + ColumnLayoutMetrics.spec(for: $1).min }
+            + ColumnLayoutMetrics.dividerThickness
+    }
+
+    /// The two surfaces and their keep-alive ZStack, used when there is no
+    /// account and therefore no navigation column.
     private var twoColumnSurfaces: some View {
         ZStack {
             briefingSurface
             messagesSurface
         }
         .id(accounts.accountId)
-    }
-
-    /// Three columns: navigation / list / reader.
-    ///
-    /// The sidebar is *outside* the ZStack on purpose. It is a control, not a
-    /// surface: only one surface is ever mounted-visible, and putting the
-    /// sidebar inside it would have to unmount one surface to show it. As a
-    /// sibling it costs one small list view regardless of which surface is up.
-    @ViewBuilder
-    private func withSidebar(accountId: UUID) -> some View {
-        NavigationSplitView {
-            Sidebar(
-                selection: $destination,
-                rules: sidebarRules,
-                counts: folderCounts
-            )
-            .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 300)
-        } detail: {
-            twoColumnSurfaces
-        }
-        // The sidebar's own disclosure button is the affordance; AppKit's
-        // automatic one would duplicate it (same reason
-        // `MessageSplitLayout` removes the toggle it inherits).
-        .toolbar(removing: .sidebarToggle)
-        .task(id: accountId) { await refreshSidebarData() }
     }
 
     private var sheetStack: some View {

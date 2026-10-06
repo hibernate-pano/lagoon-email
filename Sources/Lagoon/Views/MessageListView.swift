@@ -207,6 +207,13 @@ struct MessageListView: View {
     /// The poll loop sleeps instead of refreshing — keep-alive costs no
     /// traffic. Hidden shortcuts are disabled by the parent.
     var isVisible: Bool = true
+    /// The window's shared column layout, handed down by `RootView`.
+    ///
+    /// Injected rather than created here so the navigation column's region and
+    /// this surface's region solve as one three-column system. A store owned by
+    /// this view would reset the user's layout on every surface switch, and two
+    /// stores would be exactly the nested-constraint bug the layout replaced.
+    let columnStore: ColumnLayoutStore
     private let api = APIClient.shared
 
     /// Which slice of the mailbox the sidebar is pointing at.
@@ -550,12 +557,14 @@ struct MessageListView: View {
         }
     }
 
-    var body: some View {
-        // Selection drives the reading pane; nothing is pushed any more. The
-        // old `NavigationStack(path:)` replaced the whole window with the
-        // message, which is what made triage feel like a horizontal bar of
-        // subjects you had to commit to one at a time.
+    /// The list and reader columns, as one region of the window's layout.
+    ///
+    /// The store is injected by `RootView` so this surface and the navigation
+    /// column's region solve against the same numbers — one drag moves all
+    /// three columns, and a surface switch does not reset the layout.
+    var listColumn: some View {
         MessageSplitLayout(
+            store: columnStore,
             detailId: previewId,
             multiSelectionCount: multiSelectionCount
         ) {
@@ -565,8 +574,18 @@ struct MessageListView: View {
                 destination(for: previewId)
             }
         }
-        .noticeBanner($errorBanner)
-        .frame(minWidth: 720, minHeight: 480)
+    }
+
+    var body: some View {
+        // The list and reader columns only.
+        //
+        // This view used to own a nested `NavigationSplitView`, whose two
+        // constraint systems both answered "how wide is the list?" and whose
+        // intersection with `RootView`'s outer split was what the user hit as an
+        // invisible wall. `RootView` now owns one layout for the whole window
+        // and hands this view the shared store. See `MessageSplitLayout`.
+        listColumn
+            .noticeBanner($errorBanner)
         // 彻底删除 confirmation. `.alert` rather than a sheet, deliberately:
         // a sheet reads as a settings panel and gets dismissed reflexively,
         // whereas an alert has to be answered. It is the only irreversible

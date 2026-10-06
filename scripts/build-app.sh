@@ -6,7 +6,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-swift build -c release --product Lagoon
+# `--disable-sandbox` is not optional on this machine: without it SwiftPM dies
+# in the manifest step with `sandbox-exec: sandbox_apply: Operation not
+# permitted`, before compiling anything. CI runners permit the sandbox and
+# ignore the flag, so it is unconditional rather than probed for.
+swift build --disable-sandbox -c release --product Lagoon
 
 APP="dist/Lagoon.app"
 CONTENTS="$APP/Contents"

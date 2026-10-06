@@ -78,7 +78,7 @@ final class StackCountConsistencyTests: XCTestCase {
             )
         }
         if sent {
-            try await db.write { raw in
+            try db.write { raw in
                 try MessageStore.markSent(
                     remoteId: remoteId, accountId: accountId, db: raw
                 )

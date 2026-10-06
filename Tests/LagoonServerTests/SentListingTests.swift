@@ -80,7 +80,7 @@ final class SentListingTests: XCTestCase {
             )
         }
         if sent {
-            try await db.write { raw in
+            try db.write { raw in
                 try MessageStore.markSent(remoteId: remoteId, accountId: accountId, db: raw)
             }
         }
@@ -234,7 +234,6 @@ final class SentListingTests: XCTestCase {
     /// message?" answerable.
     func test_theThreeAxesAreMutuallyExclusive() async throws {
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
-            let provider = StubMailProvider()
             let account = makeAccount()
             try await TestDatabase.withConnection { conn in
                 try await seed(account, db: conn)
@@ -397,7 +396,7 @@ final class SentListingTests: XCTestCase {
                 try await seedLocal("unreadIn", accountId: account.id, db: conn)
                 // `seedLocal` writes `isRead: true`; unread is the state under
                 // test, so both rows are set unread explicitly below.
-                try await conn.write { raw in
+                _ = try conn.write { raw in
                     try MessageStore.setReadSync(
                         remoteId: "unreadIn", accountId: account.id,
                         isRead: false, db: raw
@@ -406,7 +405,7 @@ final class SentListingTests: XCTestCase {
                 // A sent row that was never marked read — exactly what a
                 // freshly sent reply looks like before it is opened.
                 try await seedLocal("unreadOut", accountId: account.id, db: conn, sent: true)
-                try await conn.write { raw in
+                _ = try conn.write { raw in
                     try MessageStore.setReadSync(
                         remoteId: "unreadOut", accountId: account.id,
                         isRead: false, db: raw
@@ -432,7 +431,7 @@ final class SentListingTests: XCTestCase {
                 try await seedLocal("pIn", accountId: account.id, db: conn)
                 try await seedLocal("pOut", accountId: account.id, db: conn, sent: true)
                 for remoteId in ["pIn", "pOut"] {
-                    try await conn.write { raw in
+                    try conn.write { raw in
                         try raw.execute(
                             sql: """
                                 INSERT OR REPLACE INTO message_pins

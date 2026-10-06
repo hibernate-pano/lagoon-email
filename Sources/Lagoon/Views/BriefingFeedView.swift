@@ -48,6 +48,13 @@ struct BriefingFeedView: View {
     /// The poll loop sleeps instead of refreshing, and hidden shortcuts
     /// are disabled by the parent — keep-alive without traffic or hotkeys.
     var isVisible: Bool = true
+    /// The window's shared column layout, handed down by `RootView`.
+    ///
+    /// Injected rather than created here so the navigation column's region and
+    /// this surface's region solve as one three-column system. A store owned by
+    /// this view would reset the user's layout on every surface switch, and two
+    /// stores would be exactly the nested-constraint bug the layout replaced.
+    let columnStore: ColumnLayoutStore
 
     private let api = APIClient.shared
     private static let refreshInterval: Duration = .seconds(30)
@@ -132,23 +139,30 @@ struct BriefingFeedView: View {
         }
     }
 
-    var body: some View {
-        // Selection drives the reading pane; nothing is pushed any more. The
-        // `NavigationStack(path:)` this replaced replaced the whole window with
-        // the message, so triage meant committing to one row at a time and
-        // pressing back to see the list again. The split keeps both on screen.
-        //
-        // `MessageSplitLayout` carries the `.toolbar(removing: .sidebarToggle)`
-        // the split view would otherwise leak into the window toolbar, where
-        // RootView's ZStack shows it twice (see that file's doc comment).
-        MessageSplitLayout(detailId: readerId) {
+    /// The list and reader columns, as one region of the window's layout.
+    ///
+    /// The store is injected by `RootView` so this surface and the navigation
+    /// column's region solve against the same numbers — one drag moves all
+    /// three columns, and a surface switch does not reset the layout.
+    var listColumn: some View {
+        MessageSplitLayout(store: columnStore, detailId: readerId) {
             sidebar
         } detail: {
             if let remoteId = readerId {
                 destination(for: remoteId)
             }
         }
-        .frame(minWidth: 720, minHeight: 480)
+    }
+
+    var body: some View {
+        // The list and reader columns only.
+        //
+        // This view used to own a nested `NavigationSplitView`, whose two
+        // constraint systems both answered "how wide is the list?" and whose
+        // intersection with `RootView`'s outer split was what the user hit as an
+        // invisible wall. `RootView` now owns one layout for the whole window
+        // and hands this view the shared store. See `MessageSplitLayout`.
+        listColumn
         .onAppear {
             // Debug hook: LAGOON_OPEN_MESSAGE=<remoteId> opens a message at
             // launch by selecting it. In the split layout this just moves the
