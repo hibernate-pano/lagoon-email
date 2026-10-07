@@ -43,7 +43,7 @@ final class ShortcutSheetCoversRealBindingsTests: XCTestCase {
         let root = ViewSource.url(under: "Views", "RootView")
             .deletingLastPathComponent()          // Views
             .deletingLastPathComponent()          // Lagoon
-        let urls = try FileManager.default.enumerator(
+        let urls = FileManager.default.enumerator(
             at: root, includingPropertiesForKeys: nil
         )?.compactMap { ($0 as? URL) }.filter { $0.pathExtension == "swift" } ?? []
         XCTAssertFalse(urls.isEmpty, "no client sources found under \(root.path)")

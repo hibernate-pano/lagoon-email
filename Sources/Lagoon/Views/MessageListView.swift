@@ -1475,6 +1475,14 @@ struct MessageListView: View {
         defer { isEmptyingTrash = false }
         do {
             let response = try await api.emptyTrash(accountId: accountId)
+            // Invalidate *before* the mutation, not after: the guard in
+            // `RefreshGateTests` requires the retirement to be adjacent to the
+            // write it protects, and a poll that started before this sweep would
+            // otherwise restore the pre-sweep list and bring back mail the
+            // server has just destroyed for good. Every other row-removal verb
+            // in this file carries this call — 清空废纸篓 was the one that did
+            // not, and it is the only one where the removal cannot be undone.
+            invalidatePendingRefresh()
             messages.removeAll()
             selection.removeAll()
             serverTotalCount = nil

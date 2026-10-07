@@ -228,8 +228,7 @@ final class ColumnWidthStore: ObservableObject {
             Double(widths[column] ?? range.lowerBound) + Double(delta),
             to: range
         )
-        settle(column: column, target: target)
-        return widths[column] ?? 0
+        return settle(column: column, target: target)
     }
 
     /// Jumps a column straight to a bound.
@@ -242,8 +241,7 @@ final class ColumnWidthStore: ObservableObject {
             totalWidth: Double(windowWidth)
         )
         let target = bound == .min ? range.lowerBound : range.upperBound
-        settle(column: column, target: target)
-        return widths[column] ?? 0
+        return settle(column: column, target: target)
     }
 
     /// Double-click: every column back to `ideal`, immediately, no animation.

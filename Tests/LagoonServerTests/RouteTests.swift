@@ -1380,6 +1380,12 @@ final class RouteTests: XCTestCase {
         /// moved and the local side has not committed yet.
         private var archiveGate: RaceGate?
         private var unarchiveGate: RaceGate?
+        /// Parks inside `restoreFromTrash`, for the same reason as
+        /// `archiveGate`/`unarchiveGate`: the reconcile race this route has to
+        /// survive can only be observed while the remote MOVE is still in
+        /// flight. Without a gate the window closes before the test can look
+        /// at it, and a test that never sees the window passes either way.
+        private var restoreGate: RaceGate?
         private var unarchiveCount = 0
 
         init(
@@ -1397,6 +1403,7 @@ final class RouteTests: XCTestCase {
         func setArchiveError(_ error: MailError?) { archiveError = error }
         func setArchiveGate(_ gate: RaceGate?) { archiveGate = gate }
         func setUnarchiveGate(_ gate: RaceGate?) { unarchiveGate = gate }
+        func setRestoreGate(_ gate: RaceGate?) { restoreGate = gate }
 
         func capabilities() async -> MailCapabilities { capabilitiesValue }
 
@@ -1445,6 +1452,7 @@ final class RouteTests: XCTestCase {
 
         func restoreFromTrash(remoteId: String) async throws {
             restoredRemoteIds.append(remoteId)
+            if let restoreGate { await restoreGate.hold() }
         }
 
         func permanentlyDelete(remoteId: String) async throws {

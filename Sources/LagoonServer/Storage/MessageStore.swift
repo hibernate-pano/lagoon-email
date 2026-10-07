@@ -203,6 +203,13 @@ public enum MessageStore {
     /// Shared WHERE clause for `recent()` and `count()` so the badge
     /// total can never drift from the list it labels. Returns the clause
     /// (starting at WHERE) plus its bound arguments in order.
+    ///
+    /// Columns carry the `h` alias and the clause never interpolates a value
+    /// into the SQL text, because `ci-guardrails.sh` rule 1 forbids that — and
+    /// rightly: it is the shape that lets a caller-supplied string reach a
+    /// query. `reconcileInbox` states the same three axes against the bare
+    /// table; see its doc comment for why that duplication is deliberate and
+    /// what keeps the two in step.
     static func filterSQL(
         accountId: UUID,
         sender: String?,
@@ -210,7 +217,7 @@ public enum MessageStore {
         deleted: Bool = false,
         sent: Bool = false,
         stackMatch: StackMatch?,
-        receivedAfter: Date? = nil
+        receivedAfter: Date? = nil,
     ) -> (String, [DatabaseValueConvertible?]) {
         // 「已发送」是第三个**独立轴**，与 archived / deleted 互斥。
         //
@@ -366,6 +373,37 @@ public enum MessageStore {
     /// **Deleted rows are retained for the same reason** — they sit in the
     /// server's Trash and `is_deleted` must survive reconcile or the undo
     /// would restore a row that no longer exists.
+    ///
+    /// **Sent rows are retained for the same reason, and by the same rule.**
+    /// Sent rows used to fall through this predicate: it listed
+    /// `is_archived`/`is_deleted` but not `is_sent`, which R1 added later. That
+    /// divergence was not cosmetic: `SentRoutes`
+    /// writes sent rows with `is_archived = FALSE` and `is_deleted = FALSE`
+    /// (the sync loop hardcodes `isArchived: false`), so every reply the user
+    /// had ever sent fell straight through this predicate and was deleted
+    /// from `message_headers` — taking its cached body with it via
+    /// `ON DELETE CASCADE`, and orphaning `draft_replies`/`ai_overrides`,
+    /// which carry no FK. The list came back on the next GET, so it read as
+    /// a flicker; the classifications the user had taught it did not.
+    ///
+    /// The three axes are therefore spelled out here as a literal, and this
+    /// predicate is now a **second** copy of the inbox definition rather than a
+    /// derived one.
+    ///
+    /// That was tried and reverted. `filterSQL` gained an alias parameter so
+    /// this could call it — and the alias has to be interpolated into the SQL
+    /// text, which `ci-guardrails.sh` rule 1 exists to forbid (correctly: it is
+    /// the shape that lets a caller-supplied string reach a query). Parameterising
+    /// the columns to dodge that just traded one interpolation for eight.
+    /// The project already has the sanctioned shape for this — assemble with
+    /// `[literal, whereClause].joined(separator:)`, as `recent()` and `count()`
+    /// do — but joining is no help when the shared piece *is* the SQL.
+    ///
+    /// So the duplication stays, deliberately, and the guard against drift is
+    /// a test rather than an abstraction: `SentListingTests` asserts this exact
+    /// predicate against a sent row. A third axis added to `filterSQL` without
+    /// being added here turns that test red, which is the moment to fix it.
+    /// Adding it here without adding it to `filterSQL` turns it red too.
     public static func reconcileInbox(
         accountId: UUID,
         keeping remoteIds: Set<String>,
@@ -377,7 +415,10 @@ public enum MessageStore {
                 sql: """
                     SELECT remote_id
                     FROM message_headers
-                    WHERE account_id = ? AND is_archived = FALSE AND is_deleted = FALSE
+                    WHERE account_id = ?
+                      AND is_archived = FALSE
+                      AND is_deleted = FALSE
+                      AND is_sent = FALSE
                     """,
                 arguments: [accountId]
             )

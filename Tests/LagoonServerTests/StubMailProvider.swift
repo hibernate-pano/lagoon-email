@@ -34,6 +34,15 @@ actor StubMailProvider: MailProvider {
     private(set) var restoreCalls: [String] = []
     private var unarchiveFailure: MailError?
     private var restoreFailure: MailError?
+    /// Rendezvous points for the restore/unarchive routes' reconcile race.
+    ///
+    /// The window these routes have to survive only exists while the remote
+    /// MOVE is in flight, so a test cannot observe it without parking the
+    /// provider here first. Parking happens *after* the call is recorded and
+    /// *before* any scripted failure is thrown, so a gated test still sees the
+    /// call in `restoreCalls`/`unarchiveCalls`.
+    private var unarchiveGate: RaceGate?
+    private var restoreGate: RaceGate?
     /// 彻底删除的调用记录。Recorded separately from `trashCalls` because the
     /// two are opposites: `trash` is reversible via the route, `permanentlyDelete`
     /// is not, and a test that cannot tell them apart cannot assert that a
@@ -119,6 +128,7 @@ actor StubMailProvider: MailProvider {
     }
     func unarchive(remoteId: String) async throws {
         unarchiveCalls.append(remoteId)
+        if let unarchiveGate { await unarchiveGate.hold() }
         if let unarchiveFailure { throw unarchiveFailure }
     }
     func trash(remoteId: String) async throws {
@@ -127,6 +137,7 @@ actor StubMailProvider: MailProvider {
     }
     func restoreFromTrash(remoteId: String) async throws {
         restoreCalls.append(remoteId)
+        if let restoreGate { await restoreGate.hold() }
         if let restoreFailure { throw restoreFailure }
     }
     func permanentlyDelete(remoteId: String) async throws {
@@ -177,6 +188,12 @@ actor StubMailProvider: MailProvider {
     }
     func setRestoreFailure(_ error: MailError?) {
         restoreFailure = error
+    }
+    func setUnarchiveGate(_ gate: RaceGate?) {
+        unarchiveGate = gate
+    }
+    func setRestoreGate(_ gate: RaceGate?) {
+        restoreGate = gate
     }
     /// Actor-isolated knobs for scripted trash failures + observation.
     func setTrashFailure(_ error: MailError?) {

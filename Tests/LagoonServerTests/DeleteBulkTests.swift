@@ -126,7 +126,7 @@ final class DeleteBulkTests: XCTestCase {
     private func isDeleted(
         _ remoteId: String, _ accountId: UUID, _ db: LagoonDB
     ) async throws -> Bool {
-        try await db.read { raw in
+        try db.read { raw in
             try Bool.fetchOne(
                 raw,
                 sql: "SELECT is_deleted FROM message_headers WHERE account_id = ? AND remote_id = ?",
@@ -309,7 +309,7 @@ final class DeleteBulkTests: XCTestCase {
                 // was synced, so the test has to say so explicitly, exactly as
                 // `SentListingTests` does. `markSent` is the sync-shaped writer
                 // and takes a raw `Database`, so it goes through `db.write`.
-                try await conn.write { raw in
+                try conn.write { raw in
                     for id in ["s1", "s2"] {
                         try MessageStore.markSent(
                             remoteId: id, accountId: account.id, db: raw

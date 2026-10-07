@@ -80,7 +80,7 @@ final class SentListingTests: XCTestCase {
             )
         }
         if sent {
-            try await db.write { raw in
+            try db.write { raw in
                 try MessageStore.markSent(remoteId: remoteId, accountId: accountId, db: raw)
             }
         }
@@ -234,7 +234,6 @@ final class SentListingTests: XCTestCase {
     /// message?" answerable.
     func test_theThreeAxesAreMutuallyExclusive() async throws {
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
-            let provider = StubMailProvider()
             let account = makeAccount()
             try await TestDatabase.withConnection { conn in
                 try await seed(account, db: conn)
@@ -397,7 +396,7 @@ final class SentListingTests: XCTestCase {
                 try await seedLocal("unreadIn", accountId: account.id, db: conn)
                 // `seedLocal` writes `isRead: true`; unread is the state under
                 // test, so both rows are set unread explicitly below.
-                try await conn.write { raw in
+                _ = try conn.write { raw in
                     try MessageStore.setReadSync(
                         remoteId: "unreadIn", accountId: account.id,
                         isRead: false, db: raw
@@ -406,7 +405,7 @@ final class SentListingTests: XCTestCase {
                 // A sent row that was never marked read — exactly what a
                 // freshly sent reply looks like before it is opened.
                 try await seedLocal("unreadOut", accountId: account.id, db: conn, sent: true)
-                try await conn.write { raw in
+                _ = try conn.write { raw in
                     try MessageStore.setReadSync(
                         remoteId: "unreadOut", accountId: account.id,
                         isRead: false, db: raw
@@ -432,7 +431,7 @@ final class SentListingTests: XCTestCase {
                 try await seedLocal("pIn", accountId: account.id, db: conn)
                 try await seedLocal("pOut", accountId: account.id, db: conn, sent: true)
                 for remoteId in ["pIn", "pOut"] {
-                    try await conn.write { raw in
+                    try conn.write { raw in
                         try raw.execute(
                             sql: """
                                 INSERT OR REPLACE INTO message_pins
@@ -449,6 +448,86 @@ final class SentListingTests: XCTestCase {
                 XCTAssertEqual(
                     pinned, 1,
                     "a pin on a sent message describes nothing the 置顶 list shows"
+                )
+            }
+        }
+    }
+
+    /// `reconcileInbox` must not delete sent rows — the **write** half of the
+    /// exclusion this file already tests on the read half.
+    ///
+    /// `test_sentMailNeverAppearsInTheInbox` proves the inbox *listing*
+    /// excludes sent mail. It says nothing about the reconciler, which decides
+    /// which rows still *exist* — and that predicate used to be a second,
+    /// hand-written copy of the inbox axes. It listed `is_archived` and
+    /// `is_deleted` but not `is_sent`, because `is_sent` arrived later, with
+    /// R1.
+    ///
+    /// That divergence deleted real mail. A sent row is written by
+    /// `SentRoutes` with `is_archived = FALSE` and `is_deleted = FALSE` (the
+    /// sync loop hardcodes `isArchived: false`), so it fell straight through
+    /// the delete predicate on the next sync round: the header went, the
+    /// cached body went with it via `ON DELETE CASCADE`, and `draft_replies`
+    /// / `ai_overrides` — which carry no FK — were orphaned. The list came
+    /// back on the next GET, so from the outside it read as a flicker; what
+    /// did not come back was everything the user had taught the app about
+    /// that sender.
+    ///
+    /// The row has to survive with its **body** attached: a surviving header
+    /// over a cascaded-away body is the same loss wearing a nicer symptom.
+    ///
+    /// The ordinary inbox row is the control. It *should* be reconciled away,
+    /// and if it ever survives, this test has passed for the wrong reason —
+    /// which is why it is asserted rather than left implicit.
+    func test_reconcileInboxKeepsSentRowsAndTheirBodies() async throws {
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            let account = makeAccount()
+            try await TestDatabase.withConnection { conn in
+                try await seed(account, db: conn)
+                let sentId = "sent-\(UUID().uuidString)"
+                try await seedLocal(sentId, accountId: account.id, db: conn, sent: true)
+                try await BodyStore.put(
+                    accountId: account.id,
+                    remoteId: sentId,
+                    body: FetchedBody(
+                        text: "a reply I sent", html: nil, attachments: [], hasMore: false
+                    ),
+                    db: conn
+                )
+                let goneId = "gone-\(UUID().uuidString)"
+                try await seedLocal(goneId, accountId: account.id, db: conn)
+
+                try await MessageStore.reconcileInbox(
+                    accountId: account.id, keeping: [], db: conn
+                )
+
+                let survivors = try await MessageStore.recent(
+                    forAccount: account.id, limit: 100, sender: nil,
+                    archived: false, deleted: false, sent: true,
+                    stackMatch: nil, db: conn
+                ).map(\.remoteId)
+                XCTAssertEqual(
+                    survivors, [sentId],
+                    "reconcile deleted a sent row: it is absent from the INBOX "
+                    + "snapshot, but it is not inbox mail either"
+                )
+                let body = try await BodyStore.get(
+                    accountId: account.id, remoteId: sentId, db: conn
+                )
+                XCTAssertEqual(
+                    body?.text, "a reply I sent",
+                    "the header survived but its body was cascaded away — the "
+                    + "same loss with a symptom that reads like a cache miss"
+                )
+                let inbox = try await MessageStore.recent(
+                    forAccount: account.id, limit: 100, sender: nil,
+                    archived: false, deleted: false, sent: false,
+                    stackMatch: nil, db: conn
+                ).map(\.remoteId)
+                XCTAssertTrue(
+                    inbox.isEmpty,
+                    "the control row survived, so this test could pass with "
+                    + "reconcile having stopped deleting altogether"
                 )
             }
         }
