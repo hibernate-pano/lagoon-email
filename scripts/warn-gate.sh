@@ -45,9 +45,12 @@ ALLOWED=(
 #
 # Two output shapes are possible and BOTH must work:
 #
-#   1. Plain (this is what the gate actually sees today):
+#   1. Plain, with a trailing fixed-name marker:
 #        …: warning: 'x' was deprecated [#DeprecatedDeclaration]
-#      Fixed-width `warning:` and a trailing `[#Name]`.
+#      Emitted by Swift 6.2+ when diagnostics reach the terminal without the
+#      hyperlink form. Not what THIS gate sees today (see the -no-color-diagnostics
+#      note at the bottom of the file), but it is the shape CI logs have shown
+#      and the shape the Swift 6.1 fallback below cannot see.
 #
 #   2. OSC-8 hyperlink (colour diagnostics on):
 #        …: warning: 'x' was deprecated [#\e]8;;URL\e\DeprecatedDeclaration\e]8;;\e\]
@@ -150,7 +153,14 @@ warn_is_allowlisted() {
 # `swift build`. Args: path to a build log on stdin-compatible file $1.
 run_warn_gate() {
   local build_log="${1:?build log path required}"
-  local repo_root="$PWD"
+  # Must be RESOLVED, not $PWD. swiftc prints the physical path in its
+  # diagnostics; comparing them against a logical $PWD means a repo reached
+  # through a symlink (/tmp -> /private/tmp, a linked worktree, a checkout
+  # under mktemp) matches NO warning, every line falls through the `*) continue`
+  # arm, and this hard gate reports ✅ over real violations — the silent no-op
+  # failure mode, the mirror image of the permanently-red gate that already
+  # cost this repo a day. Covered by scripts/test-warn-gate.sh.
+  local repo_root="$(pwd -P)"
 
   # `file:line:col: warning: message [#DiagnosticName]`
   #
@@ -209,10 +219,16 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   scratch="$(mktemp -d)"
   trap 'rm -f "$build_log"; rm -rf "$scratch"' EXIT
 
-  # SwiftPM passes `-no-color-diagnostics` through, and on this toolchain that
-  # is the whole diagnostic — the OSC-8 form warn_diagnostic_name also accepts
-  # only appears with colour enabled. The flag is kept because it makes the
-  # rest of the line plain and the log stable to grep.
+  # The flag is passed because it is documented to stabilise the diagnostic
+  # text, but on this toolchain (Swift 6.4) it does NOT strip colour: the build
+  # log still carries ANSI and OSC-8 hyperlink escapes (measured: 581 lines with
+  # ESC bytes). Real diagnostics therefore arrive as
+  #   `... [#<OSC-8>]DeprecatedDeclaration<OSC-8>]`
+  # and are classified by warn_diagnostic_name's OSC-8 branch, not the plain
+  # `[#Name]` branch. Both shapes are matched and both are covered by
+  # scripts/test-warn-gate.sh fixtures — do NOT delete either branch on the
+  # assumption that only one is live; the allowlist entry depends on the OSC-8
+  # branch actually firing.
   if ! swift build --build-tests --scratch-path "$scratch" -Xswiftc -no-color-diagnostics > "$build_log" 2>&1; then
     cat "$build_log" >&2
     echo "❌ build failed" >&2

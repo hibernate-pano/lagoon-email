@@ -24,7 +24,12 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/warn-gate.sh"
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-repo_root="$PWD"
+# MUST be the resolved path, not $PWD. swiftc prints the physical path in its
+# diagnostics, and run_warn_gate compares the two. A repo reached through a
+# symlink (/tmp -> /private/tmp, a linked worktree, mktemp under /var) makes
+# $PWD logical while the log stays physical, every warning then falls through
+# the `*) continue` arm, and the gate reports green over real violations.
+repo_root="$(pwd -P)"
 
 pass=0
 fail=0
@@ -201,6 +206,67 @@ if warn_is_allowlisted "$repo_root/Sources/LagoonServer/Routes/MessageRoutes.swi
   bad "different file + same diagnostic still rejected"
 else
   ok "different file + same diagnostic still rejected"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== symlinked repo root (the silent no-op) =="
+
+# swiftc resolves symlinks before printing a diagnostic path, so a build log
+# always holds the PHYSICAL path. If the gate takes its repo root from $PWD and
+# that is the LOGICAL path (/tmp vs /private/tmp, a linked worktree, a repo
+# under mktemp), no warning matches `$repo_root/Sources/` and every one drops
+# into `*) continue`: the hard gate becomes a no-op that reports ✅ over real
+# violations. This fixture feeds a physical path and runs the gate from a
+# symlinked directory, so the mismatch is the thing under test — not an
+# assumption baked into the fixture, which is why the existing $repo_root-built
+# logs could never catch it.
+physical="$tmp/phys"
+logical="$tmp/logi"
+mkdir -p "$physical/Sources/LagoonServer"
+ln -s "$physical" "$logical"
+# Resolve the physical root the way swiftc does: $tmp itself is under
+# /var/folders on macOS and /var is a symlink, so an unresolved fixture path
+# would mismatch for the wrong reason and mask the thing under test.
+physical="$(cd "$physical" && pwd -P)"
+log="$tmp/symlinked.log"
+cat > "$log" <<LOG
+$physical/Sources/LagoonServer/Foo.swift:1:1: warning: variable 'x' was never used [#NoUsage]
+LOG
+rc=0
+( cd "$logical" && run_warn_gate "$log" ) >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 1 ]; then
+  ok "physical log path + symlinked cwd → still exit 1 (was a silent no-op)"
+else
+  bad "physical log path + symlinked cwd → exit $rc, want 1: gate is a no-op when the repo is reached through a symlink"
+fi
+
+# Same mismatch on the Tests/ arm: a gated NoUsage there must still be counted,
+# otherwise a symlinked checkout quietly stops gating the test tree too.
+cat > "$log" <<LOG
+$physical/Tests/LagoonTests/Foo.swift:2:2: warning: initialization of immutable value 'y' was never used [#NoUsage]
+LOG
+mkdir -p "$physical/Tests/LagoonTests"
+rc=0
+( cd "$logical" && run_warn_gate "$log" ) >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 1 ]; then
+  ok "Tests/ NoUsage under a symlinked cwd → still exit 1"
+else
+  bad "Tests/ NoUsage under a symlinked cwd → exit $rc, want 1"
+fi
+
+# And the allowlisted entry must STILL be allowlisted when the paths arrive in
+# physical form: warn_is_allowlisted matches a path fragment, so this is the
+# half that must not regress into a false red.
+cat > "$log" <<LOG
+$physical/Sources/LagoonServer/Networking/NIOSSLStreamTransport.swift:98:48: warning: 'inbound' is deprecated: Use the executeThenClose scoped method instead. [#DeprecatedDeclaration]
+LOG
+mkdir -p "$physical/Sources/LagoonServer/Networking"
+rc=0
+( cd "$logical" && run_warn_gate "$log" ) >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "allowlisted deprecation under a symlinked cwd → still exit 0 (no false red)"
+else
+  bad "allowlisted deprecation under a symlinked cwd → exit $rc, want 0"
 fi
 
 # ---------------------------------------------------------------------------
