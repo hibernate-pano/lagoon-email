@@ -73,7 +73,6 @@ private func makeAccount(
     /// deliberately never writes `is_deleted` (a header arriving from the
     /// provider is by definition not deleted), so a fixture that sets it there
     /// silently produces a live message.
-    @discardableResult
     private func seedMessage(
         _ remoteId: String,
         accountId: UUID,

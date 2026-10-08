@@ -38,7 +38,6 @@ final class FolderCountsRouteTests: XCTestCase {
         )
     }
 
-    @discardableResult
     private func seedMessage(
         _ remoteId: String,
         accountId: UUID,

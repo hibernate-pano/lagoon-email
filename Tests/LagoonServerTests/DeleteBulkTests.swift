@@ -52,7 +52,6 @@ final class DeleteBulkTests: XCTestCase {
         )
     }
 
-    @discardableResult
     private func seedMessage(
         _ remoteId: String,
         accountId: UUID,

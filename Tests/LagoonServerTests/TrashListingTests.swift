@@ -54,7 +54,6 @@ final class TrashListingTests: XCTestCase {
         )
     }
 
-    @discardableResult
     private func seedMessage(
         _ remoteId: String,
         accountId: UUID,

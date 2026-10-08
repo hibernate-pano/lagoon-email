@@ -65,7 +65,6 @@ final class PurgeRoutesTests: XCTestCase {
 
     /// Seeds a message plus the dependent rows a real one would have, so the
     /// cascade test has something to check.
-    @discardableResult
     private func seedMessage(
         _ remoteId: String,
         accountId: UUID,

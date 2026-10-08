@@ -48,7 +48,6 @@ final class SentListingTests: XCTestCase {
     }
 
     /// A row already in the local table, in a given state.
-    @discardableResult
     private func seedLocal(
         _ remoteId: String,
         accountId: UUID,
