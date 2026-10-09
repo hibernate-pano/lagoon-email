@@ -25,6 +25,21 @@ struct ConnectView: View {
     /// The in-flight QQ connect/adopt task, so Cancel and `.onDisappear` can
     /// actually stop the request instead of letting it complete after dismissal.
     @State private var connectTask: Task<Void, Never>?
+    /// True only while the user asked to stop: the Cancel button, or Escape.
+    ///
+    /// `onDisappear` fires for reasons that are NOT the user backing out — the
+    /// sheet is also dismissed by the system (Return on the focused field,
+    /// window close) and by the parent re-rendering its `showConnect` binding.
+    /// Cancelling the task unconditionally there killed the request *before it
+    /// ever reached the server*: the sheet disappeared, `.onDisappear`
+    /// cancelled `connectTask`, and the database stayed untouched with no
+    /// error copy anywhere — a silent no-op that looked exactly like "I
+    /// clicked and nothing happened" (reported 2026-10-09).
+    ///
+    /// So: cancel only when the user asked for it. Any other dismissal lets
+    /// the probe finish, and `connectQQ` already refuses to adopt the account
+    /// when the task was genuinely cancelled.
+    @State private var userCancelled = false
     @State private var errorMessage: String?
     /// Non-nil after a 409 `account-exists`: render a neutral prompt plus a
     /// "use this account" action instead of a dead-end red error.
@@ -65,6 +80,7 @@ struct ConnectView: View {
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 360)
                     Button(l10n.useThisAccount) {
+                        userCancelled = false
                         connectTask = Task { await useExistingAccount(email: accountExistsEmail) }
                     }
                 }
@@ -78,6 +94,7 @@ struct ConnectView: View {
 
             if accounts.accountId != nil {
                 Button(l10n.cancel) {
+                    userCancelled = true
                     connectTask?.cancel()
                     if presentedAsSheet { dismiss() }
                 }
@@ -97,12 +114,43 @@ struct ConnectView: View {
         // A sheet can be closed while the probe is still in flight; without
         // this the request keeps running and can adopt an account the user
         // backed out of.
-        .onDisappear { connectTask?.cancel() }
+        // Only when the user actually asked to stop — see `userCancelled`.
+        // Cancelling unconditionally made every system-initiated dismissal a
+        // silent abort: no request reached the server and no copy was shown.
+        .onDisappear {
+            if Self.shouldCancelConnectOnDisappear(
+                isDisappearing: true,
+                userCancelled: userCancelled
+            ) {
+                connectTask?.cancel()
+            }
+        }
     }
 
     private func clearFailureState() {
         errorMessage = nil
         accountExistsEmail = nil
+    }
+
+    /// Whether a disappearance of this view should cancel the in-flight
+    /// connect request.
+    ///
+    /// Extracted as a pure function so the rule is unit-testable: the bug it
+    /// fixes was invisible to every existing test because it lived in a
+    /// `.onDisappear` closure, and the failure mode was a *silent* no-op —
+    /// the request never left the process, so no assertion on server calls,
+    /// database rows, or error copy could ever have caught it.
+    ///
+    /// `true` only for a user-initiated cancel. A sheet can also disappear
+    /// because the system dismissed it (Return on the focused field, window
+    /// close) or because the parent flipped `showConnect`; those must let the
+    /// probe finish, and `connectQQ` already refuses to adopt the account when
+    /// the task was genuinely cancelled.
+    static func shouldCancelConnectOnDisappear(
+        isDisappearing: Bool,
+        userCancelled: Bool
+    ) -> Bool {
+        isDisappearing && userCancelled
     }
 
     @ViewBuilder
@@ -149,6 +197,8 @@ struct ConnectView: View {
         }
         .frame(maxWidth: 320)
         Button {
+            // A previous cancel must not poison this attempt.
+            userCancelled = false
             connectTask = Task { await connectQQ() }
         } label: {
             // Keep the label text alongside the spinner: replacing it wholesale
