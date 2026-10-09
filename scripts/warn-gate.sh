@@ -115,6 +115,16 @@ warn_diagnostic_name() {
     if ($msg =~ /^no\s+.async.\s+operations occur within\s+.await./) {
       print "UnnecessaryEffectMarker\n"; next;
     }
+    # The sibling of the above, and the one that hid for a whole CI generation:
+    #   no calls to throwing functions occur within 'try' expression
+    # Without this arm the fallback below reads its first word and returns the
+    # bogus class "no", which is not in the Tests/ gate list, so a stale `try`
+    # in the test tree passes the gate on any marker-less toolchain. `try` on a
+    # non-throwing call is the same defect family as `await` on a non-async one:
+    # the effect marker is lying about what the code does.
+    if ($msg =~ /^no calls to throwing functions occur within\s+.\w+.\s+expression/) {
+      print "UnnecessaryEffectMarker\n"; next;
+    }
     # Deprecations on Swift 6.1 look like:
     #   'kCFStreamPropertyHTTPSProxyHost' was deprecated in macOS 10.11: ...
     #   'inbound' is deprecated: Use the executeThenClose scoped method instead.

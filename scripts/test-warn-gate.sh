@@ -143,6 +143,20 @@ else
   bad "Swift 6.1 UnnecessaryEffectMarker (no marker) -> got '$name', want 'UnnecessaryEffectMarker'"
 fi
 
+# The `try` sibling. Without its own arm the parser falls through to the
+# first-token fallback and returns the bogus class "no" — which is not in the
+# Tests/ gate list, so a stale `try` in the test tree slips past the gate on any
+# marker-less toolchain. Verified real: the 6.4 toolchain emits this diagnostic
+# at ShortcutSheetCoversRealBindingsTests.swift:46 and CI (6.1.2) has never
+# emitted it, which is exactly how it hid — a class only the newer compiler
+# sees, classified only by the arm only the older compiler needs.
+name="$(printf '%s\n' "/r/Tests/A.swift:1:20: warning: no calls to throwing functions occur within 'try' expression" | warn_diagnostic_name)"
+if [ "$name" = "UnnecessaryEffectMarker" ]; then
+  ok "Swift 6.1 unnecessary-try (no marker) -> UnnecessaryEffectMarker"
+else
+  bad "Swift 6.1 unnecessary-try (no marker) -> got '$name', want 'UnnecessaryEffectMarker'"
+fi
+
 # End-to-end: the deprecation CI actually still produces (Swift 6.1 marker-less
 # form) must clear the gate. ProviderHTTP's two deprecations are GONE from this
 # set — round 5 fixed the duplicate-key launch crash by deleting the deprecated
