@@ -200,16 +200,21 @@ public enum MessageStore {
     /// The pin join is what lets the client render pin state: pins live in
     /// their own table, so a plain `message_headers` read leaves the client
     /// with no way to tell a pinned mail from an unpinned one.
-    /// Shared WHERE clause for `recent()` and `count()` so the badge
-    /// total can never drift from the list it labels. Returns the clause
-    /// (starting at WHERE) plus its bound arguments in order.
+    /// Shared WHERE clause for `recent()` / `count()` — and, since the R-01
+    /// convergence, for every **lens** query in this file that used to state
+    /// the axes by hand: `unreadCount`, `sentCount`, `deletedCount`,
+    /// `trashedRemoteIds`, `reconcileInbox`. One authored copy of the axes, so
+    /// "which list is this in" has one definition instead of eight kept in
+    /// step by memory. (`StackStore.messageCount` also reaches it via
+    /// `count()`.) Queries that are *not* about a list — `pinnedCount`,
+    /// `senderRanking`, `oldestReceivedAt`, `listUnsubscribeIds` — stay
+    /// outside on purpose; each carries a note saying why.
     ///
-    /// Columns carry the `h` alias and the clause never interpolates a value
-    /// into the SQL text, because `ci-guardrails.sh` rule 1 forbids that — and
-    /// rightly: it is the shape that lets a caller-supplied string reach a
-    /// query. `reconcileInbox` states the same three axes against the bare
-    /// table; see its doc comment for why that duplication is deliberate and
-    /// what keeps the two in step.
+    /// Returns the clause (starting at WHERE) plus its bound arguments in
+    /// order. Columns carry the `h` alias and the clause never interpolates a
+    /// value into the SQL text, because `ci-guardrails.sh` rule 1 forbids that
+    /// — and rightly: it is the shape that lets a caller-supplied string reach
+    /// a query. Callers assemble with `[literal, whereClause].joined(...)`.
     static func filterSQL(
         accountId: UUID,
         sender: String?,
@@ -386,41 +391,32 @@ public enum MessageStore {
     /// which carry no FK. The list came back on the next GET, so it read as
     /// a flicker; the classifications the user had taught it did not.
     ///
-    /// The three axes are therefore spelled out here as a literal, and this
-    /// predicate is now a **second** copy of the inbox definition rather than a
-    /// derived one.
-    ///
-    /// That was tried and reverted. `filterSQL` gained an alias parameter so
-    /// this could call it — and the alias has to be interpolated into the SQL
-    /// text, which `ci-guardrails.sh` rule 1 exists to forbid (correctly: it is
-    /// the shape that lets a caller-supplied string reach a query). Parameterising
-    /// the columns to dodge that just traded one interpolation for eight.
-    /// The project already has the sanctioned shape for this — assemble with
-    /// `[literal, whereClause].joined(separator:)`, as `recent()` and `count()`
-    /// do — but joining is no help when the shared piece *is* the SQL.
-    ///
-    /// So the duplication stays, deliberately, and the guard against drift is
-    /// a test rather than an abstraction: `SentListingTests` asserts this exact
-    /// predicate against a sent row. A third axis added to `filterSQL` without
-    /// being added here turns that test red, which is the moment to fix it.
-    /// Adding it here without adding it to `filterSQL` turns it red too.
+    /// The predicate is now the **shared** inbox definition, resolved through
+    /// `filterSQL` and assembled with the `[literal, whereClause].joined()`
+    /// shape `recent()` uses — so the reconciler and the inbox listing cannot
+    /// disagree about what "in the inbox" means. (This used to be a literal
+    /// second copy, and a comment here claimed the duplication was forced by
+    /// `ci-guardrails.sh` blocking alias interpolation. That claim was wrong —
+    /// `filterSQL` hardcodes the `h.` alias and never interpolates — and the
+    /// convergence removed the copy.)
+    /// `SentListingTests.test_reconcileInboxKeepsSentRowsAndTheirBodies` is
+    /// the regression net for the original loss.
     public static func reconcileInbox(
         accountId: UUID,
         keeping remoteIds: Set<String>,
         db: LagoonDB
     ) async throws {
+        let (whereClause, filterArgs) = filterSQL(
+            accountId: accountId, sender: nil, archived: false, deleted: false,
+            sent: false, stackMatch: nil
+        )
         try db.write { db in
+            let sql = [
+                "SELECT h.remote_id FROM message_headers h",
+                whereClause,
+            ].joined(separator: " ")
             let rows = try Row.fetchAll(
-                db,
-                sql: """
-                    SELECT remote_id
-                    FROM message_headers
-                    WHERE account_id = ?
-                      AND is_archived = FALSE
-                      AND is_deleted = FALSE
-                      AND is_sent = FALSE
-                    """,
-                arguments: [accountId]
+                db, sql: sql, arguments: StatementArguments(filterArgs)
             )
             let localIds = rows.compactMap { $0.optionalText("remote_id") }
             for remoteId in localIds where !remoteIds.contains(remoteId) {
@@ -515,6 +511,12 @@ public enum MessageStore {
 
     /// Remote ids whose metadata carried a non-empty List-Unsubscribe
     /// header. Used to seed the heuristic classifier's subscription signal.
+    ///
+    /// **Not a lens query**: the signal set deliberately spans every axis — an
+    /// archived or trashed newsletter still teaches the classifier what
+    /// subscription mail looks like, and a mail the user has not read yet must
+    /// not be classified blind. `filterSQL` answers "which list is this in",
+    /// which is not the question here, so this query stays outside it.
     public static func listUnsubscribeIds(
         forAccount accountId: UUID,
         db: LagoonDB
@@ -630,21 +632,25 @@ public enum MessageStore {
         forAccount accountId: UUID,
         db: LagoonDB
     ) async throws -> Int {
-        // `is_sent = FALSE` is the R1 addition, and it was found in the
-        // round-end review rather than by a test: this query predates
-        // `filterSQL` and hand-rolls its own predicate, so adding a third axis
-        // to the shared clause did not reach it. Without it, a reply the user
-        // sent but has not "read" would sit in the unread badge while being
-        // invisible in every list the badge labels — the exact
-        // number-does-not-match-its-list failure the whole axis system exists
-        // to prevent.
-        let sql = """
-            SELECT COUNT(*) AS count FROM message_headers
-            WHERE account_id = ? AND is_archived = FALSE
-              AND is_deleted = FALSE AND is_sent = FALSE AND is_read = FALSE
-        """
+        // Converged on `filterSQL` (R-01). This used to hand-roll the whole
+        // predicate, which is how the `is_sent` axis arrived here last — found
+        // in the round-end review rather than by a test. Now it is the inbox
+        // clause plus one `is_read` test, so a future axis cannot reach the
+        // lists and skip the badge: the badge IS the list, minus the read
+        // rows, by construction.
+        let (whereClause, arguments) = filterSQL(
+            accountId: accountId, sender: nil, archived: false, deleted: false,
+            sent: false, stackMatch: nil
+        )
+        // Joined, not interpolated — the same sanctioned shape `count()` uses.
+        // The `is_read` fragment is static text; only `accountId` is bound.
+        let sql = [
+            "SELECT COUNT(*) AS count FROM message_headers h",
+            whereClause,
+            "  AND h.is_read = FALSE",
+        ].joined(separator: "\n")
         return try db.read { db in
-            let row = try Row.fetchOne(db, sql: sql, arguments: [accountId])
+            let row = try Row.fetchOne(db, sql: sql, arguments: StatementArguments(arguments))
             return row.map { $0["count"] } ?? 0
         }
     }
@@ -658,6 +664,15 @@ public enum MessageStore {
     /// place a user looks for "what did I deliberately keep", and a pin that
     /// vanished because a message was trashed would be a worse answer than a
     /// count that is not obviously comparable to its neighbours.
+    ///
+    /// **Not a lens query**, so it does not route through `filterSQL`: it
+    /// counts the pin table, not a `message_headers` lens — the JOIN direction
+    /// is the opposite of `filterSQL`'s, and the set it answers ("everything
+    /// I deliberately kept") is not a set any single list shows. One
+    /// header-side guard remains (`is_sent = FALSE`), because a pin on sent
+    /// mail describes nothing the 置顶 view can display. Pinned semantics are
+    /// pinned by `SentListingTests.test_pinnedBadge_excludesSentMail` and the
+    /// non-lens test in `FilterConvergenceTests`.
     public static func pinnedCount(
         forAccount accountId: UUID,
         db: LagoonDB
@@ -677,18 +692,14 @@ public enum MessageStore {
         }
     }
 
-    /// How many messages sit in the server's Trash.
+    /// 已发送 的本地计数 (R1) — the 已发送 lens' badge.
     ///
-    /// The one count the sidebar shows for rows no list will display: deleted
-    /// mail is reachable only through undo or the trash folder, so without this
-    /// number a user who archived too eagerly has no way to learn that anything
-    /// is recoverable.
-    /// 已发送 的本地计数 (R1).
-    ///
-    /// Deliberately `is_deleted = FALSE` as well: a message the user trashed
-    /// after sending it should leave the 已发送 badge, exactly as it leaves
-    /// every other surface. A badge that counts trashed mail is a number the
-    /// user cannot reconcile with the list it labels.
+    /// Delegates to `count(sent: true)`, i.e. the shared `filterSQL` clause,
+    /// so the badge and the list it labels are one definition. The `sent`
+    /// branch deliberately requires `is_deleted = FALSE` as well: a message
+    /// the user trashed after sending it should leave the 已发送 badge,
+    /// exactly as it leaves every other surface. A badge that counts trashed
+    /// mail is a number the user cannot reconcile with the list it labels.
     ///
     /// A **lower bound**, by construction — the local table only learns about
     /// sent mail when 已发送 is opened (or a reply is sent from this machine).
@@ -700,28 +711,23 @@ public enum MessageStore {
         forAccount accountId: UUID,
         db: LagoonDB
     ) async throws -> Int {
-        let sql = """
-            SELECT COUNT(*) AS count FROM message_headers
-            WHERE account_id = ? AND is_sent = TRUE AND is_deleted = FALSE
-        """
-        return try db.read { db in
-            let row = try Row.fetchOne(db, sql: sql, arguments: [accountId])
-            return row.map { $0["count"] } ?? 0
-        }
+        try await count(forAccount: accountId, sent: true, db: db)
     }
 
+    /// How many messages sit in the server's Trash — the 废纸篓 badge.
+    ///
+    /// The one count the sidebar shows for rows no list will display: deleted
+    /// mail is reachable only through undo or the trash folder, so without this
+    /// number a user who archived too eagerly has no way to learn that anything
+    /// is recoverable. Delegates to `count(deleted: true)`, which resolves
+    /// through `filterSQL` — the same clause the trash listing and
+    /// `trashedRemoteIds` (清空废纸篓) use, so the badge cannot disagree with
+    /// what a sweep would actually erase.
     public static func deletedCount(
         forAccount accountId: UUID,
         db: LagoonDB
     ) async throws -> Int {
-        let sql = """
-            SELECT COUNT(*) AS count FROM message_headers
-            WHERE account_id = ? AND is_deleted = TRUE
-        """
-        return try db.read { db in
-            let row = try Row.fetchOne(db, sql: sql, arguments: [accountId])
-            return row.map { $0["count"] } ?? 0
-        }
+        try await count(forAccount: accountId, deleted: true, db: db)
     }
 
     /// Senders ranked by how much mail they have written, for the 发件人排行
@@ -751,6 +757,13 @@ public enum MessageStore {
     /// "the newest one": a sender whose display name changed should not make the
     /// row's label flicker between refreshes, and any non-empty name is more
     /// useful than none.
+    ///
+    /// **Not a lens query**: it is an aggregate over the whole local mailbox
+    /// (archived included on purpose — a newsletter archived every week is
+    /// exactly the row this panel exists to surface), so there is no list
+    /// whose badge it must equal and `filterSQL`'s lens branches do not
+    /// describe it. Its semantics are pinned by `SenderRouteTests` and the
+    /// non-lens test in `FilterConvergenceTests`.
     public static func senderRanking(
         forAccount accountId: UUID,
         limit: Int,
@@ -815,6 +828,13 @@ public enum MessageStore {
     /// Diagnostics only: this is the lower edge of what the local cache
     /// covers, and the number that tells a "the list window is too small"
     /// report apart from a "the sync never reached back that far" one.
+    ///
+    /// **Not a lens query**: it bounds the cache's *coverage*, so it
+    /// deliberately spans archived and sent rows too (a cached reply is still
+    /// cache — dropping it would claim the history is shallower than it is).
+    /// Only deleted rows are excluded, because those are the ones the user
+    /// has thrown away. Semantics are pinned by the non-lens test in
+    /// `FilterConvergenceTests`.
     public static func oldestReceivedAt(
         forAccount accountId: UUID,
         db: LagoonDB
@@ -940,22 +960,26 @@ public enum MessageStore {
 
     /// Every remote id in the Trash, for 清空废纸篓.
     ///
-    /// Read through the same filter the trash *list* uses, so "empty the trash"
-    /// and "what the trash is showing" can never disagree — the same invariant
-    /// `TrashListingTests` pins for the count and the rows.
+    /// Read through `filterSQL(deleted: true)` — the same clause the trash
+    /// *list* uses — so "empty the trash" and "what the trash is showing" can
+    /// never disagree: the invariant `TrashListingTests` pins for the count
+    /// and the rows. (This used to be a hand-rolled `is_deleted = TRUE` copy;
+    /// see the convergence note on `filterSQL`.)
     public static func trashedRemoteIds(
         forAccount accountId: UUID,
         db: LagoonDB
     ) async throws -> [String] {
-        try db.read { raw in
-            try String.fetchAll(
-                raw,
-                sql: """
-                    SELECT remote_id FROM message_headers
-                    WHERE account_id = ? AND is_deleted = TRUE
-                    """,
-                arguments: [accountId]
-            )
+        let (whereClause, filterArgs) = filterSQL(
+            accountId: accountId, sender: nil, archived: false, deleted: true,
+            sent: false, stackMatch: nil
+        )
+        // Joined, not interpolated — the same sanctioned shape as `recent()`.
+        let sql = [
+            "SELECT h.remote_id FROM message_headers h",
+            whereClause,
+        ].joined(separator: " ")
+        return try db.read { raw in
+            try String.fetchAll(raw, sql: sql, arguments: StatementArguments(filterArgs))
         }
     }
 

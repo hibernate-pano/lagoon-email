@@ -194,4 +194,41 @@ final class LocalizationTests: XCTestCase {
             XCTAssertNotEqual(chinese, english, "untranslated string pair: \(chinese)")
         }
     }
+
+    // MARK: - Audit batch: startup / body / bulk-delete copy
+
+    /// The boot screen, the embedded server's two errors, the body container's
+    /// VoiceOver label and the bulk-delete failure title — every string the
+    /// UX-06/07/08 batch introduced, in both languages.
+    func test_bootBodyAndBulkDeleteStrings_existInBothLanguages() {
+        let zhStrings = [
+            zh.serverStarting, zh.serverStartFailed,
+            zh.keyGenerationFailed, zh.embeddedServerStartFailed,
+            zh.messageBody, zh.bulkDeleteFailed,
+        ]
+        let enStrings = [
+            en.serverStarting, en.serverStartFailed,
+            en.keyGenerationFailed, en.embeddedServerStartFailed,
+            en.messageBody, en.bulkDeleteFailed,
+        ]
+        for value in zhStrings + enStrings {
+            XCTAssertFalse(value.isEmpty)
+        }
+        for (chinese, english) in zip(zhStrings, enStrings) {
+            XCTAssertNotEqual(chinese, english, "untranslated string pair: \(chinese)")
+        }
+    }
+
+    /// The embedded server's errors are what the boot-failure screen renders,
+    /// and they are non-View code — so they must follow the stored preference,
+    /// not a hardcoded language.
+    func test_embeddedServerErrors_followTheStoredLanguage() {
+        UserDefaults.standard.set(AppLanguage.english.rawValue, forKey: LanguagePreference.defaultsKey)
+        XCTAssertEqual(
+            EmbeddedServerError.startFailed.errorDescription,
+            "The embedded server couldn't start"
+        )
+        UserDefaults.standard.set(AppLanguage.zhHans.rawValue, forKey: LanguagePreference.defaultsKey)
+        XCTAssertEqual(EmbeddedServerError.startFailed.errorDescription, "内嵌服务启动失败")
+    }
 }

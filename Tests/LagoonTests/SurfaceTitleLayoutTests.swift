@@ -18,17 +18,34 @@ import Foundation
 /// `fixedSize()` is invisible in review and trivial to drop in a later edit,
 /// and because "the heading wrapped" is exactly the kind of regression that
 /// nobody re-tests until a user screenshots it again.
+///
+/// ## T1 (Q-04 in docs/全方位审查报告-2026-10-16.md)
+///
+/// Two upgrades, because both halves of this file used to be able to pass
+/// without looking at the product:
+///
+/// * The length assertion compared two literals typed into this test — so a
+///   translation that turned 「简报」 into a paragraph stayed invisible; the
+///   test was validating itself. It now reads the *production* strings from
+///   `L10n`.
+/// * The `fixedSize()` claim was prose in a comment. It is now a source
+///   assertion per pipeline: a `.fixedSize()` must sit between each title's
+///   anchors, so deleting any one of the four modifiers turns a test red.
 @MainActor
 final class SurfaceTitleLayoutTests: XCTestCase {
-    /// The titles that must never wrap.
+    /// The titles that must never wrap, read from the real `L10n` values.
     ///
-    /// Pinned as literals rather than read from `L10n` so a translation change
-    /// cannot quietly turn a short label into a long one and reintroduce the
-    /// squeeze without this test noticing.
-    private let protectedTitles = [
-        ("全部邮件", "All messages"),
-        ("简报", "Briefing"),
-    ]
+    /// These are the titles the two surfaces actually render:
+    /// `MessageListView.surfaceTitle` (全部邮件 — the fallback case beside
+    /// every other lens) and `BriefingFeedView`'s header.
+    private func protectedTitles() -> [(chinese: String, english: String)] {
+        let zh = L10n(language: .zhHans)
+        let en = L10n(language: .english)
+        return [
+            (zh.allMessages, en.allMessages),
+            (zh.briefing, en.briefing),
+        ]
+    }
 
     /// Each protected title is short enough to sit beside a segmented control
     /// and three icon buttons in a 280pt column.
@@ -36,8 +53,10 @@ final class SurfaceTitleLayoutTests: XCTestCase {
     /// The threshold is not arbitrary: the list column is `min: 280` in
     /// `MessageSplitLayout`, and the controls that share the row with the title
     /// need roughly 200pt of it. Anything past ~8 CJK glyphs starts competing.
+    /// Reading the production strings is what lets a longer translation fail
+    /// here — the old literal-in-test version could not.
     func test_protectedTitles_areShortEnoughForTheNarrowColumn() {
-        for (chinese, english) in protectedTitles {
+        for (chinese, english) in protectedTitles() {
             XCTAssertLessThanOrEqual(
                 chinese.count, 8,
                 "\"\(chinese)\" is too long for the 280pt list column and will squeeze its neighbours"
@@ -45,6 +64,47 @@ final class SurfaceTitleLayoutTests: XCTestCase {
             XCTAssertLessThanOrEqual(
                 english.count, 16,
                 "\"\(english)\" is too long for the 280pt list column"
+            )
+        }
+    }
+
+    /// The regression itself, pinned per pipeline: every title chain still
+    /// carries its `.fixedSize()`.
+    ///
+    /// Each entry is (source, from-anchor, to-anchor): the assertion is that a
+    /// `.fixedSize()` sits *between* the two anchors — string presence
+    /// anywhere in the file is not enough, because a `.fixedSize()` that
+    /// survived on a neighbouring control would read as coverage while the
+    /// title itself wrapped. The four pipelines are the four production sites:
+    /// `MessageListView.swift:341` (title) and `:349` (grouping picker),
+    /// `BriefingFeedView.swift:234` (header title), `RootView.swift:834`
+    /// (surface picker). Deleting any one turns this red.
+    func test_surfaceTitlesStillCarryFixedSize() throws {
+        let pipelines: [(name: String, source: String, from: String, to: String)] = [
+            ("MessageListView title", try ViewSource.read("MessageListView"),
+             "Text(surfaceTitle)", ".layoutPriority(1)"),
+            ("MessageListView grouping picker", try ViewSource.read("MessageListView"),
+             "Picker(l10n.groupingLabel", ".help(l10n.groupingHelp)"),
+            ("BriefingFeedView title", try ViewSource.read("BriefingFeedView"),
+             "Text(l10n.briefing)", ".layoutPriority(1)"),
+            ("RootView surface picker", try ViewSource.read("RootView"),
+             "Picker(l10n.surface", ".help(l10n.surfaceHelp)"),
+        ]
+        for (name, source, from, to) in pipelines {
+            let start = try XCTUnwrap(
+                source.range(of: from), "\(name): anchor '\(from)' moved"
+            )
+            let rest = source[start.upperBound...]
+            let end = try XCTUnwrap(
+                rest.range(of: to), "\(name): anchor '\(to)' moved"
+            )
+            XCTAssertTrue(
+                rest[..<end.lowerBound].contains(".fixedSize()"),
+                """
+                \(name) lost its .fixedSize() — the title will wrap one glyph \
+                per line under width pressure, which is the exact regression \
+                this file was written for.
+                """
             )
         }
     }

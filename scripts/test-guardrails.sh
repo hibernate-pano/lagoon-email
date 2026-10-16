@@ -531,7 +531,21 @@ struct F {
 }
 FIXTURE
 
-sed "s#Sources/Lagoon/Views/\*\.swift#${silent_fixture}/*.swift#" \
+# The subdirectory blind spot. The lint used to glob `Views/*.swift`, so a
+# silent catch under a subdirectory (ColumnLayout/ is a real one in the
+# production tree) was never opened — the lint reported success over files it
+# had not read. This fixture lives one level down and MUST be reported.
+mkdir -p "$silent_fixture/ColumnLayout"
+cat > "$silent_fixture/ColumnLayout/Nested.swift" <<'FIXTURE'
+struct G {
+    func swallowed() {
+        do { try a() } catch {
+        }
+    }
+}
+FIXTURE
+
+sed "s#^views_root=.*#views_root=\"${silent_fixture}\"#" \
     scripts/lint-no-silent-catch.sh > "$lint_copy"
 lint_out="$(bash "$lint_copy" 2>&1 || true)"
 
@@ -556,6 +570,15 @@ expect_not_flagged 13
 expect_flagged 23
 expect_flagged 24
 expect_not_flagged 25
+
+# The recursive glob. Before the fix this line's fixture was never scanned:
+# the input list was `Views/*.swift`, so a nested file produced no output and
+# the lint read as green over a subdirectory it had never opened.
+if printf '%s' "$lint_out" | grep -q "ColumnLayout/Nested.swift:3"; then
+  ok "silent catch in a subdirectory is reported (old glob missed it)"
+else
+  bad "silent catch in a subdirectory NOT reported — the lint is top-level only again"
+fi
 
 echo
 echo "guardrail self-test: $pass passed, $fail failed"

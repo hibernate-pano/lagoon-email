@@ -891,10 +891,13 @@ public enum MessageRoutes {
                 "remoteId": .string(remoteId),
                 "attachmentId": .string(attachmentId),
             ])
-            // Hummingbird's HTTPResponse.Status does not expose 413 as a named
-            // case. Fall back to .internalServerError — the JSON body's
-            // `error` code is the source of truth for the client.
-            return RouteJSON.error(.internalServerError, "attachment-too-large")
+            // 413 is the contract the client's copy names ("单个附件上限
+            // 25MB"). This used to answer 500 behind a comment claiming
+            // Hummingbird exposed no named 413 case — the dependency chain
+            // says otherwise (`HTTPResponse.Status.contentTooLarge` = 413),
+            // and a "server broke" status for a size limit sends every retry
+            // and retry-loop decision down the wrong path.
+            return RouteJSON.error(.contentTooLarge, "attachment-too-large")
         } catch AttachmentError.notFound {
             return RouteJSON.error(.notFound, "attachment-not-found")
         } catch let error as MailError {

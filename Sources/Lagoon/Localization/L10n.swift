@@ -267,6 +267,10 @@ public struct L10n: Sendable, Equatable {
     public var downloadEml: String { pick("下载 .eml", "Download .eml") }
     public var downloadEmlHelp: String { pick("导出原始邮件文件（.eml 格式）", "Export the original message file (.eml format)") }
     public var loadingInlineImages: String { pick("正在加载内嵌图片…", "Loading inline images…") }
+    /// 正文容器（WKWebView）的 VoiceOver 标签。The WebView's own elements are
+    /// *contained* inside this region rather than merged into one opaque node,
+    /// so this label is what announces what the whole region is.
+    public var messageBody: String { pick("邮件正文", "Message body") }
     public var print: String { pick("打印…", "Print…") }
     public var printHelp: String { pick("打印当前邮件（⌘P）", "Print the current message (⌘P)") }
     public var printFailed: String { pick("打印失败", "Print failed") }
@@ -729,6 +733,10 @@ public struct L10n: Sendable, Equatable {
     public var movedToInboxToast: String { pick("已移回收件箱", "Moved to inbox") }
     public var unarchiveFailedTitle: String { pick("取消归档失败", "Couldn't unarchive") }
     public var restoreFailedTitle: String { pick("恢复失败", "Couldn't restore") }
+    /// 批量删除（阶段二 allMatching）失败。刻意不复用 `loadFailed`：用户刚按下
+    /// 的是「删除这一整批」，而「加载失败」描述的是另一个操作——错误文案必须说出
+    /// 失败的那件事，否则用户会去检查网络而问题出在删除本身。
+    public var bulkDeleteFailed: String { pick("批量删除失败", "Bulk delete didn't complete") }
 
     // MARK: 两段式全选
     /// ⌘A 的说明必须写明它只选已加载的——快捷键表是用户判断"这个键有多危险"
@@ -1012,6 +1020,24 @@ public struct L10n: Sendable, Equatable {
     public var emptyReply: String { pick("回复内容不能为空。", "The reply cannot be empty.") }
     public var cancel: String { pick("取消", "Cancel") }
     public var shortcutSend: String { pick("⌘↩ = 发送", "⌘↩ = send") }
+
+    // MARK: - 启动 / 内嵌服务
+
+    /// 启动阶段的两句文案，以及内嵌服务的两条错误。启动态发生在 `RootView`
+    /// 之前——而 `RootView` 才是注入 `\.l10n` 的那一层——所以这些字串按非 View
+    /// 代码的既有路径读 `L10n.current`（与工具栏语言选择器写的是同一个
+    /// UserDefaults 键）。英文界面下启动阶段即英文，不再硬编码中文。
+    public var serverStarting: String { pick("Lagoon 正在启动…", "Lagoon is starting…") }
+    public var serverStartFailed: String { pick("启动失败", "Failed to start") }
+    public var keyGenerationFailed: String {
+        pick(
+            "无法生成加密密钥（Keychain 写入失败）",
+            "Couldn't generate the encryption key (Keychain write failed)"
+        )
+    }
+    public var embeddedServerStartFailed: String {
+        pick("内嵌服务启动失败", "The embedded server couldn't start")
+    }
 
     // MARK: - Infrastructure errors
 

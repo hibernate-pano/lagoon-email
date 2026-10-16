@@ -69,6 +69,16 @@ struct MessageListView: View {
     /// (R1). Kept apart from `errorBanner` because it is **not** an error the
     /// user needs to act on — it is context for what they are reading.
     @State private var isSentStale = false
+    /// Pending suggestions keyed by the message they are about, so the hover
+    /// card can answer "is this worth opening" without a lookup layer of its
+    /// own.
+    ///
+    /// Loaded together with the list rather than on hover: the card opens on
+    /// a deliberate rest, and a second round trip there would flash it
+    /// without the judgement — the whole point of putting it on the card is
+    /// that it is *already* there. Mirrors `BriefingFeedView.adviceByRemoteId`
+    /// — same key, same lifecycle rules.
+    @State private var adviceByRemoteId: [String: AdviceRecord] = [:]
     /// 空状态的三件套：图标 / 标题 / 补充说明。
     ///
     /// Split out so the title and the hint can disagree productively — most
@@ -696,6 +706,24 @@ struct MessageListView: View {
                 .opacity(0)
                 .focusable(false)
                 .accessibilityHidden(true)
+            // ⌘[ keeps Mail.app's "back" muscle memory, re-pointed at the one
+            // thing it can mean on this surface: clear the current selection,
+            // returning the reader pane to its placeholder. No-op with nothing
+            // selected. Deliberately identical to the Briefing feed's binding
+            // (UX-09), so the cheatsheet's single global "back" row stays
+            // honest on both surfaces.
+            Button(l10n.back) {
+                withAnimation(.snappy) {
+                    selection.removeAll()
+                    selectedAllOnServer = false
+                }
+            }
+            .keyboardShortcut("[", modifiers: .command)
+            .help(l10n.backHelp)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+            .focusable(false)
+            .accessibilityHidden(true)
         }
         // Initial load, then track the server's 30s poller while visible.
         // The view stays alive across surface switches (RootView ZStack),
@@ -970,6 +998,12 @@ struct MessageListView: View {
             messages = resp.messages
             serverTotalCount = resp.totalCount
             accounts.setLastSync(resp)
+            // Advice rides along with the list but is a separate table, so a
+            // failure here must not fail the refresh: the rows stay, the
+            // hover card just carries no suggestion. Loading it after the
+            // items commit keeps the ordering explicit — the list is never
+            // blocked on the advice queue.
+            await loadAdvice()
         } catch {
             guard generation == refreshGate.generation else { return }
             errorBanner = ErrorBanner(
@@ -978,6 +1012,36 @@ struct MessageListView: View {
                 actionLabel: l10n.retry,
                 action: { [self] in await self.refresh() }
             )
+        }
+    }
+
+    /// Loads the pending suggestion queue and indexes it by message.
+    ///
+    /// Only `pending` rows are fetched: a dismissed suggestion must never come
+    /// back (constitution §3), and an accepted one has already been acted on.
+    /// Only messages currently on screen are indexed, so the dictionary stays
+    /// the size of the list rather than the size of the mailbox.
+    ///
+    /// Failure is deliberately silent and non-fatal, exactly as on the
+    /// Briefing feed: the advice table is a derived convenience — losing it
+    /// costs the user a hover-card suggestion, not any mail — and a red banner
+    /// here would read as "your mail failed to load", which is both untrue and
+    /// alarming.
+    private func loadAdvice() async {
+        guard let accountId = accounts.accountId else {
+            adviceByRemoteId = [:]
+            return
+        }
+        do {
+            let records = try await api.fetchAdvice(accountId: accountId)
+            let visible = Set(messages.map(\.remoteId))
+            adviceByRemoteId = Dictionary(
+                uniqueKeysWithValues: records
+                    .filter { visible.contains($0.remoteId) }
+                    .map { ($0.remoteId, $0) }
+            )
+        } catch {
+            adviceByRemoteId = [:]
         }
     }
 
@@ -1322,6 +1386,17 @@ struct MessageListView: View {
             if let index = messages.firstIndex(where: { $0.remoteId == m.remoteId }) {
                 messages[index] = m.withRead(m.isRead)
             }
+            // Not silent (UX-03). A revert with no explanation reads as "the
+            // app ignored the click". Same banner shape as the Briefing
+            // feed's twin toggle: what failed, and a retry that re-attempts
+            // the flip.
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.markReadFailedTitle,
+                detail: l10n.markReadFailedDetail,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.toggleRead(m) }
+            )
         }
     }
 
@@ -1345,6 +1420,15 @@ struct MessageListView: View {
             }
         } catch {
             applyPin(m, m.isPinned)
+            // Same rule as `toggleRead` (UX-03): the optimistic revert is the
+            // state fix, the banner is the explanation. Without it, a failed
+            // pin looked exactly like a click that did nothing.
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: target ? l10n.pinFailed : l10n.unpinFailed,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.togglePin(m) }
+            )
         }
     }
 
@@ -1614,9 +1698,12 @@ struct MessageListView: View {
         } catch {
             selection.removeAll()
             selectedAllOnServer = false
+            // UX-08: this is the 删除 failure, not a load failure — the old
+            // `loadFailed` title named the wrong operation at the moment the
+            // user most needs to know what actually failed.
             errorBanner = ErrorBanner(
                 severity: .error,
-                title: l10n.loadFailed,
+                title: l10n.bulkDeleteFailed,
                 detail: error.lagoonUIMessage
             )
         }
@@ -1635,28 +1722,21 @@ struct MessageListView: View {
     ///
     /// Rendered in the list's overlay rather than as a `.popover` on each row:
     /// one card, driven by one piece of state, instead of N anchors fighting
-    /// over screen edges.
+    /// over screen edges. The AI's suggestion rides along when the table has
+    /// one for the row (UX-10) — the question the card answers is "is this
+    /// worth my time", and "the AI thinks it is disposable" is part of that
+    /// answer. The card stays read-only either way: no verbs, no closures.
     @ViewBuilder
     private var hoverCard: some View {
         if let hoveredRemoteId,
            let message = messages.first(where: { $0.remoteId == hoveredRemoteId }) {
-            RowHoverPreview(message: message, advice: nil)
+            RowHoverPreview(message: message, advice: adviceByRemoteId[message.remoteId])
                 .padding(12)
                 // No animation on the card itself: it appears only after the
                 // deliberate rest, and fading it in would blur the text the
                 // user is trying to read.
                 .allowsHitTesting(false)
         }
-    }
-
-    /// Wraps a row so the pointer can rest on it.
-    ///
-    /// `allowsHitTesting(false)` on the *tracker* would break selection, so the
-    /// tracker stays interactive; the card above is the part that ignores the
-    /// mouse.
-    private func hoverTracked<Content: View>(_ remoteId: String, @ViewBuilder content: () -> Content) -> some View {
-        content()
-            .onHover { inside in hover(inside ? remoteId : nil) }
     }
 
     // MARK: - Keyboard navigation

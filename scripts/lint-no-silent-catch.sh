@@ -31,7 +31,24 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 scan_out="$(mktemp)"
 trap 'rm -f "$scan_out"' EXIT
 
-perl - Sources/Lagoon/Views/*.swift > "$scan_out" <<'PERL'
+# RECURSIVE on purpose. The first version globbed `Views/*.swift`, so every
+# subdirectory was invisible in both directions: a silent catch under
+# `Views/ColumnLayout/` passed the lint, and the success line overstated what
+# had been scanned. A directory-shaped blind spot in a guard is worse than no
+# guard, because it reads like coverage.
+#
+# The self-test (scripts/test-guardrails.sh) swaps the single `views_root=`
+# assignment below for its fixture root — keep it on one line, and keep the
+# file list built from it rather than from a literal path.
+views_root="Sources/Lagoon/Views"
+view_files=()
+while IFS= read -r f; do view_files+=("$f"); done < <(find "$views_root" -name '*.swift' | sort)
+if [ "${#view_files[@]}" -eq 0 ]; then
+    echo "❌ no Swift files found under $views_root — the lint would pass vacuously" >&2
+    exit 1
+fi
+
+perl - "${view_files[@]}" > "$scan_out" <<'PERL'
 use strict;
 use warnings;
 
@@ -110,11 +127,11 @@ violations="$(tail -1 "$scan_out")"
 details="$(sed '$d' "$scan_out")"
 
 if [ "${violations:-0}" -ne 0 ]; then
-    echo "❌ Silent catch detected in Sources/Lagoon/Views/ (spec §6.5):"
+    echo "❌ Silent catch detected in Sources/Lagoon/Views/ (recursive):"
     echo "$details"
     echo ""
     echo "Allowed alternatives: ErrorBanner, ErrorCenter.shared.report(...), or throw."
     exit 1
 fi
 
-echo "✅ No silent catches in Sources/Lagoon/Views/"
+echo "✅ No silent catches in Sources/Lagoon/Views/ (recursive)"

@@ -283,11 +283,11 @@ public enum SearchRoutes {
     private static func search(
         accountId: UUID, q: String, sender: String?, since: Date?, db: LagoonDB
     ) async throws -> [MessageHeader] {
-        // LIKE specials in the query are data, not wildcards.
-        let escaped = q.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "%", with: "\\%")
-            .replacingOccurrences(of: "_", with: "\\_")
-        let pattern = "%\(escaped)%"
+        // LIKE specials in the query are data, not wildcards. This used to be
+        // a second, hand-maintained copy of the escaping — a twin is exactly
+        // what lets a fix land on one side only — so the route calls the
+        // shared `MessageStore.likePattern(containing:)` now.
+        let pattern = MessageStore.likePattern(containing: q)
         // One path, one recall: LIKE substrings over subject/snippet/from/body.
         // The Postgres build ORed a plainto_tsquery arm into this predicate for
         // English inflection recall; SQLite has no tsvector and the body LIKE
@@ -308,13 +308,19 @@ public enum SearchRoutes {
         // accidental translation rather than a real filter. Only the enum-
         // shaped columns participate, and the UI labels them as AI-derived so
         // the user knows why the hit appeared.
+        // `m.is_sent` is selected because `decode` can only carry the flag it
+        // is given: without it, a sent reply opened from search results reads
+        // as received mail end to end — the display lies, and its detail
+        // actions resolve the UID in the INBOX scope and fail. `find()` states
+        // the same reason (its column-list omission was invisible for the
+        // identical reason: the nil-tolerant decode defaults it to false).
         var sql = """
             SELECT m.id, m.account_id, m.remote_id, m.thread_id,
                    m.from_address,
                    NULLIF(m.from_name, '') as from_name,
                    NULLIF(m.subject, '') as subject,
                    NULLIF(m.snippet, '') as snippet,
-                   m.received_at, m.is_read, m.is_archived, m.is_deleted,
+                   m.received_at, m.is_read, m.is_archived, m.is_deleted, m.is_sent,
                    m.message_id_header, m.in_reply_to, m.references_header
             FROM message_headers m
             LEFT JOIN message_bodies b

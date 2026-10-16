@@ -51,7 +51,7 @@ final class ColumnWidthStoreTests: XCTestCase {
     /// thing and can drift.
     func test_theSolvedWidthsFillTheWindow() {
         let store = makeStore()
-        for window in [832.0, 1024.0, 1440.0, 1920.0] {
+        for window in [ColumnLayoutMetrics.windowMinimumWidth, 1024.0, 1440.0, 1920.0] {
             store.window(width: window, columns: [.navigation, .list, .reader])
             let dividers = CGFloat(max(0, store.columns.count - 1))
                 * ColumnLayoutMetrics.dividerThickness
@@ -245,8 +245,9 @@ final class ColumnWidthStoreTests: XCTestCase {
 
     /// A window too narrow for three minimums must not produce a negative width.
     ///
-    /// The floor is 832, so this is unreachable through the window's own chrome —
-    /// which is exactly why it needs a test: the solver's degradation path is
+    /// The floor is `windowMinimumWidth` (822 for three columns), so this is
+    /// unreachable through the window's own chrome — which is exactly why it
+    /// needs a test: the solver's degradation path is
     /// real code with real arithmetic, and "unreachable" is not a proof.
     func test_aWindowTooNarrowStaysLegal() {
         let store = makeStore()

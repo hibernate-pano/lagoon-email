@@ -268,4 +268,104 @@ final class AdviceSearchRecallTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - R-02: the `is_sent` column, wildcard literals, account scope
+
+    /// A sent row found through search must come back with `isSent == true`.
+    ///
+    /// The SELECT used to omit `m.is_sent`, and `MessageStore.decode` tolerates
+    /// a missing column by defaulting it to false — so the omission was
+    /// invisible: a sent reply opened from search results read as received
+    /// mail end to end, and its detail actions resolved the UID in the INBOX
+    /// scope and failed. That nil-tolerant decode is exactly why this needs an
+    /// assertion rather than a compile error. Mutation check: removing
+    /// `m.is_sent` from the search SELECT turns this red.
+    func test_sentMailIsRecalled_andFlaggedAsSent() async throws {
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            let account = makeAccount()
+            try await TestDatabase.withConnection { conn in
+                try await seed(account, db: conn)
+                try await seedMessage(
+                    "outbox", accountId: account.id, db: conn, subject: "已发出的回复"
+                )
+                try conn.write { raw in
+                    try MessageStore.markSent(
+                        remoteId: "outbox", accountId: account.id, db: raw
+                    )
+                }
+                let hits = try await search(account.id, q: "已发出的回复", db: conn)
+                XCTAssertEqual(hits.map(\.remoteId), ["outbox"])
+                XCTAssertTrue(
+                    hits[0].isSent,
+                    "search returned a sent row with isSent=false — the SELECT dropped m.is_sent "
+                        + "and decode quietly defaulted it"
+                )
+            }
+        }
+    }
+
+    /// `_` and `\` in a query are data, not wildcards.
+    ///
+    /// `_` matches any single character in LIKE, so an unescaped `a_b` query
+    /// would also return `aXb` — a "search finds mail I did not ask for"
+    /// failure that looks like recall but is pattern bleed. `\` is the escape
+    /// character itself; without escaping its own occurrence, `c\d` collapses
+    /// and matches unrelated rows. The escaping now lives in exactly one place
+    /// (`MessageStore.likePattern`) instead of a hand-maintained copy in this
+    /// route, so a fix cannot land on one copy only.
+    func test_underscoreAndBackslashAreLiterals_notWildcards() async throws {
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            let account = makeAccount()
+            try await TestDatabase.withConnection { conn in
+                try await seed(account, db: conn)
+                try await seedMessage(
+                    "literal", accountId: account.id, db: conn,
+                    subject: "project a_b and path c\\d"
+                )
+                try await seedMessage(
+                    "wildcardBait", accountId: account.id, db: conn,
+                    subject: "project aXb and plain cd"
+                )
+
+                let underscore = try await search(account.id, q: "a_b", db: conn)
+                XCTAssertEqual(
+                    underscore.map(\.remoteId), ["literal"],
+                    "`_` was treated as a wildcard: the query leaked onto aXb"
+                )
+
+                let backslash = try await search(account.id, q: "c\\d", db: conn)
+                XCTAssertEqual(
+                    backslash.map(\.remoteId), ["literal"],
+                    "the escape character itself was not escaped: `c\\d` matched `cd`"
+                )
+            }
+        }
+    }
+
+    /// Search is scoped to one account.
+    ///
+    /// Two mailboxes on one Mac can contain the same word; a query issued for
+    /// one must not surface the other's mail. Cheap to state, and it is the
+    /// boundary every list route is built on.
+    func test_searchIsIsolatedPerAccount() async throws {
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            let first = makeAccount()
+            let second = makeAccount()
+            try await TestDatabase.withConnection { conn in
+                try await seed(first, db: conn)
+                try await seed(second, db: conn)
+                try await seedMessage(
+                    "a-hit", accountId: first.id, db: conn, subject: "invoice 共同词"
+                )
+                try await seedMessage(
+                    "b-hit", accountId: second.id, db: conn, subject: "invoice 共同词"
+                )
+
+                let firstHits = try await search(first.id, q: "共同词", db: conn)
+                XCTAssertEqual(firstHits.map(\.remoteId), ["a-hit"])
+                let secondHits = try await search(second.id, q: "共同词", db: conn)
+                XCTAssertEqual(secondHits.map(\.remoteId), ["b-hit"])
+            }
+        }
+    }
 }

@@ -163,10 +163,14 @@ enum EmbeddedServerError: LocalizedError {
     case keyGenerationFailed
     case startFailed
 
+    /// Non-View code path, so the strings come through `L10n.current` — the
+    /// convention every other non-View error in the client uses. These two
+    /// used to be hardcoded Chinese, which surfaced on the boot-failure
+    /// screen of an English install.
     var errorDescription: String? {
         switch self {
-        case .keyGenerationFailed: return "无法生成加密密钥（Keychain 写入失败）"
-        case .startFailed: return "内嵌服务启动失败"
+        case .keyGenerationFailed: return L10n.current.keyGenerationFailed
+        case .startFailed: return L10n.current.embeddedServerStartFailed
         }
     }
 }

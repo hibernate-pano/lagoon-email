@@ -194,9 +194,10 @@ final class ColumnSolverTests: XCTestCase {
     /// Below the window floor the columns may go under `min` — but never under
     /// `softMin`, and never negative.
     func test_narrowWindowsSqueezeToSoftMinButNeverBelow() {
-        // 832 is the product floor; below it the window is outside the promise,
-        // and `sum(softMin) + dividers` is 692, so 691 is the first width where
-        // a soft floor must itself give.
+        // The product floor is `windowMinimumWidth` (822 for three columns);
+        // below it the window is outside the promise, and `sum(softMin) +
+        // dividers` is 692, so 691 is the first width where a soft floor must
+        // itself give. The sweep runs from far below through the floor.
         for available in stride(from: 400.0, through: 832.0, by: 4.0) {
             let solution = ColumnSolver.solve(
                 columns: allColumns,
@@ -224,9 +225,9 @@ final class ColumnSolverTests: XCTestCase {
 
     /// A window at or above the product floor honours every `min` exactly.
     ///
-    /// This is the assertion the old `minWidth: 720` made impossible: 832 is the
-    /// narrowest window, and 180 + 280 + 360 + 2 dividers is 822, so there are
-    /// 10pt of slack and no `min` may be crossed.
+    /// This is the assertion the old `minWidth: 720` made impossible: the
+    /// narrowest window is `windowMinimumWidth` (180 + 280 + 360 + 2 dividers =
+    /// 822), so at and above it no `min` may be crossed.
     func test_wideEnoughWindowsHonourEveryMinimum() {
         for available in stride(from: ColumnLayoutMetrics.windowMinimumWidth, through: 1600.0, by: 4.0) {
             for dragged in allColumns {
@@ -295,8 +296,9 @@ final class ColumnSolverTests: XCTestCase {
     /// itself is visible as a twitch while the window is being dragged.
     func test_growingTheWindowNeverMakesAColumnJump() {
         // Scoped to the window widths where a three-column layout exists at all:
-        // below the 832pt floor the columns are being squeezed below their
-        // minimums, and above `sum(max) + dividers` = 1662pt the reader is
+        // below the floor (`windowMinimumWidth` = 822pt for three columns) the
+        // columns are squeezed below their minimums, and above
+        // `sum(max) + dividers` = 1662pt the reader is
         // absorbing a surplus that grows with the window — so a column moving as
         // the window grows is the *correct* answer there, not a jump. Both
         // regimes have their own tests.
@@ -525,7 +527,7 @@ final class ColumnSolverTests: XCTestCase {
         let sumOfMaxes = allColumns.reduce(0) { $0 + ColumnLayoutMetrics.spec(for: $1).max }
             + Double(allColumns.count - 1) * divider
         let reader = ColumnSolver.widestColumn(of: allColumns)
-        for available in stride(from: 832.0, through: 1900.0, by: 20.0) {
+        for available in stride(from: ColumnLayoutMetrics.windowMinimumWidth, through: 1900.0, by: 20.0) {
             for column in allColumns {
                 let min = ColumnLayoutMetrics.spec(for: column).min
                 let range = ColumnSolver.achievableRange(
@@ -578,7 +580,7 @@ final class ColumnSolverTests: XCTestCase {
         let sumOfMaxes = allColumns.reduce(0) { $0 + ColumnLayoutMetrics.spec(for: $1).max }
             + Double(allColumns.count - 1) * divider
         for column in allColumns {
-            for available in stride(from: 832.0, through: sumOfMaxes, by: 20.0) {
+            for available in stride(from: ColumnLayoutMetrics.windowMinimumWidth, through: sumOfMaxes, by: 20.0) {
                 let range = ColumnSolver.achievableRange(
                     for: column, columns: allColumns, totalWidth: available
                 )
@@ -794,7 +796,7 @@ final class ColumnSolverTests: XCTestCase {
         var checked = 0
         // The reader is the ⌥ target on the list boundary, so the raw pointer x
         // is the reader's *left* edge, not the list's.
-        for available in stride(from: 832.0, through: 1662.0, by: 5.0) {
+        for available in stride(from: ColumnLayoutMetrics.windowMinimumWidth, through: 1662.0, by: 5.0) {
             let listLeading = ColumnLayoutMetrics.spec(for: .navigation).min
                 + ColumnLayoutMetrics.dividerThickness
             for raw in stride(from: 0.0, through: 1000.0, by: 5.0) {
@@ -884,8 +886,9 @@ final class ColumnSolverTests: XCTestCase {
     /// `available < sum(min)` has defined semantics: shed by weight, reader
     /// first, and never negative.
     ///
-    /// Unreachable through the UI — the window floor is 832 and `sum(min) +
-    /// dividers` is 822 — and tested anyway, because the floor is a *UI* rule
+    /// Unreachable through the UI — the window floor is exactly `sum(min) +
+    /// dividers` (`windowMinimumWidth` = 822 for three columns) — and tested
+    /// anyway, because the floor is a *UI* rule
     /// and the solver must not depend on it. A window that small is what a
     /// future compact mode, a Stage Manager resize, or a drag of the window
     /// against the screen edge would produce, and "the solver assumes the floor
@@ -1016,7 +1019,7 @@ final class ColumnSolverTests: XCTestCase {
     /// A raw, undamped target is not a thing the app ever produces, and
     /// asserting on it would test a path that does not exist.
     func test_theDraggedColumnIsClampedByTheOtherColumnsFeasibility() {
-        for available in stride(from: 832.0, through: 1662.0, by: 10.0) {
+        for available in stride(from: ColumnLayoutMetrics.windowMinimumWidth, through: 1662.0, by: 10.0) {
             for column in allColumns {
                 let othersMin = allColumns
                     .filter { $0 != column }
@@ -1094,7 +1097,7 @@ final class ColumnSolverTests: XCTestCase {
             [.navigation: .nan, .list: .nan, .reader: .nan],
         ]
         for carried in absurd {
-            for available in [832.0, 1000.0, 1400.0, 1900.0] {
+            for available in [ColumnLayoutMetrics.windowMinimumWidth, 1000.0, 1400.0, 1900.0] {
                 let solution = ColumnSolver.solve(
                     columns: allColumns,
                     totalWidth: available,
@@ -1119,18 +1122,27 @@ final class ColumnSolverTests: XCTestCase {
 
     // MARK: - The metrics themselves
 
-    /// The window floor is `sum(min) + separators`, not the old flat 720.
-    ///
-    /// 720 is arithmetically smaller than the three columns' minimums, so any
-    /// window allowed to reach it *must* breach a minimum. Pinned here because
-    /// the number looks arbitrary otherwise.
+    /// The window floor is `sum(min) + separators`, **derived** — not a
+    /// rounded-up literal. 720 is arithmetically smaller than the three
+    /// columns' minimums, so any window allowed to reach it *must* breach a
+    /// minimum; likewise the stale static `832` that used to sit next to this
+    /// calculation under a "rounded up to the 8pt grid" comment that was wrong
+    /// twice over (822 ceils to 824, not 832) and was referenced only by
+    /// tests. Equality — not `>=` — is the point now: there is one
+    /// derivation, and putting any literal back turns this red.
     func test_theWindowFloorIsTheSumOfTheMinimums() {
         let computed = allColumns.reduce(0) { $0 + ColumnLayoutMetrics.spec(for: $1).min }
             + Double(allColumns.count - 1) * divider
         XCTAssertEqual(computed, 822.0, accuracy: 0.001)
-        XCTAssertGreaterThanOrEqual(
-            ColumnLayoutMetrics.windowMinimumWidth, computed,
-            "the window floor is below the sum of the columns' minimums"
+        XCTAssertEqual(
+            ColumnLayoutMetrics.windowMinimumWidth, computed, accuracy: 0.001,
+            "the window floor must be derived from the specs, not a second hand-written number"
+        )
+        // The two-column arrangement (no account connected) derives through
+        // the same function; `RootView` hands its live column set to it.
+        let twoColumn = allColumns.filter { $0 != .navigation }
+        XCTAssertEqual(
+            ColumnLayoutMetrics.minimumWindowWidth(for: twoColumn), 641.0, accuracy: 0.001
         )
     }
 

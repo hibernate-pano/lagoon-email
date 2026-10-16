@@ -308,7 +308,7 @@ struct BriefingFeedView: View {
                             BriefingRow(
                                 item: item,
                                 advice: adviceByRemoteId[item.message.remoteId],
-                                showsSnippet: density.showsSnippet,
+                                density: density,
                                 expandedAdviceId: $expandedAdviceId,
                                 busyAdviceId: $busyAdviceId,
                                 onOpenAdvice: { remoteId in
@@ -1129,12 +1129,17 @@ private struct BriefingRow: View {
     /// a pure renderer — it cannot fetch, and it cannot record a dismissal
     /// without going back through the feed.
     let advice: AdviceRecord?
-    /// Whether the row shows its third line (reason or snippet).
+    /// The shared density preference.
     ///
-    /// Driven by the shared density preference rather than hardcoded, so the
-    /// feed and the raw list pack identically — they are two views of the same
-    /// mailbox and a user who sets one dense expects the other to follow.
-    let showsSnippet: Bool
+    /// The row used to receive a bare `showsSnippet` flag, which could express
+    /// "hide the third line" but not the one-line layout dense mode promises —
+    /// so the feed's dense silently rendered as compact (UX-04). Passing the
+    /// density itself is what lets the row honour all three modes exactly like
+    /// the raw list does.
+    let density: ListDensity
+
+    /// Whether the row shows its third line (reason or snippet).
+    private var showsSnippet: Bool { density.showsSnippet }
     /// Which suggestion is expanded, across all rows.
     ///
     /// One id rather than a `Set`: two rows open at once is not a state the
@@ -1149,6 +1154,45 @@ private struct BriefingRow: View {
     @Environment(\.l10n) private var l10n
 
     var body: some View {
+        if density == .dense {
+            denseRow
+        } else {
+            regularRow
+        }
+    }
+
+    /// The dense row: one line — unread dot, sender, subject, time — the same
+    /// scan-line the raw list's dense mode renders, deliberately.
+    ///
+    /// Dense is the "hundreds of rows looking for one sender" mode, and it
+    /// trades away the avatar, the reason/snippet *and the advice strip* to
+    /// keep that promise: the strip is an extra line, and a row that sometimes
+    /// wraps to two lines is not a dense row. compact and comfortable are
+    /// untouched and still carry all of it.
+    private var denseRow: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            if !item.message.isRead {
+                Circle()
+                    .fill(.tint)
+                    .frame(width: 6, height: 6)
+            }
+            Text(item.message.fromName ?? item.message.fromAddress)
+                .font(.caption)
+                .lineLimit(1)
+                .frame(maxWidth: 110, alignment: .leading)
+            Text(item.message.subject ?? l10n.noSubject)
+                .font(.callout)
+                .bold(!item.message.isRead)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Text(item.message.receivedAt.formatted(date: .omitted, time: .shortened))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var regularRow: some View {
 
         VStack(alignment: .leading, spacing: 0) {
 

@@ -92,10 +92,27 @@ enum ColumnLayoutMetrics {
     /// actually left the column at.
     static let storageKeyPrefix = "lagoon.column."
 
-    /// The narrowest window the three columns can honour without breaking a
-    /// single `min`: `180 + 280 + 360` plus two 1pt dividers, rounded up to
-    /// the 8pt grid the system resizes on.
-    static let windowMinimumWidth: Double = 832
+    /// The narrowest window the given columns can honour without breaking a
+    /// single `min`: `sum(min) + separators` over the columns actually
+    /// present.
+    ///
+    /// The one derivation of the floor (UX-11). It used to exist three times:
+    /// a static `832` here under a "rounded up to the 8pt grid" comment that
+    /// was wrong twice over (822 ceils to 824, not 832 — the number was a
+    /// leftover), a computed three-column twin that nothing called, and a
+    /// re-derivation inside `RootView` for the live column set. `RootView`
+    /// and the solver tests both call this now.
+    static func minimumWindowWidth(for columns: [LagoonColumn]) -> Double {
+        columns.reduce(0) { $0 + spec(for: $1).min }
+            + Double(max(0, columns.count - 1)) * dividerThickness
+    }
+
+    /// The three-column floor — the window's minimum once an account is
+    /// connected. Derived from `specs`, never re-spelled: `ColumnSolverTests`
+    /// asserts the solver honours every `min` at and above this value.
+    static var windowMinimumWidth: Double {
+        minimumWindowWidth(for: LagoonColumn.allCases)
+    }
 
     /// The shortest window the three columns are usable in.
     ///
@@ -125,11 +142,6 @@ enum ColumnLayoutMetrics {
     /// one piece of this layout that is genuinely ambiguous.
     static func resizedColumn(forHandle index: Int) -> LagoonColumn? {
         LagoonColumn(rawValue: index)
-    }
-
-    /// Sum of every column's `min`, plus the separators between them.
-    static var minimumWindowWidth: Double {
-        specs.reduce(0) { $0 + $1.min } + Double(specs.count - 1) * dividerThickness
     }
 
     /// `UserDefaults` key for a column's persisted width.

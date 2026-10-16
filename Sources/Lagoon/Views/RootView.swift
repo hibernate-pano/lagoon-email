@@ -275,10 +275,13 @@ struct RootView: View {
         accounts.accountId == nil ? [.list, .reader] : [.navigation, .list, .reader]
     }
 
-    /// `sum(min) + separators` over the columns actually present.
+    /// `sum(min) + separators` over the columns actually present — derived by
+    /// the layout's one authority (`ColumnLayoutMetrics.minimumWindowWidth(for:)`)
+    /// rather than re-spelled here. A second hand-written copy is exactly how
+    /// this drifted before: the window enforced 822 while a stale static 832
+    /// survived in tests (UX-11).
     private var minimumWindowWidth: CGFloat {
-        visibleColumns.reduce(0) { $0 + CGFloat(ColumnLayoutMetrics.spec(for: $1).min) }
-            + CGFloat(Double(max(0, visibleColumns.count - 1)) * ColumnLayoutMetrics.dividerThickness)
+        CGFloat(ColumnLayoutMetrics.minimumWindowWidth(for: visibleColumns))
     }
 
     private var decorated: some View {

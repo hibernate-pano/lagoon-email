@@ -503,11 +503,13 @@ final class PurgeRoutesTests: XCTestCase {
 
         let readOnly = try XCTUnwrap(
             Self.methods(inProtocolNamed: "MailSyncReading", in: source),
-            "could not find the MailSyncReading declaration in \(Self.mailProviderSource.path)"
+            "could not find the MailSyncReading declaration in \(Self.mailProviderSource.path) — "
+                + "if the protocol was renamed, point this guard at the new name"
         )
         let writable = try XCTUnwrap(
             Self.methods(inProtocolNamed: "MailProvider", in: source),
-            "could not find the MailProvider declaration in \(Self.mailProviderSource.path)"
+            "could not find the MailProvider declaration in \(Self.mailProviderSource.path) — "
+                + "if the protocol was renamed, point this guard at the new name"
         )
 
         for forbidden in ["permanentlyDelete", "emptyTrash", "setRead", "archive",
@@ -553,12 +555,25 @@ final class PurgeRoutesTests: XCTestCase {
     /// Deliberately shallow: it collects the `func` signatures at the protocol's
     /// own brace depth and does not follow comments or nested declarations, which
     /// is enough because these protocols declare requirements flat.
-    private static func methods(inProtocolNamed name: String, in source: String) throws -> Set<String> {
+    ///
+    /// Returns nil — and records an `XCTFail`, T2 — when the protocol is not
+    /// found. It used to `throw XCTSkip` there, which made a renamed protocol
+    /// *skip* the guard: the run summary said "1 skipped", which
+    /// `run-all-tests.sh` happily included, so the guarantee could be deleted
+    /// by a rename and nothing failed. A missing declaration is precisely the
+    /// drift this guard exists to catch, so it fails loudly instead; the
+    /// callers' `XCTUnwrap` (previously unreachable, since the old function
+    /// threw before it could return) supplies the second, named failure.
+    private static func methods(inProtocolNamed name: String, in source: String) -> Set<String>? {
         let lines = source.components(separatedBy: .newlines)
         guard let start = lines.firstIndex(where: {
             $0.contains("protocol \(name):") || $0.contains("protocol \(name) {")
         }) else {
-            throw XCTSkip("protocol \(name) not found — the declaration shape changed")
+            XCTFail(
+                "protocol \(name) not found — the declaration shape changed; "
+                    + "point this guard at the new declaration"
+            )
+            return nil
         }
         var names: Set<String> = []
         var opened = false

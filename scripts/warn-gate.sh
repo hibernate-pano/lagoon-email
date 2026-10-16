@@ -35,6 +35,16 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# Extra SwiftPM flags, from LAGOON_SWIFTPM_FLAGS (same contract as
+# scripts/run-all-tests.sh — see the header note there). A nested-sandbox
+# session passes `--disable-sandbox`; without it the build below dies with
+# `sandbox-exec: sandbox_apply: Operation not permitted` and this gate never
+# gets to run. Parsed into an array via `read -a` for bash 3.2 compatibility.
+SWIFTPM_FLAGS=()
+if [[ -n "${LAGOON_SWIFTPM_FLAGS:-}" ]]; then
+  read -r -a SWIFTPM_FLAGS <<< "$LAGOON_SWIFTPM_FLAGS"
+fi
+
 # file-path-fragment | diagnostic-name | why it is allowed
 ALLOWED=(
   'Sources/LagoonServer/Networking/NIOSSLStreamTransport.swift|DeprecatedDeclaration|NIOAsyncChannel.inbound: executeThenClose cannot express a long-lived transport'
@@ -239,7 +249,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   # scripts/test-warn-gate.sh fixtures — do NOT delete either branch on the
   # assumption that only one is live; the allowlist entry depends on the OSC-8
   # branch actually firing.
-  if ! swift build --build-tests --scratch-path "$scratch" -Xswiftc -no-color-diagnostics > "$build_log" 2>&1; then
+  #
+  # `LAGOON_SWIFTPM_FLAGS` (parsed at the top of this file) rides along here:
+  # in a nested sandbox this is the build that hangs/dies without
+  # `--disable-sandbox`, so the passthrough is load-bearing for the gate, not
+  # just for run-all-tests.sh.
+  if ! swift build --build-tests --scratch-path "$scratch" -Xswiftc -no-color-diagnostics ${SWIFTPM_FLAGS[@]+"${SWIFTPM_FLAGS[@]}"} > "$build_log" 2>&1; then
     cat "$build_log" >&2
     echo "❌ build failed" >&2
     exit 1

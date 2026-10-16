@@ -13,16 +13,24 @@ struct LagoonApp: App {
                 case .starting:
                     // The embedded server binds in well under a second; this
                     // only exists so no view races a not-yet-listening socket.
+                    //
+                    // Copy via `L10n.current`, not a literal: `LagoonApp` is
+                    // not a View and during boot there is no `RootView` yet to
+                    // inject `\.l10n` (RootView is what does it for the rest of
+                    // the app), so the startup phase reads the stored
+                    // preference the same way non-View code does. Hardcoded
+                    // Chinese here was the one systematic localization gap:
+                    // English installs booted showing Chinese.
                     VStack(spacing: 12) {
                         ProgressView()
-                        Text("Lagoon 正在启动…").foregroundStyle(.secondary)
+                        Text(L10n.current.serverStarting).foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .failed(let message):
                     VStack(spacing: 12) {
-                        Text("启动失败").font(.headline)
+                        Text(L10n.current.serverStartFailed).font(.headline)
                         Text(message).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                        Button("重试") { serverBoot.retry() }
+                        Button(L10n.current.retry) { serverBoot.retry() }
                             .buttonStyle(.borderedProminent)
                     }
                     .padding(32)

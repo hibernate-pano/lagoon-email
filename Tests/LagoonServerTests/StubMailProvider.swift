@@ -96,8 +96,24 @@ actor StubMailProvider: MailProvider {
         return FetchedBody(text: body, html: bodyHTML, attachments: [], hasMore: false)
     }
 
+    /// Attachment bytes for the download route. Defaults to `.failure(.notFound)`
+    /// — the pre-existing behaviour — so every test that only reaches
+    /// `fetchAttachment` incidentally is unaffected.
+    private var attachmentResult: Result<FetchedAttachmentBytes, AttachmentError> = .failure(.notFound)
+    /// What `fetchAttachment` was asked for, in order. The attachment route
+    /// tests assert on this so "the route answered 200" and "the provider was
+    /// actually asked for those bytes" stay distinguishable.
+    private(set) var attachmentCalls: [(remoteId: String, attachmentId: String)] = []
+
     func fetchAttachment(remoteId: String, attachmentId: String) async throws -> FetchedAttachmentBytes {
-        throw AttachmentError.notFound
+        attachmentCalls.append((remoteId: remoteId, attachmentId: attachmentId))
+        return try attachmentResult.get()
+    }
+
+    /// Configures the scripted attachment response (bytes or an
+    /// `AttachmentError`).
+    func setAttachmentResult(_ result: Result<FetchedAttachmentBytes, AttachmentError>) {
+        attachmentResult = result
     }
 
     func fetchRawMessage(remoteId: String) async throws -> Data {

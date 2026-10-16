@@ -340,6 +340,38 @@ final class ColumnLayoutGuardTests: XCTestCase {
         }
     }
 
+    /// The divider's accessibility wiring must stay **attached to the view**,
+    /// not merely present as words somewhere in the file.
+    ///
+    /// A separator is a 1pt line whose entire VoiceOver surface is these
+    /// modifiers: drop the label and VoiceOver announces "adjustable" with
+    /// nothing to adjust; drop the adjustable action and the arrow keys it
+    /// advertises do nothing. None of that is visible to any width or drag
+    /// assertion, which is why it is pinned here — each string below is the
+    /// actual modifier call site, so deleting one of the wirings turns this
+    /// red (verified by mutation).
+    func test_theDividersAccessibilityWiringIsAttached() throws {
+        let region = try String(
+            contentsOf: ViewSource.url(under: "Views/ColumnLayout", "ColumnDivider"),
+            encoding: .utf8
+        )
+        let code = Self.strippingComments(region)
+        for wiring in [
+            ".accessibilityElement()",
+            ".accessibilityLabel(ColumnWidthStrings.label(for: column))",
+            ".accessibilityValue(ColumnWidthStrings.spoken(Int(store.width(of: column).rounded())))",
+            ".accessibilityAdjustableAction",
+            ".accessibilityAction(named: Text(ColumnWidthStrings.toMin))",
+            ".accessibilityAction(named: Text(ColumnWidthStrings.toMax))",
+        ] {
+            XCTAssertTrue(
+                code.contains(wiring),
+                "ColumnDivider lost `\(wiring)` — that absence is invisible until a "
+                    + "VoiceOver user hits it, which is how it shipped unnoticed in the first place"
+            )
+        }
+    }
+
     // MARK: - Helpers
 
     /// The file's code with `//` and `/* */` comments removed.

@@ -605,12 +605,12 @@ struct MessageDetailView: View {
                 .frame(height: max(80, htmlContentHeight))
                 // Keep the body reachable for VoiceOver: the region is a
                 // container of the WebView's own elements rather than one
-                // opaque node.
-                // # ponytail: no `l10n.messageBody` key exists yet, so the
-                // container is unlabelled. Add one to L10n.swift (both
-                // languages) and set `.accessibilityLabel(l10n.messageBody)`
-                // here — LocalizationTests will then cover both strings.
+                // opaque node, and the label says *what* the region is —
+                // "the message body" — before the user walks into it. (Was a
+                // TODO here for want of the `l10n.messageBody` key; added to
+                // both languages, and `LocalizationTests` covers the pair.)
                 .accessibilityElement(children: .contain)
+                .accessibilityLabel(l10n.messageBody)
                 if isLoadingInlineImages {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
