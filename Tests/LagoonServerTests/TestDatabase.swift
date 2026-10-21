@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 import GRDB
+import Crypto
 @testable import LagoonKit
 import LagoonServer
 
@@ -37,7 +38,22 @@ enum TestDatabase {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("lagoon-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        installTestBodyKey()
         return try LagoonDatabase.open(path: dir.appendingPathComponent("lagoon.sqlite").path)
+    }
+
+    /// The body is sealed at rest, so every test that opens a store needs a
+    /// body key. It is a **fixed** key, not a random one: the same key has
+    /// to be in place for the whole test process, because the seal/open
+    /// round trip and the migration both use the process-wide provider, and
+    /// a key that changed between two calls would read back as garbage.
+    ///
+    /// A test key is not a secret. It protects nothing — the store is a
+    /// throwaway file in the temporary directory.
+    static func installTestBodyKey() {
+        guard BodyCipher.keyProvider == nil else { return }
+        let bytes = Data((0..<32).map { UInt8($0) })
+        BodyCipher.keyProvider = { SymmetricKey(data: bytes) }
     }
 
     // MARK: - Direct helpers (ported call sites; scoped deletes)

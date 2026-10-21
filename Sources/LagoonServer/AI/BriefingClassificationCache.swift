@@ -84,7 +84,25 @@ public actor BriefingClassificationCache {
         inFlight.subtract(messages.map(key))
     }
 
+    /// The cache key of one message.
+    ///
+    /// **The account id is part of the key**, and it has to be.
+    ///
+    /// The key used to be `remoteId|isRead` — and `remoteId` is not unique
+    /// across mailboxes. When a message carries no `Message-ID` header the
+    /// provider falls back to `uid:<n>`, and each account's IMAP UIDs
+    /// count up independently, so account A's `uid:42` and account B's
+    /// `uid:42` are the same string.
+    ///
+    /// The cache is one instance for the whole process, so the two accounts
+    /// shared it: B's message was served A's classification. The user sees
+    /// a mail filed under the wrong category, with a rationale that talks
+    /// about a different message, and nothing in the UI says so.
+    ///
+    /// `MessageHeader` already carries `accountId`, so this is a one-line
+    /// fix — but it is the kind of one-liner that has to be *written down*,
+    /// because the key looks complete without it.
     private func key(_ message: MessageHeader) -> String {
-        "\(message.remoteId)|\(message.isRead ? 1 : 0)"
+        "\(message.accountId.uuidString)|\(message.remoteId)|\(message.isRead ? 1 : 0)"
     }
 }

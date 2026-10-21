@@ -17,6 +17,14 @@ import GRDB
 /// exists only so a mailbox receiving thousands of messages a month cannot
 /// produce a one-megabyte response and a matching LLM bill in a single pass —
 /// and when it bites, the response has to say so instead of looking complete.
+///
+/// ## Why the out-of-window rows here are *read*
+///
+/// The feed has two sources: the window, and the backlog (unread mail older
+/// than the window, which still needs a reply and so must not disappear —
+/// `BriefingBacklogTests` covers that). Old **read** mail is in neither, so
+/// these tests use read rows for the "outside the window" case: that isolates
+/// the window's own behaviour, which is what they are about.
 final class BriefingWindowTests: XCTestCase {
     private let logger = Logger(label: "briefing-window-tests")
 
@@ -43,7 +51,8 @@ final class BriefingWindowTests: XCTestCase {
     private func header(
         _ remoteId: String,
         accountId: UUID,
-        daysAgo: Double
+        daysAgo: Double,
+        isRead: Bool = false
     ) -> MessageHeader {
         MessageHeader(
             id: UUID(),
@@ -55,7 +64,7 @@ final class BriefingWindowTests: XCTestCase {
             subject: "Subject \(remoteId)",
             snippet: nil,
             receivedAt: Date().addingTimeInterval(-daysAgo * 24 * 60 * 60),
-            isRead: false,
+            isRead: isRead,
             isArchived: false
         )
     }
@@ -75,8 +84,12 @@ final class BriefingWindowTests: XCTestCase {
 
     // MARK: - The 30-day window
 
-    /// Mail older than 30 days is out of the briefing entirely — it is not a
-    /// row the user has to scroll past, and it is not sent to the classifier.
+    /// Mail older than 30 days is out of the briefing — it is not a row the
+    /// user has to scroll past, and it is not sent to the classifier.
+    ///
+    /// The out-of-window rows here are *read*, so they belong to neither the
+    /// window nor the backlog: the backlog is unread mail that still needs a
+    /// reply (`BriefingBacklogTests`).
     func test_mailOlderThan30Days_isExcluded() async throws {
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
             let account = makeAccount()
@@ -89,10 +102,10 @@ final class BriefingWindowTests: XCTestCase {
                     header("edge", accountId: account.id, daysAgo: 29), db: conn
                 )
                 try await MessageStore.upsert(
-                    header("stale", accountId: account.id, daysAgo: 31), db: conn
+                    header("stale", accountId: account.id, daysAgo: 31, isRead: true), db: conn
                 )
                 try await MessageStore.upsert(
-                    header("ancient", accountId: account.id, daysAgo: 400), db: conn
+                    header("ancient", accountId: account.id, daysAgo: 400, isRead: true), db: conn
                 )
 
                 let app = Application(router: router(conn))
@@ -135,7 +148,8 @@ final class BriefingWindowTests: XCTestCase {
                 }
                 for i in 0..<40 {
                     try await MessageStore.upsert(
-                        header("out-\(i)", accountId: account.id, daysAgo: Double(45 + i)), db: conn
+                        header("out-\(i)", accountId: account.id, daysAgo: Double(45 + i), isRead: true),
+                        db: conn
                     )
                 }
 
@@ -203,7 +217,8 @@ final class BriefingWindowTests: XCTestCase {
                 }
                 for i in 0..<10 {
                     try await MessageStore.upsert(
-                        header("old-\(i)", accountId: account.id, daysAgo: Double(60 + i)), db: conn
+                        header("old-\(i)", accountId: account.id, daysAgo: Double(60 + i), isRead: true),
+                        db: conn
                     )
                 }
 

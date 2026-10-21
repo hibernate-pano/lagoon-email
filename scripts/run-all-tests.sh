@@ -46,6 +46,13 @@ fi
 # lines carry the same numbers as the 'All tests' block).
 TEST_FLOOR=800
 
+echo "== Version =="
+# The version lives in exactly one place (Support/VERSION) and the Info.plist
+# mirrors it. A release that ships a bundle saying 3.1.0 while the source says
+# 3.2.0 is a support ticket waiting to happen, so the mirror is checked here
+# rather than by eye.
+bash scripts/check-version.sh
+
 echo "== Guardrails =="
 bash scripts/ci-guardrails.sh
 bash scripts/lint-no-silent-catch.sh

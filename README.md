@@ -78,14 +78,39 @@ One SQLite file (`GRDB`, WAL mode, foreign keys ON) holds everything: accounts
 stack rules, and the read-only `advice` table.
 
 Note on foreign keys: they **are** on (`LagoonDatabase.open` sets
-`foreignKeysEnabled = true`), so `ON DELETE CASCADE` fires for the two tables
-whose FK points at `message_headers` (`message_bodies`, `advice`). It does
-**not** fire for the three that reference `accounts(id)` instead
-(`message_pins`, `draft_replies`, `ai_overrides`) — those need explicit
-deletion, which is why `hardDeleteSync` does it by hand. Do not check this
-with the `sqlite3` CLI: it opens its own connection, and the pragma is
-per-connection and defaults to OFF there, so it reports 0 regardless of what
-the app does.
+`foreignKeysEnabled = true`), so `ON DELETE CASCADE` fires for the tables that
+reference `accounts(id)` (`message_headers`, `advice`, `ai_actions`,
+`draft_replies`, …) and for the two whose FK points at `message_headers`
+(`message_bodies`, `advice`).
+
+This was **not** true on one upgraded install, and it was not a caveat — it
+was a corruption. The `accounts` row held its UUID as 36-character *text*
+while every child held the 16-byte *binary* form. SQLite compares BLOB and
+TEXT as different values, so the parent was unreachable by every
+`WHERE id = ?`: the account could not be found, the sync failed, and the app
+told the user their authorization code had expired — a lie. The cascade never
+matched either, so a deleted account left hundreds of orphan rows behind, and
+`PRAGMA foreign_key_check` reported 727 violations. The `lagoon-v5b`
+migration repairs the encoding (`Sources/LagoonKit/AccountIDRepair.swift`),
+and `hardDeleteSync` still deletes children explicitly — belt and braces, not
+a substitute.
+
+The same missing row had a second consequence, one level up. Because the
+account could not be found, no sync round ever negotiated capabilities for
+it, so `accounts.capabilities` kept the all-false default — and
+`capabilities.archiveFolder` was a plain `Bool`, so "nobody ever asked" was
+read as "this server cannot archive". Every archive, including bulk, came
+back `409 archive-unavailable`. The role fields that gate a verb
+(`archiveFolder`, `trashFolder`, `sentFolder`, `uidplus`) are now `Bool?`,
+where `nil` means *not determined* and the gates read it as **allowed**: the
+server is the authority and still answers 409 when the folder really is
+missing. A settled `false` — a probe that could neither find nor create the
+folder — still closes the gate.
+
+Do not check foreign keys with the `sqlite3` CLI: it opens its own
+connection, and the pragma is per-connection and defaults to OFF there, so it
+reports 0 regardless of what the app does. Use `PRAGMA foreign_key_check`,
+which inspects the data and does not depend on the pragma.
 
 - **Schema**: `Sources/LagoonKit/LagoonDatabase.swift` — the final state of
   the historical 19 Postgres migrations, expressed for SQLite and applied
@@ -129,10 +154,25 @@ the app does.
   stays on. A standalone CLI (`LagoonServerCLI`) keeps the env-var contract
   for development and diagnostics (`--self-test`, `--list-mailboxes`,
   `--find-subject`, `--restore`).
-- **Message bodies are stored** in the local SQLite store on first open,
+- **Message bodies are sealed at rest** with AES-256-GCM (`BodyCipher`): the
+  plain-text body, the HTML body and the list preview are stored as
+  ciphertext (`lgb1:` + base64) and the key lives in the **Keychain**
+  (`lagoon.bodyKey`), never on disk. Headers — sender, subject, timestamps —
+  and per-message metadata (recipients, attachment names) stay in the clear,
+  because they are the index the list and the sidebar read without a key.
+  A store written by an older build is sealed in place by a migration; the
+  spec's own enforcement ("unit test that asserts no plaintext body field
+  exists in any server-side table") is `Tests/LagoonServerTests/BodyEncryptionTests.swift`.
+  Not end-to-end encryption: the key is in the Keychain of the same machine
+  — that is the trust boundary of a local-first app. Turn on **FileVault**:
+  it is what protects the metadata and the headers this app deliberately
+  leaves readable.
+- **Message bodies are cached** in the local SQLite store on first open,
   write-through, cascade-deleted with their header row when the provider
-  expunges them. Search matches subject/snippet/sender/body with LIKE
-  (escaped); the Postgres tsvector arm is gone with the provider.
+  expunges them. Search matches subject/sender with LIKE (escaped) and
+  reaches into the sealed body and preview through a registered SQL function
+  that opens the envelope inside SQLite (`lagoon_cipher_contains`); the
+  Postgres tsvector arm is gone with the provider.
 - **Unsubscribes are SSRF-guarded** (`UnsubscribeScanner`) and archive /
   unsubscribe / delete are remote-first: a remote failure returns an error
   and leaves local state unchanged.
@@ -204,7 +244,8 @@ heuristic-only and `/summary` returns 503 — it never crashes.
   Four defects fixed along the way, one of them data loss: `/api/delete-bulk`
   dropped the `sent` field, so "select all sent, then delete" resolved to the
   inbox; `hardDeleteSync` left `draft_replies` / `ai_overrides` orphaned
-  (their FK points at `accounts`, so SQLite never cascades them); API auth
+  (the cascade *should* have taken them — see the id-encoding note above for
+  why it did not on that install); API auth
   was fail-open on a path spelling like `//api/ping`; and the IMAP backfill
   window counted UID *slots* rather than messages, which on a sparse-UID
   mailbox covered ~43 of 500 intended messages while reporting healthy.

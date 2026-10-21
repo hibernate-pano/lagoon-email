@@ -402,7 +402,7 @@ private actor FailSecondTrashProvider: MailProvider {
     let kind: MailProviderKind = .qq
     private var calls = 0
 
-    func capabilities() async -> MailCapabilities {
+    func capabilities() async -> MailCapabilities? {
         MailCapabilities(archiveFolder: true, idle: true, move: true, serverSnippet: false)
     }
     func pullChanges(after cursor: MailSyncState, waitUpTo: Duration) async throws -> MailChangeSet {

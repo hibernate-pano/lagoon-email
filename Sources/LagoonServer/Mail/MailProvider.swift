@@ -79,6 +79,32 @@ public struct MailChangeSet: Sendable {
     /// moved or deleted by another client; providers without a cheap complete
     /// view leave it nil.
     public var inboxRemoteIds: Set<String>?
+    /// Remote IDs the provider confirmed are in the account's **archive**
+    /// folder, as opposed to merely absent from the inbox.
+    ///
+    /// A message can leave the inbox without being deleted — it can be
+    /// archived or trashed, by Lagoon or by another client. The store has to
+    /// know which, because "not in the inbox" is not a licence to delete:
+    /// deleting the local row drops its cached body and its paid-for AI
+    /// advice with it, and the app never reads those folders back, so the
+    /// loss would be permanent.
+    ///
+    /// `nil` means "not known" — the provider did not look, or could not look
+    /// at everything. The store then leaves the local rows alone.
+    public var archivedRemoteIds: Set<String>?
+    /// Remote IDs the provider confirmed are in the account's **trash**
+    /// folder. Same contract as `archivedRemoteIds`.
+    public var trashedRemoteIds: Set<String>?
+    /// Remote IDs the provider confirmed are **gone from the server** — not
+    /// in the inbox, not in the archive folder, not in the trash folder.
+    ///
+    /// This is the only set that licenses the store to delete a local row.
+    /// "Not in the inbox" is not enough: a message can leave the inbox by
+    /// being filed, including by another client, and deleting the local row
+    /// drops its cached body and its paid-for AI advice for good.
+    ///
+    /// `nil` means "not confirmed" — the store then removes nothing.
+    public var removedRemoteIds: Set<String>?
     /// Message-IDs (RFC 5322) this pull saw referenced from sent mail
     /// (In-Reply-To/References of Sent-folder messages). The engine records
     /// them as reply signals so mail answered from another client leaves
@@ -90,12 +116,18 @@ public struct MailChangeSet: Sendable {
         resetRequired: Bool,
         cursor: MailSyncState,
         inboxRemoteIds: Set<String>? = nil,
+        archivedRemoteIds: Set<String>? = nil,
+        trashedRemoteIds: Set<String>? = nil,
+        removedRemoteIds: Set<String>? = nil,
         repliedMessageIds: Set<String> = []
     ) {
         self.upserts = upserts
         self.resetRequired = resetRequired
         self.cursor = cursor
         self.inboxRemoteIds = inboxRemoteIds
+        self.archivedRemoteIds = archivedRemoteIds
+        self.trashedRemoteIds = trashedRemoteIds
+        self.removedRemoteIds = removedRemoteIds
         self.repliedMessageIds = repliedMessageIds
     }
 }
@@ -112,6 +144,13 @@ public struct OutboundMessage: Sendable {
     /// Carbon-copy recipients. Empty means the `Cc:` header is omitted
     /// entirely rather than emitted blank.
     public var cc: [String]
+    /// Blind carbon-copy recipients.
+    ///
+    /// A `Bcc:` header is never written — that is the whole point of a blind
+    /// copy — but the addresses still have to be in the **envelope**, or the
+    /// recipients would never receive the mail. The envelope list below adds
+    /// them; the headers do not.
+    public var bcc: [String]
     public var subject: String
     public var body: String
     public var inReplyTo: String?
@@ -119,48 +158,72 @@ public struct OutboundMessage: Sendable {
     /// New-message sends keep the subject exactly as typed; replies add the
     /// de-duplicated `Re:` prefix.
     public var isReply: Bool
+    /// Files to send with the message.
+    ///
+    /// Empty means a plain `text/plain` message, exactly as before. A
+    /// non-empty list means `multipart/mixed`, with the body as the first
+    /// part and one part per attachment.
+    public var attachments: [OutboundAttachment]
 
     public init(
         fromEmail: String,
         fromName: String?,
         to: String,
         cc: [String] = [],
+        bcc: [String] = [],
         subject: String,
         body: String,
         inReplyTo: String?,
         references: String?,
-        isReply: Bool = true
+        isReply: Bool = true,
+        attachments: [OutboundAttachment] = []
     ) {
         self.fromEmail = fromEmail
         self.fromName = fromName
         self.to = to
         self.cc = cc
+        self.bcc = bcc
         self.subject = subject
         self.body = body
         self.inReplyTo = inReplyTo
         self.references = references
         self.isReply = isReply
+        self.attachments = attachments
     }
 
-    /// Split a comma-separated `To:` string back into addresses.
+    /// The `To:` line, split into routable addresses.
+    ///
+    /// Split on top-level commas only, and pull the bare address out of
+    /// each piece. A naive `split(separator: ",")` broke two things at
+    /// once: a comma inside a quoted display name
+    /// (`"Zhang, Wei" <j@x.com>`) became two recipients, and a
+    /// display name in the ordinary form (`Zhang <j@x.com>`) was
+    /// passed on as the forward-path `Zhang wei@example.com` — which no SMTP
+    /// server accepts. The user typed a name, and the send failed with a
+    /// message about the server.
     public var recipientAddresses: [String] {
-        to.split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        AddressList.bareAddresses(to)
     }
 
-    /// The envelope recipient list: every `To` address plus every `Cc`, one
-    /// forward-path per entry. RFC 5321 §4.1.1.3 gives `RCPT TO` exactly one
+    /// The envelope recipient list: every `To` address plus every `Cc` and
+    /// `Bcc`, one forward-path per entry. RFC 5321 §4.1.1.3 gives `RCPT TO` exactly one
     /// address, so a reply-all cannot travel as a single comma-joined command
     /// — and without the Cc set here, every Cc recipient is silently never
     /// delivered to. Duplicates are dropped case-insensitively, because the
     /// same person can appear in both lists under different capitalisation.
+    ///
+    /// Bcc is here for the same reason Cc is, and the contrast is the point:
+    /// the *headers* name Cc but never Bcc, so the other recipients cannot
+    /// see who else got the mail; the *envelope* must name both, or the
+    /// blind copy would never be delivered at all.
     public var envelopeRecipients: [String] {
         var seen = Set<String>()
         var result: [String] = []
-        for raw in recipientAddresses + cc {
-            // The route accepts a bracketed address, which a forward-path
-            // must not carry twice.
+        for raw in recipientAddresses + cc + bcc {
+            // `recipientAddresses` and `cc` are already bare addresses, so
+            // the only thing left to strip is the brackets a caller may
+            // have wrapped them in: the route accepts a bracketed address,
+            // which a forward-path must not carry twice.
             let address = raw.trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
             let key = address.lowercased()
             guard !address.isEmpty, seen.insert(key).inserted else { continue }
@@ -205,6 +268,13 @@ public enum MailError: Error, Equatable {
     /// `listSent`, which reports the latter as an empty list.
     case sentUnavailable
     case notConfigured(String)
+    /// The account row could not be found by the id the caller holds.
+    ///
+    /// A *store* problem, not a credentials problem: the mailbox may be
+    /// perfectly reachable and the authorization code perfectly valid, but
+    /// this store has no addressable row for the account. It is its own case
+    /// so that it can never be reported as an expired authorization code.
+    case accountMissing(String)
 
     /// Stable, log-safe label (never interpolate payloads into user-facing text).
     public var logLabel: String {
@@ -217,6 +287,7 @@ public enum MailError: Error, Equatable {
         case .trashUnavailable: return "trash-unavailable"
         case .sentUnavailable: return "sent-unavailable"
         case .notConfigured: return "not-configured"
+        case .accountMissing: return "account-missing"
         }
     }
 }
@@ -237,7 +308,15 @@ public protocol ArchiveFolderResolving: Sendable {
 /// than a convention (advisory-only constitution §2 rule 2).
 public protocol MailSyncReading: Sendable {
     /// Negotiated once after connect and cached on the account row.
-    func capabilities() async -> MailCapabilities
+    ///
+    /// `nil` means **"could not determine"** — the negotiation did not
+    /// complete, which is not the same answer as "this server has none of
+    /// these". The distinction matters: capabilities gate the archive and
+    /// delete routes, so a failed negotiation that was recorded as "no
+    /// capabilities" turned one network blip into a permanently disabled
+    /// feature. A caller that gets `nil` must keep whatever it already knew
+    /// and try again later.
+    func capabilities() async -> MailCapabilities?
 
     /// Fetch changes newer than `cursor`, waiting up to `waitUpTo` for
     /// something to happen (IDLE, bounded by the loop's poll cadence).

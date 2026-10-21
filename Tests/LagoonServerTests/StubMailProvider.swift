@@ -77,7 +77,7 @@ actor StubMailProvider: MailProvider {
         shutdownCount += 1
     }
 
-    func capabilities() async -> MailCapabilities {
+    func capabilities() async -> MailCapabilities? {
         MailCapabilities(archiveFolder: true, idle: true, move: true, serverSnippet: false)
     }
 

@@ -33,6 +33,46 @@ struct UndoResponse: Encodable { let ok: Bool; let undone: Int64 }
 /// of a 500 that reads like a server fault.
 struct NotUndoable: Error { let kind: AIActionKind }
 
+/// The bound on one bulk sweep (清扫 / 批量删除).
+///
+/// ## Why a *time* bound and not only a count
+///
+/// The client waits 75 s for these calls (`APITimeout.slow` in `APIClient`),
+/// and every message costs at least two serial IMAP round trips: one
+/// `UID SEARCH` to turn the stored Message-ID into a UID, one `UID MOVE` to
+/// move it. 500 messages is a thousand round trips, so the client used to
+/// time out while the server was still sweeping — and the user, looking at a
+/// spinner, clicked again, which put two sweeps of the same mailbox on the
+/// wire at once.
+///
+/// A count cap cannot fix that, because the cost of a message is the server's
+/// round trip to QQ, not a constant: 500 messages can take ten seconds on a
+/// fast link and three minutes on a slow one. So the sweep is bounded by
+/// *time* as well, checked before every message, and everything it did not
+/// reach is reported instead of being silently dropped.
+///
+/// ## Why the count cap stays
+///
+/// The client says "500 per call" in its truncation notice, and that number
+/// is a contract with the user, not an implementation detail. Lowering it
+/// would make the client's own wording a lie.
+public struct BulkSweepBudget: Sendable {
+    /// The most messages one call may touch.
+    public let maxItems: Int
+    /// The wall-clock seconds the remote phase of one call may take.
+    public let seconds: TimeInterval
+
+    public init(maxItems: Int = 500, seconds: TimeInterval = 45) {
+        self.maxItems = maxItems
+        self.seconds = seconds
+    }
+
+    /// 45 s of sweeping leaves the client 30 s of its 75 s for the last
+    /// writes, the response and the network — so the sweep always answers
+    /// before the client gives up on it.
+    public static let production = BulkSweepBudget()
+}
+
 /// Every "Lagoon did something" mutation flows through here. The undo panel
 /// reads from the same table (GET /api/actions).
 public enum ActionsRoutes {
@@ -40,15 +80,18 @@ public enum ActionsRoutes {
         on router: Router<BasicRequestContext>,
         db: LagoonDB,
         logger: Logger,
-        makeProvider: MailProviderFactory.Builder? = nil
+        makeProvider: MailProviderFactory.Builder? = nil,
+        bulkBudget: BulkSweepBudget = .production
     ) {
         let makeProvider = makeProvider
             ?? MailProviderFactory.factory(db: db, logger: logger).builder
 
         // POST /api/messages/{remoteId}/archive?accountId=
         // Moves the message through the account's provider (`MailProvider.archive`).
-        // Gated on the negotiated `capabilities.archiveFolder`: a provider that
-        // cannot move messages is rejected before any local state changes.
+        // Gated on `capabilities.allowsArchive` — the negotiated verdict, read
+        // as *allowed* when it is "not determined": a provider that cannot
+        // move messages is rejected before any local state changes, but an
+        // account nobody has probed is not treated as if it had said no.
         router.post("api/messages/:remoteId/archive") { request, context -> Response in
             return await archiveHandler(
                 request: request, context: context, db: db,
@@ -132,7 +175,8 @@ public enum ActionsRoutes {
         // against the same filter the list uses, so the two cannot disagree.
         router.post("api/delete-bulk") { request, _ -> Response in
             return await deleteBulkHandler(
-                request: request, db: db, makeProvider: makeProvider, logger: logger
+                request: request, db: db, makeProvider: makeProvider, logger: logger,
+                budget: bulkBudget
             )
         }
 
@@ -143,7 +187,8 @@ public enum ActionsRoutes {
         // partial success is reported honestly, never thrown away.
         router.post("api/archive-bulk") { request, _ -> Response in
             return await archiveBulkHandler(
-                request: request, db: db, makeProvider: makeProvider, logger: logger
+                request: request, db: db, makeProvider: makeProvider, logger: logger,
+                budget: bulkBudget
             )
         }
 
@@ -219,7 +264,7 @@ public enum ActionsRoutes {
         // Spec §3.7: a provider without an archive target must not half-archive.
         // The gate runs before any write, so a 409 leaves both remote and local
         // state untouched.
-        guard account.capabilities.archiveFolder else {
+        guard account.capabilities.allowsArchive else {
             return RouteJSON.error(.conflict, "archive-unavailable")
         }
         guard let provider = makeProvider(account) else {
@@ -306,7 +351,7 @@ public enum ActionsRoutes {
         // Same gate as archive, and for the same reason: if the provider cannot
         // find an archive folder there is nothing to move out of, and a 409
         // leaves both sides untouched.
-        guard account.capabilities.archiveFolder else {
+        guard account.capabilities.allowsArchive else {
             return RouteJSON.error(.conflict, "archive-unavailable")
         }
         guard let provider = makeProvider(account) else {
@@ -743,7 +788,8 @@ public enum ActionsRoutes {
     /// 第二步选服务器上的全部（服务端做）。
     private static func deleteBulkHandler(
         request: Request, db: LagoonDB,
-        makeProvider: MailProviderFactory.Builder, logger: Logger
+        makeProvider: MailProviderFactory.Builder, logger: Logger,
+        budget: BulkSweepBudget
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -792,9 +838,12 @@ public enum ActionsRoutes {
 
         // Cap first, then resolve. The cap is on *remote round trips*, which is
         // the real cost, so it must bound whichever path produced the ids.
-        let cap = 500
+        let cap = budget.maxItems
         var ids: [String] = []
-        var truncated = 0
+        // The size of the job the user asked for, not the size of the slice
+        // this call is allowed to touch: the difference is what has to be
+        // reported back, because it is what the user still has to do.
+        var requestedTotal = 0
         if req.allMatching == true {
             var stackMatch: MessageStore.StackMatch?
             if let stackId = req.stackId {
@@ -852,81 +901,42 @@ public enum ActionsRoutes {
             // `all.count - cap`) is what lets the user be told "3,000 more" as
             // opposed to a meaningless "1 more".
             ids = Array(all.prefix(cap))
-            truncated = max(0, liveTotal - ids.count)
+            requestedTotal = liveTotal
         } else {
             let requested = req.remoteIds ?? []
-            truncated = max(0, requested.count - cap)
+            requestedTotal = requested.count
             ids = Array(requested.prefix(cap))
         }
         guard !ids.isEmpty else {
             return RouteJSON.error(.badRequest, "empty-remoteIds")
         }
 
-        var items: [ArchiveBulkItem] = []
-        for remoteId in ids {
-            do {
-                // Local flag first, remote second — the same ordering
-                // `archiveBulkHandler` uses, for the same reconcile reason: the
-                // flag is the claim `reconcileInbox` respects, so it has to be
-                // committed before the await that lets reconcile run.
-                let claimed = try db.write { raw -> Bool in
-                    let wasDeleted = try Bool.fetchOne(
-                        raw,
-                        sql: "SELECT is_deleted FROM message_headers WHERE account_id = ? AND remote_id = ?",
-                        arguments: [accountId, remoteId]
-                    ) ?? false
-                    try MessageStore.setDeletedSync(
-                        remoteId: remoteId, accountId: accountId, deleted: true, db: raw
-                    )
-                    return !wasDeleted
-                }
-                do {
-                    try await provider.trash(remoteId: remoteId)
-                } catch {
-                    if claimed {
-                        try? db.write {
-                            try MessageStore.setDeletedSync(
-                                remoteId: remoteId, accountId: accountId, deleted: false, db: $0
-                            )
-                        }
-                    }
-                    throw error
-                }
-                let action = try db.write { raw in
-                    try MessageStore.setDeletedSync(
-                        remoteId: remoteId, accountId: accountId, deleted: true, db: raw
-                    )
-                    return try AIActionStore.recordSync(
-                        accountId: accountId,
-                        kind: .delete,
-                        payload: ["remoteId": remoteId, "remoteWrite": "true"],
-                        db: raw
-                    )
-                }
-                items.append(ArchiveBulkItem(remoteId: remoteId, ok: true, actionId: action.id))
-            } catch {
-                // Per-item, honestly: a partial success is reported, never
-                // thrown away. A bulk bar that says "done" while 30 of 200
-                // failed is the failure mode this shape exists to prevent.
-                items.append(ArchiveBulkItem(
-                    remoteId: remoteId, ok: false,
-                    errorCode: MessageRoutes.providerLabel(error)
-                ))
-            }
-        }
-        // `truncatedCount` is non-nil only when truncation actually happened,
-        // matching `archiveBulkHandler`. The client must either page through the
-        // remainder or tell the user — a partial bulk delete reported as
-        // complete is the exact failure this field was added for.
+        let sweep = await runBulkSweep(
+            verb: .delete,
+            ids: ids,
+            accountId: accountId,
+            provider: provider,
+            db: db,
+            logger: logger,
+            budget: budget
+        )
+        // `truncatedCount` is the *honest* remainder: the messages this call
+        // was asked for and did not reach — over the cap, or over the time
+        // budget. The client turns it into "还有 N 封未处理", which is the
+        // "split it into batches" instruction; a sweep that reported "done"
+        // while N messages were still in the inbox is the exact failure this
+        // field was added for.
+        let truncated = max(0, requestedTotal - sweep.count)
         return RouteJSON.response(ArchiveBulkResponse(
-            items: items,
+            items: sweep,
             truncatedCount: truncated > 0 ? truncated : nil
         ))
     }
 
     private static func archiveBulkHandler(
         request: Request, db: LagoonDB,
-        makeProvider: MailProviderFactory.Builder, logger: Logger
+        makeProvider: MailProviderFactory.Builder, logger: Logger,
+        budget: BulkSweepBudget
     ) async -> Response {
         guard let accountId = RouteParams.accountId(from: request) else {
             return RouteJSON.error(.badRequest, "malformed-accountId")
@@ -944,9 +954,9 @@ public enum ActionsRoutes {
         // unbounded request. The overflow is now *reported* rather than
         // silently dropped: a caller archiving 800 messages used to get 500
         // successes and no way to know the rest were never attempted.
-        let cap = 500
+        let cap = budget.maxItems
         let ids = Array(req.remoteIds.prefix(cap))
-        let truncated = max(0, req.remoteIds.count - ids.count)
+        let requestedTotal = req.remoteIds.count
         guard !ids.isEmpty else {
             return RouteJSON.error(.badRequest, "empty-remoteIds")
         }
@@ -962,22 +972,59 @@ public enum ActionsRoutes {
         guard let provider = makeProvider(account) else {
             return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
         }
-        guard account.capabilities.archiveFolder else {
+        guard account.capabilities.allowsArchive else {
             return RouteJSON.error(.conflict, "archive-unavailable")
         }
 
-        var items: [ArchiveBulkItem] = []
-        for remoteId in ids {
-            do {
-                // Local placeholder first, remote move second. reconcileInbox
-                // deletes every `is_archived = FALSE` row the provider no longer
-                // lists, and the remote MOVE is exactly what makes it stop
-                // listing it — so a sweep that moved first and flagged second
-                // left a window in which the sync loop deleted the row and its
-                // body (ON DELETE CASCADE) for a mail the user had just swept.
-                // The flag is the claim reconcile respects; commit it before
-                // the await that lets reconcile run.
-                let claimed = try db.write { raw -> Bool in
+        let sweep = await runBulkSweep(
+            verb: .archive,
+            ids: ids,
+            accountId: accountId,
+            provider: provider,
+            db: db,
+            logger: logger,
+            budget: budget
+        )
+        let truncated = max(0, requestedTotal - sweep.count)
+        return RouteJSON.response(
+            ArchiveBulkResponse(items: sweep, truncatedCount: truncated > 0 ? truncated : nil)
+        )
+    }
+
+    // MARK: - 批量清扫（归档 / 删除）
+
+    /// The one difference between 清扫 and 批量删除: which flag is claimed,
+    /// which provider verb moves the message, and which audit row is written.
+    ///
+    /// Everything else — the cap, the time budget, the rollback, the way a
+    /// failure is reported — has to be identical, because the two sweeps used
+    /// to be two hand-written copies of the same loop, and a copy is where
+    /// "the delete sweep says 500 and the archive sweep says 480" comes from.
+    private enum BulkVerb {
+        case archive
+        case delete
+
+        /// The audit row the undo panel reads.
+        var actionKind: AIActionKind {
+            switch self {
+            case .archive: return .archive
+            case .delete: return .delete
+            }
+        }
+
+        /// Claims the local flag, and reports whether *this* call is the one
+        /// that claimed it.
+        ///
+        /// The flag is the claim `reconcileInbox` respects: it only looks at
+        /// rows with `is_archived = FALSE AND is_deleted = FALSE`, so a
+        /// flagged row is invisible to it. That is why the flag has to be
+        /// committed *before* the remote move — a move that lands first leaves
+        /// a window in which the sync loop deletes the row (and its body, by
+        /// ON DELETE CASCADE) for a mail the user has just swept.
+        func claim(remoteId: String, accountId: UUID, db: LagoonDB) throws -> Bool {
+            try db.write { raw -> Bool in
+                switch self {
+                case .archive:
                     let wasArchived = try Bool.fetchOne(
                         raw,
                         sql: "SELECT is_archived FROM message_headers WHERE account_id = ? AND remote_id = ?",
@@ -987,36 +1034,137 @@ public enum ActionsRoutes {
                         true, remoteId: remoteId, accountId: accountId, db: raw
                     )
                     return !wasArchived
+                case .delete:
+                    let wasDeleted = try Bool.fetchOne(
+                        raw,
+                        sql: "SELECT is_deleted FROM message_headers WHERE account_id = ? AND remote_id = ?",
+                        arguments: [accountId, remoteId]
+                    ) ?? false
+                    try MessageStore.setDeletedSync(
+                        remoteId: remoteId, accountId: accountId, deleted: true, db: raw
+                    )
+                    return !wasDeleted
                 }
+            }
+        }
+
+        /// Undoes a claim whose remote move failed.
+        ///
+        /// Only the claim *this* sweep made is undone: a message that was
+        /// already flagged belongs to an earlier, successful move, and
+        /// clearing that flag would resurrect a message the user trashed.
+        func release(remoteId: String, accountId: UUID, db: LagoonDB) throws {
+            try db.write { raw in
+                switch self {
+                case .archive:
+                    try MessageStore.setArchivedSync(
+                        false, remoteId: remoteId, accountId: accountId, db: raw
+                    )
+                case .delete:
+                    try MessageStore.setDeletedSync(
+                        remoteId: remoteId, accountId: accountId, deleted: false, db: raw
+                    )
+                }
+            }
+        }
+
+        /// Writes the audit row the undo panel reads, together with the flag
+        /// it describes.
+        func record(remoteId: String, accountId: UUID, db: LagoonDB) throws -> AIAction {
+            try db.write { raw in
+                switch self {
+                case .archive:
+                    try MessageStore.setArchivedSync(
+                        true, remoteId: remoteId, accountId: accountId, db: raw
+                    )
+                case .delete:
+                    try MessageStore.setDeletedSync(
+                        remoteId: remoteId, accountId: accountId, deleted: true, db: raw
+                    )
+                }
+                return try AIActionStore.recordSync(
+                    accountId: accountId,
+                    kind: actionKind,
+                    payload: ["remoteId": remoteId, "remoteWrite": "true"],
+                    db: raw
+                )
+            }
+        }
+
+        /// The remote half of the sweep.
+        ///
+        /// One provider call per message, against the *same* provider for the
+        /// whole sweep: the pooled provider keeps the selected folder and the
+        /// resolved-UID cache, so a message costs one `UID SEARCH` and one
+        /// `UID MOVE` — not a fresh LIST, SELECT and SEARCH per message.
+        /// Building a provider per message (or per request) would throw that
+        /// cache away and turn the sweep into a thousand handshakes.
+        func move(provider: any MailProvider, remoteId: String) async throws {
+            switch self {
+            case .archive: try await provider.archive(remoteId: remoteId)
+            case .delete: try await provider.trash(remoteId: remoteId)
+            }
+        }
+    }
+
+    /// Runs one bulk sweep, under a bound the client can survive.
+    ///
+    /// ## The three ways the sweep stops
+    ///
+    /// 1. **It ran out of messages.** Everything was attempted.
+    /// 2. **The client gave up.** Hummingbird cancels the request task when
+    ///    the channel closes, and a sweep that keeps moving mail after the
+    ///    client walked away is the second sweep racing the user's next
+    ///    click — the exact confusion the time bound exists to prevent.
+    /// 3. **The budget ran out.** The cost of a message is the server's round
+    ///    trip to QQ, not a constant, so a count cap cannot promise the
+    ///    client an answer inside its 75 s timeout. The budget is checked
+    ///    before every message, so the call always answers in time.
+    ///
+    /// In cases 2 and 3 the messages that were not reached are reported as
+    /// `truncatedCount` by the caller — never silently dropped.
+    private static func runBulkSweep(
+        verb: BulkVerb,
+        ids: [String],
+        accountId: UUID,
+        provider: any MailProvider,
+        db: LagoonDB,
+        logger: Logger,
+        budget: BulkSweepBudget
+    ) async -> [ArchiveBulkItem] {
+        var items: [ArchiveBulkItem] = []
+        let deadline = Date().addingTimeInterval(budget.seconds)
+        var index = 0
+        while index < ids.count {
+            if Task.isCancelled { break }
+            if Date() >= deadline { break }
+            let remoteId = ids[index]
+            index += 1
+            do {
+                let claimed = try verb.claim(remoteId: remoteId, accountId: accountId, db: db)
                 do {
-                    try await provider.archive(remoteId: remoteId)
+                    try await verb.move(provider: provider, remoteId: remoteId)
                 } catch {
                     // The remote never moved, so the placeholder must not
-                    // outlive it — otherwise the mail disappears from the inbox
-                    // view for a move that never happened.
+                    // outlive it — otherwise the mail disappears from the
+                    // inbox view for a move that never happened.
                     if claimed {
-                        try? db.write {
-                            try MessageStore.setArchivedSync(
-                                false, remoteId: remoteId, accountId: accountId, db: $0
-                            )
+                        do {
+                            try verb.release(remoteId: remoteId, accountId: accountId, db: db)
+                        } catch {
+                            // A failed rollback leaves the local flag ahead of
+                            // the remote. Loud, not silent: the next sync
+                            // reconciles it, and a swallowed error would
+                            // erase the only trace that it happened.
+                            logger.error("bulk.rollbackFailed", metadata: [
+                                "remoteId": .string(remoteId),
+                                "err": .string("\(error)"),
+                            ])
                         }
                     }
                     throw error
                 }
-                // The placeholder is already committed; this only re-asserts it
-                // so the audit row and the flag it describes land together,
-                // as they do in the single-message route.
-                let action = try db.write { raw in
-                    try MessageStore.setArchivedSync(
-                        true, remoteId: remoteId, accountId: accountId, db: raw
-                    )
-                    return try AIActionStore.recordSync(
-                        accountId: accountId,
-                        kind: .archive,
-                        payload: ["remoteId": remoteId, "remoteWrite": "true"],
-                        db: raw
-                    )
-                }
+                let action = try verb.record(remoteId: remoteId, accountId: accountId, db: db)
                 items.append(ArchiveBulkItem(remoteId: remoteId, ok: true, actionId: action.id))
             } catch let error as MailError {
                 // Same label the per-message route would return; logged there,
@@ -1033,16 +1181,14 @@ public enum ActionsRoutes {
                 // could not be written, the provider failed in a way Lagoon
                 // does not model, or the mail is archived on both sides with
                 // no undo entry. None of them can promise a per-message undo.
-                logger.error("archiveBulk.itemFailed", metadata: [
+                logger.error("bulk.itemFailed", metadata: [
                     "remoteId": .string(remoteId),
                     "err": .string("\(error)"),
                 ])
                 items.append(ArchiveBulkItem(remoteId: remoteId, ok: false, errorCode: "internal-error"))
             }
         }
-        return RouteJSON.response(
-            ArchiveBulkResponse(items: items, truncatedCount: truncated > 0 ? truncated : nil)
-        )
+        return items
     }
 
     // MARK: - Unsubscribe
@@ -1272,6 +1418,16 @@ public enum ActionsRoutes {
         struct Req: Decodable {
             let toGroup: String
             let fromGroup: String?
+            /// How far the override reaches.
+            ///
+            /// Optional, so a client that does not know about scopes keeps
+            /// working — and it defaults to the **narrow** one. A request
+            /// that names a scope the server does not understand must not
+            /// silently become the broad one: the whole point of the scope is
+            /// that "this one mail" and "every mail from this sender" are
+            /// different promises, and the safe default for an unknown
+            /// request is the one that touches less.
+            let scope: String?
         }
         let req: Req
         do { req = try JSONDecoder().decode(Req.self, from: body) } catch {
@@ -1282,6 +1438,7 @@ public enum ActionsRoutes {
         else {
             return RouteJSON.error(.badRequest, "invalid-group")
         }
+        let scope: OverrideScope = req.scope.flatMap(OverrideScope.init(rawValue:)) ?? .message
         let account: Account
         do {
             guard let found = try await AccountStore.find(byId: accountId, db: db) else {
@@ -1300,43 +1457,93 @@ public enum ActionsRoutes {
             ) else {
                 return RouteJSON.error(.notFound, "unknown-message")
             }
-            if let raw = req.fromGroup,
-               let explicit = BriefingGroup(rawValue: raw),
-               explicit != .pinned {
-                fromGroup = explicit
+            // The maps that decide where this mail sits, read the same way
+            // the briefing reads them — see `BriefingGroupResolver`.
+            let resolver = try await BriefingGroupResolver.load(
+                accountId: accountId, db: db
+            )
+            // What the client says the mail is in right now.
+            //
+            // The client sends the group its feed is showing, which is the
+            // only place the **AI** classification is visible — the server
+            // has no way to reproduce it for a single message. So this is
+            // the fallback for a mail nobody has overridden, and the
+            // overrides themselves are resolved from the database.
+            let clientStated = req.fromGroup
+                .flatMap(BriefingGroup.init(rawValue:))
+                .flatMap { $0 == .pinned ? nil : $0 }
+            if scope == .sender {
+                // ## A sender-scoped change is about the *sender's* group
+                //
+                // "Every mail from this sender moves" is a claim about the
+                // sender, not about this one mail, so the no-op test is the
+                // sender's own group: the sender-level rule if there is one,
+                // else the group the client is showing for this mail.
+                //
+                // The narrow rule is **not** consulted here, and that is
+                // deliberate. A narrow rule on one mail says nothing about
+                // the sender as a whole, so comparing the target against it
+                // would refuse a broad change the user is entitled to make
+                // — and would refuse it for the *wrong* reason: "you cannot
+                // move the sender to the group one of its mails is in".
+                // It is also the case that actually broke: a mail with a
+                // narrow rule in the target group made the broad change
+                // answer 400 「分组没变」 while the sender's other mail was
+                // still in the old group.
+                // `??` takes an autoclosure, which cannot hold an `await`,
+                // so the fallback is resolved first and then chosen.
+                let heuristic = try await heuristicGroup(
+                    for: message, account: account, db: db
+                )
+                fromGroup = resolver.senderOverrides[message.fromAddress]
+                    ?? clientStated
+                    ?? heuristic.group
             } else {
-                let overrides = try await AIActionStore.overridesBySender(
-                    accountId: accountId,
-                    db: db
+                // ## A message-scoped change is about *this mail's* group
+                //
+                // The whole point of the narrow scope is to move one mail
+                // **out of** the group a sender rule put it in. So the
+                // comparison must be against the group this mail is in
+                // right now — its own narrow rule, else the sender's rule,
+                // else the classifier — and not against the sender's group.
+                //
+                // The old code resolved this from the sender map alone, so
+                // a mail whose own narrow rule had already moved it was
+                // compared against the *sender's* group: the change was
+                // either refused with 「分组没变」 while the mail sat in a
+                // different group, or accepted while it moved nothing.
+                //
+                // `resolve` applies exactly the briefing's precedence, so
+                // the guard and the feed cannot disagree about where this
+                // mail is.
+                let heuristic = try await heuristicGroup(
+                    for: message, account: account, db: db
                 )
-                let pinned = try await MessageStore.pinnedIds(forAccount: accountId, db: db)
-                let unsubscribed = try await MessageStore.listUnsubscribeIds(
-                    forAccount: accountId,
-                    db: db
-                )
-                let heuristic = HeuristicBriefingClassifier(
-                    signals: .init(
-                        pinnedRemoteIds: pinned,
-                        listUnsubscribeRemoteIds: unsubscribed
-                    )
-                ).group(for: message, accountEmail: account.email)
-                fromGroup = overrides[message.fromAddress] ?? heuristic.group
+                fromGroup = resolver.resolve(
+                    for: message,
+                    fallback: (clientStated ?? heuristic.group, heuristic.reason)
+                ).group
             }
         } catch {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
         guard fromGroup != toGroup else {
+            // An honest no-op: the mail is already in the group the user
+            // picked, so there is nothing to record. The scope decides what
+            // "already in" means — this mail's own group for the narrow
+            // scope, the sender's group for the broad one.
             return RouteJSON.error(.badRequest, "group-unchanged")
         }
 
         let action: AIAction
         do {
             action = try db.write { raw in
-                try AIActionStore.insertOverrideSync(
+                let overrideId = try AIActionStore.insertOverrideSync(
                     accountId: accountId,
                     remoteId: remoteId,
                     fromGroup: fromGroup,
                     toGroup: toGroup,
+                    scope: scope,
                     db: raw
                 )
                 return try AIActionStore.recordSync(
@@ -1346,6 +1553,17 @@ public enum ActionsRoutes {
                         "remoteId": remoteId,
                         "fromGroup": fromGroup.rawValue,
                         "toGroup": toGroup.rawValue,
+                        // The scope travels in the audit payload so the undo
+                        // reverses it at the **same** scope. A message-scoped
+                        // override undone as a sender-scoped one would
+                        // re-file the whole mailbox — the surprise this work
+                        // exists to remove.
+                        "scope": scope.rawValue,
+                        // The id of the rule this action wrote, so the undo
+                        // removes *that* rule. Two 「改分组」 on one mail leave
+                        // two rules, and undoing the older one must not take
+                        // the newer one's rule with it.
+                        "overrideId": String(overrideId),
                     ],
                     db: raw
                 )
@@ -1361,8 +1579,62 @@ public enum ActionsRoutes {
         ))
     }
 
+    /// The deterministic classifier's answer for one mail.
+    ///
+    /// The fallback for a mail nobody has overridden. It is the heuristic
+    /// rather than the AI because this route has no classifier — and a
+    /// model call per user gesture would be both slow and a different
+    /// question from the one the feed asked (one message alone classifies
+    /// differently from the same message in a batch).
+    ///
+    /// The client sends the group its feed is showing, so the heuristic is
+    /// only consulted when the client did not say — an old client, or a
+    /// surface that has no group to show.
+    private static func heuristicGroup(
+        for message: MessageHeader,
+        account: Account,
+        db: LagoonDB
+    ) async throws -> (group: BriefingGroup, reason: BriefingReason) {
+        let pinned = try await MessageStore.pinnedIds(forAccount: account.id, db: db)
+        let unsubscribed = try await MessageStore.listUnsubscribeIds(
+            forAccount: account.id,
+            db: db
+        )
+        return HeuristicBriefingClassifier(
+            signals: .init(
+                pinnedRemoteIds: pinned,
+                listUnsubscribeRemoteIds: unsubscribed
+            )
+        ).group(for: message, accountEmail: account.email)
+    }
+
     // MARK: - List actions
 
+    /// The default page size, and the ceiling a caller may ask for.
+    ///
+    /// 100 is the number this route used to hard-cap at. It stays the
+    /// default so an existing caller sees the same first page; the ceiling
+    /// exists because `limit` is caller-supplied and an unbounded one is a
+    /// request to serialize the whole table.
+    private static let defaultActionPageSize = 100
+    private static let maxActionPageSize = 500
+
+    /// `GET /api/actions?accountId=&since=&limit=&before=<actionId>`
+    ///
+    /// ## Paging
+    ///
+    /// `before` names the id of the **last row the caller already has**;
+    /// the response starts at the next older row. Keyset, not offset: rows
+    /// are `created_at DESC`, so a new action between two requests would
+    /// shift every offset by one and make the caller skip a row. A position
+    /// in the ordering does not move.
+    ///
+    /// ## What the response says about the list's size
+    ///
+    /// `totalCount` and `hasMore` exist because the panel used to stop at
+    /// the hundredth row and say nothing — which is indistinguishable from
+    /// "that is all there is". They are computed here, not on the client:
+    /// the client cannot count rows it never received.
     private static func listActionsHandler(
         request: Request, context: BasicRequestContext, db: LagoonDB, logger: Logger
     ) async -> Response {
@@ -1376,14 +1648,63 @@ public enum ActionsRoutes {
             f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             return f.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
         }()
+        let limit: Int = {
+            let raw = request.uri.queryParameters["limit"].map(String.init) ?? ""
+            return max(1, min(Int(raw) ?? defaultActionPageSize, maxActionPageSize))
+        }()
+        // A malformed cursor is a 400, not a silently-ignored parameter: a
+        // request that says "start after row 900" and is answered with the
+        // newest page looks like the history restarted, and the user would
+        // scroll the same rows twice without ever seeing the older ones.
+        if let rawBefore = request.uri.queryParameters["before"] {
+            guard let beforeId = Int64(rawBefore), beforeId > 0 else {
+                return RouteJSON.error(.badRequest, "malformed-before")
+            }
+            do {
+                guard let cursor = try await AIActionStore.cursor(
+                    id: beforeId, accountId: accountId, db: db
+                ) else {
+                    // Another account's id, or a row that never existed.
+                    // Both must fail the same way: scoping every id by
+                    // account is what stops this route becoming an
+                    // existence oracle.
+                    return RouteJSON.error(.badRequest, "unknown-before")
+                }
+                return try await respondWithPage(
+                    cursor: cursor, accountId: accountId, since: since,
+                    limit: limit, db: db
+                )
+            } catch {
+                return errorResponse(
+                    .internalServerError, "internal-error", logger: logger, error: error
+                )
+            }
+        }
         do {
-            let actions = try await AIActionStore.recent(
-                accountId: accountId, since: since, limit: 100, db: db
+            return try await respondWithPage(
+                cursor: nil, accountId: accountId, since: since,
+                limit: limit, db: db
             )
-            return RouteJSON.response(AIActionListResponse(actions: actions))
         } catch {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
+    }
+
+    private static func respondWithPage(
+        cursor: AIActionStore.ActionListCursor?,
+        accountId: UUID,
+        since: Date?,
+        limit: Int,
+        db: LagoonDB
+    ) async throws -> Response {
+        let page = try await AIActionStore.page(
+            accountId: accountId, since: since, before: cursor, limit: limit, db: db
+        )
+        return RouteJSON.response(AIActionListResponse(
+            actions: page.actions,
+            totalCount: page.totalCount,
+            hasMore: page.hasMore
+        ))
     }
 
     // MARK: - Undo action
@@ -1655,16 +1976,50 @@ public enum ActionsRoutes {
         case .unpin:
             try await MessageStore.setPinned(true, remoteId: remoteId, accountId: account.id, db: db)
         case .classifyOverride:
-            // Counter-override: flip back to the original group.
+            // Counter-override: flip back to the previous group.
             guard let from = action.payload["fromGroup"].flatMap(BriefingGroup.init(rawValue:)),
                   let to = action.payload["toGroup"].flatMap(BriefingGroup.init(rawValue:))
             else {
                 throw MailError.protocolError("classification undo payload missing")
             }
-            try await AIActionStore.insertOverride(
-                accountId: account.id, remoteId: remoteId,
-                fromGroup: to, toGroup: from, db: db
-            )
+            // Rows written before the scope existed have no `scope` in their
+            // payload; they were all sender-level, so they default to
+            // `.sender` and keep behaving exactly as they did.
+            let scope = action.payload["scope"].flatMap(OverrideScope.init(rawValue:)) ?? .sender
+            if scope == .message {
+                // ## The narrow scope's undo *removes* the rule
+                //
+                // A counter-row would pin the mail to the group it was in
+                // when the user made the change — a **stale** value. If the
+                // sender's rule has moved on since, the mail would stay in
+                // the old group instead of falling back to the sender's
+                // current rule (or the heuristic), which is what "undo my
+                // one-off change" means.
+                //
+                // Removing the rule lets the mail fall back through the
+                // briefing's own precedence: the sender's rule if there is
+                // one, else the classifier. That is the state the user
+                // would be in if they had never made the change.
+                //
+                // The scope is still the narrow one: removing a narrow rule
+                // touches one mail, while removing a sender rule would need
+                // to be a counter-row anyway (the sender's other mail must
+                // stay where the sender rule puts it).
+                try await AIActionStore.deleteMessageOverride(
+                    accountId: account.id, remoteId: remoteId,
+                    overrideId: action.payload["overrideId"].flatMap(Int64.init),
+                    fromGroup: from, toGroup: to,
+                    db: db
+                )
+            } else {
+                // The broad scope's undo writes a counter-override at the
+                // **same** scope: the rule it reverses reached every mail
+                // from that sender, so the inverse must too.
+                try await AIActionStore.insertOverride(
+                    accountId: account.id, remoteId: remoteId,
+                    fromGroup: to, toGroup: from, scope: scope, db: db
+                )
+            }
         case .delete:
             // 从废纸篓移回 INBOX——远端先动，再翻回本地旗标。
             guard let provider = makeProvider(account) else {

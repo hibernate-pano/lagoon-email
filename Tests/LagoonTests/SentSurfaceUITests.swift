@@ -20,17 +20,22 @@ import Foundation
 /// 而不是一次性的手工对齐。
 @MainActor
 final class SentSurfaceUITests: XCTestCase {
-    /// Every lens must map to a title that is not 「全部邮件」 except the inbox.
+    /// Every lens must map to a title that is not the inbox's except the inbox.
     ///
     /// Pinned as the failure it prevents: three different folders all labelled
-    /// 全部邮件 is indistinguishable from the bug where `.deleted` mapped to
-    /// `.all` — same symptom, same confusion, and it recurred.
+    /// with the inbox's name is indistinguishable from the bug where
+    /// `.deleted` mapped to `.all` — same symptom, same confusion, and it
+    /// recurred.
     ///
     /// This drives the **real** mapping (`MessageListView.surfaceTitle(for:l10n:)`),
     /// not a restatement of it. The earlier version of this test only compared
     /// four `L10n` constants against each other and never called the production
     /// switch — so it stayed green even with every case collapsed to
     /// `allMessages`, which is exactly the bug it was written to catch.
+    ///
+    /// The `.rule` lens is asserted here with **no** rule name — that is the
+    /// fallback path (the rules header). The real title is the user's own
+    /// name for the rule, which `CopyHonestyTests` covers.
     func test_everyFolderLensHasItsOwnTitle() {
         typealias Lens = MessageListView.Lens
         let l10n = L10n(language: .zhHans)
@@ -43,7 +48,7 @@ final class SentSurfaceUITests: XCTestCase {
             )
             XCTAssertNotEqual(
                 title, l10n.allMessages,
-                "\(lens) is labelled 全部邮件 — the surface would claim to be the inbox"
+                "\(lens) is labelled with the inbox's name — the surface would claim to be the inbox"
             )
         }
 
@@ -56,7 +61,7 @@ final class SentSurfaceUITests: XCTestCase {
             "folder surfaces must not collapse onto one title: \(titles)"
         )
 
-        // And the inbox is the one place 全部邮件 is the correct answer.
+        // And the inbox is the one place 收件箱 / Inbox is the correct answer.
         XCTAssertEqual(
             MessageListView.surfaceTitle(for: .all, l10n: l10n), l10n.allMessages
         )

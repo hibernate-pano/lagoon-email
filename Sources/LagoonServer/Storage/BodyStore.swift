@@ -25,16 +25,20 @@ public enum BodyStore {
         db: LagoonDB
     ) async throws -> FetchedBody? {
         let sql = """
-            SELECT body_text, body_html, has_more, attachments, to_addresses, cc_addresses
+            SELECT body_cipher, body_html_cipher, has_more, attachments, to_addresses, cc_addresses
             FROM message_bodies
             WHERE account_id = ? AND remote_id = ?
         """
-        return try db.read { db in
+        return try db.read { (db: Database) -> FetchedBody? in
             guard let row = try Row.fetchOne(db, sql: sql, arguments: [accountId, remoteId]) else {
                 return nil
             }
-            let text: String = row["body_text"]
-            let html: String? = row["body_html"]
+            // The body is sealed at rest (spec §6.6 rule 5). Opening it here
+            // is the only place the plaintext exists in the server process.
+            let sealedText: String = row["body_cipher"]
+            let sealedHTML: String? = row["body_html_cipher"]
+            let text = try BodyCipher.open(sealedText)
+            let html: String? = try sealedHTML.map { try BodyCipher.open($0) }
             let hasMore: Bool = row["has_more"]
             let attachments = row.decodedJSON("attachments", as: [Attachment].self, decoder: JSONDecoder()) ?? []
             return FetchedBody(
@@ -74,18 +78,22 @@ public enum BodyStore {
     ) async throws {
         let sql = """
             INSERT INTO message_bodies
-                (account_id, remote_id, body_text, body_html, has_more, attachments,
+                (account_id, remote_id, body_cipher, body_html_cipher, has_more, attachments,
                  to_addresses, cc_addresses, fetched_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%d %H:%M:%f','now'))
             ON CONFLICT (account_id, remote_id) DO UPDATE SET
-                body_text = EXCLUDED.body_text,
-                body_html = EXCLUDED.body_html,
+                body_cipher = EXCLUDED.body_cipher,
+                body_html_cipher = EXCLUDED.body_html_cipher,
                 has_more = EXCLUDED.has_more,
                 attachments = EXCLUDED.attachments,
                 to_addresses = EXCLUDED.to_addresses,
                 cc_addresses = EXCLUDED.cc_addresses,
                 fetched_at = strftime('%Y-%m-%d %H:%M:%f','now')
         """
+        // Sealed before the write, so the plaintext never reaches the
+        // database — not even transiently, not even in a WAL frame.
+        let sealedText = try BodyCipher.seal(body.text)
+        let sealedHTML = try body.html.map { try BodyCipher.seal($0) }
         try db.write { raw in
             let headerExists = try Bool.fetchOne(
                 raw,
@@ -96,8 +104,8 @@ public enum BodyStore {
             try raw.execute(sql: sql, arguments: [
                 accountId,
                 remoteId,
-                body.text,
-                body.html,
+                sealedText,
+                sealedHTML,
                 body.hasMore,
                 Self.json(body.attachments.map { $0.toWire() }),
                 Self.json(body.to),

@@ -81,7 +81,7 @@ final class UnsubscribeRouteTests: XCTestCase {
     /// route must report the transport failure, never "no unsubscribe link".
     private actor BodyFailingProvider: MailProvider {
         let kind: MailProviderKind = .qq
-        func capabilities() async -> MailCapabilities {
+        func capabilities() async -> MailCapabilities? {
             MailCapabilities(archiveFolder: true, idle: false, move: true, serverSnippet: false)
         }
         func pullChanges(after cursor: MailSyncState, waitUpTo: Duration) async throws -> MailChangeSet {

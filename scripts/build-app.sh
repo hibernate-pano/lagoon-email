@@ -6,6 +6,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# The version comes from Support/VERSION — the one place it is written down.
+# It is stamped into the bundle's Info.plist at build time, so the shipped
+# .app can never disagree with the repo about what version it is. See
+# scripts/check-version.sh for the drift guard.
+VERSION="$(tr -d '[:space:]' < Support/VERSION)"
+
 swift build -c release --product Lagoon
 
 APP="dist/Lagoon.app"
@@ -15,6 +21,17 @@ mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 
 cp ".build/release/Lagoon" "$CONTENTS/MacOS/Lagoon"
 cp "Support/Info.plist" "$CONTENTS/Info.plist"
+
+# Stamp the version into the bundle. PlistBuddy writes the plist in place and
+# preserves everything it does not touch, so the checked-in plist stays the
+# template and the bundle carries the authoritative value.
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$CONTENTS/Info.plist"
+# The build number is the git revision, so two builds of the same source
+# still differ. `git describe` is unavailable in a tarball checkout, so this
+# falls back to a counter-free "1" rather than failing the build.
+if git rev-parse --short HEAD >/dev/null 2>&1; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(git rev-parse --short HEAD)" "$CONTENTS/Info.plist"
+fi
 
 # The AI provider registry (model routing + cost rates) is bundled so the
 # embedded server finds it without a repo checkout; the embedded runtime
@@ -44,4 +61,4 @@ if command -v codesign >/dev/null 2>&1; then
   codesign --force --sign - "$APP"
 fi
 
-echo "Built $APP"
+echo "Built $APP (version $VERSION)"

@@ -29,6 +29,30 @@ struct LagoonServerCLIMain {
             die("refusing to start: LAGOON_TOKEN_KEY is malformed (need base64 of 32 bytes)")
         }
 
+        // The body key seals the cached mail body at rest (spec §6.6 rule 5).
+        // It is a separate key from the credential key on purpose — the two
+        // protect different data, and rotating one must not orphan the other.
+        // It has to be set before the store is opened, because the migration
+        // that seals a legacy store runs there.
+        guard let bodyKey = env["LAGOON_BODY_KEY"], !bodyKey.isEmpty else {
+            die("""
+                refusing to start: LAGOON_BODY_KEY is missing.
+                It must be base64 of exactly 32 random bytes. Generate one with:
+                  export LAGOON_BODY_KEY="$(openssl rand -base64 32)"
+                To share data with the app, use the value of its Keychain item
+                'lagoon.bodyKey'.
+                """)
+        }
+        guard Data(base64Encoded: bodyKey)?.count == 32 else {
+            die("refusing to start: LAGOON_BODY_KEY is malformed (need base64 of 32 bytes)")
+        }
+        BodyCipher.keyProvider = {
+            guard let data = Data(base64Encoded: bodyKey), data.count == 32 else {
+                throw BodyCipherError.badKey
+            }
+            return SymmetricKey(data: data)
+        }
+
         let dbPath = env["LAGOON_DB_PATH"]
             ?? defaultDatabasePath().appendingPathComponent("lagoon.sqlite").path
         let cfg = LagoonRuntimeConfiguration(
@@ -36,11 +60,61 @@ struct LagoonServerCLIMain {
             host: env["LAGOON_SERVER_HOST"] ?? "127.0.0.1",
             port: Int(env["LAGOON_SERVER_PORT"] ?? "8080") ?? 8080,
             apiToken: env["LAGOON_API_TOKEN"],
-            tokenKeyBase64: tokenKey
+            tokenKeyBase64: tokenKey,
+            bodyKey: bodyKey
         )
 
         // Diagnostics run against the store and exit; they never serve HTTP.
         let args = CommandLine.arguments
+        // An unknown flag must **stop** the run, not be ignored.
+        //
+        // This CLI used to ignore any argument it did not recognise and
+        // carry on against the default store — the user's real mailbox, in
+        // Application Support. So a command that said `--db /tmp/copy.sqlite`
+        // (a natural thing to try) silently ran against the live database
+        // instead, migrating it with whatever key the environment happened to
+        // carry. That is how the real store got sealed with a throwaway key
+        // on 2026-10-20.
+        //
+        // The rule now: every argument must be one this binary knows. A typo
+        // fails loudly, before the store is opened — so nothing is written.
+        let knownFlags: Set<String> = [
+            "--self-test", "--list-mailboxes", "--find-subject", "--restore",
+            "--help", "-h",
+        ]
+        let knownValueFlags: Set<String> = ["--restore", "--find-subject"]
+        var index = 1
+        while index < args.count {
+            let argument = args[index]
+            if knownFlags.contains(argument) {
+                if knownValueFlags.contains(argument) {
+                    // The flag takes a value; skip it as well.
+                    index += 2
+                } else {
+                    index += 1
+                }
+                continue
+            }
+            die("""
+                unknown argument '\(argument)'.
+                This CLI never opens a store it was not told to: set
+                LAGOON_DB_PATH to the file you mean, or use one of:
+                  --self-test          run the store's self-check
+                  --list-mailboxes     list the account's IMAP folders
+                  --find-subject <s>   find a message by subject
+                  --restore <uid>      restore a message from the server's Trash
+                (no argument was applied; nothing was written.)
+                """)
+        }
+        if args.contains("--help") || args.contains("-h") {
+            print("""
+                LagoonServerCLI — diagnostics against the local store.
+                  LAGOON_DB_PATH     the SQLite file to open (required: no default is assumed)
+                  LAGOON_TOKEN_KEY   base64 of 32 bytes
+                  LAGOON_BODY_KEY    base64 of 32 bytes
+                """)
+            return
+        }
         let pool = try LagoonDatabase.open(path: cfg.dbPath)
         let diagnosticsDB = LagoonDB(pool)
         if args.contains("--self-test") {

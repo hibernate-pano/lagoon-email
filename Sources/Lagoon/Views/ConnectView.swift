@@ -3,9 +3,11 @@ import LagoonKit
 
 /// First-run surface: connect a QQ Mailbox with an address + authorization code.
 ///
-/// The form is the only entry point (the app is a bare SwiftPM executable with
-/// no `Info.plist` and registers no URL scheme, so a browser OAuth round-trip
-/// has nowhere to land). The server probes the mailbox before storing anything.
+/// The form is the entry point. The app registers a `lagoon://` URL scheme
+/// (see `Support/Info.plist`), but a *browser* OAuth round-trip still has
+/// nowhere to land: QQ Mail's own sign-in needs a session this app cannot
+/// have, so the authorization code is pasted in by hand. The server probes
+/// the mailbox before storing anything.
 struct ConnectView: View {
     @EnvironmentObject var accounts: AccountStore
     @Environment(\.l10n) private var l10n
@@ -61,6 +63,23 @@ struct ConnectView: View {
     }
 
     private let api = APIClient.shared
+
+    /// QQ Mail's web interface — where the authorization code is generated.
+    ///
+    /// ## Why the root, and not the settings page
+    ///
+    /// The settings screen itself needs a signed-in session (`sid`), which
+    /// this app does not have and cannot have: the user has to log in with
+    /// their QQ password and a phone verification. Every deep link that
+    /// skips the login bounces to the sign-in page, and every one that does
+    /// not exists only for a signed-in session — so a link to it would be a
+    /// link to a 404 for anyone not already in a browser session.
+    ///
+    /// `https://mail.qq.com` is the one URL that is *always* the right
+    /// place: it signs the user in, and the numbered path in the step above
+    /// says where to go from there. It was verified to resolve (200) and to
+    /// serve QQ Mail's sign-in page.
+    static let qqMailURL = URL(string: "https://mail.qq.com")!
 
     var body: some View {
         VStack(spacing: 16) {
@@ -157,69 +176,122 @@ struct ConnectView: View {
     private var qqSection: some View {
         Text(l10n.connectQQTitle)
             .font(.headline)
-        VStack(alignment: .leading, spacing: 4) {
-            Text(l10n.qqEmailPlaceholder)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            TextField(l10n.qqEmailPlaceholder, text: $qqEmail)
-                .textFieldStyle(.roundedBorder)
-                .focused($focusedField, equals: .email)
-        }
-        .frame(maxWidth: 320)
-        VStack(alignment: .leading, spacing: 4) {
-            Text(l10n.qqAuthCodePlaceholder)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            HStack(spacing: 6) {
-                Group {
-                    if showAuthCode {
-                        TextField(l10n.qqAuthCodePlaceholder, text: $qqAuthCode)
-                    } else {
-                        SecureField(l10n.qqAuthCodePlaceholder, text: $qqAuthCode)
-                    }
-                }
-                .textFieldStyle(.roundedBorder)
-                .focused($focusedField, equals: .authCode)
-                Button {
-                    showAuthCode.toggle()
-                } label: {
-                    Label(
-                        showAuthCode ? l10n.hideAuthCode : l10n.showAuthCode,
-                        systemImage: showAuthCode ? "eye.slash" : "eye"
-                    )
-                    .labelStyle(.iconOnly)
-                }
-                .help(showAuthCode ? l10n.hideAuthCode : l10n.showAuthCode)
-            }
+        authCodeStep
+        formStep
+    }
+
+    /// 第 1 步 — where the authorization code comes from.
+    ///
+    /// ## Why this is a step and not a footnote
+    ///
+    /// Without the code the form cannot be completed at all, and the step
+    /// itself fails in several ways (a phone verification, a 16-character
+    /// code, a code that is not the password). It used to be two lines of
+    /// `caption2`/`tertiary` grey text under the field, which made the only
+    /// hard step in the whole onboarding the hardest one to read.
+    ///
+    /// So it is a labelled step, in normal type, with the path spelled out
+    /// in the order the user walks it, and with a **button that takes them
+    /// there**. A step that says where to go but makes the user go there by
+    /// hand is still a hunt; the button removes the hunt and leaves the
+    /// navigation (which only the user can do — it needs their password and
+    /// their phone) to them.
+    private var authCodeStep: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(l10n.qqAuthCodeStepTitle)
+                .font(.headline)
             Text(l10n.qqAuthCodeHelp)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .frame(maxWidth: 320)
-        Button {
-            // A previous cancel must not poison this attempt.
-            userCancelled = false
-            connectTask = Task { await connectQQ() }
-        } label: {
-            // Keep the label text alongside the spinner: replacing it wholesale
-            // left VoiceOver announcing only "button".
-            HStack(spacing: 6) {
-                if isConnecting {
-                    ProgressView().controlSize(.small)
-                }
-                Text(l10n.qqConnectButton)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+            // `Link`, not a bare string: the path is a place the user has to
+            // go, and a place you can go in one click is worth having. The
+            // link opens QQ Mail's web interface in the default browser —
+            // the settings page itself needs a signed-in session this app
+            // does not have and cannot have, so the link opens the mailbox
+            // and the numbered path above says where to go from there.
+            Link(destination: Self.qqMailURL) {
+                Label(l10n.qqAuthCodeOpenButton, systemImage: "arrow.up.forward.square")
             }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help(l10n.qqAuthCodeOpenHelp)
         }
-        .controlSize(.large)
-        .buttonStyle(.borderedProminent)
-        .disabled(isConnecting)
-        .keyboardShortcut(.defaultAction)
-        .accessibilityLabel(l10n.qqConnectButton)
-        Text(l10n.qqHelp)
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: 360)
-            .multilineTextAlignment(.leading)
+        .frame(maxWidth: 360, alignment: .leading)
+    }
+
+    /// 第 2 步 — the form itself.
+    private var formStep: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(l10n.qqFormStepTitle)
+                .font(.headline)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(l10n.qqEmailPlaceholder)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField(l10n.qqEmailPlaceholder, text: $qqEmail)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .email)
+            }
+            .frame(maxWidth: 320)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(l10n.qqAuthCodePlaceholder)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Group {
+                        if showAuthCode {
+                            TextField(l10n.qqAuthCodePlaceholder, text: $qqAuthCode)
+                        } else {
+                            SecureField(l10n.qqAuthCodePlaceholder, text: $qqAuthCode)
+                        }
+                    }
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focusedField, equals: .authCode)
+                    Button {
+                        showAuthCode.toggle()
+                    } label: {
+                        Label(
+                            showAuthCode ? l10n.hideAuthCode : l10n.showAuthCode,
+                            systemImage: showAuthCode ? "eye.slash" : "eye"
+                        )
+                        .labelStyle(.iconOnly)
+                    }
+                    .help(showAuthCode ? l10n.hideAuthCode : l10n.showAuthCode)
+                }
+                // The field's own hint: what the value *is*, in one line.
+                // Not a second copy of the path above — two copies of the
+                // same step drift apart, and the user is left unsure which
+                // one is current.
+                Text(l10n.qqHelp)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .multilineTextAlignment(.leading)
+            }
+            .frame(maxWidth: 320)
+            Button {
+                // A previous cancel must not poison this attempt.
+                userCancelled = false
+                connectTask = Task { await connectQQ() }
+            } label: {
+                // Keep the label text alongside the spinner: replacing it wholesale
+                // left VoiceOver announcing only "button".
+                HStack(spacing: 6) {
+                    if isConnecting {
+                        ProgressView().controlSize(.small)
+                    }
+                    Text(l10n.qqConnectButton)
+                }
+            }
+            .controlSize(.large)
+            .buttonStyle(.borderedProminent)
+            .disabled(isConnecting)
+            .keyboardShortcut(.defaultAction)
+            .accessibilityLabel(l10n.qqConnectButton)
+        }
+        .frame(maxWidth: 360, alignment: .leading)
     }
 
     private var displayedError: String? {
@@ -250,7 +322,7 @@ struct ConnectView: View {
             // The user may have cancelled while the probe was in flight; do not
             // adopt the account they backed out of.
             if Task.isCancelled { return }
-            try accounts.set(accountId: account.id)
+            try await accounts.set(accountId: account.id)
             if presentedAsSheet { dismiss() }
         } catch let apiError as APIError {
             applyConnectFailure(apiError, email: email)
@@ -335,7 +407,7 @@ struct ConnectView: View {
                 return
             }
             try await api.activateAccount(id: row.id)
-            try accounts.set(accountId: row.id)
+            try await accounts.set(accountId: row.id)
             if presentedAsSheet { dismiss() }
         } catch let urlError as URLError where urlError.code == .cancelled {
             return

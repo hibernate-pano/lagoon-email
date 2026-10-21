@@ -127,12 +127,15 @@ final class PurgeRoutesTests: XCTestCase {
                     """,
                 arguments: [accountId, remoteId]
             )
+            // The variants column holds a sealed envelope — the drafts are
+            // encrypted at rest like the bodies are — so the fixture seals
+            // it the same way the write path does.
             try raw.execute(
                 sql: """
                     INSERT INTO draft_replies (account_id, remote_id, variants)
-                    VALUES (?, ?, '[]')
+                    VALUES (?, ?, ?)
                     """,
-                arguments: [accountId, remoteId]
+                arguments: [accountId, remoteId, try DraftCipher.seal([])]
             )
             try raw.execute(
                 sql: """

@@ -360,10 +360,29 @@ struct HTMLMessageView: NSViewRepresentable {
         /// user's real browser hands the sender their IP and the exact open
         /// time from a different, cookie-carrying app. `navigationPolicy`
         /// below is the rule.
+        ///
+        /// The handler is spelled `@MainActor` because that is how the SDK
+        /// declares it (`WK_SWIFT_UI_ACTOR` on the block). Without the
+        /// annotation this method is only a *near match* for the protocol
+        /// requirement — and a near match is not a promise: it is dispatched
+        /// today because the Objective-C selector still lines up, but nothing
+        /// in the language guarantees it, so a future SDK could drop it
+        /// without anyone noticing that the privacy rule quietly stopped
+        /// running. The annotation makes the method a true Swift witness.
+        ///
+        /// This is the *preferences* overload, the one the SDK prefers: the
+        /// header says that implementing it means the older
+        /// `decidePolicyFor:decisionHandler:` is not called at all, so
+        /// there is one place where the rule lives instead of two that have
+        /// to agree. It is also the overload whose witness the compiler
+        /// checks cleanly — the older one only matches when the handler
+        /// carries the same `@MainActor` annotation, and the mismatch is
+        /// only a warning.
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
-            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+            preferences: WKWebpagePreferences,
+            decisionHandler: @escaping @MainActor (WKNavigationActionPolicy, WKWebpagePreferences) -> Void
         ) {
             // A nil target frame means "new window" (`target="_blank"`), not
             // "child frame" — treating the two as the same silently breaks
@@ -376,13 +395,13 @@ struct HTMLMessageView: NSViewRepresentable {
             ) {
             case .openExternally(let url):
                 NSWorkspace.shared.open(url)
-                decisionHandler(.cancel)
+                decisionHandler(.cancel, preferences)
             case .cancel:
-                decisionHandler(.cancel)
+                decisionHandler(.cancel, preferences)
             case .allow:
                 // About: / data: / blob: etc.: let the WebView handle them
                 // (mostly no-ops).
-                decisionHandler(.allow)
+                decisionHandler(.allow, preferences)
             }
         }
 

@@ -36,6 +36,9 @@ struct BulkActionBar: View {
     /// the same gate the per-row button uses, so the bar cannot offer a verb
     /// the row would have refused.
     var canArchive: Bool = true
+    /// Delete is disabled when the account has no trash folder — the same
+    /// gate the per-row menu uses, for the same reason.
+    var canDelete: Bool = true
     /// 「选择服务器上的全部 N 封」— Gmail 式两段式全选的第二段。
     ///
     /// Nil when the list holds everything already, because then there is no
@@ -103,7 +106,8 @@ struct BulkActionBar: View {
                 Button(role: .destructive, action: onDelete) {
                     Label(l10n.deleteSelectedTitle, systemImage: "trash")
                 }
-                .help(l10n.deleteContext)
+                .disabled(!canDelete)
+                .help(canDelete ? l10n.moveToTrash : l10n.deleteUnavailable)
 
                 Spacer(minLength: 0)
 

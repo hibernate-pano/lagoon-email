@@ -1,4 +1,5 @@
 import XCTest
+import LagoonKit
 @testable import Lagoon
 
 /// The cheatsheet is hand-curated, so it drifts from the code in one
@@ -24,19 +25,7 @@ final class ShortcutSheetCoversRealBindingsTests: XCTestCase {
 
     /// Bindings this file deliberately does not require the sheet to list,
     /// each with the reason. Empty is the goal — an entry here is a debt.
-    private static let allowlist: [String: String] = [
-        // ⌘1–⌘9 is a single dynamic binding over the briefing groups; the
-        // sheet teaches it as one row, keyed "⌘1–⌘9".
-        "⌘1": "covered by the groupJump row (⌘1–⌘9)",
-        "⌘2": "covered by the groupJump row (⌘1–⌘9)",
-        "⌘3": "covered by the groupJump row (⌘1–⌘9)",
-        "⌘4": "covered by the groupJump row (⌘1–⌘9)",
-        "⌘5": "covered by the groupJump row (⌘1–⌘9)",
-        "⌘6": "covered by the groupJump row (⌘1–⌘9)",
-        "⌘7": "covered by the groupJump row (⌘1–⌘9)",
-        "⌘8": "covered by the groupJump row (⌘1–⌘9)",
-        "⌘9": "covered by the groupJump row (⌘1–⌘9)",
-    ]
+    private static let allowlist: [String: String] = [:]
 
     /// `Sources/Lagoon`, recursively — the bindings live in `Views/`.
     private func clientSources() throws -> [(name: String, text: String)] {
@@ -53,7 +42,7 @@ final class ShortcutSheetCoversRealBindingsTests: XCTestCase {
     /// Every binding in the client must appear in the cheatsheet.
     @MainActor
     func test_everyRealBindingIsDocumented() throws {
-        let documented = Set(ShortcutsSheet().entries.map(\.keys))
+        let documented = Self.documentedKeys
         var missing: [String] = []
 
         for (name, text) in try clientSources() {
@@ -88,17 +77,21 @@ final class ShortcutSheetCoversRealBindingsTests: XCTestCase {
         let real = try clientSources().reduce(into: Set<String>()) { acc, entry in
             acc.formUnion(Self.symbols(for: entry.text))
         }
-        // The dynamic ⌘1–⌘9 family renders as nine separate symbols above.
-        let groupJumpFamily = Set((1...9).map { "⌘\($0)" })
 
         var ghost: [String] = []
         for entry in ShortcutsSheet().entries {
-            if entry.keys == "⌘1–⌘9" {
-                if !groupJumpFamily.isSubset(of: real) {
-                    ghost.append("⌘1–⌘9 (group jump)")
+            let taught = Self.expandRange(entry.keys)
+            if taught.isEmpty {
+                if !real.contains(entry.keys) {
+                    ghost.append("\(entry.keys) (\(entry.id))")
                 }
-            } else if !real.contains(entry.keys) {
-                ghost.append("\(entry.keys) (\(entry.id))")
+            } else {
+                // A range row ("⌘1–⌘5") teaches each key in the range, so
+                // every one of them must be bound.
+                let unbound = taught.subtracting(real)
+                if !unbound.isEmpty {
+                    ghost.append("\(entry.keys) (\(entry.id)): \(unbound.sorted().joined(separator: " "))")
+                }
             }
         }
 
@@ -106,6 +99,72 @@ final class ShortcutSheetCoversRealBindingsTests: XCTestCase {
             ghost.isEmpty,
             "the cheatsheet advertises keys that are bound nowhere: \(ghost.joined(separator: ", "))"
         )
+    }
+
+    /// The group-jump row's upper bound is the number of briefing groups.
+    ///
+    /// The sheet used to teach "⌘1–⌘9" for a binding that only exists five
+    /// times over (`BriefingGroup` has five cases), so ⌘6–⌘9 were ghost keys
+    /// — the user pressed them and nothing happened. Both the row and the
+    /// enumeration now derive from the same source, and this asserts that
+    /// they still agree.
+    @MainActor
+    func test_groupJumpRangeMatchesTheNumberOfBriefingGroups() {
+        let count = BriefingGroup.allCases.count
+        let row = ShortcutsSheet().entries.first { $0.id == "groupJump" }
+        XCTAssertEqual(
+            row?.keys,
+            "⌘1–⌘\(count)",
+            "the cheatsheet's group-jump range must be exactly the groups that exist"
+        )
+    }
+
+    /// Every row says where its key works.
+    ///
+    /// A row without a scope teaches a gesture that silently does nothing
+    /// in the wrong surface — the user presses ⌫ on the Briefing, nothing
+    /// happens, and the cheatsheet is the one place that should have said
+    /// why.
+    @MainActor
+    func test_everyEntryDeclaresAScope() {
+        let l10n = L10n(language: .zhHans)
+        for entry in ShortcutsSheet().entries {
+            XCTAssertFalse(
+                entry.scope.label(l10n).isEmpty,
+                "'\(entry.id)' has no scope label — the row would not say where the key works"
+            )
+        }
+    }
+
+    /// The keys the cheatsheet teaches, with range rows expanded.
+    ///
+    /// "⌘1–⌘5" is one row that teaches five keys. Comparing the raw row
+    /// strings against the enumerated bindings would call each of ⌘1…⌘5
+    /// undocumented, so the range is expanded here — the same way the user
+    /// reads it.
+    @MainActor
+    static var documentedKeys: Set<String> {
+        var out = Set<String>()
+        for entry in ShortcutsSheet().entries {
+            out.insert(entry.keys)
+            out.formUnion(expandRange(entry.keys))
+        }
+        return out
+    }
+
+    /// "⌘1–⌘5" → {"⌘1", "⌘2", "⌘3", "⌘4", "⌘5"}.
+    ///
+    /// Returns an empty set for anything that is not a simple ⌘N–⌘M range,
+    /// so a malformed row is reported as "not a range" rather than silently
+    /// expanding into nonsense.
+    static func expandRange(_ keys: String) -> Set<String> {
+        guard let separator = keys.range(of: "–") else { return [] }
+        let lower = String(keys[..<separator.lowerBound])
+        let upper = String(keys[separator.upperBound...])
+        guard lower.hasPrefix("⌘"), upper.hasPrefix("⌘"),
+              let first = Int(lower.dropFirst()), let last = Int(upper.dropFirst()),
+              first <= last, last - first < 32 else { return [] }
+        return Set((first...last).map { "⌘\($0)" })
     }
 
     // MARK: - Parsing
@@ -215,7 +274,11 @@ final class ShortcutSheetCoversRealBindingsTests: XCTestCase {
         case let b where b.contains(".keyboardShortcut(.delete"):
             key = "⌫"
         case let b where b.contains("KeyEquivalent(Character(String(index + 1)))"):
-            return (1...9).map { "⌘\($0)" }
+            // The group-jump family is one dynamic binding whose upper
+            // bound is the number of briefing groups — not a fixed nine.
+            // Rendering it as nine symbols taught ⌘6–⌘9, which are bound
+            // nowhere.
+            return (1...BriefingGroup.allCases.count).map { "⌘\($0)" }
         default:
             return []
         }

@@ -9,6 +9,8 @@ import LagoonKit
 /// - `GET  /api/advice?accountId=[&decision=pending]` → suggestion queue
 /// - `POST /api/advice/{id}/decision?accountId=` `{decision}` → record the
 ///   user's verdict on one suggestion
+/// - `GET  /api/advice/accepted-stats?accountId=` → the accepted
+///   `(category, action)` distribution — the read-only learning signal
 ///
 /// **This file cannot touch the mailbox.** It reads and writes only the
 /// `advice` table. Every route in `ActionsRoutes` / `MessageRoutes` that
@@ -16,6 +18,14 @@ import LagoonKit
 /// and from nowhere else — see constitution §2 rules 3 and 5. The only write
 /// here is a verdict on a suggestion, which changes no mail.
 public enum AdviceRoutes {
+    /// How many accepted pairs the distribution route returns.
+    ///
+    /// Five is a handful. The route exists so the signal can be audited, not
+    /// so it can be dumped — the same handful the classifier prompt gets,
+    /// because a distribution that grows with the user's history is a cost
+    /// problem and a wall of text.
+    public static let acceptedStatsLimit = 5
+
     public static func register(
         on router: Router<BasicRequestContext>,
         db: LagoonDB,
@@ -51,6 +61,26 @@ public enum AdviceRoutes {
                     accountId: accountId, filter: filter, limit: limit, db: db
                 )
                 return RouteJSON.response(AdviceListResponse(advice: rows))
+            } catch {
+                return RouteJSON.failure(
+                    .internalServerError, "internal-error",
+                    label: "advice", logger: logger, failure: error
+                )
+            }
+        }
+
+        router.get("api/advice/accepted-stats") { request, _ -> Response in
+            guard let accountId = RouteParams.accountId(from: request) else {
+                return RouteJSON.error(.badRequest, "malformed-accountId")
+            }
+            do {
+                guard try await AccountStore.find(byId: accountId, db: db) != nil else {
+                    return RouteJSON.error(.notFound, "unknown-account")
+                }
+                let stats = try await AdviceStore.acceptedStats(
+                    accountId: accountId, limit: acceptedStatsLimit, db: db
+                )
+                return RouteJSON.response(AcceptedAdviceStatsResponse(stats: stats))
             } catch {
                 return RouteJSON.failure(
                     .internalServerError, "internal-error",

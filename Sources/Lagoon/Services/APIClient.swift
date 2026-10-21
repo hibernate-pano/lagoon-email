@@ -154,6 +154,8 @@ public final class APIClient: Sendable {
         sender: String? = nil,
         archived: Bool = false,
         deleted: Bool = false,
+        pinned: Bool = false,
+        unread: Bool = false,
         stackId: UUID? = nil
     ) async throws -> SyncResponse {
         guard var c = URLComponents(url: baseURL.appendingPathComponent("api/messages"), resolvingAgainstBaseURL: false) else {
@@ -168,6 +170,17 @@ public final class APIClient: Sendable {
             // and that is exactly the ambiguity that made the trash unreachable.
             .init(name: "deleted", value: deleted ? "true" : "false")
         ]
+        if pinned {
+            // 置顶. Only sent when it is asked for: the axis is exclusive with
+            // the other lenses, and a stray "pinned=true" on an inbox request
+            // would silently turn the inbox into the pin list.
+            items.append(.init(name: "pinned", value: "true"))
+        }
+        if unread {
+            // 未读. Same reasoning: the server answers the lens, because the
+            // client cannot — it only ever sees the newest page.
+            items.append(.init(name: "unread", value: "true"))
+        }
         if let limit {
             items.append(.init(name: "limit", value: String(limit)))
         }
@@ -194,8 +207,9 @@ public final class APIClient: Sendable {
         try await post(path: ["api", "sync"], query: [])
     }
 
-    /// OAuth completion handshake (M0): polled by ConnectView because the
-    /// app is a bare SwiftPM executable and cannot register a URL scheme.
+    /// OAuth completion handshake (M0): polled by ConnectView while the
+    /// connect screen is visible, because the server cannot deep-link a new
+    /// `accountId` back to a client that may not be running yet.
     public func fetchAccounts() async throws -> [ConnectedAccount] {
         let url = baseURL.appendingPathComponent("api/accounts")
         var request = URLRequest(url: url)
@@ -214,6 +228,36 @@ public final class APIClient: Sendable {
         request.timeoutInterval = APITimeout.fast.seconds
         let (data, _) = try await send(request, timeout: .fast)
         return try JSONDecoder().decode(AIStatus.self, from: data)
+    }
+
+    /// POST /api/ai/reload → AIStatus.
+    ///
+    /// ## Why this exists
+    ///
+    /// The AI gateway used to be built once, at launch. Saving a new key
+    /// therefore needed a restart — an architecture accident, not a
+    /// requirement: a key is a credential, and changing one does not
+    /// require rebuilding the process.
+    ///
+    /// The server keeps the gateway behind a holder, so this call swaps it
+    /// in place and the answer is the **new** status: the caller can tell
+    /// "the key is live" from "the key was stored but the provider is not
+    /// usable" without a second round trip.
+    ///
+    /// The environment sent is the client's whole stored map — the same
+    /// bytes it wrote to the Keychain — so the running server ends up with
+    /// exactly the configuration that was stored.
+    public func reloadAI(environment: [String: String]) async throws -> AIStatus {
+        let url = try makeURL(path: ["api", "ai", "reload"], query: [])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "environment": environment
+        ])
+        request.timeoutInterval = APITimeout.interactive.seconds
+        let (data, _) = try await send(request, timeout: .interactive)
+        return try Self.decode(AIStatus.self, from: data)
     }
 
     // MARK: - M1.6 attachments + raw message
@@ -649,6 +693,38 @@ public final class APIClient: Sendable {
         _ = try await send(request, timeout: .fast)
     }
 
+    /// PATCH /api/stacks/:id — rename a group, change what it matches, or both.
+    ///
+    /// The counterpart of `createStack`, and the reason a group is no longer a
+    /// one-way door. Every field of the request is optional, and only the
+    /// ones the caller sets are written: `nil` means "leave this alone", not
+    /// "clear it". A client that sent all three every time would rewrite the
+    /// fields the user did not touch.
+    ///
+    /// The response carries the group **as it now stands**, with its live
+    /// count — the same shape `createStack` returns, so the caller can treat
+    /// a create and an edit as one thing.
+    public func updateStack(
+        id: UUID,
+        name: String? = nil,
+        kind: StackRule.Kind? = nil,
+        value: String? = nil,
+        accountId: UUID
+    ) async throws -> StackUpdateResponse {
+        let url = try makeURL(path: ["api", "stacks", id.uuidString], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.timeoutInterval = APITimeout.fast.seconds
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            StackUpdateRequest(name: name, kind: kind, value: value)
+        )
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(StackUpdateResponse.self, from: data)
+    }
+
     /// POST /api/messages/{remoteId}/classify {fromGroup,toGroup}.
     public func overrideClassification(
         remoteId: String,
@@ -715,7 +791,9 @@ public final class APIClient: Sendable {
         body: String,
         requestId: String,
         to: [String]? = nil,
-        cc: [String]? = nil
+        cc: [String]? = nil,
+        bcc: [String]? = nil,
+        attachments: [OutgoingAttachment] = []
     ) async throws -> SendResponse {
         let url = try makeURL(path: ["api", "messages", remoteId, "send"], query: [
             .init(name: "accountId", value: accountId.uuidString)
@@ -729,6 +807,16 @@ public final class APIClient: Sendable {
         ]
         if let to, !to.isEmpty { payload["to"] = to }
         if let cc, !cc.isEmpty { payload["cc"] = cc }
+        if let bcc, !bcc.isEmpty { payload["bcc"] = bcc }
+        if !attachments.isEmpty {
+            payload["attachments"] = attachments.map { attachment in
+                [
+                    "filename": attachment.filename,
+                    "mimeType": attachment.mimeType,
+                    "dataBase64": attachment.base64,
+                ]
+            }
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         request.timeoutInterval = APITimeout.interactive.seconds
         let (data, _) = try await send(request, timeout: .interactive)
@@ -736,25 +824,98 @@ public final class APIClient: Sendable {
     }
 
     /// POST /api/compose/send {to,subject,body,requestId} → SendResponse.
+    ///
+    /// The optional `cc`, `bcc` and `attachments` are the whole reason this
+    /// method takes structured values rather than three strings: a mail to
+    /// three people is one `To:` field with three addresses, a blind copy
+    /// has to be *blind*, and an attachment has bytes.
     public func sendNewMessage(
         to: String,
         subject: String,
         body: String,
         accountId: UUID,
-        requestId: String
+        requestId: String,
+        cc: [String] = [],
+        bcc: [String] = [],
+        attachments: [OutgoingAttachment] = []
     ) async throws -> SendResponse {
         let url = try makeURL(path: ["api", "compose", "send"], query: [
             .init(name: "accountId", value: accountId.uuidString)
         ])
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
+        var payload: [String: Any] = [
             "to": to,
             "subject": subject,
             "body": body,
             "requestId": requestId,
+        ]
+        if !cc.isEmpty { payload["cc"] = cc }
+        if !bcc.isEmpty { payload["bcc"] = bcc }
+        if !attachments.isEmpty {
+            payload["attachments"] = attachments.map { attachment in
+                [
+                    "filename": attachment.filename,
+                    "mimeType": attachment.mimeType,
+                    "dataBase64": attachment.base64,
+                ]
+            }
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        request.timeoutInterval = APITimeout.interactive.seconds
+        let (data, _) = try await send(request, timeout: .interactive)
+        return try Self.decode(SendResponse.self, from: data)
+    }
+
+    /// POST /api/messages/{remoteId}/forward?accountId= → SendResponse.
+    ///
+    /// ## Why the client does not build the forwarded message
+    ///
+    /// A forward is not a new message that quotes an old one — RFC 5322
+    /// §3.6.4 says it travels as a `message/rfc822` part, carrying the
+    /// **original** message. The original's bytes live on the server; the
+    /// client only has a *parse* of it (text, HTML, attachment metadata),
+    /// and a message reassembled from a parse is a guess — the formatting
+    /// is gone, the attachments are gone, the headers are gone.
+    ///
+    /// So the client names the message and the server does the wrapping.
+    /// The result is a forward the recipient's client renders as the
+    /// original, with the original's attachments attached to it.
+    public func forwardMessage(
+        remoteId: String,
+        to: [String],
+        body: String,
+        subject: String?,
+        accountId: UUID,
+        requestId: String,
+        cc: [String] = [],
+        bcc: [String] = []
+    ) async throws -> SendResponse {
+        let url = try makeURL(path: ["api", "messages", remoteId, "forward"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
         ])
+        struct ForwardPayload: Encodable {
+            let to: [String]
+            let body: String
+            let subject: String?
+            let cc: [String]
+            let bcc: [String]
+            let requestId: String
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(ForwardPayload(
+            to: to,
+            body: body,
+            subject: subject,
+            cc: cc,
+            bcc: bcc,
+            requestId: requestId
+        ))
+        // The server fetches the original from IMAP before it sends, so
+        // this is the slowest send in the app by a wide margin.
         request.timeoutInterval = APITimeout.interactive.seconds
         let (data, _) = try await send(request, timeout: .interactive)
         return try Self.decode(SendResponse.self, from: data)
@@ -791,14 +952,31 @@ public final class APIClient: Sendable {
 
     /// GET /api/search?q=&accountId=
     public func search(query: String, accountId: UUID) async throws -> [MessageHeader] {
+        try await searchPage(query: query, scope: .account(accountId)).results
+    }
+
+    /// The search and the number of matches, so the panel can say whether
+    /// the list it is showing is the whole answer.
+    ///
+    /// The count is the point. A search that stops at the server's cap and
+    /// says nothing reads as "these are all of them" — and the user has no
+    /// way to tell otherwise.
+    ///
+    /// The **scope** is which mailboxes the search covers. It used to be a
+    /// single account id, which made search a half-feature for anyone with
+    /// more than one mailbox — the query could only ever reach the account
+    /// that happened to be active.
+    public func searchPage(
+        query: String, scope: SearchScope
+    ) async throws -> SearchResponse {
         let url = try makeURL(path: ["api", "search"], query: [
-            .init(name: "accountId", value: accountId.uuidString),
+            .init(name: "accountId", value: scope.queryValue),
             .init(name: "q", value: query)
         ])
         var request = URLRequest(url: url)
         request.timeoutInterval = APITimeout.fast.seconds
         let (data, _) = try await send(request, timeout: .fast)
-        return try Self.decode(SearchResponse.self, from: data).results
+        return try Self.decode(SearchResponse.self, from: data)
     }
 
     /// GET /api/usage → UsageReport. `.interactive` because the server
@@ -873,6 +1051,96 @@ public final class APIClient: Sendable {
         request.timeoutInterval = APITimeout.fast.seconds
         let (data, _) = try await send(request, timeout: .fast)
         return try Self.decode(AdviceDecisionResponse.self, from: data)
+    }
+
+    /// GET /api/reminders?accountId= → the reminders still waiting.
+    ///
+    /// The reminders the user set for themselves. Read-only: a reminder
+    /// changes nothing about the mail, and the user sets them from the
+    /// detail view and the advice strip.
+    ///
+    /// `includeDismissed` brings back the ones the user already marked
+    /// done. They are hidden by default because the list exists to answer
+    /// "what is still waiting" — but they must be findable, because a
+    /// mis-click on 「完成」 and a genuine completion look identical
+    /// afterwards.
+    public func fetchReminders(
+        accountId: UUID,
+        includeDismissed: Bool = false
+    ) async throws -> [Reminder] {
+        var query = [URLQueryItem(name: "accountId", value: accountId.uuidString)]
+        if includeDismissed {
+            query.append(URLQueryItem(name: "includeDismissed", value: "true"))
+        }
+        let url = try makeURL(path: ["api", "reminders"], query: query)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(ReminderListResponse.self, from: data).reminders
+    }
+
+    /// POST /api/reminders?accountId= `{remoteId,dueAt,note?}` → the reminder.
+    public func setReminder(
+        remoteId: String,
+        dueAt: Date,
+        note: String?,
+        accountId: UUID
+    ) async throws -> Reminder {
+        let url = try makeURL(path: ["api", "reminders"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        // A concrete payload type rather than a dictionary: `Date` has no
+        // `Any`-typed dictionary encoding, and a hand-rolled struct keeps
+        // the wire shape in one place.
+        struct SetReminderPayload: Encodable {
+            let remoteId: String
+            let dueAt: Date
+            let note: String?
+        }
+        request.httpBody = try encoder.encode(
+            SetReminderPayload(
+                remoteId: remoteId,
+                dueAt: dueAt,
+                note: (note?.isEmpty ?? true) ? nil : note
+            )
+        )
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(Reminder.self, from: data)
+    }
+
+    /// POST /api/reminders/{id}/dismiss?accountId= → the updated reminder.
+    public func dismissReminder(
+        id: Int64,
+        dismissed: Bool,
+        accountId: UUID
+    ) async throws -> Reminder {
+        let url = try makeURL(path: ["api", "reminders", "\(id)", "dismiss"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["dismissed": dismissed])
+        request.timeoutInterval = APITimeout.fast.seconds
+        let (data, _) = try await send(request, timeout: .fast)
+        return try Self.decode(Reminder.self, from: data)
+    }
+
+    /// DELETE /api/reminders/{id}?accountId= → 204.
+    public func deleteReminder(id: Int64, accountId: UUID) async throws {
+        let url = try makeURL(path: ["api", "reminders", "\(id)"], query: [
+            .init(name: "accountId", value: accountId.uuidString)
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.timeoutInterval = APITimeout.fast.seconds
+        _ = try await send(request, timeout: .fast)
     }
 
     /// POST /api/messages/{remoteId}/read?accountId=[&isRead=] → 204.
@@ -963,7 +1231,7 @@ public final class APIClient: Sendable {
         return try Self.decode(MessageSummary.self, from: data)
     }
 
-    private func post(path: [String], query: [URLQueryItem], timeout: APITimeout = .fast) async throws {
+    func post(path: [String], query: [URLQueryItem], timeout: APITimeout = .fast) async throws {
         let url = try makeURL(path: path, query: query)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -974,7 +1242,7 @@ public final class APIClient: Sendable {
     /// Builds a URL where every supplied path component is percent-encoded.
     /// Remote ids are opaque and may contain `/`, `?` or `#`, which
     /// `appendingPathComponent` would leave in place and thus change the route.
-    private func makeURL(path: [String], query: [URLQueryItem]) throws -> URL {
+    func makeURL(path: [String], query: [URLQueryItem]) throws -> URL {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
             throw APIError.invalidURL(baseURL.absoluteString)
         }
@@ -991,13 +1259,13 @@ public final class APIClient: Sendable {
         return url
     }
 
-    private static func percentEncodedPathComponent(_ raw: String) -> String {
+    static func percentEncodedPathComponent(_ raw: String) -> String {
         var allowed = CharacterSet.urlPathAllowed
         allowed.remove(charactersIn: "/?#%")
         return raw.addingPercentEncoding(withAllowedCharacters: allowed) ?? raw
     }
 
-    private static func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+    static func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode(type, from: data)
@@ -1025,7 +1293,7 @@ public final class APIClient: Sendable {
     /// `shouldAutoRetry`. Validating in callers would leave 5xx invisible
     /// to the retry layer. Callers therefore receive the validated
     /// (Data, URLResponse) and skip their own `validate(...)` call.
-    private func send(_ request: URLRequest, timeout: APITimeout) async throws -> (Data, URLResponse) {
+    func send(_ request: URLRequest, timeout: APITimeout) async throws -> (Data, URLResponse) {
         let request = Self.authenticated(request)
         let attempt: () async throws -> (Data, URLResponse) = {
             let (data, resp) = try await self.session.data(for: request)

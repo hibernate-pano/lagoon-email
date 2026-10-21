@@ -115,6 +115,11 @@ final class SchemaMigrationTests: XCTestCase {
                 LagoonDatabase.advisoryOnlyVersion,
                 LagoonDatabase.adviceVersion,
                 LagoonDatabase.sentFolderVersion,
+                LagoonDatabase.encryptedBodiesVersion,
+                LagoonDatabase.reminderVersion,
+                LagoonDatabase.overrideScopeVersion,
+                LagoonDatabase.sealedDraftsVersion,
+                LagoonDatabase.accountIDRepairVersion,
             ]),
             "every registered migration must be recorded exactly once"
         )

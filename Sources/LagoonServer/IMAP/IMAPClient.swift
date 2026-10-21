@@ -495,6 +495,70 @@ public actor IMAPClient {
         _ = try await connection.execute("UID EXPUNGE \(list)")
     }
 
+    /// Every UID in the selected mailbox that carries `\Deleted`.
+    ///
+    /// Used by `deleteExactly` to find out who *else* is pending deletion in
+    /// this folder — a plain `EXPUNGE` would take them all.
+    public func deletedUIDs() async throws -> Set<Int64> {
+        let responses = try await connection.execute("UID SEARCH DELETED")
+        for response in responses {
+            guard case .untagged = response.kind,
+                  response.atoms.count >= 3,
+                  response.atoms[0] == "*",
+                  response.atoms[1].uppercased() == "SEARCH"
+            else { continue }
+            return Set(response.atoms.dropFirst(2).compactMap(Int64.init))
+        }
+        return []
+    }
+
+    /// Removes exactly one message, whatever the server supports.
+    ///
+    /// ## Why this exists
+    ///
+    /// The obvious way to remove one message is `EXPUNGE` — and it is wrong.
+    /// Plain `EXPUNGE` is folder-wide: it removes *every* message the server
+    /// considers pending deletion, including ones another client flagged and
+    /// is about to remove. On a shared account that is silent, permanent
+    /// destruction of mail the user never asked Lagoon to touch.
+    ///
+    /// So the removal is done in two steps, in order of preference:
+    ///
+    /// 1. `UID EXPUNGE <uid>` (RFC 4315) removes exactly this message. The
+    ///    server has to implement it; it is the only command that means
+    ///    "this one" rather than "everything pending".
+    /// 2. If the server rejects `UID EXPUNGE`, the safe fallback is to make
+    ///    the folder contain exactly one pending deletion before expunging:
+    ///    unflag everyone else's `\Deleted`, expunge (now only ours is
+    ///    flagged), then restore their flags so the other client's pending
+    ///    delete survives the detour.
+    ///
+    /// The fallback is not free — it costs one search plus two flag commands
+    /// per message another client had already flagged — which is why the
+    /// `UID EXPUNGE` path is tried first.
+    public func deleteExactly(uid: Int64) async throws {
+        try await store(uid: uid, add: ["\\Deleted"])
+        do {
+            try await uidExpunge(uid: uid)
+            return
+        } catch MailError.protocolError {
+            // The server does not implement UID EXPUNGE. Fall through to the
+            // careful path. A transport failure is *not* caught here: a dead
+            // socket cannot be talked into anything, and pretending otherwise
+            // would turn "the connection dropped" into "the message is gone".
+        }
+        let others = try await deletedUIDs().subtracting([uid])
+        for other in others {
+            try await store(uid: other, remove: ["\\Deleted"])
+        }
+        try await expunge()
+        // Put the other client's pending deletion back. The detour was ours,
+        // not theirs, and it must not outlive it.
+        for other in others {
+            try await store(uid: other, add: ["\\Deleted"])
+        }
+    }
+
     public func createMailbox(_ name: String) async throws {
         let quoted = try Self.quoted(name)
         _ = try await connection.execute("CREATE \(quoted)")
@@ -546,6 +610,10 @@ public actor IMAPClient {
             // such folder, and retrying will not conjure one.
             return true
         case .authFailed, .unreachable, .notConfigured:
+            return false
+        case .accountMissing:
+            // Not a verdict about the message or folder: the account row is
+            // gone, so there is no connection to issue another command on.
             return false
         }
     }

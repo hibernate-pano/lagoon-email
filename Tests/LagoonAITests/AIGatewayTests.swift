@@ -144,7 +144,10 @@ final class AIGatewayTests: XCTestCase {
         return URLSession(configuration: cfg)
     }
 
-    private func gateway(budget: BudgetPolicy = NoBudgetPolicy()) throws -> AIGateway {
+    private func gateway(
+        budget: BudgetPolicy = NoBudgetPolicy(),
+        preferences: (any AdvicePreferenceProviding)? = nil
+    ) throws -> AIGateway {
         let resolved = try ProviderRegistry.load(
             environment: ["STUB_LLM_KEY": "test-key"],
             fileURL: configURL
@@ -154,7 +157,8 @@ final class AIGatewayTests: XCTestCase {
         return AIGateway(
             providers: [provider],
             routing: ["summary": "stub", "classify": "stub", "draft": "stub"],
-            budget: budget
+            budget: budget,
+            preferences: preferences
         )
     }
 
@@ -420,6 +424,93 @@ final class AIGatewayTests: XCTestCase {
         _ = try await ai.classify([message(remoteId: "g1")], accountEmail: "me@example.com", language: nil)
         let prompt = String(data: Self.bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
         XCTAssertTrue(prompt.contains("never translated"))
+    }
+
+    // MARK: - The learning loop's read side (P1-08)
+
+    /// A stub that answers with the id it was asked about.
+    private struct StubPreferences: AdvicePreferenceProviding {
+        let stats: [AcceptedAdviceStat]
+        func acceptedAdviceStats(accountId: UUID) async -> [AcceptedAdviceStat] { stats }
+    }
+
+    /// The preferences the user built up by acting on suggestions must reach
+    /// the classifier prompt.
+    ///
+    /// This is the end-to-end half of the learning loop: the client writes
+    /// `.accepted`, the server counts it, and the count changes what the
+    /// model is told. Without this the verdict would be written and then
+    /// read by nobody — a log, not a loop.
+    func test_classify_prompt_carriesTheAcceptedPreferences() async throws {
+        StubURLProtocol.set { _ in
+            (200, Data(#"{"choices":[{"message":{"content":"{\"g1\":\"needsReply\"}"}}]}"#.utf8))
+        }
+        let ai = try gateway(preferences: StubPreferences(stats: [
+            AcceptedAdviceStat(category: .newsletter, action: .archive, count: 7),
+            AcceptedAdviceStat(category: .marketing, action: .unsubscribe, count: 3),
+        ]))
+        _ = try await ai.classify(
+            [message(remoteId: "g1")], accountEmail: "me@example.com", language: nil
+        )
+        let prompt = String(data: Self.bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
+        XCTAssertTrue(
+            prompt.contains("newsletter -> archive"),
+            "the accepted (category, action) pair must reach the prompt: \(prompt)"
+        )
+        XCTAssertTrue(
+            prompt.contains("marketing -> unsubscribe"),
+            "the second accepted pair must reach the prompt: \(prompt)"
+        )
+        XCTAssertTrue(
+            prompt.contains("accepted 7x"),
+            "the frequency must reach the prompt — it is what the order is by: \(prompt)"
+        )
+    }
+
+    /// The hint must be a *hint*, never an order.
+    ///
+    /// A model told "the user usually archives newsletters" and nothing else
+    /// starts over-suggesting archive for anything vaguely marketing-shaped
+    /// — so the wording has to say the model still judges each email on its
+    /// own content.
+    func test_thePreferenceHintIsAHintNotAnOrder() async throws {
+        StubURLProtocol.set { _ in
+            (200, Data(#"{"choices":[{"message":{"content":"{\"g1\":\"needsReply\"}"}}]}"#.utf8))
+        }
+        let ai = try gateway(preferences: StubPreferences(stats: [
+            AcceptedAdviceStat(category: .newsletter, action: .archive, count: 7),
+        ]))
+        _ = try await ai.classify(
+            [message(remoteId: "g1")], accountEmail: "me@example.com", language: nil
+        )
+        let prompt = String(data: Self.bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
+        XCTAssertTrue(
+            prompt.contains("never an order"),
+            "the hint must not read as an instruction: \(prompt)"
+        )
+        XCTAssertTrue(
+            prompt.contains("still judge each email"),
+            "the hint must leave the judgement to the model: \(prompt)"
+        )
+    }
+
+    /// With no preferences the prompt says nothing about preferences.
+    ///
+    /// An empty section would be a sentence about an absence, and it would
+    /// cost prompt tokens on every call for the whole install.
+    func test_classify_prompt_omitsTheHintWithoutPreferences() async throws {
+        StubURLProtocol.set { _ in
+            (200, Data(#"{"choices":[{"message":{"content":"{\"g1\":\"needsReply\"}"}}]}"#.utf8))
+        }
+        let ai = try gateway()
+        _ = try await ai.classify(
+            [message(remoteId: "g1")], accountEmail: "me@example.com", language: nil
+        )
+        let prompt = String(data: Self.bodyData(StubURLProtocol.requests.first), encoding: .utf8) ?? ""
+        XCTAssertFalse(
+            prompt.contains("Tendencies this user has shown"),
+            "the hint must be absent when there is nothing to say: \(prompt)"
+        )
     }
 
     func test_languageName_mapsTags() {

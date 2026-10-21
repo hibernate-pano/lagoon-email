@@ -51,6 +51,20 @@ public enum SyncRoutes {
             // belongs to the trash, and the trash listing passes archived=false
             // so one row never appears in two places.
             let deleted = req.uri.queryParameters["deleted"] == "true"
+            // 置顶: ?pinned=true lists the messages the user deliberately kept.
+            //
+            // This lens used to exist only in the client's head: the sidebar
+            // badge counted pins correctly, but the list route had no filter
+            // for them, so clicking 置顶 showed the whole inbox under a
+            // heading that said 置顶. The badge and the list it labels are
+            // now one query.
+            let pinned = req.uri.queryParameters["pinned"] == "true"
+            // 未读: ?unread=true lists the unread messages. The server has to
+            // answer this one — the client used to fetch the newest N
+            // messages and filter the unread ones out of them, so a mailbox
+            // whose unread mail was older than the Nth showed an empty 未读
+            // list.
+            let unread = req.uri.queryParameters["unread"] == "true"
             let stackMatch: MessageStore.StackMatch?
             if let raw = req.uri.queryParameters["stackId"].map(String.init), let ruleId = UUID(uuidString: raw) {
                 guard let rule = try await StackStore.listStackRule(id: ruleId, accountId: uuid, db: db) else {
@@ -68,15 +82,15 @@ public enum SyncRoutes {
                 let msgs = try await MessageStore.recent(
                     forAccount: uuid, limit: limit, sender: sender,
                     archived: archived, deleted: deleted,
-                    stackMatch: stackMatch, db: db
+                    stackMatch: stackMatch, pinned: pinned, unread: unread, db: db
                 )
-                let unread = try await MessageStore.unreadCount(forAccount: uuid, db: db)
+                let unreadTotal = try await MessageStore.unreadCount(forAccount: uuid, db: db)
                 let total = try await MessageStore.count(
                     forAccount: uuid, sender: sender,
                     archived: archived, deleted: deleted,
-                    stackMatch: stackMatch, db: db
+                    stackMatch: stackMatch, pinned: pinned, unread: unread, db: db
                 )
-                let cursor = SyncCursor(accountId: uuid, lastFetchedAt: Date(), totalUnread: unread)
+                let cursor = SyncCursor(accountId: uuid, lastFetchedAt: Date(), totalUnread: unreadTotal)
                 let payload = SyncResponse(cursor: cursor, messages: msgs, totalCount: total)
                 return RouteJSON.response(payload)
             } catch {

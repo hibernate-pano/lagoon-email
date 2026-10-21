@@ -81,14 +81,35 @@ public struct BriefingResponse: Codable, Equatable, Sendable {
     /// not included" line so the boundary is visible instead of inferred.
     /// Optional so a v0.4.x client talking to this server still decodes.
     public let omittedCount: Int?
+    /// How many messages are still waiting **outside** the 30-day window.
+    ///
+    /// The window bounds the feed, but a mail does not stop needing a reply
+    /// because it got old. So the briefing also carries the unread mail from
+    /// before the window — up to its own cap — and this says how many such
+    /// messages exist in total.
+    ///
+    /// The number matters because the rows are capped: the client shows the
+    /// oldest ones, and without a total the user would see "3" and assume
+    /// that three old mails were all of them. With the total they can tell
+    /// that 40 more are waiting behind the ones on screen.
+    ///
+    /// Nil means "there is no backlog" — not "the server did not say". An
+    /// older server does not send the field at all, and the client then
+    /// shows nothing rather than inventing a number.
+    public let backlogCount: Int?
 
-    public init(items: [BriefingItem], omittedCount: Int? = nil) {
+    public init(
+        items: [BriefingItem],
+        omittedCount: Int? = nil,
+        backlogCount: Int? = nil
+    ) {
         self.items = items
         self.omittedCount = omittedCount
+        self.backlogCount = backlogCount
     }
 
     private enum CodingKeys: String, CodingKey {
-        case items, omittedCount
+        case items, omittedCount, backlogCount
     }
 }
 

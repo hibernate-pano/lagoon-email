@@ -11,6 +11,10 @@ public enum SyncHealthViewState: Equatable, Sendable {
     case degraded(reason: String)
     case error(reason: String)
     case needsReconnect(reason: String)
+    /// The account row could not be found. A distinct state from
+    /// `needsReconnect`, because the remedy is different: a code that is
+    /// already wrong will not be fixed by entering it again.
+    case accountMissing(reason: String)
 
     /// Map the wire model to the UI state. The reason is the server's
     /// `lastError` when present, or `"—"` so the banner always has
@@ -22,6 +26,7 @@ public enum SyncHealthViewState: Equatable, Sendable {
         case .degraded: return .degraded(reason: health.lastError ?? "—")
         case .error: return .error(reason: health.lastError ?? "—")
         case .needsReconnect: return .needsReconnect(reason: health.lastError ?? "—")
+        case .accountMissing: return .accountMissing(reason: health.lastError ?? "—")
         }
     }
 }

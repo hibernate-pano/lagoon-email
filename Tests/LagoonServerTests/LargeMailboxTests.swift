@@ -74,13 +74,18 @@ final class LargeMailboxTests: XCTestCase {
                     sql: """
                         INSERT INTO message_headers (
                             id, account_id, remote_id, thread_id, from_address,
-                            subject, snippet, received_at, is_read, is_archived,
+                            subject, snippet_cipher, received_at, is_read, is_archived,
                             is_deleted, is_sent
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                     arguments: [
                         UUID(), account.id, "bulk-\(index)", "t-\(index)",
-                        "bulk@example.com", "Subject \(index)", "snippet \(index)",
+                        "bulk@example.com", "Subject \(index)",
+                        // The preview is sealed at rest, so the fixture has to
+                        // seal it too — otherwise it would be writing a shape
+                        // the app itself can never write, and the test would
+                        // be measuring a store that cannot exist.
+                        try BodyCipher.seal("snippet \(index)"),
                         base.addingTimeInterval(-Double(index)), !unread,
                         archived, deleted, sent,
                     ]

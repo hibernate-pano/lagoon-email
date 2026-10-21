@@ -201,8 +201,8 @@ final class FilterConvergenceTests: XCTestCase {
         }
     }
 
-    /// `reconcileInbox` deletes **only** rows that are absent from the
-    /// provider's inbox *and* live on the inbox axes.
+    /// `reconcileInbox` never touches a row that does not live on the inbox
+    /// axes.
     ///
     /// This is the write half of the same definition the listing uses. The
     /// archived/sent/deleted rows are the control: the original bug deleted
@@ -214,7 +214,6 @@ final class FilterConvergenceTests: XCTestCase {
             try await TestDatabase.withConnection { conn in
                 try await seed(account, db: conn)
                 try await seedRow("inKeep", accountId: account.id, db: conn)
-                try await seedRow("inVanished", accountId: account.id, db: conn)
                 try await seedRow("archVanished", accountId: account.id, db: conn, archived: true)
                 try await seedRow("outVanished", accountId: account.id, db: conn, sent: true)
                 try await seedRow("goneVanished", accountId: account.id, db: conn, deleted: true)
@@ -227,11 +226,6 @@ final class FilterConvergenceTests: XCTestCase {
                     accountId: account.id, keeping: ["inKeep"], db: conn
                 )
 
-                // The inbox row the provider no longer lists is gone.
-                let vanished = try await MessageStore.find(
-                    remoteId: "inVanished", accountId: account.id, db: conn
-                )
-                XCTAssertNil(vanished, "an inbox row absent from the snapshot must be reconciled away")
                 // The kept inbox row and every non-inbox row survive.
                 for survivor in ["inKeep", "archVanished", "outVanished", "goneVanished", "outGoneVanished"] {
                     let row = try await MessageStore.find(
@@ -243,6 +237,80 @@ final class FilterConvergenceTests: XCTestCase {
                             + "and its absence from the INBOX snapshot says nothing about it"
                     )
                 }
+            }
+        }
+    }
+
+    /// "Not in the inbox" is not "deleted".
+    ///
+    /// The reconciler used to read it that way: any inbox row the provider
+    /// no longer listed was deleted, taking its cached body and its
+    /// paid-for AI advice with it. But a message leaves the inbox every time
+    /// it is **filed** — by Lagoon, or by another client on the same
+    /// account — and the app never reads the archive or trash folders back.
+    /// So the old rule could delete mail that was still on the server, in a
+    /// folder Lagoon does not look at, for good.
+    ///
+    /// The rule now is: a row is removed only when the provider *confirmed*
+    /// it is gone from the server, and a row whose whereabouts are unknown
+    /// stays. This test pins both halves — the "confirmed gone" row is
+    /// deleted, the "unknown" row is not, and the two confirmed-elsewhere
+    /// rows are re-labelled rather than removed.
+    func test_reconcileInboxRemovesOnlyRowsTheProviderConfirmedAreGone() async throws {
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            let account = makeAccount()
+            try await TestDatabase.withConnection { conn in
+                try await seed(account, db: conn)
+                try await seedRow("inKeep", accountId: account.id, db: conn)
+                try await seedRow("inUnknown", accountId: account.id, db: conn)
+                try await seedRow("inGone", accountId: account.id, db: conn)
+                try await seedRow("inFiled", accountId: account.id, db: conn)
+                try await seedRow("inBinned", accountId: account.id, db: conn)
+
+                try await MessageStore.reconcileInbox(
+                    accountId: account.id,
+                    keeping: ["inKeep"],
+                    archived: ["inFiled"],
+                    trashed: ["inBinned"],
+                    removing: ["inGone"],
+                    db: conn
+                )
+
+                // `XCTAssert` takes autoclosures, which cannot await — every
+                // lookup is hoisted into a local first.
+                let gone = try await MessageStore.find(
+                    remoteId: "inGone", accountId: account.id, db: conn
+                )
+                XCTAssertNil(
+                    gone,
+                    "a row the provider confirmed is gone from the server must be removed"
+                )
+                let unknown = try await MessageStore.find(
+                    remoteId: "inUnknown", accountId: account.id, db: conn
+                )
+                XCTAssertNotNil(
+                    unknown,
+                    "a row whose whereabouts are unknown must not be deleted — it may have "
+                        + "been filed by another client, and the app never reads that folder back"
+                )
+                let filed = try await MessageStore.find(
+                    remoteId: "inFiled", accountId: account.id, db: conn
+                )
+                XCTAssertEqual(
+                    filed?.isArchived, true,
+                    "a row the provider found in the archive folder is re-labelled, not removed"
+                )
+                let binned = try await MessageStore.find(
+                    remoteId: "inBinned", accountId: account.id, db: conn
+                )
+                XCTAssertEqual(
+                    binned?.isDeleted, true,
+                    "a row the provider found in the trash folder is re-labelled, not removed"
+                )
+                let kept = try await MessageStore.find(
+                    remoteId: "inKeep", accountId: account.id, db: conn
+                )
+                XCTAssertNotNil(kept, "a row still in the inbox is kept")
             }
         }
     }

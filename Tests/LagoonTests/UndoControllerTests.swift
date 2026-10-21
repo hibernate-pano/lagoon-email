@@ -63,10 +63,10 @@ final class UndoControllerTests: XCTestCase {
         return data
     }
 
-    private func makeController() throws -> (UndoController, UUID) {
+    private func makeController() async throws -> (UndoController, UUID) {
         let accountId = UUID()
         let store = AccountStore(service: service)
-        try store.set(accountId: accountId)
+        try await store.set(accountId: accountId)
         self.store = store
         let controller = UndoController(api: makeClient())
         controller.bind(store)
@@ -79,7 +79,7 @@ final class UndoControllerTests: XCTestCase {
     /// like it worked.
     func test_undo_postsExactlyTheIdFromTheToast() async throws {
         stub(status: 200)
-        let (controller, accountId) = try makeController()
+        let (controller, accountId) = try await makeController()
         controller.show(UndoItem(id: 4242, message: "已归档", systemImage: "tray"))
 
         await controller.undo()
@@ -119,7 +119,7 @@ final class UndoControllerTests: XCTestCase {
             )!
             return (response, Data("{}".utf8))
         }
-        let (controller, _) = try makeController()
+        let (controller, _) = try await makeController()
         controller.show(UndoItem(id: 7, message: "已归档", systemImage: "tray"))
 
         let undoing = Task { await controller.undo() }
@@ -134,7 +134,7 @@ final class UndoControllerTests: XCTestCase {
 
     func test_doubleTapFiresExactlyOneUndo() async throws {
         stub(status: 200)
-        let (controller, _) = try makeController()
+        let (controller, _) = try await makeController()
         controller.show(UndoItem(id: 9, message: "已归档", systemImage: "tray"))
 
         async let first: Void = controller.undo()
@@ -152,7 +152,7 @@ final class UndoControllerTests: XCTestCase {
     /// the user needs to know it could not be taken back.
     func test_undoFailureSurfacesAnErrorAndKeepsTheActionUndone() async throws {
         stub(status: 400, body: Data(#"{"error":"action-expired"}"#.utf8))
-        let (controller, _) = try makeController()
+        let (controller, _) = try await makeController()
         controller.show(UndoItem(id: 11, message: "已归档", systemImage: "tray"))
 
         await controller.undo()
@@ -194,7 +194,7 @@ final class UndoControllerTests: XCTestCase {
             return (response, Data(payload.utf8))
         }
         let store = AccountStore(service: service)
-        try store.set(accountId: accountId)
+        try await store.set(accountId: accountId)
         self.store = store
         let controller = UndoController(api: makeClient())
         controller.bind(store)
@@ -220,7 +220,7 @@ final class UndoControllerTests: XCTestCase {
             UndoBulkResponse(items: [1, 2, 3].map { UndoBulkItem(actionId: $0, ok: true) }, undone: 3)
         )
         stub(status: 200, body: body)
-        let (controller, accountId) = try makeController()
+        let (controller, accountId) = try await makeController()
         controller.show(UndoItem(
             id: 1, message: "已将 3 封标为已读", systemImage: "envelope.open",
             extraIds: [2, 3]
@@ -256,7 +256,7 @@ final class UndoControllerTests: XCTestCase {
     /// ordinary archive must not change endpoint.
     func test_undo_withoutExtraIds_keepsUsingTheSingleActionRoute() async throws {
         stub(status: 200)
-        let (controller, _) = try makeController()
+        let (controller, _) = try await makeController()
         controller.show(UndoItem(id: 7, message: "已归档", systemImage: "tray"))
 
         await controller.undo()
@@ -285,7 +285,7 @@ final class UndoControllerTests: XCTestCase {
             )
         )
         stub(status: 200, body: body)
-        let (controller, _) = try makeController()
+        let (controller, _) = try await makeController()
         controller.show(UndoItem(
             id: 1, message: "已将 3 封标为已读", systemImage: "envelope.open",
             extraIds: [2, 3]
@@ -312,7 +312,7 @@ final class UndoControllerTests: XCTestCase {
             UndoBulkResponse(items: [1, 2, 3].map { UndoBulkItem(actionId: $0, ok: true) }, undone: 3)
         )
         stub(status: 200, body: body)
-        let (controller, _) = try makeController()
+        let (controller, _) = try await makeController()
         controller.show(UndoItem(
             id: 1, message: "已将 3 封标为已读", systemImage: "envelope.open",
             extraIds: [2, 3]
@@ -336,7 +336,7 @@ final class UndoControllerTests: XCTestCase {
 
     func test_undoLatestWithNoUndoableActionReportsInsteadOfFailing() async throws {
         stub(status: 200, body: Data(#"{"actions":[]}"#.utf8))
-        let (controller, _) = try makeController()
+        let (controller, _) = try await makeController()
 
         await controller.undoLatest()
 
@@ -345,6 +345,103 @@ final class UndoControllerTests: XCTestCase {
             StubURLProtocol.capturedRequests.allSatisfy { $0.url?.path.hasSuffix("/undo") != true },
             "nothing to undo must not produce an undo call"
         )
+    }
+
+    /// A bulk operation that wrote one audit row per message must be undone
+    /// **whole**, even after the toast has faded.
+    ///
+    /// The rows share a timestamp, and the old code took `actions.first` — a
+    /// single row. So ⌘Z after the six-second toast undid exactly one of
+    /// the fifty messages the user had archived, and the other forty-nine
+    /// stayed archived with no way back. It *looked* like it worked, which
+    /// is the worst version of the bug: the user believes the mail is back
+    /// and it is not.
+    func test_undoLatestWithoutAToastReversesTheWholeBatch() async throws {
+        let accountId = UUID()
+        // Three actions written inside the same operation, and one older
+        // action from a previous operation that must NOT be swept in.
+        let payload = """
+        {"actions":[
+          {"id":11,"accountId":"\(accountId.uuidString)","kind":"archive","payload":{},
+           "createdAt":"2026-09-29T11:00:00Z"},
+          {"id":12,"accountId":"\(accountId.uuidString)","kind":"archive","payload":{},
+           "createdAt":"2026-09-29T11:00:00Z"},
+          {"id":13,"accountId":"\(accountId.uuidString)","kind":"archive","payload":{},
+           "createdAt":"2026-09-29T11:00:00Z"},
+          {"id":9,"accountId":"\(accountId.uuidString)","kind":"archive","payload":{},
+           "createdAt":"2026-09-29T09:00:00Z"}
+        ]}
+        """
+        let bulkBody = try JSONEncoder().encode(
+            UndoBulkResponse(
+                items: [11, 12, 13].map { UndoBulkItem(actionId: $0, ok: true) },
+                undone: 3
+            )
+        )
+        StubURLProtocol.setHandler { request in
+            let response = HTTPURLResponse(
+                url: request.url ?? self.baseURL,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            if request.url?.path == "/api/actions" {
+                return (response, Data(payload.utf8))
+            }
+            return (response, bulkBody)
+        }
+        let store = AccountStore(service: service)
+        try await store.set(accountId: accountId)
+        self.store = store
+        let controller = UndoController(api: makeClient())
+        controller.bind(store)
+
+        await controller.undoLatest()
+
+        let bulkCalls = StubURLProtocol.capturedRequests.filter {
+            $0.url?.path == "/api/actions/undo-bulk"
+        }
+        XCTAssertEqual(bulkCalls.count, 1, "the whole batch must be undone in one call")
+        let decoded = try JSONDecoder().decode(
+            UndoBulkRequest.self, from: try bodyData(of: XCTUnwrap(bulkCalls.first))
+        )
+        XCTAssertEqual(
+            Set(decoded.actionIds), [11, 12, 13],
+            "one message out of a bulk operation is not an undo"
+        )
+        XCTAssertFalse(
+            decoded.actionIds.contains(9),
+            "a separate, older operation must not be swept into this undo"
+        )
+        XCTAssertTrue(
+            StubURLProtocol.capturedRequests.filter { $0.url?.path.hasSuffix("/undo") == true }.isEmpty,
+            "a batch must not fall back to the single-action route"
+        )
+    }
+
+    /// Two operations a moment apart are two operations.
+    ///
+    /// The clustering window is two seconds. If it were wide enough to merge
+    /// them, ⌘Z would revert an action the user never asked to revert — and
+    /// a wrong undo is worse than a missing one.
+    func test_theBatchWindowDoesNotMergeTwoSeparateOperations() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let newest = AIAction(
+            id: 2, accountId: UUID(), kind: .archive, payload: [:],
+            createdAt: base
+        )
+        let sameOperation = AIAction(
+            id: 1, accountId: UUID(), kind: .archive, payload: [:],
+            createdAt: base.addingTimeInterval(-1)
+        )
+        let separateOperation = AIAction(
+            id: 3, accountId: UUID(), kind: .archive, payload: [:],
+            createdAt: base.addingTimeInterval(-30)
+        )
+        let batch = UndoController.batch(
+            containing: newest, in: [newest, sameOperation, separateOperation]
+        )
+        XCTAssertEqual(Set(batch), [1, 2], "a 30-second-old operation is a different operation")
     }
 }
 

@@ -55,7 +55,7 @@ public enum AIActionKind: String, Codable, Sendable, CaseIterable {
     }
 }
 
-/// 一条用户自定义聚合（归集规则）。命中的邮件自动归入该聚合：
+/// 一条用户自定义聚合（归集条件）。命中的邮件自动归入该聚合：
 /// `sender` 精确匹配 `from_address`；`keyword` 对主题做大小写不敏感的
 /// 包含匹配。求值发生在读取时，未来的邮件无需登记即自动归入。
 public struct StackRule: Codable, Sendable, Identifiable, Equatable {
@@ -63,12 +63,13 @@ public struct StackRule: Codable, Sendable, Identifiable, Equatable {
         case sender
         case keyword
 
-        public var displayName: String {
-            switch self {
-            case .sender: return "发件人"
-            case .keyword: return "关键词"
-            }
-        }
+        // There is deliberately no `displayName` here any more. It returned
+        // hardcoded Chinese ("发件人" / "关键词") and the client printed it
+        // straight into the group row — so an English user read 「按发件人」
+        // next to a group they had just named in English. `LagoonKit` is
+        // shared with the server and owns no user-facing copy, so the wording
+        // lives in the client's `L10n` instead (`L10n.stackKindName(_:)`).
+        // What the API and the database store is `rawValue`.
     }
 
     public let id: UUID
@@ -114,7 +115,23 @@ public struct DraftReply: Codable, Sendable, Identifiable, Equatable {
 /// `GET /api/actions?since=...` response.
 public struct AIActionListResponse: Codable, Sendable, Equatable {
     public let actions: [AIAction]
-    public init(actions: [AIAction]) { self.actions = actions }
+    /// How many rows the history holds, ignoring `limit` and the cursor.
+    ///
+    /// Optional so the field's absence is distinguishable from a zero: an
+    /// older server that does not count must not be read as "there is
+    /// nothing else", and that is exactly the lie this field exists to stop.
+    public let totalCount: Int?
+    /// Whether an older page exists. Measured by the server (it fetches one
+    /// row more than it returns), not inferred from `actions.count == limit`
+    /// — that inference is also true on a last page that lands exactly on a
+    /// page boundary.
+    public let hasMore: Bool?
+
+    public init(actions: [AIAction], totalCount: Int? = nil, hasMore: Bool? = nil) {
+        self.actions = actions
+        self.totalCount = totalCount
+        self.hasMore = hasMore
+    }
 }
 
 /// User override on AI classification. The heuristic applies these so future
@@ -189,9 +206,30 @@ public struct ClassifyOverrideRequest: Codable, Sendable, Equatable {
 public struct SearchResponse: Codable, Sendable, Equatable {
     public let results: [MessageHeader]
     public let query: String
-    public init(results: [MessageHeader], query: String) {
+    /// How many messages matched, before the server's cap.
+    ///
+    /// The search used to stop at 100 hits and say nothing about it. A user
+    /// who searched "发票" and got 100 rows had no way to know whether that
+    /// was all of them or the first hundred — and "the first hundred" reads
+    /// as "all of them" every time. The count is what turns a silent cap
+    /// into a statement the user can act on.
+    ///
+    /// Nil means "the server did not say", which is the honest answer for an
+    /// older server; the client then falls back to the old behaviour rather
+    /// than claiming a number it does not have.
+    public let totalCount: Int?
+    /// True when the server stopped at its cap and more matched.
+    public let truncated: Bool?
+    public init(
+        results: [MessageHeader],
+        query: String,
+        totalCount: Int? = nil,
+        truncated: Bool? = nil
+    ) {
         self.results = results
         self.query = query
+        self.totalCount = totalCount
+        self.truncated = truncated
     }
 }
 
@@ -209,6 +247,25 @@ public struct AIStatus: Codable, Sendable, Equatable {
         self.circuitOpen = circuitOpen
     }
 }
+/// One account's share of the month's LLM spend.
+///
+/// The account is identified by **email**, not id, because that is what
+/// `usage_log` records: the AI gateway is handed an account's address on
+/// every call, and the log has stored it since the table existed. An id
+/// would have to be joined back to `accounts` — and then a spend row would
+/// disappear from the panel the moment the account was removed, which
+/// silently rewrites history: the money was still spent.
+public struct UsageAccountShare: Codable, Sendable, Equatable {
+    public let accountEmail: String
+    public let monthUSD: Double
+    public let callCount: Int
+    public init(accountEmail: String, monthUSD: Double, callCount: Int) {
+        self.accountEmail = accountEmail
+        self.monthUSD = monthUSD
+        self.callCount = callCount
+    }
+}
+
 public struct UsageReport: Codable, Sendable, Equatable {
     public let monthUSD: Double
     public let capUSD: Double
@@ -216,15 +273,47 @@ public struct UsageReport: Codable, Sendable, Equatable {
     /// False when the provider has no token rates. Tokens can still be counted,
     /// but a dollar-denominated cap cannot be enforced truthfully.
     public let costTrackingAvailable: Bool
+    /// The month's spend grouped by account, cost descending.
+    ///
+    /// ## Why this is decoded by hand, with a default
+    ///
+    /// It was added after `UsageReport` shipped, so a client built before
+    /// it existed must still be able to read this response. The synthesised
+    /// `Decodable` would treat a missing key as an error and the usage
+    /// panel would fail to load against a server that is merely newer —
+    /// which is exactly the failure this default prevents. An **older**
+    /// server answers without the key, and that decodes to an empty array;
+    /// the panel then says nothing about accounts rather than showing a
+    /// fabricated split.
+    ///
+    /// An empty array is therefore load-bearing and must not be rendered as
+    /// "every account spent $0" — see `UsageSheet`.
+    public let accounts: [UsageAccountShare]
+
     public init(
         monthUSD: Double,
         capUSD: Double,
         callCount: Int,
-        costTrackingAvailable: Bool = true
+        costTrackingAvailable: Bool = true,
+        accounts: [UsageAccountShare] = []
     ) {
         self.monthUSD = monthUSD
         self.capUSD = capUSD
         self.callCount = callCount
         self.costTrackingAvailable = costTrackingAvailable
+        self.accounts = accounts
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case monthUSD, capUSD, callCount, costTrackingAvailable, accounts
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        monthUSD = try c.decode(Double.self, forKey: .monthUSD)
+        capUSD = try c.decode(Double.self, forKey: .capUSD)
+        callCount = try c.decode(Int.self, forKey: .callCount)
+        costTrackingAvailable = try c.decodeIfPresent(Bool.self, forKey: .costTrackingAvailable) ?? true
+        accounts = try c.decodeIfPresent([UsageAccountShare].self, forKey: .accounts) ?? []
     }
 }

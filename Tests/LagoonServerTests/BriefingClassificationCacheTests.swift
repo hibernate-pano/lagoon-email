@@ -104,6 +104,48 @@ final class BriefingClassificationCacheTests: XCTestCase {
         XCTAssertEqual(stale.pending.count, 1)
     }
 
+    /// Two mailboxes must not share a cache entry.
+    ///
+    /// `remoteId` is **not** unique across accounts: a message with no
+    /// `Message-ID` header gets the provider's fallback id `uid:<n>`, and
+    /// each account's IMAP UIDs count up independently — so account A's
+    /// `uid:42` and account B's `uid:42` are the same string.
+    ///
+    /// The cache is one instance for the whole process, so without the
+    /// account id in the key, B's message is served A's classification: the
+    /// mail is filed under the wrong category, with a rationale that talks
+    /// about a different message, and nothing in the UI says so.
+    func test_twoAccountsWithTheSameRemoteIdDoNotShareAnEntry() async {
+        let cache = BriefingClassificationCache()
+        let accountA = UUID()
+        let accountB = UUID()
+
+        // Both accounts have a message the provider could only identify by
+        // its IMAP uid.
+        let messageA = MessageHeader(
+            id: UUID(), accountId: accountA, remoteId: "uid:42", threadId: "t-42",
+            fromAddress: "a@example.com", fromName: nil, subject: "s", snippet: nil,
+            receivedAt: Date(), isRead: false, isArchived: false
+        )
+        let messageB = MessageHeader(
+            id: UUID(), accountId: accountB, remoteId: "uid:42", threadId: "t-42",
+            fromAddress: "b@example.com", fromName: nil, subject: "s", snippet: nil,
+            receivedAt: Date(), isRead: false, isArchived: false
+        )
+
+        await cache.store(["uid:42": .group(.needsReply)], for: [messageA])
+
+        let (known, pending) = await cache.cached(for: [messageB])
+        XCTAssertTrue(
+            known.isEmpty,
+            "the other account's classification was served for this account's message"
+        )
+        XCTAssertEqual(
+            pending.map(\.remoteId), ["uid:42"],
+            "the message must be classified again for its own account"
+        )
+    }
+
     // MARK: - Route behaviour (the cost fix)
 
     private func makeAccount(oauthUser: String) -> Account {

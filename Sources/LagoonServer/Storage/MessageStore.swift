@@ -55,7 +55,7 @@ public enum MessageStore {
             let sql = """
                 INSERT INTO message_headers (
                     id, account_id, remote_id, thread_id,
-                    from_address, from_name, subject, snippet,
+                    from_address, from_name, subject, snippet_cipher,
                     received_at, is_read, is_archived, list_unsubscribe,
                     message_id_header, in_reply_to, references_header,
                     unsubscribe_links, fetched_at
@@ -68,7 +68,7 @@ public enum MessageStore {
                 )
                 ON CONFLICT (account_id, remote_id) DO UPDATE SET
                     subject = CASE WHEN EXCLUDED.subject = '' THEN message_headers.subject ELSE EXCLUDED.subject END,
-                    snippet = CASE WHEN EXCLUDED.snippet = '' THEN message_headers.snippet ELSE EXCLUDED.snippet END,
+                    snippet_cipher = CASE WHEN EXCLUDED.snippet_cipher = '' THEN message_headers.snippet_cipher ELSE EXCLUDED.snippet_cipher END,
                     is_read = message_headers.is_read OR EXCLUDED.is_read,
                     list_unsubscribe = message_headers.list_unsubscribe OR EXCLUDED.list_unsubscribe,
                     message_id_header = COALESCE(EXCLUDED.message_id_header, message_headers.message_id_header),
@@ -77,9 +77,14 @@ public enum MessageStore {
                     unsubscribe_links = EXCLUDED.unsubscribe_links,
                     fetched_at = strftime('%Y-%m-%d %H:%M:%f','now')
             """
+            // The snippet is body text — it is the first lines of the body,
+            // shown in the list — so it is sealed with the body. An empty
+            // snippet stays empty: the `CASE` above reads that as "this sync
+            // round carried no preview" and keeps the stored one.
+            let sealedSnippet = try m.snippet.flatMap { $0.isEmpty ? nil : try BodyCipher.seal($0) } ?? ""
             try db.execute(sql: sql, arguments: [
                 m.id, m.accountId, m.remoteId, m.threadId,
-                m.fromAddress, m.fromName ?? "", m.subject ?? "", m.snippet ?? "",
+                m.fromAddress, m.fromName ?? "", m.subject ?? "", sealedSnippet,
                 m.receivedAt, m.isRead, m.isArchived, listUnsubscribe,
                 m.messageIdHeader, m.inReplyTo, m.references,
                 links
@@ -200,6 +205,20 @@ public enum MessageStore {
     /// The pin join is what lets the client render pin state: pins live in
     /// their own table, so a plain `message_headers` read leaves the client
     /// with no way to tell a pinned mail from an unpinned one.
+    /// The 置顶 predicate, in one piece.
+    ///
+    /// A named constant rather than a concatenation of fragments: the CI
+    /// guardrail flags any SQL literal sitting next to a `+`, because that is
+    /// the shape a *spliced value* takes. This fragment splices nothing — the
+    /// only placeholder is the account id, bound like every other one — and a
+    /// reader sees the whole predicate in one line instead of assembling it in
+    /// their head.
+    ///
+    /// EXISTS rather than a join, because the same clause has to work for
+    /// `recent()` (which joins the pin table) and `count()` (which does not),
+    /// and one definition beats two.
+    private static let pinnedWhereClause = "WHERE h.account_id = ? AND h.is_sent = FALSE AND EXISTS (SELECT 1 FROM message_pins p WHERE p.account_id = h.account_id AND p.remote_id = h.remote_id)"
+
     /// Shared WHERE clause for `recent()` / `count()` — and, since the R-01
     /// convergence, for every **lens** query in this file that used to state
     /// the axes by hand: `unreadCount`, `sentCount`, `deletedCount`,
@@ -223,6 +242,8 @@ public enum MessageStore {
         sent: Bool = false,
         stackMatch: StackMatch?,
         receivedAfter: Date? = nil,
+        pinned: Bool = false,
+        unread: Bool = false,
     ) -> (String, [DatabaseValueConvertible?]) {
         // 「已发送」是第三个**独立轴**，与 archived / deleted 互斥。
         //
@@ -234,33 +255,59 @@ public enum MessageStore {
         // 这也延续了 R1 之前确立的形状：`deleted` 忽略 archived 维度，理由
         // 完全一样——一封邮件只能在一个地方，否则「它在哪个列表里」这个问题
         // 就没有答案了。
-        var clause = "WHERE h.account_id = ? AND h.is_deleted = "
-        clause += deleted ? "TRUE" : "FALSE"
-        if sent {
-            // Sent ignores the archived axis for the same reason Trash does:
-            // an archived reply I sent belongs to 已发送, and putting it in both
-            // makes "which list is it in" unanswerable.
-            clause += " AND h.is_sent = TRUE"
-        } else if deleted {
-            // The Trash likewise ignores the archived axis.
+        var clause = "WHERE h.account_id = ?"
+        if pinned {
+            // 置顶 is a lens of its own, and it deliberately ignores the archived
+            // and deleted axes: a pin means "I deliberately kept this", and
+            // filing the message elsewhere does not un-keep it.
             //
-            // Without this, a message that was archived and *then* deleted
-            // matched neither listing: the trash query asked for
-            // `is_archived = FALSE` and the row is TRUE, while the archive
-            // query asked for `is_deleted = FALSE` and the row is TRUE too. The
-            // mail existed on the server in the Trash folder and was reachable
-            // from no list in the app — permanently invisible, which is the one
-            // outcome worse than "no trash view at all".
+            // The set here is exactly the set `pinnedCount` counts, so the
+            // badge in the sidebar and the list it labels are one set by
+            // construction. They were not: the lens had no server-side filter
+            // at all, so the badge said "3" and the list showed the whole
+            // inbox — a number the user could not reconcile with the page it
+            // labelled.
+            clause = Self.pinnedWhereClause
         } else {
-            clause += " AND h.is_archived = "
-            clause += archived ? "TRUE" : "FALSE"
-            // The inbox, the archive and every rule listing **exclude** sent
-            // mail. Without this, opening 已发送 once would make every reply
-            // the user had ever sent appear in their inbox as if it had just
-            // arrived — the single most confusing thing this axis could do, and
-            // the direction the data flows on its own (a reply is written by
-            // `refresh`, not by a user filing it).
-            clause += " AND h.is_sent = FALSE"
+            clause += " AND h.is_deleted = "
+            clause += deleted ? "TRUE" : "FALSE"
+            if sent {
+                // Sent ignores the archived axis for the same reason Trash does:
+                // an archived reply I sent belongs to 已发送, and putting it in both
+                // makes "which list is it in" unanswerable.
+                clause += " AND h.is_sent = TRUE"
+            } else if deleted {
+                // The Trash likewise ignores the archived axis.
+                //
+                // Without this, a message that was archived and *then* deleted
+                // matched neither listing: the trash query asked for
+                // `is_archived = FALSE` and the row is TRUE, while the archive
+                // query asked for `is_deleted = FALSE` and the row is TRUE too. The
+                // mail existed on the server in the Trash folder and was reachable
+                // from no list in the app — permanently invisible, which is the one
+                // outcome worse than "no trash view at all".
+            } else {
+                clause += " AND h.is_archived = "
+                clause += archived ? "TRUE" : "FALSE"
+                // The inbox, the archive and every rule listing **exclude** sent
+                // mail. Without this, opening 已发送 once would make every reply
+                // the user had ever sent appear in their inbox as if it had just
+                // arrived — the single most confusing thing this axis could do, and
+                // the direction the data flows on its own (a reply is written by
+                // `refresh`, not by a user filing it).
+                clause += " AND h.is_sent = FALSE"
+            }
+        }
+        if unread {
+            // 未读 is a lens the server has to answer, not the client.
+            //
+            // The client used to fetch the newest N messages and filter the
+            // unread ones out of them, so a mailbox with 5,000 messages
+            // showed an empty 未读 list whenever the unread ones were older
+            // than the Nth — a list that claimed there was nothing to read
+            // when there was. The same class of lie as the 置顶 badge: the
+            // number and the list disagreeing.
+            clause += " AND h.is_read = FALSE"
         }
         var arguments: [DatabaseValueConvertible?] = [accountId]
         switch stackMatch {
@@ -297,11 +344,14 @@ public enum MessageStore {
         sent: Bool = false,
         stackMatch: StackMatch? = nil,
         receivedAfter: Date? = nil,
+        pinned: Bool = false,
+        unread: Bool = false,
         db: LagoonDB
     ) async throws -> [MessageHeader] {
         let (whereClause, filterArgs) = filterSQL(
             accountId: accountId, sender: sender, archived: archived, deleted: deleted,
-            sent: sent, stackMatch: stackMatch, receivedAfter: receivedAfter
+            sent: sent, stackMatch: stackMatch, receivedAfter: receivedAfter,
+            pinned: pinned, unread: unread
         )
         // Assembled with joined() rather than interpolation: the SQL
         // guardrail rejects `\()` inside a SELECT literal, and `+`
@@ -312,7 +362,7 @@ public enum MessageStore {
             SELECT h.id, h.account_id, h.remote_id, h.thread_id, h.from_address,
                    NULLIF(h.from_name, '') AS from_name,
                    NULLIF(h.subject, '') AS subject,
-                   NULLIF(h.snippet, '') AS snippet,
+                   NULLIF(h.snippet_cipher, '') AS snippet_cipher,
                    h.received_at, h.is_read, h.is_archived, h.is_deleted, h.is_sent,
                    h.message_id_header, h.in_reply_to, h.references_header,
                    (message_pins.account_id IS NOT NULL) AS is_pinned
@@ -352,7 +402,7 @@ public enum MessageStore {
             SELECT id, account_id, remote_id, thread_id, from_address,
                    NULLIF(from_name, '') AS from_name,
                    NULLIF(subject, '') AS subject,
-                   NULLIF(snippet, '') AS snippet,
+                   NULLIF(snippet_cipher, '') AS snippet_cipher,
                    received_at, is_read, is_archived, is_deleted, is_sent,
                    message_id_header, in_reply_to, references_header
             FROM message_headers
@@ -365,14 +415,57 @@ public enum MessageStore {
         }
     }
 
-    /// Wipes every header for an account (UIDVALIDITY change → full resync).
-    /// Pins/drafts live in their own tables and are intentionally preserved.
-    public static func deleteAll(accountId: UUID, db: LagoonDB) async throws {
-        let sql = "DELETE FROM message_headers WHERE account_id = ?"
+    /// Wipes the account's **live** rows — the ones the inbox shows — for a
+    /// UIDVALIDITY reset.
+    ///
+    /// ## Why not every row
+    ///
+    /// A UIDVALIDITY change invalidates the server's *UID* space, not its
+    /// messages. The messages in the account's archive and trash folders are
+    /// still on the server and still reachable: they are addressed by
+    /// Message-ID, which does not change when UIDs do.
+    ///
+    /// Wiping them was therefore pure loss — the user's archived and deleted
+    /// mail disappeared from the app with no way back, because the app never
+    /// reads those folders to rebuild them. So the reset clears the inbox
+    /// axis and leaves the filed axes alone; their rows keep pointing at the
+    /// messages they always pointed at.
+    ///
+    /// Pins and drafts live in their own tables and are preserved either way.
+    public static func deleteLiveRows(accountId: UUID, db: LagoonDB) async throws {
+        let sql = """
+            DELETE FROM message_headers
+            WHERE account_id = ?
+              AND is_archived = FALSE AND is_deleted = FALSE AND is_sent = FALSE
+            """
         try db.write { try $0.execute(sql: sql, arguments: [accountId]) }
     }
 
-    /// Remove non-archived rows that no longer exist in the provider's inbox.
+    /// Reconciles the local live rows against what the provider reports.
+    ///
+    /// ## The rule, and why it is not what it used to be
+    ///
+    /// A message that is no longer in the inbox has not necessarily been
+    /// deleted. It may have been **archived** or **trashed** — by Lagoon, or
+    /// by another client on the same account. The old reconciler read
+    /// "not in the inbox" as "gone" and deleted the local row, which took the
+    /// cached body and the paid-for AI advice with it via `ON DELETE
+    /// CASCADE`. Because the app never reads the archive or trash folders
+    /// back, that deletion was permanent: the mail was still on the server,
+    /// in a folder Lagoon does not look at, and gone from the app.
+    ///
+    /// So the provider now says *where* each message is, and this function
+    /// acts on that:
+    ///
+    /// * in the archive folder → re-label the row as archived
+    /// * in the trash folder → re-label the row as deleted
+    /// * confirmed gone → delete the row
+    /// * **unknown → keep the row**
+    ///
+    /// The last line is the important one. A local row is only removed when
+    /// the provider has positively confirmed the message is in neither
+    /// folder; absence of information never destroys anything.
+    ///
     /// Archived rows are retained because they represent messages Lagoon moved
     /// out of the inbox intentionally and may still need local history/undo.
     /// **Deleted rows are retained for the same reason** — they sit in the
@@ -403,7 +496,10 @@ public enum MessageStore {
     /// the regression net for the original loss.
     public static func reconcileInbox(
         accountId: UUID,
-        keeping remoteIds: Set<String>,
+        keeping inboxRemoteIds: Set<String>,
+        archived archivedRemoteIds: Set<String> = [],
+        trashed trashedRemoteIds: Set<String> = [],
+        removing removedRemoteIds: Set<String> = [],
         db: LagoonDB
     ) async throws {
         let (whereClause, filterArgs) = filterSQL(
@@ -419,11 +515,37 @@ public enum MessageStore {
                 db, sql: sql, arguments: StatementArguments(filterArgs)
             )
             let localIds = rows.compactMap { $0.optionalText("remote_id") }
-            for remoteId in localIds where !remoteIds.contains(remoteId) {
-                try db.execute(
-                    sql: "DELETE FROM message_headers WHERE account_id = ? AND remote_id = ?",
-                    arguments: [accountId, remoteId]
-                )
+            for remoteId in localIds where !inboxRemoteIds.contains(remoteId) {
+                if archivedRemoteIds.contains(remoteId) {
+                    // Filed, not gone. Re-label the row so it shows up in the
+                    // archive list, and keep its body and its advice.
+                    try db.execute(
+                        sql: """
+                        UPDATE message_headers SET is_archived = TRUE
+                        WHERE account_id = ? AND remote_id = ?
+                        """,
+                        arguments: [accountId, remoteId]
+                    )
+                } else if trashedRemoteIds.contains(remoteId) {
+                    try db.execute(
+                        sql: """
+                        UPDATE message_headers SET is_deleted = TRUE
+                        WHERE account_id = ? AND remote_id = ?
+                        """,
+                        arguments: [accountId, remoteId]
+                    )
+                } else if removedRemoteIds.contains(remoteId) {
+                    // The server has confirmed it is in neither the archive
+                    // folder nor the trash folder: it really is gone, and the
+                    // local row goes with it.
+                    try db.execute(
+                        sql: "DELETE FROM message_headers WHERE account_id = ? AND remote_id = ?",
+                        arguments: [accountId, remoteId]
+                    )
+                }
+                // Otherwise: whereabouts unknown. The row stays. A message
+                // that merely left the inbox is not evidence of anything, and
+                // a wrong deletion is not recoverable.
             }
         }
     }
@@ -611,11 +733,14 @@ public enum MessageStore {
         sent: Bool = false,
         stackMatch: StackMatch? = nil,
         receivedAfter: Date? = nil,
+        pinned: Bool = false,
+        unread: Bool = false,
         db: LagoonDB
     ) async throws -> Int {
         let (whereClause, arguments) = filterSQL(
             accountId: accountId, sender: sender, archived: archived, deleted: deleted,
-            sent: sent, stackMatch: stackMatch, receivedAfter: receivedAfter
+            sent: sent, stackMatch: stackMatch, receivedAfter: receivedAfter,
+            pinned: pinned, unread: unread
         )
         // Joined, not interpolated — see recent() above.
         let sql = [
@@ -625,6 +750,111 @@ public enum MessageStore {
         return try db.read { db in
             let row = try Row.fetchOne(db, sql: sql, arguments: StatementArguments(arguments))
             return row.map { $0["count"] } ?? 0
+        }
+    }
+
+    /// Mail that is **still unresolved** and older than the briefing window.
+    ///
+    /// ## Why this query exists
+    ///
+    /// The briefing's window is 30 days, and mail older than that is out of
+    /// the feed entirely. That is right for the *bulk* of a mailbox — nobody
+    /// wants a three-year-old newsletter in their "needs reply" pile, and the
+    /// cost of scanning it is real.
+    ///
+    /// But the promise the briefing makes is "clear the inbox in ten
+    /// minutes". If a mail that genuinely needs a reply is 35 days old, it
+    /// never appears in the queue, and the queue can therefore never be
+    /// cleared — the promise is not kept by a wider window, it is broken by
+    /// the window's existence.
+    ///
+    /// A mail does not stop needing a reply because it got old. Age is a
+    /// property of the *message*; needing a reply is a property of the
+    /// *thread*. So the window bounds the noise, and this query reaches past
+    /// it for the mail that is still open.
+    ///
+    /// ## What "unresolved" means here
+    ///
+    /// **Unread.** Read mail has been seen; the user has had their chance.
+    ///
+    /// This is deliberately a *storage-level* test rather than a
+    /// classification-level one: the group a message lands in is the
+    /// classifier's opinion, and the classifier only ever sees mail inside
+    /// the window. Asking "which old mail needs a reply?" through the
+    /// classifier would be circular — the mail outside the window is exactly
+    /// the mail the classifier never saw.
+    ///
+    /// Read-and-unanswered is the other half, and it is covered by the
+    /// `repliedRemoteIds` signal the classifier already uses: mail the user
+    /// has replied to is archived by the normal route, so it leaves the
+    /// inbox. The mail that stays is the mail that was never answered.
+    public static func unresolvedOlderThan(
+        forAccount accountId: UUID,
+        receivedBefore cutoff: Date,
+        limit: Int,
+        db: LagoonDB
+    ) async throws -> [MessageHeader] {
+        // The inbox clause (account, not deleted, not archived, not sent) with
+        // the window's lower bound **inverted**: older than the cutoff rather
+        // than newer. Everything else about the axes is the shared one, so a
+        // message that is archived or trashed is not resurrected here.
+        let sql = [
+            """
+            SELECT h.id, h.account_id, h.remote_id, h.thread_id, h.from_address,
+                   NULLIF(h.from_name, '') AS from_name,
+                   NULLIF(h.subject, '') AS subject,
+                   NULLIF(h.snippet_cipher, '') AS snippet_cipher,
+                   h.received_at, h.is_read, h.is_archived, h.is_deleted, h.is_sent,
+                   h.message_id_header, h.in_reply_to, h.references_header,
+                   (message_pins.account_id IS NOT NULL) AS is_pinned
+            FROM message_headers h
+            LEFT JOIN message_pins
+                   ON message_pins.account_id = h.account_id
+                  AND message_pins.remote_id = h.remote_id
+            WHERE h.account_id = ?
+              AND h.is_deleted = FALSE
+              AND h.is_archived = FALSE
+              AND h.is_sent = FALSE
+              AND h.is_read = FALSE
+              AND h.received_at < ?
+            ORDER BY h.received_at ASC
+            LIMIT ?
+            """
+        ].joined(separator: "\n")
+        return try db.read { db in
+            try Row.fetchAll(
+                db,
+                sql: sql,
+                arguments: [accountId, cutoff, limit]
+            )
+            .map { try Self.decode($0) }
+        }
+    }
+
+    /// How many unread, unresolved messages are older than `cutoff`.
+    ///
+    /// The count is a separate query from the rows because the rows are
+    /// capped: without it, "there are 400 old mails still waiting" would
+    /// read as "here are 50" and the user would think the feed was
+    /// complete. The same argument the search count makes.
+    public static func unresolvedOlderThanCount(
+        forAccount accountId: UUID,
+        receivedBefore cutoff: Date,
+        db: LagoonDB
+    ) async throws -> Int {
+        let sql = """
+            SELECT COUNT(*) FROM message_headers h
+            WHERE h.account_id = ?
+              AND h.is_deleted = FALSE
+              AND h.is_archived = FALSE
+              AND h.is_sent = FALSE
+              AND h.is_read = FALSE
+              AND h.received_at < ?
+            """
+        return try db.read { db in
+            try Int.fetchOne(
+                db, sql: sql, arguments: [accountId, cutoff]
+            ) ?? 0
         }
     }
 
@@ -1014,11 +1244,33 @@ public enum MessageStore {
             "SELECT h.remote_id FROM message_headers h",
             whereClause,
             "ORDER BY h.received_at DESC",
-            "LIMIT \(max(1, limit))",
+            "LIMIT ?",
         ].joined(separator: " ")
+        // The limit is bound, not interpolated. It is an `Int` today, so
+        // nothing could have been injected through it — but the *shape* is
+        // what matters: this was the only place in the repository where a
+        // value was spliced into SQL text, and the CI guardrail's keyword
+        // list did not cover `LIMIT`, so the shape passed review. A bound
+        // parameter is the same query and cannot grow a second meaning.
+        var arguments = filterArgs
+        arguments.append(max(1, limit))
         return try db.read { raw in
-            try String.fetchAll(raw, sql: sql, arguments: StatementArguments(filterArgs))
+            try String.fetchAll(raw, sql: sql, arguments: StatementArguments(arguments))
         }
+    }
+
+    /// Opens a stored preview, or nil when it cannot be opened.
+    ///
+    /// The preview is cosmetic — it is the grey line under the subject in the
+    /// list — so a value that will not open (a body key that no longer
+    /// matches the store, a row written by a build that predates the
+    /// sealing) must not take the whole list down with it. The body itself
+    /// is a different matter: `BodyStore.get` throws there, because failing
+    /// to open the mail the user explicitly asked to read is worth saying
+    /// out loud.
+    private static func openSnippet(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        return (try? BodyCipher.open(value)) ?? nil
     }
 
     public static func decode(_ row: Row) throws -> MessageHeader {
@@ -1039,7 +1291,7 @@ public enum MessageStore {
             fromAddress: row["from_address"],
             fromName: row.optionalText("from_name"),
             subject: row.optionalText("subject"),
-            snippet: row.optionalText("snippet"),
+            snippet: Self.openSnippet(row.optionalText("snippet_cipher")),
             receivedAt: row["received_at"],
             isRead: row["is_read"],
             isArchived: row["is_archived"],

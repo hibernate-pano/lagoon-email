@@ -194,6 +194,11 @@ final class AdvisoryOnlySyncTests: XCTestCase {
                 LagoonDatabase.advisoryOnlyVersion,
                 LagoonDatabase.adviceVersion,
                 LagoonDatabase.sentFolderVersion,
+                LagoonDatabase.accountIDRepairVersion,
+                LagoonDatabase.encryptedBodiesVersion,
+                LagoonDatabase.reminderVersion,
+                LagoonDatabase.overrideScopeVersion,
+                LagoonDatabase.sealedDraftsVersion,
             ]
         )
     }
@@ -254,7 +259,7 @@ private actor ReadOnlyStub: MailSyncReading {
         self.changes = changes
     }
 
-    func capabilities() async -> MailCapabilities {
+    func capabilities() async -> MailCapabilities? {
         // Advertises archive support on purpose: the loop must ignore it.
         MailCapabilities(archiveFolder: true, idle: true, move: true, serverSnippet: false)
     }

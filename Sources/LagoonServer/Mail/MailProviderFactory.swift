@@ -117,8 +117,8 @@ actor PooledMailProvider: MailProvider, ArchiveFolderResolving {
         self.kind = account.provider
     }
 
-    func capabilities() async -> MailCapabilities {
-        guard let provider = await resolved() else { return .unknown }
+    func capabilities() async -> MailCapabilities? {
+        guard let provider = await resolved() else { return nil }
         return await provider.capabilities()
     }
 

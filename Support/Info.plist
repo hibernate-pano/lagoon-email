@@ -16,6 +16,14 @@
     <string>Lagoon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!--
+      The version is written down in exactly one place: Support/VERSION.
+      `scripts/build-app.sh` stamps that value into the built bundle; the
+      copy here is a checked-in mirror that `scripts/check-version.sh`
+      refuses to let drift. Editing this number by hand works — the check
+      will tell you to also bump Support/VERSION — but the intended edit
+      is Support/VERSION alone.
+    -->
     <key>CFBundleShortVersionString</key>
     <string>3.2.0</string>
     <key>CFBundleVersion</key>
@@ -30,5 +38,24 @@
     <string>Lagoon</string>
     <key>CFBundleIconName</key>
     <string>Lagoon</string>
+    <!-- A real Mac app declares its category: it decides where the app
+         appears in Launchpad and in the App Store's listings. -->
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+    <!-- `lagoon://` links. A mail client that cannot be linked to is a
+         private tool; a mail client that can be linked to is a component
+         other people build on. The handler (LagoonURLRouter) understands
+         lagoon://message/<id> and lagoon://search?q=… -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.lagoon.email</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>lagoon</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

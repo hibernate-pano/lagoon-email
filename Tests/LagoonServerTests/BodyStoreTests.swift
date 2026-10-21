@@ -181,7 +181,7 @@ final class BodyStoreTests: XCTestCase {
         nonisolated let kind: MailProviderKind = .qq
         private(set) var fetchCount = 0
 
-        func capabilities() async -> MailCapabilities {
+        func capabilities() async -> MailCapabilities? {
             MailCapabilities(archiveFolder: true, idle: true, move: true, serverSnippet: true)
         }
 
@@ -243,7 +243,7 @@ final class BodyStoreTests: XCTestCase {
                 accountId: account.id, remoteId: "b2", body: body(text: "x"), db: conn
             )
 
-            try await MessageStore.deleteAll(accountId: account.id, db: conn)
+            try await MessageStore.deleteLiveRows(accountId: account.id, db: conn)
 
             let gone = try await BodyStore.get(accountId: account.id, remoteId: "b2", db: conn)
             XCTAssertNil(gone, "reconciliation expunge must take the body with it")
@@ -343,7 +343,7 @@ final class BodyStoreTests: XCTestCase {
 
         func setBodyError(_ error: MailError?) { bodyError = error }
 
-        func capabilities() async -> MailCapabilities {
+        func capabilities() async -> MailCapabilities? {
             MailCapabilities(archiveFolder: true, idle: true, move: true, serverSnippet: true)
         }
 

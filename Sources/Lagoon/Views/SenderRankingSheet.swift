@@ -23,8 +23,20 @@ import LagoonKit
 /// still a decision you get to make.
 struct SenderRankingSheet: View {
     let accountId: UUID
-    /// Called when the user picks a sender to file. Left to the caller because
-    /// creating a rule needs the stack editor, which lives on the list surface.
+    /// The address a 聚合规则 was just created for, so the row can confirm
+    /// instead of appearing to do nothing.
+    ///
+    /// A **binding**, not local state, and that is the whole fix for the dead
+    /// checkmark. The rule is created by the stack editor, which lives in a
+    /// different view tree; the panel could never hear about it on its own,
+    /// so `filedAddress` stayed nil and the 「已建立聚合」 label never
+    /// appeared. The owner of both surfaces (RootView) holds the fact and
+    /// hands it down here, so the write and the read meet in one place.
+    @Binding var filedAddress: String?
+    /// Called once the rule for a sender has actually been created.
+    ///
+    /// The parent owns the sidebar, which has to learn about the new rule —
+    /// the panel cannot refresh the 自定义聚合 section itself.
     var onFileSender: (SenderSummary) -> Void = { _ in }
     /// Opens one sender's full history.
     var onOpenSender: (SenderSummary) -> Void = { _ in }
@@ -37,9 +49,8 @@ struct SenderRankingSheet: View {
     @State private var query = ""
     @State private var isLoading = true
     @State private var errorBanner: ErrorBanner?
-    /// The address a rule was just created for, so the row can confirm instead
-    /// of appearing to do nothing.
-    @State private var filedAddress: String?
+    /// The sender whose rule is being written, and the editor that writes it.
+    @State private var pendingFiling: PendingFiling?
     /// Set when the list came back empty *because of a filter*, so the empty
     /// state can say "no sender matches" rather than "nobody writes to you" —
     /// which would be a lie when the mailbox is simply not loaded yet.
@@ -55,6 +66,27 @@ struct SenderRankingSheet: View {
         }
         .frame(width: 620, height: 520)
         .task { await load() }
+        // The rule editor, presented by the panel itself.
+        //
+        // It used to be opened by the list surface, one view tree away, and
+        // handed over through a pending value — a route that dropped the
+        // request whenever the destination changed underneath it (the list
+        // is keyed on the destination, so switching to it *recreated* the
+        // list and the pending value with it). The editor is a sheet of its
+        // own; there is no reason for the panel to go through another
+        // surface to reach it.
+        .sheet(item: $pendingFiling) { filing in
+            StackRuleEditorSheet(
+                initialKind: .sender,
+                prefilledValue: filing.sender.address,
+                prefilledName: filing.sender.displayName ?? filing.sender.address
+            ) { _ in
+                // The rule landed — this is the only place that knows it, and
+                // the only place the confirmation can be raised from.
+                markFiled(filing.sender.address)
+                onFileSender(filing.sender)
+            }
+        }
     }
 
     // MARK: - Chrome
@@ -194,7 +226,7 @@ struct SenderRankingSheet: View {
                 .buttonStyle(.link)
                 .font(.caption)
             if sender.isWorthCollapsing {
-                Button(l10n.senderFile) { onFileSender(sender) }
+                Button(l10n.senderFile) { pendingFiling = PendingFiling(sender: sender) }
                     .buttonStyle(.link)
                     .font(.caption)
             }
@@ -230,9 +262,25 @@ struct SenderRankingSheet: View {
         }
     }
 
-    /// Called by the parent once the stack editor has created a rule, so the row
-    /// can confirm rather than look unchanged.
+    /// Records that a rule now exists for this address.
+    ///
+    /// Writes through the binding rather than into local state: the rule is
+    /// created by the stack editor, which this panel cannot see. The binding
+    /// is precisely so that this write lands where the owner of both surfaces
+    /// can see it — and where the row that has to show the confirmation can
+    /// read it.
     func markFiled(_ address: String) {
         filedAddress = address
     }
+}
+
+/// A sender waiting to be filed into a 聚合规则.
+///
+/// Carries the whole sender rather than just the address: the rule editor
+/// reports back that a rule exists, and the panel has to turn that into a
+/// confirmation *on that sender's row* — an address alone would leave the
+/// row to be matched by string comparison in two places.
+struct PendingFiling: Identifiable {
+    let sender: SenderSummary
+    var id: String { sender.address }
 }

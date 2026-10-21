@@ -139,16 +139,55 @@ final class LocalizationTests: XCTestCase {
         }
         XCTAssertEqual(zh.reconnect, "重新连接")
         XCTAssertEqual(en.reconnect, "Reconnect")
-        XCTAssertEqual(zh.healthDegraded, "同步不稳定：")
-        XCTAssertEqual(en.healthDegraded, "Sync degraded: ")
-        XCTAssertEqual(zh.healthError, "同步失败：")
-        XCTAssertEqual(en.healthError, "Sync failed: ")
+        XCTAssertEqual(zh.healthDegradedTitle, "同步不稳定")
+        XCTAssertEqual(en.healthDegradedTitle, "Sync is unstable")
+        XCTAssertEqual(zh.healthErrorTitle, "同步失败")
+        XCTAssertEqual(en.healthErrorTitle, "Sync failed")
         XCTAssertFalse(zh.healthNeedsReconnect.isEmpty)
         XCTAssertFalse(en.healthNeedsReconnect.isEmpty)
         XCTAssertFalse(zh.archiveUnavailable.isEmpty)
         XCTAssertFalse(en.archiveUnavailable.isEmpty)
         XCTAssertFalse(zh.archiveFailed.isEmpty)
         XCTAssertFalse(en.archiveFailed.isEmpty)
+    }
+
+    /// Every label the server can record must have a human sentence in both
+    /// languages. A missing translation would silently degrade to the generic
+    /// fallback, hiding the specific cause from the user.
+    func test_everySyncFailureLabel_hasAHumanSentence() {
+        let labels = [
+            "auth-failed", "unreachable", "protocol-error", "message-gone",
+            "archive-unavailable", "trash-unavailable", "sent-unavailable",
+            "not-configured", "no-provider",
+        ]
+        for label in labels {
+            XCTAssertNotNil(
+                SyncErrorReason.humanReadable(label, l10n: zh),
+                "missing zh sentence for \(label)"
+            )
+            XCTAssertNotNil(
+                SyncErrorReason.humanReadable(label, l10n: en),
+                "missing en sentence for \(label)"
+            )
+        }
+    }
+
+    /// The whole point of the translation layer: a label must never reach the
+    /// user, and an unknown label must not leak either.
+    func test_unknownLabels_neverReachTheUser() {
+        let raw = "some-internal-code"
+        let zhSentence = SyncErrorReason.sentence(for: raw, l10n: zh)
+        XCTAssertFalse(zhSentence.contains(raw), "the raw label leaked into the sentence")
+        XCTAssertEqual(zhSentence, zh.reasonUnknown)
+        XCTAssertEqual(SyncErrorReason.sentence(for: nil, l10n: zh), zh.reasonUnknown)
+        XCTAssertEqual(SyncErrorReason.sentence(for: "", l10n: zh), zh.reasonUnknown)
+    }
+
+    /// A known label becomes its own sentence, not the generic fallback.
+    func test_knownLabel_becomesItsOwnSentence() {
+        let sentence = SyncErrorReason.sentence(for: "auth-failed", l10n: zh)
+        XCTAssertEqual(sentence, zh.reasonAuthFailed)
+        XCTAssertFalse(sentence.contains("auth-failed"))
     }
 
     // MARK: - T11: reply composer

@@ -132,7 +132,45 @@ public actor SMTPClient {
             try await self.transport.write(Self.dotStuffedForData(message))
         }
         try await expect(250, phase: .postData)
-        try await command("QUIT", expecting: 221, phase: .postData)
+        // The 250 above is the delivery verdict: the server has taken the
+        // message into its queue. Everything after it is transport
+        // housekeeping and cannot change that verdict, so it must not be
+        // able to fail the send either.
+        await quit()
+    }
+
+    /// Ends the session politely — and never fails the send.
+    ///
+    /// RFC 5321 §4.1.1.3 makes the server's 250 to the DATA terminator
+    /// the point of no return: the message is queued, and the client owes
+    /// the server nothing but a goodbye. A server that hangs up instead of
+    /// answering 221, a QUIT that times out, a socket that dies on the way
+    /// out — none of that says anything about the delivery.
+    ///
+    /// Reporting it as a send failure is what made Lagoon tell the user
+    /// "not sent" for a mail that was already on its way. The user then
+    /// pressed send again and the recipient got two copies. A failure here
+    /// is therefore logged and dropped; the only thing it may still affect
+    /// is how the session is torn down, which `sendRaw` does anyway.
+    private func quit() async {
+        do {
+            try await perform(phase: .postData) {
+                try await self.transport.write(Data("QUIT\r\n".utf8))
+            }
+            let code = try await readReply(phase: .postData)
+            guard code == 221 else {
+                logger.warning("smtp.quitRefused", metadata: ["code": .string("\(code)")])
+                return
+            }
+        } catch let failure as SMTPFailure {
+            logger.warning("smtp.quitFailed", metadata: [
+                "label": .string(failure.error.logLabel),
+            ])
+        } catch {
+            logger.warning("smtp.quitFailed", metadata: [
+                "err": .string("\(error)"),
+            ])
+        }
     }
 
     private func command(_ line: String, expecting code: Int, phase: Phase) async throws {
@@ -243,6 +281,24 @@ public actor SMTPClient {
 
     /// Races one operation against `readTimeout`. Cancellation-safe: both
     /// production and test transports honour task cancellation.
+    ///
+    /// The loser is cancelled **and drained** inside the group scope, on
+    /// both paths — the same shape `IMAPConnection.withReadTimeout` uses.
+    ///
+    /// Why drain explicitly when Swift already awaits the remaining
+    /// children when the group scope exits: because the loser here is the
+    /// transport read, and the point of this function is that the read is
+    /// over before the caller starts tearing the transport down. Draining
+    /// states that ordering at the place that owns it instead of leaving
+    /// it to the scope-exit cleanup, and it makes `cancelAll()` run on
+    /// the error path too (the old shape only reached it on the success
+    /// path, relying on the cleanup for the other).
+    ///
+    /// Measured, not assumed: a task group that exits its scope — by
+    /// returning *or* by throwing — awaits its remaining children before
+    /// the caller resumes, so this change is hardening and explicitness,
+    /// not a behaviour change. The old and the new shape both leave no
+    /// read running when the caller takes the socket back.
     private func withTimeout<T: Sendable>(
         phase: Phase,
         _ operation: @escaping @Sendable () async throws -> T
@@ -253,11 +309,27 @@ public actor SMTPClient {
                 try await AsyncTimeout.sleep(for: self.readTimeout)
                 throw StreamTransportError.timedOut
             }
-            guard let result = try await group.next() else {
-                throw StreamTransportError.timedOut
+            // The outcome is captured before the drain so the drain can run
+            // on the failure path too — that is the path where the loser is
+            // the transport read.
+            let outcome: Result<T, Error>
+            do {
+                guard let value = try await group.next() else {
+                    throw StreamTransportError.timedOut
+                }
+                outcome = .success(value)
+            } catch {
+                outcome = .failure(error)
             }
             group.cancelAll()
-            return result
+            // Drain the losing child before leaving the task-group scope.
+            // This avoids a release-runtime teardown crash seen when the
+            // timeout child was still deallocating after the result was
+            // returned.
+            while !group.isEmpty {
+                _ = try? await group.next()
+            }
+            return try outcome.get()
         }
     }
 

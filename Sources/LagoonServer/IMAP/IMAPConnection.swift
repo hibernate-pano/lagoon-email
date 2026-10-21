@@ -11,11 +11,27 @@ import Logging
 public actor IMAPConnection {
     public static let connectTimeout: Duration = .seconds(10)
     public static let defaultReadTimeout: Duration = .seconds(30)
-    /// Ceiling on the bytes a single response may declare across its literals.
-    /// Generous next to a real message (a 25 MB attachment cap exists
-    /// downstream) but finite, so a hostile or broken server cannot talk us
-    /// into an unbounded allocation.
-    static let maxLiteralBytes = 32 * 1024 * 1024
+    /// Ceiling on the bytes a single response may declare across its
+    /// literals. Finite, so a hostile or broken server cannot talk us into
+    /// an unbounded allocation — but it has to be generous enough for a
+    /// *legitimate* message to come through whole.
+    ///
+    /// The number that matters is the attachment cap downstream
+    /// (`AttachmentLimit.maxBytes`, 25 MB). A body part is carried base64
+    /// encoded on the wire, so 25 MB of attachment arrives as 25 × 4/3 ≈
+    /// 33.3 MB of literal, plus the headers and the text around it. A 32 MB
+    /// ceiling therefore rejected messages the product had already promised
+    /// to accept: the literal overflow was raised as a protocol error and
+    /// the route answered 502 "server error" for a mail that was merely too
+    /// big. 40 MB leaves ~20% headroom over the worst legitimate case and
+    /// still refuses anything absurd.
+    static let maxLiteralBytes = 40 * 1024 * 1024
+
+    /// Stable label for "this response is larger than we will frame". It is
+    /// a *size* verdict, not a broken server, and the routes map it onto
+    /// 413 rather than 502 — the client has to be able to tell "too big"
+    /// from "try again later".
+    public static let oversizeLiteralLabel = "literal-too-large"
 
     private let transport: any StreamTransport
     private let logger: Logger
@@ -189,7 +205,14 @@ public actor IMAPConnection {
             // add and trap before the guard ever ran — the very thing the
             // cap exists to prevent.
             guard length <= Self.maxLiteralBytes - literalBytes else {
-                throw MailError.protocolError("literal exceeds \(Self.maxLiteralBytes) bytes")
+                // The label is a stable, machine-readable code (the routes
+                // map it onto 413); the byte count goes to the log, not into
+                // the error the client can see.
+                logger.warning("imap.literalTooLarge", metadata: [
+                    "bytes": .string("\(length)"),
+                    "limit": .string("\(Self.maxLiteralBytes)"),
+                ])
+                throw MailError.protocolError(Self.oversizeLiteralLabel)
             }
             literalBytes += length
             let chunk = try await withReadTimeout(timeout) { try await transport.readExactly(length) }

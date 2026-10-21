@@ -245,6 +245,82 @@ final class SyncEngineTests: XCTestCase {
         }
     }
 
+    /// A UIDVALIDITY reset clears the **inbox** axis and nothing else.
+    ///
+    /// The messages in the archive and trash folders are still on the server
+    /// and still addressed by Message-ID; only the UID space moved. Wiping
+    /// them was a deletion with no way back, because the app never reads
+    /// those folders to rebuild them.
+    func test_resetRequired_keepsArchivedAndTrashedRows() async throws {
+        let oauthUser = "sync-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(account, db: conn)
+
+                for (remoteId, archived, deleted) in [
+                    ("live-1", false, false),
+                    ("filed-1", true, false),
+                    ("trashed-1", false, true),
+                ] {
+                    try await MessageStore.upsert(
+                        MessageHeader(
+                            id: UUID(),
+                            accountId: account.id,
+                            remoteId: remoteId,
+                            threadId: remoteId,
+                            fromAddress: "old@example.com",
+                            fromName: nil,
+                            subject: remoteId,
+                            snippet: nil,
+                            receivedAt: Date(),
+                            isRead: false,
+                            isArchived: archived
+                        ),
+                        db: conn
+                    )
+                    if deleted {
+                        try await MessageStore.setDeleted(
+                            remoteId: remoteId, accountId: account.id, deleted: true, db: conn
+                        )
+                    }
+                }
+
+                let provider = StubMailProvider.once(MailChangeSet(
+                    upserts: [.stub(remoteId: "5")],
+                    resetRequired: true,
+                    cursor: MailSyncState(uidValidity: 77, lastUid: 5)
+                ))
+                let loop = makeLoop(db: conn, account: account, provider: provider)
+
+                await loop.round()
+
+                let live = try await MessageStore.recent(
+                    forAccount: account.id, limit: 50, db: conn
+                )
+                XCTAssertEqual(
+                    live.map(\.remoteId), ["5"],
+                    "the inbox axis is wiped and refilled from the new identity space"
+                )
+                let archived = try await MessageStore.recent(
+                    forAccount: account.id, limit: 50, archived: true, db: conn
+                )
+                XCTAssertEqual(
+                    archived.map(\.remoteId), ["filed-1"],
+                    "a filed message survives the reset — the server still has it"
+                )
+                let trashed = try await MessageStore.recent(
+                    forAccount: account.id, limit: 50, deleted: true, db: conn
+                )
+                XCTAssertEqual(
+                    trashed.map(\.remoteId), ["trashed-1"],
+                    "a trashed message survives the reset too"
+                )
+            }
+        }
+    }
+
     /// (b) `resetRequired` (UIDVALIDITY change) wipes stale rows first, then the
     /// cursor is reset to the new identity space.
     func test_resetRequired_wipesStaleRowsBeforeApplying() async throws {
@@ -300,10 +376,14 @@ final class SyncEngineTests: XCTestCase {
         }
     }
 
-    /// (b2) A complete inbox snapshot removes rows another client moved or
-    /// deleted remotely. Without this, the UI keeps opening a stale message and
-    /// the body route correctly answers 410 `message-gone`.
-    func test_inboxSnapshot_removesMessagesNoLongerInInbox() async throws {
+    /// (b2) A message the server confirms is gone is removed locally.
+    ///
+    /// This test used to assert that *anything* missing from the inbox
+    /// snapshot was removed — and its seed row was even called "Moved in
+    /// another client", which is the case that must **not** remove anything.
+    /// The rule is now: a row is removed only when the provider confirms the
+    /// message is in neither the archive folder nor the trash folder.
+    func test_inboxSnapshot_removesMessagesConfirmedGone() async throws {
         let oauthUser = "sync-\(UUID().uuidString)"
 
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
@@ -318,7 +398,7 @@ final class SyncEngineTests: XCTestCase {
                         threadId: "stale",
                         fromAddress: "old@example.com",
                         fromName: nil,
-                        subject: "Moved in another client",
+                        subject: "Deleted on the server",
                         snippet: nil,
                         receivedAt: Date(),
                         isRead: false,
@@ -332,7 +412,8 @@ final class SyncEngineTests: XCTestCase {
                     upserts: [.stub(remoteId: "<fresh@example.com>")],
                     resetRequired: false,
                     cursor: cursor,
-                    inboxRemoteIds: ["<fresh@example.com>"]
+                    inboxRemoteIds: ["<fresh@example.com>"],
+                    removedRemoteIds: ["<stale@example.com>"]
                 ))
                 let loop = makeLoop(db: conn, account: account, provider: provider)
 
@@ -344,6 +425,109 @@ final class SyncEngineTests: XCTestCase {
                     db: conn
                 )
                 XCTAssertEqual(stored.map(\.remoteId), ["<fresh@example.com>"])
+            }
+        }
+    }
+
+    /// A message that left the inbox because it was **archived** — by Lagoon
+    /// or by another client — must be re-labelled, not deleted.
+    ///
+    /// This is the data-loss bug in its purest form: the app never reads the
+    /// archive folder back, so a deleted row is gone for good, while the mail
+    /// is still on the server and the user still expects to see it in 档案柜.
+    func test_inboxSnapshot_relabelsMessagesArchivedElsewhere() async throws {
+        let oauthUser = "sync-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(account, db: conn)
+                try await MessageStore.upsert(
+                    MessageHeader(
+                        id: UUID(),
+                        accountId: account.id,
+                        remoteId: "<filed@example.com>",
+                        threadId: "filed",
+                        fromAddress: "old@example.com",
+                        fromName: nil,
+                        subject: "Archived in another client",
+                        snippet: nil,
+                        receivedAt: Date(),
+                        isRead: false,
+                        isArchived: false
+                    ),
+                    db: conn
+                )
+
+                let provider = StubMailProvider.once(MailChangeSet(
+                    upserts: [],
+                    resetRequired: false,
+                    cursor: MailSyncState(uidValidity: 42, lastUid: 901),
+                    inboxRemoteIds: [],
+                    archivedRemoteIds: ["<filed@example.com>"]
+                ))
+                let loop = makeLoop(db: conn, account: account, provider: provider)
+
+                await loop.round()
+
+                let archived = try await MessageStore.recent(
+                    forAccount: account.id, limit: 50, archived: true, db: conn
+                )
+                XCTAssertEqual(
+                    archived.map(\.remoteId), ["<filed@example.com>"],
+                    "a filed message must show up in the archive list, not vanish"
+                )
+                let inbox = try await MessageStore.recent(
+                    forAccount: account.id, limit: 50, db: conn
+                )
+                XCTAssertTrue(inbox.isEmpty, "and it must leave the inbox list")
+            }
+        }
+    }
+
+    /// A message whose whereabouts the provider could not establish stays
+    /// put. Absence of information must never destroy a local row.
+    func test_inboxSnapshot_keepsMessagesWithUnknownWhereabouts() async throws {
+        let oauthUser = "sync-\(UUID().uuidString)"
+
+        try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
+            try await TestDatabase.withConnection(cleanup: cleanup(oauthUser)) { conn in
+                let account = makeAccount(oauthUser: oauthUser)
+                try await seed(account, db: conn)
+                try await MessageStore.upsert(
+                    MessageHeader(
+                        id: UUID(),
+                        accountId: account.id,
+                        remoteId: "<unknown@example.com>",
+                        threadId: "unknown",
+                        fromAddress: "old@example.com",
+                        fromName: nil,
+                        subject: "Whereabouts unknown",
+                        snippet: nil,
+                        receivedAt: Date(),
+                        isRead: false,
+                        isArchived: false
+                    ),
+                    db: conn
+                )
+
+                let provider = StubMailProvider.once(MailChangeSet(
+                    upserts: [],
+                    resetRequired: false,
+                    cursor: MailSyncState(uidValidity: 42, lastUid: 901),
+                    inboxRemoteIds: []
+                ))
+                let loop = makeLoop(db: conn, account: account, provider: provider)
+
+                await loop.round()
+
+                let stored = try await MessageStore.recent(
+                    forAccount: account.id, limit: 50, db: conn
+                )
+                XCTAssertEqual(
+                    stored.map(\.remoteId), ["<unknown@example.com>"],
+                    "an unchecked message must not be deleted"
+                )
             }
         }
     }
@@ -942,7 +1126,7 @@ actor SlowProbeProvider: MailProvider {
         shutdowns += 1
     }
 
-    func capabilities() async -> MailCapabilities {
+    func capabilities() async -> MailCapabilities? {
         MailCapabilities(archiveFolder: false, idle: true, move: false, serverSnippet: false)
     }
 

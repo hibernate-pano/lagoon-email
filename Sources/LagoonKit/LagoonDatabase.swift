@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import Logging
 
 /// The embedded SQLite database that replaces the Docker Postgres install
 /// (storage v1, V3 rebuild). One file, owned by the app, under Application
@@ -48,6 +49,155 @@ public enum LagoonDatabase {
     /// me from the same person, and it breaks the moment the account has a
     /// second identity.
     public static let sentFolderVersion = "lagoon-v5"
+    /// Seals the mail body at rest.
+    ///
+    /// The body used to be stored as plain TEXT while the spec (§6.6 rule 5)
+    /// said it would be ciphertext. This migration renames the body columns
+    /// so the schema can no longer be misread — `body_cipher` cannot be
+    /// mistaken for a body — and seals every value that is still in the
+    /// clear. See `BodyCipher` for what is sealed and what is deliberately
+    /// left as metadata.
+    public static let encryptedBodiesVersion = "lagoon-v6"
+    /// Adds the reminder table, so the AI's "remind" suggestion is backed by
+    /// something that actually happens.
+    ///
+    /// ## Why a table and not a notification scheduled on the spot
+    ///
+    /// A local notification is scheduled with the system, and the system
+    /// forgets it: a reboot, a logout, a reinstall, and the reminder is
+    /// gone. A row in the app's own store survives all of those, and the
+    /// client re-arms the pending notifications on every launch. The
+    /// notification is the delivery mechanism; the row is the truth.
+    ///
+    /// ## Why it is not part of `ai_actions`
+    ///
+    /// `ai_actions` is the undo history: every row there is something the
+    /// user *did* to their mailbox, and every one of them can be undone.
+    /// A reminder changes nothing about the mail — it is a note to
+    /// yourself. Putting it in the undo history would make "撤销" offer to
+    /// undo a note, and the audit view would claim the user did something
+    /// they did not.
+    public static let reminderVersion = "lagoon-v7"
+    /// Tells an override how far it reaches: one mail, or one sender.
+    ///
+    /// ## Why this column and not a second table
+    ///
+    /// An override used to mean exactly one thing — "this sender's mail goes
+    /// to that group" — because the row was keyed by a mail and *resolved*
+    /// to a sender by a join. The user acted on one mail and the product
+    /// moved every mail from that sender, silently (audit P2-13).
+    ///
+    /// The narrow case needs somewhere to live, and a **separate table** was
+    /// the alternative. A second table would have been worse: two tables, two
+    /// ranking rules, two undo paths, and two places for a future reader to
+    /// look when a mail sits in an unexpected group. One table with an
+    /// explicit `scope` keeps every override in one place, and the ranking
+    /// query reads both scopes out of it.
+    ///
+    /// ## Why `scope` is absent from `schema`
+    ///
+    /// SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so a column
+    /// that appears in `schema` (which only `lagoon-v1` runs, on a fresh
+    /// install) would make this statement fail with "duplicate column name"
+    /// on every fresh install while succeeding on every existing one — the
+    /// same trap `is_sent` documented. Absent from `schema`, the ALTER is the
+    /// first and only time the column is added, on both paths.
+    ///
+    /// ## Why the default is `sender`
+    ///
+    /// Every row that exists today is a sender-level override, and that is
+    /// what it meant when it was written. Defaulting the new column to
+    /// `sender` makes an existing install behave exactly as it did before the
+    /// migration — no silent re-filing of a mailbox.
+    public static let overrideScopeVersion = "lagoon-v8"
+    /// Seals the AI-generated reply drafts at rest.
+    ///
+    /// ## Why the drafts had to be sealed too
+    ///
+    /// `lagoon-v6` sealed the body, the HTML body and the snippet, and the
+    /// user's manual then listed exactly what stayed in the clear: sender,
+    /// subject, time, attachment names. The drafts were in neither list — and
+    /// they were in the clear.
+    ///
+    /// A draft is *generated from* the mail: "关于贵方提出的开源维护者合作方
+    /// 案" is the substance of somebody else's email, reproduced verbatim in
+    /// a column the product never sealed. So the guarantee the manual
+    /// described was true for the body and false for a column holding body
+    /// text, and a reader of the backup file would have found it.
+    ///
+    /// ## Why a new migration and not a change to `lagoon-v6`
+    ///
+    /// GRDB records applied migrations by *identifier*, not by content, so
+    /// editing `lagoon-v6` would do nothing for every install that already
+    /// ran it — the sealing would be silently absent from every existing
+    /// install while looking correct in a fresh test database. The same
+    /// reason `indexReconciliation` and `advisoryOnlyReconciliation` exist.
+    ///
+    /// ## Why it also creates `store_notices`
+    ///
+    /// The fail-closed path (no key) **deletes** the drafts that cannot be
+    /// sealed, because a plaintext draft is exactly what this migration
+    /// exists to remove and a draft is regenerable. But deleting the user's
+    /// work without saying so is not acceptable: the deletion is recorded in
+    /// `store_notices` so the app can tell the user their drafts are gone.
+    public static let sealedDraftsVersion = "lagoon-v9"
+    /// Normalises an `accounts.id` that is stored in the wrong *encoding*.
+    ///
+    /// ## The defect
+    ///
+    /// `accounts.id` is `BLOB PRIMARY KEY`, and GRDB stores a `UUID` as 16
+    /// raw bytes. One install had the same UUID in **two encodings**: the
+    /// parent row held the 36-character UTF-8 text, while every child table
+    /// held the 16-byte binary form. SQLite compares BLOB and TEXT as
+    /// different values, so the parent row was unreachable by every
+    /// `WHERE id = ?` the server issues.
+    ///
+    /// The consequences reached all the way to the screen: the account could
+    /// not be found, so the sync failed, so the row's `sync_status` became
+    /// `needsReconnect` — and the user was told their **authorization code
+    /// had expired**, which was a lie. The code was fine; the row was
+    /// unfindable. `ON DELETE CASCADE` stopped matching too, so deleting the
+    /// account left 356 headers, 246 `ai_actions` and 124 `advice` rows
+    /// behind as orphans, and `PRAGMA foreign_key_check` reported 727
+    /// violations.
+    ///
+    /// ## Why the repair is a migration and not a lookup fallback
+    ///
+    /// A "find the account by trying both encodings" query would make the
+    /// account findable while leaving the store corrupt: the cascade would
+    /// still not fire and the violations would still be there. The encoding
+    /// has to be *fixed*.
+    ///
+    /// ## Why the binary form is the target
+    ///
+    /// Because every query in the server binds a `UUID`, and GRDB encodes a
+    /// `UUID` as 16 bytes. A row whose id is the text form is unreachable
+    /// whatever the other rows hold. So the repair normalises the parent
+    /// **and** any child row still holding the text form onto the binary
+    /// form. See `AccountIDRepair` for the full argument.
+    ///
+    /// ## Why it must run *before* `lagoon-v6`
+    ///
+    /// This is the part that is easy to get wrong, and it is not a detail.
+    ///
+    /// GRDB runs `PRAGMA foreign_key_check` at the end of every deferred
+    /// migration, and aborts the migration if it finds a violation. `lagoon-v6`
+    /// is a deferred migration, so on a store that still carries the
+    /// mismatched id — 727 violations, as the real install had — **the app
+    /// cannot open its own database at all**: the open fails with a SQLite
+    /// constraint error before a single query is served.
+    ///
+    /// The repair therefore has to be registered *before* `lagoon-v6`, not
+    /// after it. A migration registered later would be correct in every
+    /// other respect and still useless: the store would never get far enough
+    /// to run it.
+    ///
+    /// The identifier is `lagoon-v5b` rather than a later `lagoon-vN`
+    /// because the number here is not a position in the chain — it is
+    /// chosen to read as "after v5, before v6", which is exactly where it
+    /// runs. GRDB orders migrations by *registration*, not by identifier, so
+    /// the identifier is documentation, not a schedule.
+    public static let accountIDRepairVersion = "lagoon-v5b"
 
     public static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
@@ -68,8 +218,124 @@ public enum LagoonDatabase {
         migrator.registerMigration(sentFolderVersion) { db in
             try db.execute(sql: Self.sentFolderReconciliation)
         }
+        // Registered *before* `lagoon-v6` on purpose: GRDB runs a foreign
+        // key check at the end of every deferred migration, and `lagoon-v6`
+        // is one. On a store that still carries the mismatched id, that
+        // check aborts the migration — and the app cannot open its own
+        // database. Repairing the id first is what lets the store open.
+        migrator.registerMigration(accountIDRepairVersion) { db in
+            // The repair is data, not schema, and it needs the foreign key
+            // checks to be deferred while it moves a parent key that its
+            // children point at. `defer_foreign_keys` is scoped to the
+            // transaction, so it is switched on here and off again in the
+            // same breath — it must not leak into the next migration.
+            try db.execute(sql: "PRAGMA defer_foreign_keys = ON")
+            let outcomes = try AccountIDRepair.repairAccountIDs(in: db)
+            try db.execute(sql: "PRAGMA defer_foreign_keys = OFF")
+            for outcome in outcomes {
+                Logger(label: "lagoon.database").warning(
+                    "store.accountIDRepaired",
+                    metadata: [
+                        "account": .string(outcome.uuid.uuidString),
+                        "from": .string(String(describing: outcome.from)),
+                        "children": .string("\(outcome.childRowsRewritten)"),
+                        "skipped": .string("\(outcome.childRowsSkipped)"),
+                    ]
+                )
+            }
+        }
+        migrator.registerMigration(encryptedBodiesVersion) { db in
+            try db.execute(sql: Self.encryptedBodiesReconciliation)
+            // The rename is schema; the sealing is data, and it needs the
+            // key. It runs here, inside the migration, so a store is never
+            // left half-sealed: either every body is an envelope or the
+            // migration rolls back and the app refuses to open the store.
+            try BodyCipher.sealLegacyRows(in: db)
+        }
+        migrator.registerMigration(reminderVersion) { db in
+            try db.execute(sql: Self.reminderReconciliation)
+        }
+        migrator.registerMigration(overrideScopeVersion) { db in
+            try db.execute(sql: Self.overrideScopeReconciliation)
+        }
+        migrator.registerMigration(sealedDraftsVersion) { db in
+            try db.execute(sql: Self.sealedDraftsReconciliation)
+            // The sealing is data, and it needs the key. It runs here,
+            // inside the migration, so a store is never left half-sealed:
+            // either every draft is an envelope or the migration rolls back.
+            try DraftCipher.sealLegacyRows(in: db)
+        }
         return migrator
     }
+
+    /// Creates the table the store uses to tell the user about something it
+    /// did on their behalf.
+    ///
+    /// `IF NOT EXISTS` keeps a fresh install — whose `lagoon-v1` body
+    /// already creates the table — on the same path, exactly as every other
+    /// reconciliation here does.
+    public static let sealedDraftsReconciliation = """
+        CREATE TABLE IF NOT EXISTS store_notices (
+            id         TEXT PRIMARY KEY,
+            detail     TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
+        );
+    """
+
+    /// Adds the override scope column to an already-migrated install.
+    ///
+    /// `ADD COLUMN ... DEFAULT 'sender'` is safe on every path: SQLite fills
+    /// the default into the existing rows, so the overrides an install
+    /// already has keep the meaning they had.
+    public static let overrideScopeReconciliation = """
+        ALTER TABLE ai_overrides ADD COLUMN scope TEXT NOT NULL DEFAULT 'sender';
+    """
+
+    /// Adds the reminder table to an already-migrated install.
+    ///
+    /// `IF NOT EXISTS` keeps a fresh install — whose `lagoon-v1` body
+    /// creates the table — on the same path, exactly as every other
+    /// reconciliation here does.
+    public static let reminderReconciliation = """
+        CREATE TABLE IF NOT EXISTS reminders (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id   BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            remote_id    TEXT NOT NULL,
+            due_at       TEXT NOT NULL,
+            note         TEXT,
+            created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+            dismissed_at TEXT,
+            UNIQUE (account_id, remote_id),
+            FOREIGN KEY (account_id, remote_id)
+                REFERENCES message_headers(account_id, remote_id)
+                ON DELETE CASCADE
+        );
+        -- statement
+        -- The list the client opens: the reminders still waiting, soonest
+        -- first. `dismissed_at IS NULL` is the "still waiting" half, and
+        -- the index carries it so the query does not scan the whole table.
+        CREATE INDEX IF NOT EXISTS reminders_pending_idx
+            ON reminders (account_id, dismissed_at, due_at);
+    """
+
+    /// Renames the body columns so the schema cannot be misread.
+    ///
+    /// A `RENAME COLUMN` is the whole of it: SQLite rewrites the table
+    /// definition in place, keeps the composite primary key and the foreign
+    /// key into `message_headers` intact, and leaves the *values* alone —
+    /// which is what lets the sealing step that follows find them.
+    ///
+    /// The names are deliberately not "body_text" any more. A column called
+    /// `body_text` that holds ciphertext is a trap for the next person who
+    /// reads the schema, and it is exactly the kind of drift that let the
+    /// spec and the implementation disagree for this long.
+    static let encryptedBodiesReconciliation = """
+        ALTER TABLE message_bodies RENAME COLUMN body_text TO body_cipher;
+        -- statement
+        ALTER TABLE message_bodies RENAME COLUMN body_html TO body_html_cipher;
+        -- statement
+        ALTER TABLE message_headers RENAME COLUMN snippet TO snippet_cipher;
+    """
 
     /// R1: `is_sent` plus the index the Sent list reads through.
     ///
@@ -170,6 +436,18 @@ public enum LagoonDatabase {
         // GRDB 7 enables foreign keys by default; stated explicitly because
         // the schema leans on ON DELETE CASCADE for reconciliation semantics.
         configuration.foreignKeysEnabled = true
+        // The body is sealed, so SQLite cannot match inside it. These two
+        // functions put the decision back inside the query: `…_contains`
+        // answers "does this sealed body contain the needle" for the search
+        // route, and `…_seal` seals a whole column for the migration.
+        //
+        // Registered per connection — `prepareDatabase` runs for every
+        // connection the pool hands out, including the one the migrator
+        // borrows, which is why the migration can use `lagoon_cipher_seal`.
+        configuration.prepareDatabase { db in
+            db.add(function: BodyCipher.containsFunction)
+            db.add(function: BodyCipher.sealFunction)
+        }
         let pool = try DatabasePool(path: path, configuration: configuration)
         try migrator.migrate(pool)
         return pool
@@ -371,5 +649,35 @@ public enum LagoonDatabase {
         -- The decision queue: pending rows, newest first, per account.
         CREATE INDEX advice_queue_idx
             ON advice (account_id, decision, created_at DESC);
+        -- statement
+        -- Reminders the user set for themselves. A reminder points at a
+        -- mail and survives a reboot — the notification is delivered from
+        -- this row, not from the system's (forgettable) queue.
+        CREATE TABLE reminders (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id   BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            remote_id    TEXT NOT NULL,
+            due_at       TEXT NOT NULL,
+            note         TEXT,
+            created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+            dismissed_at TEXT,
+            UNIQUE (account_id, remote_id),
+            FOREIGN KEY (account_id, remote_id)
+                REFERENCES message_headers(account_id, remote_id)
+                ON DELETE CASCADE
+        );
+        -- statement
+        CREATE INDEX reminders_pending_idx
+            ON reminders (account_id, dismissed_at, due_at);
+        -- statement
+        -- One-shot notices the store raises for the user. A migration that
+        -- had to drop what it could not encrypt writes one here, so the app
+        -- can say "your drafts were deleted" instead of the user discovering
+        -- an empty list and guessing.
+        CREATE TABLE store_notices (
+            id         TEXT PRIMARY KEY,
+            detail     TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
+        );
     """
 }

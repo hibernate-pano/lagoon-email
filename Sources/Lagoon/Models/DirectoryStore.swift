@@ -50,6 +50,16 @@ public final class DirectoryStore: ObservableObject {
         }
     }
 
+    /// Records a status the client already knows — the AI settings sheet
+    /// gets one back from the reload it just performed.
+    ///
+    /// Without this the banner would keep saying "AI 未配置" until the
+    /// next poll (up to 30 seconds), so the app would contradict itself a
+    /// moment after telling the user the key was live.
+    public func applyAIStatus(_ status: AIStatus) {
+        aiStatus = status
+    }
+
     /// Select the one account that owns the provider connection. Refresh only
     /// after the server confirms, so the client never shows a switch that did
     /// not actually happen.
@@ -65,12 +75,24 @@ public final class DirectoryStore: ObservableObject {
     }
 
     /// Remove an account (server cascades its messages/pins/drafts).
-    public func remove(_ account: ConnectedAccount) async {
+    ///
+    /// **Throws** instead of recording the failure in `loadError`.
+    ///
+    /// `loadError` feeds the "the mail list could not be loaded" banner, so
+    /// a removal failure parked there would be announced under the wrong
+    /// headline — and, worse, it would appear *twice*: once as that banner
+    /// and once as the removal's own error, because the removal is a
+    /// distinct thing the user did and deserves its own report. Spec
+    /// INV-6: one banner at a time, and the right one.
+    public func remove(_ account: ConnectedAccount) async throws {
         do {
             try await api.deleteAccount(id: account.id)
             await refresh()
         } catch {
-            loadError = L10n.current.deleteAccountFailed + error.lagoonUIMessage
+            // A failed removal must not leave the directory stale: the
+            // account is still there, and the list has to keep saying so.
+            await refresh()
+            throw error
         }
     }
 }

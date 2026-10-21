@@ -38,6 +38,21 @@ struct SenderSheet: View {
         let count: Int
     }
     private let api = APIClient.shared
+    /// 批量请求同时在途的上限。
+    ///
+    /// 和「全部邮件」页的 `MessageListView.bulkConcurrency` 是同一个数、同
+    /// 一段理由。常量各自定义而不抽到共享类型里：三个界面只有数值相同，
+    /// 没有别的关系，抽出去换来的只是多一处要同步改的间接层。
+    ///
+    /// 设上限的原因是两条界面之外的事实：每一个批量动词都是一次真实的
+    /// 远程 IMAP 写请求，整个应用共用那条唯一的 IMAP 连接，而 30 秒一次
+    /// 的轮询也排在它后面。发件人面板覆盖的是该发件人的**全部**历史邮件
+    /// ——营销/通知类发件人积累几百上千封是常态。不限并发地全打出去，就是
+    /// 把轮询堵在几百个写请求之后，界面看起来像卡死。
+    ///
+    /// 八个足够把管道填满，再多只是把队列排得更长：扇出是延迟受限，不是
+    /// CPU 受限。
+    private static let bulkConcurrency = 8
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -121,12 +136,14 @@ struct SenderSheet: View {
                     accountId: accountId,
                     header: messages.first { $0.remoteId == remoteId },
                     initiallyPinned: messages.first { $0.remoteId == remoteId }?.isPinned ?? false,
-                    siblings: messages.map(\.remoteId),
+                    siblings: messages.map {
+                        MessageRef(accountId: accountId, remoteId: $0.remoteId)
+                    },
                     onArchived: { id, _ in
                         messages.removeAll { $0.remoteId == id }
                     },
                     onAdvanceTo: { next in
-                        path = next.map { [$0] } ?? []
+                        path = next.map { [$0.remoteId] } ?? []
                     }
                 )
                 // Same reset contract as the other destinations: without this
@@ -152,7 +169,15 @@ struct SenderSheet: View {
             messages = response.messages
             totalCount = response.totalCount ?? response.messages.count
         } catch {
-            errorBanner = ErrorBanner(severity: .error, title: l10n.loadFailed, detail: error.lagoonUIMessage)
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.loadFailed,
+                detail: error.lagoonUIMessage,
+                // A pure read that failed on the network: the same fetch can
+                // simply be run again. Spec INV-4.
+                actionLabel: l10n.retry,
+                action: { [self] in await self.load() }
+            )
         }
     }
 
@@ -276,9 +301,15 @@ struct SenderSheet: View {
 
     /// Delete via the single-message delete route: mail moves to the server's
     /// Trash, one undoable audit row per message. The fan-out mirrors
-    /// markAllRead. There is no bulk-delete endpoint, but at the volumes a
-    /// single sender accumulates (dozens, not thousands) the concurrent calls
-    /// finish in seconds.
+    /// markAllRead.
+    ///
+    /// There is no bulk-delete endpoint, so every message is its own request —
+    /// and this sheet lists the sender's *entire* history, where a marketing
+    /// or notification address routinely has hundreds, not dozens. Firing them
+    /// all at once put that many writes in front of the single shared IMAP
+    /// connection, with the 30s poll queued behind them; the window below
+    /// bounds in-flight requests to `bulkConcurrency`, admitting one new one
+    /// per completion — the same rule as `MessageListView.runBulk`.
     private func deleteAll() async {
         let ids = archivableIds
         guard !ids.isEmpty else { return }
@@ -287,21 +318,20 @@ struct SenderSheet: View {
         var deleted: [String] = []
         var actionIds: [Int64] = []
         var firstError: Error?
-        await withTaskGroup(of: (String, Result<Int64?, Error>)?.self) { group in
-            for id in ids {
-                group.addTask { [api, accountId] in
-                    do {
-                        let response = try await api.deleteMessage(
-                            remoteId: id, accountId: accountId
-                        )
-                        return (id, .success(response.actionId))
-                    } catch {
-                        return (id, .failure(error))
-                    }
+        let api = self.api
+        let accountId = self.accountId
+        await withTaskGroup(of: (String, Result<Int64?, Error>).self) { group in
+            var next = 0
+            // Fill the window first, then keep it full: one new task per
+            // completion, so the number outstanding never exceeds the limit.
+            while next < min(Self.bulkConcurrency, ids.count) {
+                let id = ids[next]
+                next += 1
+                group.addTask {
+                    await Self.deleteOne(api: api, remoteId: id, accountId: accountId)
                 }
             }
-            for await result in group {
-                guard let (id, outcome) = result else { continue }
+            while let (id, outcome) = await group.next() {
                 switch outcome {
                 case .success(let actionId):
                     deleted.append(id)
@@ -309,14 +339,35 @@ struct SenderSheet: View {
                 case .failure(let error):
                     if firstError == nil { firstError = error }
                 }
+                guard next < ids.count else { continue }
+                let id = ids[next]
+                next += 1
+                group.addTask {
+                    await Self.deleteOne(api: api, remoteId: id, accountId: accountId)
+                }
             }
         }
         if let firstError {
             errorBanner = ErrorBanner(
                 severity: .warning,
                 title: l10n.senderBulkPartial,
-                detail: firstError.lagoonUIMessage
+                // The reason *and* the state of the mail: a bare error string
+                // ("网络连接失败") says what went wrong but not what the
+                // failed rows are doing now, and the retry is only honest if
+                // the user knows it will re-run over exactly those.
+                detail: l10n.senderBulkPartialDetail(firstError.lagoonUIMessage),
+                // Partial success is retryable, and the retry is real: the
+                // rows that went through were removed from the list, so
+                // re-running the same delete covers exactly the rows that
+                // failed. Spec INV-4.
+                actionLabel: l10n.retry,
+                action: { [self] in await self.deleteAll() }
             )
+        } else if errorBanner?.title == l10n.senderBulkPartial {
+            // This run went through — the stale "some messages failed"
+            // banner would otherwise keep asking for another click on a
+            // batch that no longer exists.
+            errorBanner = nil
         }
         let removed = Set(deleted)
         messages.removeAll { removed.contains($0.remoteId) }
@@ -330,6 +381,26 @@ struct SenderSheet: View {
                 systemImage: "trash",
                 extraIds: Array(actionIds.dropFirst())
             ))
+        }
+    }
+
+    /// One delete, as its own failure domain.
+    ///
+    /// Split out of `deleteAll` so the bounded window has something to await
+    /// that is the *same* request in both the fill and the top-up phase —
+    /// the sweep is one task per message either way, only the scheduling
+    /// changed. Returns the remoteId alongside the outcome so the caller can
+    /// name which row failed without re-deriving it.
+    private static func deleteOne(
+        api: APIClient, remoteId: String, accountId: UUID
+    ) async -> (String, Result<Int64?, Error>) {
+        do {
+            let response = try await api.deleteMessage(
+                remoteId: remoteId, accountId: accountId
+            )
+            return (remoteId, .success(response.actionId))
+        } catch {
+            return (remoteId, .failure(error))
         }
     }
 
@@ -366,15 +437,29 @@ struct SenderSheet: View {
     }
 
     private func markAllRead() async {
-        await bulk { remoteId in
+        let failed = await bulk { remoteId in
             _ = try await api.markRead(
                 remoteId: remoteId, accountId: accountId, record: true
             )
         }
         // Optimistic flip after success; the list reloads from the server on
         // the next open, so this only needs to keep the rows consistent now.
-        for i in messages.indices where !messages[i].isRead {
+        //
+        // Only the rows the server actually accepted are flipped. A row that
+        // failed stays unread in the list — which is what the banner's detail
+        // promises (失败的邮件仍留在列表里) and what makes the banner's
+        // retry real: the retry scopes itself to the rows that are still
+        // unread, so it covers exactly the ones that failed.
+        let failedSet = Set(failed)
+        for i in messages.indices {
+            guard !messages[i].isRead, !failedSet.contains(messages[i].remoteId) else { continue }
             messages[i] = messages[i].withRead(true)
+        }
+        if failed.isEmpty, errorBanner?.title == l10n.senderBulkPartial {
+            // The retry went through — the stale "some messages failed"
+            // banner would otherwise keep asking for another click on a
+            // batch that no longer exists.
+            errorBanner = nil
         }
     }
 
@@ -396,8 +481,23 @@ struct SenderSheet: View {
                 errorBanner = ErrorBanner(
                     severity: .warning,
                     title: l10n.senderBulkPartial,
-                    detail: l10n.senderCount(truncated)
+                    // Not a bare count: the number says *how much* was left,
+                    // the detail says *why* and *what to do* — the server caps
+                    // one call, and the retry button right here is the way to
+                    // continue with the rest.
+                    detail: l10n.senderTruncatedDetail(truncated),
+                    // The server's per-call cap stopped the batch short. The
+                    // rows it did archive left the list, so re-running the
+                    // same sweep covers the ones that are still there.
+                    // Spec INV-4.
+                    actionLabel: l10n.retry,
+                    action: { [self] in await self.archiveAll() }
                 )
+            } else if errorBanner?.title == l10n.senderBulkPartial {
+                // The retry went through — the stale partial banner would
+                // otherwise keep asking for another click on a batch that
+                // no longer exists.
+                errorBanner = nil
             }
             if let first = ok.first, let actionId = first.actionId {
                 undo.show(UndoItem(
@@ -418,35 +518,66 @@ struct SenderSheet: View {
             errorBanner = ErrorBanner(
                 severity: .error,
                 title: l10n.senderBulkPartial,
-                detail: error.lagoonUIMessage
+                detail: error.lagoonUIMessage,
+                // The whole batch failed, so nothing moved: re-running the
+                // same sweep is the whole fix. Spec INV-4.
+                actionLabel: l10n.retry,
+                action: { [self] in await self.archiveAll() }
             )
         }
     }
 
     /// Shared fan-out for the markRead path: per-item errors are captured so
     /// a partial batch is reported, and the actionIds feed the undo toast.
-    private func bulk(_ body: @escaping (String) async throws -> Void) async {
+    ///
+    /// Returns the ids that failed, so the caller can leave them alone. That
+    /// is what makes the banner's retry real: the failed rows keep their
+    /// unread state in the list, and the retry scopes itself to the rows that
+    /// are still unread — so it covers exactly the ones that failed.
+    ///
+    /// Bounded on purpose, same rule and same number as
+    /// `MessageListView.runBulk`: one task per unread message would put the
+    /// sender's entire unread history on the wire at once, and the shared
+    /// IMAP connection answers the 30s poll too. The window admits one new
+    /// request per completion, so at most `bulkConcurrency` are outstanding.
+    private func bulk(_ body: @escaping (String) async throws -> Void) async -> [String] {
         let ids = unreadIds
-        guard !ids.isEmpty else { return }
+        guard !ids.isEmpty else { return [] }
         bulkInFlight = true
         defer { bulkInFlight = false }
-        var failures = 0
+        var failedIds: [String] = []
         var firstError: Error?
-        await withTaskGroup(of: Error?.self) { group in
-            for id in ids {
+        await withTaskGroup(of: (String, Error?).self) { group in
+            var next = 0
+            // Fill the window first, then keep it full: one new task per
+            // completion, so the number outstanding never exceeds the limit.
+            while next < min(Self.bulkConcurrency, ids.count) {
+                let id = ids[next]
+                next += 1
                 group.addTask {
                     do {
                         try await body(id)
-                        return nil
+                        return (id, nil)
                     } catch {
-                        return error
+                        return (id, error)
                     }
                 }
             }
-            for await result in group {
+            while let (id, result) = await group.next() {
                 if let result {
-                    failures += 1
+                    failedIds.append(id)
                     if firstError == nil { firstError = result }
+                }
+                guard next < ids.count else { continue }
+                let id = ids[next]
+                next += 1
+                group.addTask {
+                    do {
+                        try await body(id)
+                        return (id, nil)
+                    } catch {
+                        return (id, error)
+                    }
                 }
             }
         }
@@ -454,10 +585,14 @@ struct SenderSheet: View {
             errorBanner = ErrorBanner(
                 severity: .warning,
                 title: l10n.senderBulkPartial,
-                detail: firstError.lagoonUIMessage
+                detail: l10n.senderBulkPartialDetail(firstError.lagoonUIMessage),
+                // Partial success is retryable, and the retry is real: the
+                // failed rows are still unread in the list, so re-running the
+                // same mark-read covers exactly them. Spec INV-4.
+                actionLabel: l10n.retry,
+                action: { [self] in await self.markAllRead() }
             )
-        } else if failures > 0 {
-            errorBanner = ErrorBanner(severity: .warning, title: l10n.senderBulkPartial)
         }
+        return failedIds
     }
 }

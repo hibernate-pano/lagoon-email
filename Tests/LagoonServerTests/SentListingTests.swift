@@ -475,9 +475,13 @@ final class SentListingTests: XCTestCase {
     /// The row has to survive with its **body** attached: a surviving header
     /// over a cascaded-away body is the same loss wearing a nicer symptom.
     ///
-    /// The ordinary inbox row is the control. It *should* be reconciled away,
-    /// and if it ever survives, this test has passed for the wrong reason —
-    /// which is why it is asserted rather than left implicit.
+    /// The ordinary inbox rows are the control, and there are two of them on
+    /// purpose. One whose whereabouts the provider confirmed as gone must be
+    /// reconciled away; one whose whereabouts are unknown must not be, because
+    /// a message filed by another client is still on the server in a folder
+    /// this app never reads back. If the second one ever disappears, this
+    /// test has passed for the wrong reason — and if the first one survives,
+    /// reconcile has stopped deleting altogether.
     func test_reconcileInboxKeepsSentRowsAndTheirBodies() async throws {
         try await TokenKeyFixture.withKeyAsync(TokenKeyFixture.freshKey()) {
             let account = makeAccount()
@@ -495,9 +499,14 @@ final class SentListingTests: XCTestCase {
                 )
                 let goneId = "gone-\(UUID().uuidString)"
                 try await seedLocal(goneId, accountId: account.id, db: conn)
+                let confirmedGoneId = "confirmed-gone-\(UUID().uuidString)"
+                try await seedLocal(confirmedGoneId, accountId: account.id, db: conn)
 
                 try await MessageStore.reconcileInbox(
-                    accountId: account.id, keeping: [], db: conn
+                    accountId: account.id,
+                    keeping: [],
+                    removing: [confirmedGoneId],
+                    db: conn
                 )
 
                 let survivors = try await MessageStore.recent(
@@ -518,15 +527,27 @@ final class SentListingTests: XCTestCase {
                     "the header survived but its body was cascaded away — the "
                     + "same loss with a symptom that reads like a cache miss"
                 )
+                // The control: reconcile must still be able to delete. A row
+                // the provider *confirmed* is gone from the server goes; a
+                // row whose whereabouts are unknown stays, because a message
+                // that was filed by another client is still on the server in
+                // a folder this app never reads back.
                 let inbox = try await MessageStore.recent(
                     forAccount: account.id, limit: 100, sender: nil,
                     archived: false, deleted: false, sent: false,
                     stackMatch: nil, db: conn
                 ).map(\.remoteId)
-                XCTAssertTrue(
-                    inbox.isEmpty,
-                    "the control row survived, so this test could pass with "
-                    + "reconcile having stopped deleting altogether"
+                XCTAssertEqual(
+                    inbox, [goneId],
+                    "a row the provider confirmed is gone must be removed, and a row whose "
+                        + "whereabouts are unknown must not be"
+                )
+                let confirmedGone = try await MessageStore.find(
+                    remoteId: confirmedGoneId, accountId: account.id, db: conn
+                )
+                XCTAssertNil(
+                    confirmedGone,
+                    "reconcile stopped deleting altogether — the confirmed-gone row survived"
                 )
             }
         }

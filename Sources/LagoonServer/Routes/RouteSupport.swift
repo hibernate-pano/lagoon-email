@@ -82,6 +82,30 @@ enum RouteJSON {
         encoder.dateEncodingStrategy = .iso8601
         return try encoder.encode(value)
     }
+
+    /// A decoder that matches `encode(_:)`.
+    ///
+    /// ## Why this exists
+    ///
+    /// `JSONEncoder.dateEncodingStrategy = .iso8601` writes a date as
+    /// `"2026-10-20T05:00:00Z"`. A **plain** `JSONDecoder` does not read
+    /// that back: its default strategy expects a number (seconds since the
+    /// reference date), so the decode fails and the route answers
+    /// `malformed-body` for a body the server itself produced.
+    ///
+    /// That is not a hypothetical: the reminder route's body carries a
+    /// `Date`, and every request to set a reminder was rejected as
+    /// malformed. The client got a "bad request" for a well-formed body,
+    /// and the *client* could not tell a past due date from a broken
+    /// request — so the two errors were indistinguishable.
+    ///
+    /// One decoder, used everywhere a body carries a date, so the two
+    /// halves of the wire format cannot drift apart again.
+    static func decoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
 }
 
 /// Untrusted-input parsing.
@@ -125,7 +149,33 @@ enum RouteParams {
     /// Raw request body bytes, capped so a hostile client cannot make the
     /// server buffer without bound. The caller maps a failure onto 400.
     static func collectBody(_ request: Request) async throws -> Data {
-        let buffer = try await request.body.collect(upTo: 1 << 20)
+        let buffer = try await request.body.collect(upTo: defaultBodyLimit)
+        return Data(buffer: buffer)
+    }
+
+    /// The default request-body cap: 1 MB.
+    ///
+    /// Enough for every JSON payload the app sends — a list of messages, a
+    /// few hundred rows — and small enough that a hostile client cannot
+    /// make the server hold a gigabyte.
+    static let defaultBodyLimit = 1 << 20
+
+    /// The cap for a request that may carry file attachments.
+    ///
+    /// Attachments travel base64-encoded inside the JSON, so the wire size
+    /// is about 4/3 of the file size. 64 MB of request body therefore holds
+    /// roughly 48 MB of files — comfortably past the 25 MB per-file cap
+    /// that `OutboundAttachment` enforces, and past anything a user
+    /// attaches to one mail in practice.
+    ///
+    /// It is a *separate* limit rather than a raised global one: every other
+    /// route keeps the 1 MB cap, so no other endpoint becomes a way to make
+    /// the server hold 64 MB.
+    static let attachmentBodyLimit = 64 << 20
+
+    /// `collectBody` with the attachment-sized cap.
+    static func collectAttachmentBody(_ request: Request) async throws -> Data {
+        let buffer = try await request.body.collect(upTo: attachmentBodyLimit)
         return Data(buffer: buffer)
     }
 }

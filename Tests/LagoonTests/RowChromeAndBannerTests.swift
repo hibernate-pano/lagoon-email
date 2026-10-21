@@ -60,14 +60,26 @@ final class RefreshShortcutScopeTests: XCTestCase {
     private static let replyShortcut = #".keyboardShortcut("r", modifiers: .command)"#
     private static let refreshShortcut = #".keyboardShortcut("r", modifiers: [.command, .option])"#
 
-    /// Both list surfaces bind refresh as ⌥⌘R, and no plain ⌘R remains there
-    /// to fight the detail view's reply binding.
+    /// The menu bar owns ⌥⌘R; the list surfaces must not bind it a second
+    /// time.
+    ///
+    /// This used to assert the opposite — that both surfaces carried the
+    /// binding — and that assertion was wrong about how macOS dispatches
+    /// key equivalents. A main-menu item's key equivalent is matched
+    /// **before** the responder chain, so the menu's ⌥⌘R always won and the
+    /// view-level copy was dead code that looked alive: it read as "this
+    /// surface handles ⌥⌘R" in the source, and the menu's version — the
+    /// complete one, which re-reads the list, the counts and the account
+    /// state — was the only thing that actually ran.
+    ///
+    /// One key, one owner. Plain ⌘R must not reappear in the surfaces
+    /// either: it belongs to reply in the detail view.
     func test_refreshUsesOptionCommandRAndReplyKeepsCommandR() throws {
         for view in ["MessageListView", "BriefingFeedView"] {
             let source = try ViewSource.read(view)
-            XCTAssertNotNil(
+            XCTAssertNil(
                 source.range(of: Self.refreshShortcut),
-                "\(view): the ⌥⌘R refresh binding disappeared"
+                "\(view): ⌥⌘R is bound here as well as in the menu bar — one key, one owner"
             )
             XCTAssertNil(
                 source.range(of: Self.replyShortcut),
@@ -239,7 +251,14 @@ final class PriorityBannerDismissalTests: XCTestCase {
         )
         // Anchored on the loop: the same identifiers also appear in their
         // `@State` declarations, which is a `= false` that means nothing.
-        let body = ViewSource.code(after: loop.lowerBound, in: source[loop.lowerBound...], limit: 600)
+        //
+        // Comments are stripped **before** the window is measured. Measuring
+        // first is a budget an unrelated edit can spend: a two-line comment
+        // added to the loop body once pushed the third reset just past the
+        // cutoff, and the test failed while the code was correct. What this
+        // pins is the statements in the loop, so the window counts them.
+        let uncommented = ViewSource.code(after: loop.lowerBound, in: source[loop.lowerBound...], limit: 4_000)
+        let body = String(uncommented.prefix(600))
         for flag in [
             "syncHealthDismissed = false",
             "loadErrorDismissed = false",

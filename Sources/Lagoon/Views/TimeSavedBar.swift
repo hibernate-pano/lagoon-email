@@ -65,6 +65,13 @@ struct TimeSavedBar: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            // One element, one name: without this VoiceOver reads the
+            // clock glyph's symbol name and then the sentence, and the
+            // glyph carries no information the sentence does not.
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(summary(report))
+            .accessibilityHint(l10n.viewDetails)
+            .accessibilityAddTraits(.isButton)
             .popover(isPresented: $showWeek, arrowEdge: .bottom) {
                 weekDetail(report)
             }

@@ -12,7 +12,13 @@ struct MessageDetailView: View {
     let initiallyPinned: Bool
     let initialGroup: BriefingGroup?
     /// Optional sibling list for j/k navigation and auto-advance on archive.
-    var siblings: [String]? = nil
+    ///
+    /// The siblings are **references**, not bare ids, because a sibling list
+    /// can span mailboxes: a cross-account search result list can hold
+    /// `uid:42` from two different mailboxes, and a bare id would resolve
+    /// "archive & next" to whichever came first — the user files a mail in
+    /// their work mailbox and the reader jumps to their personal one.
+    var siblings: [MessageRef]? = nil
     /// Called after a successful delete so the host can drop the row and pop.
     var onDelete: ((String) -> Void)? = nil
     /// Called after a successful archive/undo so the list row can disappear/return.
@@ -21,7 +27,7 @@ struct MessageDetailView: View {
     var onPinnedChanged: (Bool) -> Void = { _ in }
     /// Called after a successful archive with the next sibling, or nil when
     /// the archived message was the last one in the current view.
-    var onAdvanceTo: ((String?) -> Void)? = nil
+    var onAdvanceTo: ((MessageRef?) -> Void)? = nil
 
     @State private var messageBody: MessageBody?
     @State private var isLoadingBody = true
@@ -60,7 +66,17 @@ struct MessageDetailView: View {
     @State private var showDraftPicker = false
     @State private var selectedDraftBody = ""
 
+    /// The 「改分组」 sheet.
+    ///
+    /// It replaced a `confirmationDialog` that listed the groups and said
+    /// nothing about the blast radius. The dialog read as a per-mail
+    /// action; the server applied it to **every mail from the sender**; and
+    /// the user found out afterwards. The sheet now makes the scope an
+    /// explicit choice, with the narrow one as the default.
     @State private var showOverrideMenu = false
+    /// The reminder sheet. A user gesture only — the AI may suggest a
+    /// reminder, but it never sets one.
+    @State private var showReminderSheet = false
 
     @State private var showComposer = false
     /// 发件人归集 sheet: the sender's full received-mail history.
@@ -110,12 +126,13 @@ struct MessageDetailView: View {
         header: MessageHeader?,
         initiallyPinned: Bool,
         initialGroup: BriefingGroup? = nil,
-        siblings: [String]? = nil,
+        siblings: [MessageRef]? = nil,
         onArchived: ((String, Bool) -> Void)? = nil,
-        onAdvanceTo: ((String?) -> Void)? = nil,
+        onAdvanceTo: ((MessageRef?) -> Void)? = nil,
         onDelete: ((String) -> Void)? = nil,
         onReadStateChange: @escaping (String, Bool) -> Void = { _, _ in },
-        onPinnedChanged: @escaping (Bool) -> Void = { _ in }
+        onPinnedChanged: @escaping (Bool) -> Void = { _ in },
+        isVisible: Bool = true
     ) {
         self.remoteId = remoteId
         self.accountId = accountId
@@ -128,9 +145,27 @@ struct MessageDetailView: View {
         self.onDelete = onDelete
         self.onReadStateChange = onReadStateChange
         self.onPinnedChanged = onPinnedChanged
+        self.isVisible = isVisible
         _isRead = State(initialValue: header?.isRead ?? false)
         _isPinned = State(initialValue: initiallyPinned)
     }
+
+    /// Whether this detail view's surface is the one on screen.
+    ///
+    /// RootView keeps *both* mail surfaces alive in a ZStack and hides the
+    /// inactive one with opacity/disabled/allowsHitTesting/accessibilityHidden.
+    /// That hides the **view**, but not its keyboard shortcuts: a
+    /// `.keyboardShortcut` registered on a hidden-but-mounted view still
+    /// fires. Two mounted detail views (one under the Briefing, one under the
+    /// raw list) therefore both had ⌘R / ⌘E / ⌘P / ⌘D registered at once, and
+    /// the user could reply from the message they were *not* looking at.
+    ///
+    /// The same escape route was recorded for toolbar items in
+    /// `.memory/toolbar-items-escape-hidden-zstack-surfaces`; the action bar
+    /// moved out of the toolbar afterwards, but the shortcut half of the
+    /// bypass list was never applied — this is the second time the same hole
+    /// opened. The gate below closes it.
+    var isVisible: Bool = true
 
     /// Reading-column width. Matches Mail.app / Superhuman defaults; anything
     /// wider makes the subject / from / body sit visually disconnected and
@@ -247,33 +282,53 @@ struct MessageDetailView: View {
                     showSentNotice()
                 }
             case .forward:
-                // Forward reuses the compose sheet (arbitrary recipient,
-                // editable To). The original is quoted so the recipient
-                // has the context; the Fwd: prefix follows the same
-                // de-dup rule as Re:.
-                NewMessageSheet(
+                // Forward gets its own sheet, not the compose sheet.
+                //
+                // The old forward reused `NewMessageSheet` and pre-filled
+                // it with the original's body wrapped in `>` characters.
+                // That produced a *quoted* forward: the recipient got a
+                // wall of plain text, the original's formatting was gone,
+                // its attachments were gone, and its headers were gone.
+                //
+                // RFC 5322 §3.6.4 has the answer. The original travels as a
+                // `message/rfc822` part — the original message itself —
+                // and the server has the bytes to do that. The sheet owns
+                // only what is the user's: the recipients, the note, and
+                // the subject.
+                ForwardSheet(
                     accountId: accountId,
-                    prefillTo: "",
-                    prefillSubject: forwardSubject,
-                    prefillBody: Self.formatForwardBody(
-                        from: messageBody?.fromAddress ?? header?.fromAddress ?? "",
-                        date: receivedAt,
-                        subject: subjectText,
-                        body: messageBody?.text ?? ""
-                    )
+                    remoteId: remoteId,
+                    originalSubject: subjectText
                 ) { _ in
                     showSentNotice()
                 }
             }
         }
-        .confirmationDialog(l10n.overrideGroup, isPresented: $showOverrideMenu, titleVisibility: .visible) {
-            ForEach(
-                BriefingGroup.allCases.filter { $0 != .pinned && $0 != initialGroup },
-                id: \.self
-            ) { group in
-                Button(l10n.groupTitle(group)) { overrideClassification(to: group) }
+        .sheet(isPresented: $showReminderSheet) {
+            ReminderSheet(
+                accountId: accountId,
+                remoteId: remoteId,
+                subject: subjectText,
+                dueText: nil
+            ) { reminder in
+                // The notice says the reminder was set, and when it is
+                // due. It used to reuse the *send* notice, so setting a
+                // reminder announced "已发送给 <发件人>" — a mail the
+                // app never sent. The user was told the product did
+                // something it did not do.
+                showTransientNotice(l10n.reminderSetConfirmation(reminder.dueAt))
             }
-            Button(l10n.cancel, role: .cancel) {}
+        }
+        .sheet(isPresented: $showOverrideMenu) {
+            OverrideScopeSheet(
+                senderAddress: senderEmail,
+                currentGroup: initialGroup,
+                availableGroups: BriefingGroup.allCases.filter {
+                    $0 != .pinned && $0 != initialGroup
+                }
+            ) { group, scope in
+                overrideClassification(to: group, scope: scope)
+            }
         }
     }
 
@@ -288,6 +343,20 @@ struct MessageDetailView: View {
     /// Summarize, Generate Drafts, Download .eml, Mark Read, Override and
     /// Unsubscribe stay in the ⋯ menu with their ⌘ shortcuts.
     private var actionBar: some View {
+        Group {
+            if isVisible {
+                visibleActionBar
+            } else {
+                // The surface is hidden, so its shortcuts must not be
+                // registered. An empty bar keeps the layout identical (the
+                // Divider under it stays in place) while removing every
+                // `.keyboardShortcut` from the responder chain.
+                Color.clear.frame(height: 0)
+            }
+        }
+    }
+
+    private var visibleActionBar: some View {
         HStack(spacing: 10) {
             Button { Task { await togglePin() } } label: {
                 if isPinBusy {
@@ -302,7 +371,11 @@ struct MessageDetailView: View {
             .buttonStyle(.borderless)
             .disabled(isPinBusy)
             .help(isPinned ? l10n.unpinHelp : l10n.pinHelp)
-            .keyboardShortcut("p", modifiers: .command)
+            // ⇧⌘P, not ⌘P: on macOS ⌘P is the muscle memory for *print*, and
+            // a mail client that answers it by silently pinning the open
+            // message is changing mail state on a key press the user aimed
+            // somewhere else entirely.
+            .keyboardShortcut("p", modifiers: [.command, .shift])
 
             Divider()
                 .frame(height: 16)
@@ -375,13 +448,27 @@ struct MessageDetailView: View {
 
             Divider()
 
-            Button(isRead ? l10n.markAsUnread : l10n.markAsRead) { Task { await toggleReadState() } }
+            Button(isRead ? l10n.markUnread : l10n.markRead) { Task { await toggleReadState() } }
             Button(l10n.overrideGroup) { showOverrideMenu = true }
             Button(l10n.unsubscribe, role: .destructive) { Task { await unsubscribe() } }
                 .disabled(header == nil)
             // 删除也是可逆的（移入服务器废纸篓，⌘Z 恢复），但它是用户心智里
             // 最"重"的动词，所以给 destructive 着色并放在 ⋯ 菜单末尾。
-            Button(l10n.deleteContext, role: .destructive) { Task { await deleteMessage() } }
+            Button(l10n.moveToTrash, role: .destructive) { Task { await deleteMessage() } }
+                // Off *before* the click when the account has no trash folder.
+                // The server would answer 409 delete-unavailable; the point of
+                // the capability is that the user learns it from the disabled
+                // button and its tooltip, not from a failed action.
+                .disabled(!canDelete)
+                .help(canDelete ? l10n.moveToTrash : l10n.deleteUnavailable)
+
+            Divider()
+
+            // 设提醒. The AI may *suggest* a reminder, but only the user
+            // can set one — so this is an ordinary user gesture, in the
+            // menu next to the other per-message verbs.
+            Button(l10n.reminderSet) { showReminderSheet = true }
+                .disabled(header == nil)
 
             Divider()
 
@@ -401,7 +488,18 @@ struct MessageDetailView: View {
     /// pretend archiving is impossible: the server is the authority and
     /// answers 409 archive-unavailable if it really is.
     private var canArchive: Bool {
-        directory.active?.capabilities.archiveFolder ?? true
+        directory.active?.capabilities.allowsArchive ?? true
+    }
+
+    /// Whether 移到废纸篓 can be offered.
+    ///
+    /// Same reasoning as `canArchive`, applied to the trash role: an account
+    /// whose server negotiated no trash folder cannot delete, and the server
+    /// would answer 409. Unknown reads as allowed — the server is the
+    /// authority, and a user locked out of delete by a cached guess has no
+    /// way to appeal the guess.
+    private var canDelete: Bool {
+        directory.active?.capabilities.allowsDelete ?? true
     }
 
     /// The recipient line in the metadata block. Prefers the parsed `to`
@@ -512,35 +610,6 @@ struct MessageDetailView: View {
             let lower = $0.lowercased()
             return lower != selfAddress && !toSet.contains(lower)
         }
-    }
-
-    private var forwardSubject: String {
-        let base = messageBody?.subject ?? header?.subject ?? ""
-        if base.lowercased().hasPrefix("fwd:") { return base }
-        return base.isEmpty ? "Fwd:" : "Fwd: \(base)"
-    }
-
-    /// The quoted block a forward carries. Mirrors the reply quote
-    /// convention (`> ` prefix) but with a header block naming the
-    /// original sender and date — a forwarded message usually lands in
-    /// front of someone who has no context.
-    static func formatForwardBody(
-        from: String,
-        date: Date?,
-        subject: String,
-        body: String
-    ) -> String {
-        var header = "\n\n---------- Forwarded message ----------\n"
-        header += "From: \(from)\n"
-        if let date {
-            header += "Date: \(date.formatted(date: .complete, time: .standard))\n"
-        }
-        header += "Subject: \(subject)\n\n"
-        let quoted = body
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map { $0.isEmpty ? ">" : "> \($0)" }
-            .joined(separator: "\n")
-        return header + quoted
     }
 
     private var fromDisplay: String {
@@ -706,14 +775,29 @@ struct MessageDetailView: View {
             panel.allowedContentTypes = []
             panel.nameFieldStringValue = result.filename ?? "attachment"
             panel.canCreateDirectories = true
-            let response = await panel.beginSheetModal(for: NSApp.keyWindow ?? NSApp.mainWindow!)
+            guard let window = presentingWindow else {
+                actionBanner = ErrorBanner(
+                    severity: .error,
+                    title: l10n.downloadFailed,
+                    detail: l10n.downloadNoWindow,
+                    // The window was not attachable at that instant — by the
+                    // time the user presses this, it may well be. Retrying
+                    // is one click and costs a server round trip.
+                    actionLabel: l10n.retry,
+                    action: { await downloadAttachment(attachment) }
+                )
+                return
+            }
+            let response = await panel.beginSheetModal(for: window)
             guard response == .OK, let url = panel.url else { return }
             try result.data.write(to: url)
         } catch {
             actionBanner = ErrorBanner(
                 severity: .error,
                 title: l10n.downloadFailed,
-                detail: error.lagoonUIMessage
+                detail: error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                action: { await downloadAttachment(attachment) }
             )
         }
     }
@@ -729,14 +813,26 @@ struct MessageDetailView: View {
             let panel = NSSavePanel()
             panel.nameFieldStringValue = (messageBody?.subject ?? "message") + ".eml"
             panel.canCreateDirectories = true
-            let response = await panel.beginSheetModal(for: NSApp.keyWindow ?? NSApp.mainWindow!)
+            guard let window = presentingWindow else {
+                actionBanner = ErrorBanner(
+                    severity: .error,
+                    title: l10n.downloadFailed,
+                    detail: l10n.downloadNoWindow,
+                    actionLabel: l10n.retry,
+                    action: { await downloadRawEml() }
+                )
+                return
+            }
+            let response = await panel.beginSheetModal(for: window)
             guard response == .OK, let url = panel.url else { return }
             try data.write(to: url)
         } catch {
             actionBanner = ErrorBanner(
                 severity: .error,
                 title: l10n.downloadFailed,
-                detail: error.lagoonUIMessage
+                detail: error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                action: { await downloadRawEml() }
             )
         }
     }
@@ -756,8 +852,8 @@ struct MessageDetailView: View {
                     if !summary.actionItems.isEmpty {
                         Divider()
                         Text(l10n.actionItems).font(.caption).foregroundStyle(.secondary)
-                        ForEach(Array(summary.actionItems.enumerated()), id: \.offset) { _, item in
-                            HStack(alignment: .firstTextBaseline, spacing: 6) { Text("•"); Text(item).textSelection(.enabled) }
+                        ForEach(Self.identifiedRows(summary.actionItems)) { row in
+                            HStack(alignment: .firstTextBaseline, spacing: 6) { Text("•"); Text(row.text).textSelection(.enabled) }
                         }
                     }
                     if let provider = summary.provider, !provider.isEmpty {
@@ -782,10 +878,10 @@ struct MessageDetailView: View {
                     Button(l10n.pickOne) { showDraftPicker = true }
                         .buttonStyle(.borderedProminent)
                 }
-                ForEach(Array(draft.variants.enumerated()), id: \.offset) { index, variant in
+                ForEach(Array(Self.identifiedRows(draft.variants).enumerated()), id: \.element.id) { index, row in
                     VStack(alignment: .leading, spacing: 4) {
                         Text(l10n.variant + " " + "\(index + 1)").font(.caption2).foregroundStyle(.secondary)
-                        Text(variant).font(.callout).textSelection(.enabled).padding(8)
+                        Text(row.text).font(.callout).textSelection(.enabled).padding(8)
                             .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
                     }
                 }
@@ -818,6 +914,19 @@ struct MessageDetailView: View {
 
     // MARK: - Actions
 
+    /// The window a save panel should hang off.
+    ///
+    /// Both `keyWindow` and `mainWindow` are optional, and either can be nil
+    /// while the app is alive — the user can close the window while a
+    /// download is still in flight. The old `?? NSApp.mainWindow!` turned
+    /// that into a crash the user could trigger by closing the window at the
+    /// wrong moment, and a `catch` cannot see it: the force unwrap happens
+    /// before the throwing call. A missing window is not worth crashing
+    /// over — the download simply has nowhere to go, and says so.
+    private var presentingWindow: NSWindow? {
+        NSApp.keyWindow ?? NSApp.mainWindow
+    }
+
     private func loadBody() async {
         isLoadingBody = true
         bodyError = nil
@@ -835,32 +944,83 @@ struct MessageDetailView: View {
         }
     }
 
+    /// Fetch the inline images of one message and hand the bytes to the
+    /// HTML renderer.
+    ///
+    /// The loader (`InlineImageLoader`) owns the *policy* — the one-shot
+    /// route first, the cache second, the capped per-image fallback last —
+    /// and this function owns the *wiring*: which API calls to make, and
+    /// what the user is told when some images do not arrive.
     private func loadInlineImages(_ attachments: [Attachment]) async {
+        let wanted = attachments.compactMap { attachment -> (attachment: Attachment, key: String)? in
+            let cid = attachment.contentId?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let key = cid, !key.isEmpty else { return nil }
+            return (attachment, key.lowercased())
+        }
+        guard !wanted.isEmpty else { return }
+
         isLoadingInlineImages = true
         defer { isLoadingInlineImages = false }
-        await withTaskGroup(of: (String, Data?).self) { group in
-            for attachment in attachments {
-                let cidKey = attachment.contentId?.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard let key = cidKey, !key.isEmpty else { continue }
-                group.addTask { [accountId, remoteId, attachment] in
-                    do {
-                        let result = try await api.downloadAttachment(
-                            accountId: accountId,
-                            remoteId: remoteId,
-                            attachmentId: attachment.id
-                        )
-                        return (key, result.data)
-                    } catch {
-                        return (key, nil)
-                    }
-                }
+
+        // One read of the cache, taken here on the main actor. The loader
+        // runs off the main actor and cannot touch the cache itself, so the
+        // snapshot is what it decides from.
+        let cached = InlineImageCache.shared.snapshot(for: wanted.map(\.attachment.id))
+
+        let result = await InlineImageLoader.load(
+            images: wanted,
+            cached: cached,
+            fetchAll: { [api] in
+                try await api.fetchInlineImages(
+                    remoteId: remoteId,
+                    accountId: accountId
+                ).images
+            },
+            fetchOne: { [api] attachment in
+                try await api.downloadAttachment(
+                    accountId: accountId,
+                    remoteId: remoteId,
+                    attachmentId: attachment.id
+                ).data
             }
-            for await (key, data) in group {
-                if let data {
-                    inlineImageData[key.lowercased()] = data
-                }
-            }
+        )
+
+        for image in result.fetched {
+            inlineImageData[image.key] = image.data
+            InlineImageCache.shared.store(image.data, for: image.attachmentId)
         }
+        reportInlineImageFailuresIfAny(result)
+    }
+
+    /// Say so when some images could not be fetched.
+    ///
+    /// The message view itself is never broken by a missing image — the
+    /// HTML renders and the rest of the mail is readable. But a picture
+    /// that silently does not appear reads as "the sender sent a broken
+    /// mail", which is the wrong conclusion and sends the user looking for
+    /// a problem that is not there.
+    private func reportInlineImageFailuresIfAny(_ result: InlineImageLoader.LoadResult) {
+        guard !result.failedKeys.isEmpty else { return }
+        actionBanner = ErrorBanner(
+            severity: .warning,
+            title: l10n.inlineImageFailedTitle,
+            detail: l10n.inlineImageFailedDetail,
+            actionLabel: l10n.inlineImageRetry,
+            action: { [self] in await self.reloadInlineImages() }
+        )
+    }
+
+    /// Re-fetch the inline images of the current message.
+    ///
+    /// The cached bytes are dropped first, so a retry actually retries
+    /// rather than replaying the same cached result.
+    private func reloadInlineImages() async {
+        guard let body = messageBody else { return }
+        for attachment in body.inlineImageAttachments {
+            InlineImageCache.shared.remove(attachment.id)
+        }
+        inlineImageData.removeAll()
+        await loadInlineImages(body.inlineImageAttachments)
     }
 
     /// Manual read/unread toggle from the ⋯ menu. Unlike the automatic
@@ -947,6 +1107,7 @@ struct MessageDetailView: View {
             pinBanner = ErrorBanner(
                 severity: .error,
                 title: target ? l10n.pinFailed : l10n.unpinFailed,
+                detail: target ? l10n.pinFailedDetail : l10n.unpinFailedDetail,
                 actionLabel: l10n.retry,
                 action: { [self] in await self.togglePin() }
             )
@@ -994,7 +1155,17 @@ struct MessageDetailView: View {
             case .specific(let message):
                 draftState = .failed(message)
             case .none:
-                draftState = .failed(l10n.draftFailed + apiError.lagoonUIMessage)
+                // The store could not seal the draft it was asked to write,
+                // or it could not open one it has. Both are storage
+                // conditions, not AI conditions, and the generic "生成草稿
+                // 失败" would send the user to check their AI key for a
+                // problem that has nothing to do with the AI.
+                if apiError.serverErrorCode == "draft-seal-failed"
+                    || apiError.serverErrorCode == "draft-unreadable" {
+                    draftState = .failed(l10n.draftUnreadable)
+                } else {
+                    draftState = .failed(l10n.draftFailed + apiError.lagoonUIMessage)
+                }
             }
         } catch {
             draftState = .failed(l10n.draftFailed + error.lagoonUIMessage)
@@ -1028,8 +1199,12 @@ struct MessageDetailView: View {
             onArchived?(remoteId, true)
             // Find the next sibling for auto-advance. A nil tells the parent
             // to close the detail view instead of leaving an archived message onscreen.
-            var next: String?
-            if let siblings, let index = siblings.firstIndex(of: remoteId) {
+            //
+            // The match is on the **pair**, not the bare id: the sibling list
+            // can span mailboxes, and `uid:42` exists in every one of them.
+            let self_ = MessageRef(accountId: accountId, remoteId: remoteId)
+            var next: MessageRef?
+            if let siblings, let index = siblings.firstIndex(of: self_) {
                 let nextIndex = siblings.index(after: index)
                 if nextIndex < siblings.endIndex {
                     next = siblings[nextIndex]
@@ -1038,9 +1213,25 @@ struct MessageDetailView: View {
             onAdvanceTo?(next)
             undo.show(UndoItem(
                 id: response.actionId,
-                message: l10n.archived,
+                message: l10n.archivedToast,
                 systemImage: "tray.and.arrow.down"
             ))
+        } catch APIError.badStatus(let code, _) where code == 409 {
+            // The account negotiated no archive-capable folder, so the
+            // server refuses every archive. Retrying cannot fix that, and
+            // the list and feed surfaces already say so — the reader has to
+            // say the same thing, or the same failure reads differently
+            // depending on which window the user was in.
+            actionBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.archiveUnavailable,
+                detail: l10n.archiveUnavailableDetail,
+                helpURL: LagoonHelp.bannerMailto(
+                    failure: l10n.archiveUnavailable,
+                    detail: l10n.archiveUnavailableDetail,
+                    l10n: l10n
+                )
+            )
         } catch {
             actionBanner = ErrorBanner(
                 severity: .error,
@@ -1056,6 +1247,12 @@ struct MessageDetailView: View {
     private func deleteMessage() async {
         do {
             let response = try await api.deleteMessage(remoteId: remoteId, accountId: accountId)
+            // A reminder about a mail the user threw away must not still
+            // be able to ring. The server hides such a reminder from the
+            // list, but the notification lives in the *system's* queue,
+            // and the system does not know the mail is gone. The client
+            // is the only place that can close that gap.
+            MailNotificationService.shared.cancelReminders(forRemoteId: remoteId)
             undo.show(UndoItem(
                 id: response.actionId,
                 message: l10n.deleted,
@@ -1066,7 +1263,11 @@ struct MessageDetailView: View {
             actionBanner = ErrorBanner(
                 severity: .error,
                 title: l10n.deleteFailedTitle,
-                detail: error.lagoonUIMessage
+                detail: error.lagoonUIMessage,
+                // Moving to the trash failed, so the message is still in the
+                // inbox. Retrying is the one thing that can change that.
+                actionLabel: l10n.retry,
+                action: { [self] in await self.deleteMessage() }
             )
         }
     }
@@ -1088,14 +1289,20 @@ struct MessageDetailView: View {
         } catch {
             if let code = (error as? APIError)?.serverErrorCode {
                 if code == "unsubscribe-manual-required" {
-                    // No action: "open the original email" needs a
-                    // `messageWebLink` the server does not emit yet, and a
-                    // button that does nothing is worse than copy that just
-                    // tells the user what to do by hand.
+                    // No retry: the publisher has no one-click endpoint, so
+                    // the request will be refused the same way forever. Per
+                    // spec INV-5 the banner offers a way out instead — a
+                    // report that already names the failure, so the user is
+                    // not asked to narrate it.
                     actionBanner = ErrorBanner(
                         severity: .error,
                         title: l10n.unsubscribeFailedTitle,
-                        detail: l10n.unsubscribeManualRequired
+                        detail: l10n.unsubscribeManualRequired,
+                        helpURL: LagoonHelp.bannerMailto(
+                            failure: l10n.unsubscribeFailedTitle,
+                            detail: l10n.unsubscribeManualRequired,
+                            l10n: l10n
+                        )
                     )
                 } else if code == "unsubscribe-page-required" {
                     // Not a failure: a publisher that wants a web
@@ -1108,10 +1315,19 @@ struct MessageDetailView: View {
                         detail: l10n.unsubscribePageRequired
                     )
                 } else if code == "unsubscribe-unavailable" {
+                    // The server has no way to reach this publisher's
+                    // unsubscribe endpoint. Retrying cannot conjure one, so
+                    // the banner offers the way out instead of a button that
+                    // would fail identically every time.
                     actionBanner = ErrorBanner(
                         severity: .error,
                         title: l10n.unsubscribeFailedTitle,
-                        detail: l10n.unsubscribeUnavailable
+                        detail: l10n.unsubscribeUnavailable,
+                        helpURL: LagoonHelp.bannerMailto(
+                            failure: l10n.unsubscribeFailedTitle,
+                            detail: l10n.unsubscribeUnavailable,
+                            l10n: l10n
+                        )
                     )
                 } else {
                     actionBanner = ErrorBanner(
@@ -1134,16 +1350,24 @@ struct MessageDetailView: View {
         }
     }
 
-    private func overrideClassification(to group: BriefingGroup) {
+    /// Store a group change, at the scope the user chose.
+    ///
+    /// `scope` is not decoration: it decides whether the server writes a
+    /// rule about **this mail** or about **every mail from this sender**.
+    /// The toast says which one happened, because "the mail moved" and "the
+    /// sender's whole mailbox moved" are different facts and the user is
+    /// entitled to know which one they got.
+    private func overrideClassification(to group: BriefingGroup, scope: OverrideScope) {
         Task {
             do {
                 try await api.overrideClassification(
                     remoteId: remoteId, accountId: accountId,
                     from: initialGroup,
-                    to: group
+                    to: group,
+                    scope: scope
                 )
                 actionBanner = nil
-                showTransientNotice(l10n.overrideApplied)
+                showTransientNotice(l10n.overrideAppliedToast(scope: scope))
                 NotificationCenter.default.post(name: .lagoonDidChangeData, object: nil)
             } catch {
                 actionBanner = ErrorBanner(
@@ -1151,7 +1375,9 @@ struct MessageDetailView: View {
                     title: l10n.overrideGroupFailedTitle,
                     detail: l10n.overrideGroupFailedDetail,
                     actionLabel: l10n.retry,
-                    action: { [self] in await self.overrideClassification(to: group) }
+                    action: { [self] in
+                        await self.overrideClassification(to: group, scope: scope)
+                    }
                 )
             }
         }
@@ -1182,4 +1408,38 @@ struct MessageDetailView: View {
             Spacer()
         }
     }
+
+    /// The action items and the draft variants as identified rows.
+    ///
+    /// Both are plain strings — there is no id field to key on — so the rows
+    /// used to be identified by their *position*. A re-generated summary
+    /// renumbered them: SwiftUI kept the old views and moved their content
+    /// along, so the rows visibly jumped and a text selection followed the
+    /// wrong line. The payload is the identity instead.
+    static func identifiedRows(_ rows: [String]) -> [TextRow] {
+        var occurrences: [String: Int] = [:]
+        return rows.map { text in
+            // Two identical lines are two different rows, and `ForEach`
+            // refuses duplicate ids — so the occurrence counts.
+            let occurrence = occurrences[text, default: 0]
+            occurrences[text] = occurrence + 1
+            return TextRow(id: TextRowID(text: text, occurrence: occurrence), text: text)
+        }
+    }
+}
+
+/// A row of plain text with an identity that survives a reordering.
+struct TextRow: Identifiable {
+    let id: TextRowID
+    let text: String
+}
+
+/// The identity of a `TextRow`.
+///
+/// The payload plus which of the identical rows this is: the first is 0,
+/// the second 1. A composite rather than a string so two different rows
+/// can never collide on a separator that happens to occur in the text.
+struct TextRowID: Hashable {
+    let text: String
+    let occurrence: Int
 }

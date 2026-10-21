@@ -78,8 +78,40 @@ sql_hits_for_files() {
 use strict;
 use warnings;
 
+# The statement verbs. A literal carrying one of these is SQL, and the
+# concat rule (a SQL literal next to a `+`) applies to it.
+#
+# A verb alone is not enough — it is also how English says "delete",
+# "update", "select" and "insert". A UI string or a test assertion that
+# says "Delete them, or wire them up: \(keys)" carries a statement verb
+# and an interpolation, and it is not SQL. So a statement verb only makes
+# a literal SQL when the literal also carries SQL *structure* — a clause
+# keyword or a table reference. Every real query has one:
+#
+#   SELECT ... FROM ...      UPDATE ... SET ...      DELETE ... WHERE ...
+#   INSERT INTO ... VALUES ...
+#
+# A "SELECT" with none of those is not a query, it is a sentence. (The
+# clause keywords below are a different matter and are matched on their
+# own — see $FRAG.)
 my $SQL    = qr/\b(?:SELECT|INSERT|UPDATE|DELETE)\b/i;
-my $CTX    = qr/\b(?:FROM|WHERE|VALUES|SET)\b/i;
+# The clause keywords. They are SQL too, but only when a *value* is spliced
+# into them: the repository assembles plenty of static "ORDER BY ..." and
+# "LIMIT ..." fragments with `+`, and those splice nothing. Counting them as
+# statement verbs turned every one of those into a false positive, which is
+# how a rule that says "no value in SQL text" became "no SQL text at all".
+#
+# They are checked separately because the gap this closes is real: the one
+# interpolated query in this repository was a LIMIT, and because LIMIT was on
+# no list at all, the guardrail passed it.
+my $FRAG   = qr/\b(?:LIMIT|UNION|ORDER BY|GROUP BY)\b/i;
+# The structure that turns a statement verb into an actual statement.
+my $CTX    = qr/\b(?:FROM|WHERE|VALUES|SET|INTO|JOIN)\b/i;
+# A URL is not SQL, and the two share vocabulary: a request path like
+# "/api/messages?accountId=...&limit=5" contains a clause keyword and an
+# interpolation, exactly like a spliced LIMIT does. The path markers are what
+# tell them apart.
+my $URLISH = qr{https?://|\A\s*[\"\x27]?/|\?|\&};
 
 # ---------------------------------------------------------------------------
 # Interpolation is NOT one regex. It is three, selected by the kind of literal
@@ -235,15 +267,33 @@ for my $file (@ARGV) {
 
     for my $i (0 .. $#lits) {
         my $l = $lits[$i];
-        next unless $l->{text} =~ $SQL;
+        # A statement verb only makes this SQL when the literal also has SQL
+        # structure. "Delete them: \(keys)" is a sentence, not a query.
+        my $has_verb = $l->{text} =~ $SQL;
+        my $is_statement = $has_verb && ($l->{text} =~ $CTX);
+        my $is_clause    = !$is_statement && $l->{text} =~ $FRAG;
+        next unless $is_statement || $is_clause;
 
         # (a)/(b) the literal itself interpolates a SQL string. has_interp()
         # judges by the kind of delimiter, so a regex escape inside a raw
         # string does not count here.
         if (has_interp($l)) {
+            # A URL is not SQL, and the two share vocabulary: a request path
+            # like "/api/messages?accountId=...&limit=5" carries a clause
+            # keyword and an interpolation, exactly like a spliced LIMIT
+            # does. The path markers are what tell them apart.
+            if (!$is_statement && $l->{text} =~ $URLISH) {
+                next;
+            }
             $report->($l->{line}, 'sql-interpolation');
             next;
         }
+
+        # A clause keyword on its own is not enough for the concat rule: a
+        # static "ORDER BY ..." fragment splices no value, and the repository
+        # is full of them. The concat rule is about a value reaching SQL
+        # text, which only a statement verb suggests.
+        next unless $is_statement;
 
         # (c) bare `+` concatenation with any expression, on the same physical
         # line and on either side of the SQL literal. A `;` on that line means

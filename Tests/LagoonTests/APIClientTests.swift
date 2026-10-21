@@ -591,7 +591,7 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(account.provider, .qq)
         XCTAssertEqual(account.email, "me@qq.com")
         XCTAssertTrue(account.isActive)
-        XCTAssertTrue(account.capabilities.archiveFolder)
+        XCTAssertEqual(account.capabilities.archiveFolder, true)
 
         let request = try XCTUnwrap(StubURLProtocol.capturedRequests.first)
         XCTAssertEqual(request.httpMethod, "POST")

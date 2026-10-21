@@ -66,12 +66,34 @@ public actor AccountSyncLoop {
         // fallback address) but not mutable state: the cursor persisted by the
         // previous round is what the next round resumes from, and reconnect can
         // replace credentials or capabilities while the loop is alive.
+        //
+        // A row that cannot be found is **not** silently ignored. It used to
+        // be: the round returned, and the account kept whatever health it
+        // had — which, after the id-encoding defect, was `needsReconnect`,
+        // which the client rendered as "your authorization code expired".
+        // The truth was "this store cannot find the account row", and the
+        // difference matters: re-entering a perfectly good authorization
+        // code cannot fix a row the server cannot address, so the user was
+        // sent in a circle. The status is now `accountMissing`, which says
+        // what is actually wrong.
         let current: Account
         do {
-            guard let row = try await AccountStore.find(byId: accountId, db: db) else {
+            if let row = try await AccountStore.find(byId: accountId, db: db) {
+                current = row
+            } else if let row = try await AccountStore.findToleratingIDEncoding(
+                byId: accountId, db: db
+            ) {
+                // Found under a different encoding. The mailbox is reachable
+                // and the round can proceed — the row is simply addressed
+                // differently than this build expects.
+                logger.warning("sync.accountIDEncodingMismatch", metadata: [
+                    "account": .string(row.email),
+                ])
+                current = row
+            } else {
+                await markAccountMissing()
                 return true
             }
-            current = row
         } catch {
             await markFailure(error, email: fallbackEmail)
             return false
@@ -140,8 +162,18 @@ public actor AccountSyncLoop {
         guard !capabilitiesChecked else {
             return
         }
+        // A failed negotiation is not written. The routes gate archiving and
+        // deleting on the stored capabilities, so a "no capabilities" record
+        // is not a harmless default — it switches those features off. The old
+        // code marked the negotiation as done *before* attempting it and
+        // wrote whatever came back, so one network blip during the first
+        // round left archiving disabled for the life of the account. Leaving
+        // the flag clear means the next round tries again, and the account
+        // keeps whatever it already knew.
+        guard let capabilities = await provider.capabilities() else {
+            return
+        }
         capabilitiesChecked = true
-        let capabilities = await provider.capabilities()
         try? await AccountStore.updateCapabilities(
             accountId: account.id,
             capabilities: capabilities,
@@ -182,7 +214,12 @@ public actor AccountSyncLoop {
         to account: Account
     ) async throws {
         if changes.resetRequired {
-            try await MessageStore.deleteAll(accountId: account.id, db: db)
+            // Only the inbox axis is wiped. A UIDVALIDITY change invalidates
+            // the server's UID space, not its messages: the mail in the
+            // archive and trash folders is still there and still addressed by
+            // Message-ID, and the app never reads those folders back — so
+            // wiping them would be a deletion with no way to undo it.
+            try await MessageStore.deleteLiveRows(accountId: account.id, db: db)
             logger.warning("sync.reset", metadata: ["account": .string(account.email)])
         }
         for header in changes.upserts {
@@ -194,9 +231,17 @@ public actor AccountSyncLoop {
             )
         }
         if let inboxRemoteIds = changes.inboxRemoteIds {
+            // The provider says where each message is, not just that it is
+            // no longer in the inbox. The store removes a row only for a
+            // message the provider confirmed is gone — a message that was
+            // filed (here or in another client) is re-labelled, and a message
+            // whose whereabouts are unknown is left alone.
             try await MessageStore.reconcileInbox(
                 accountId: account.id,
                 keeping: inboxRemoteIds,
+                archived: changes.archivedRemoteIds ?? [],
+                trashed: changes.trashedRemoteIds ?? [],
+                removing: changes.removedRemoteIds ?? [],
                 db: db
             )
         }
@@ -266,6 +311,41 @@ public actor AccountSyncLoop {
     }
 
     // MARK: - Failure handling
+
+    /// The account row cannot be found by the id this loop holds.
+    ///
+    /// Recorded as `accountMissing`, **not** `needsReconnect`. The two are
+    /// different facts with different remedies, and conflating them is what
+    /// produced the lie the user was told:
+    ///
+    /// - `needsReconnect` means "your authorization code is wrong" — and the
+    ///   remedy is to enter a new one. It was recorded here because the
+    ///   account could not be found, and the client rendered it as an
+    ///   expired authorization code.
+    /// - `accountMissing` means "this store cannot address the account" —
+    ///   and re-entering the code changes nothing, because the write goes
+    ///   to a row the server still cannot find.
+    ///
+    /// The health write is best-effort (`try?`): the row that would hold it
+    /// is, by definition, the one that cannot be found. So the status cannot
+    /// always be persisted — but the loop still parks rather than spinning,
+    /// and the log line records what happened.
+    private func markAccountMissing() async {
+        await shutdown()
+        consecutiveFailures = 0
+        logger.error("sync.accountMissing", metadata: [
+            "account": .string(fallbackEmail),
+        ])
+        try? await AccountStore.updateHealth(
+            accountId: accountId,
+            health: SyncHealth(
+                status: .accountMissing,
+                lastSyncAt: nil,
+                lastError: MailError.accountMissing("").logLabel
+            ),
+            db: db
+        )
+    }
 
     /// Credentials are wrong, revoked, or absent: record `needsReconnect`, drop
     /// the cached provider, and park until the user reconnects.

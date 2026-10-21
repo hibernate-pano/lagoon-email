@@ -19,7 +19,14 @@ import LagoonKit
 enum SidebarDestination: Hashable, Identifiable {
     /// The Briefing Feed — the classified surface that is the product's front door.
     case briefing
-    /// Every live message, unfiltered.
+    /// The **inbox** — every live message, unfiltered.
+    ///
+    /// The name is historical: it used to be called 全部邮件 / "All messages",
+    /// which was a promise the server could not keep. `filterSQL` answers
+    /// this destination with `is_archived = FALSE AND is_deleted = FALSE AND
+    /// is_sent = FALSE` — the inbox, deliberately *excluding* sent mail, so
+    /// a reply the user wrote never appears in their own inbox. The label
+    /// now says 收件箱 / Inbox, which is what the list actually holds.
     case allMessages
     /// Live messages the user has not read.
     case unread
@@ -124,10 +131,38 @@ struct Sidebar: View {
                 row(.deleted, icon: "trash")
             }
             if !rules.isEmpty {
-                Section(l10n.stackRulesHeader) {
+                // The section carries a caption, because 「我的分组」 and the
+                // Briefing's five groups are **two** grouping mechanisms and
+                // nothing on screen said so.
+                //
+                // The failure this prevents is specific: a user creates a
+                // group, sees it here with a live count, clicks it, sees
+                // exactly the mail they expected — and then finds the same
+                // mail still filed under 可归档 in the Briefing. With no
+                // caption the only conclusion available is "the AI ignores my
+                // rules", and that conclusion is wrong.
+                //
+                // The caption appears only when the user *has* groups. A user
+                // who has never made one does not need to be told what a group
+                // is; they need to be left alone.
+                //
+                // The title keeps the platform's own section-header look
+                // (`Text` with no font override), and the two caption lines
+                // are `.caption` + `.secondary` — the same treatment every
+                // other explanatory line in this app uses.
+                Section {
                     ForEach(rules) { summary in
-                        row(.rule(summary.rule.id), icon: "label", title: summary.rule.name,
-                            count: summary.count)
+                        row(.rule(summary.rule.id), icon: "label", count: summary.count)
+                    }
+                } header: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(l10n.myGroups)
+                        Text(l10n.stackGroupsCaption)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(l10n.stackGroupsCaptionLimit)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -135,6 +170,13 @@ struct Sidebar: View {
         .listStyle(.sidebar)
         // A sidebar row with a badge but no label is unreadable; the count is
         // an aid, never the content.
+        //
+        // The label goes on the *sections*, not on the List: a label on the
+        // container replaces the accessibility of everything inside it, so
+        // VoiceOver would read "侧边栏导航" and then nothing — no "未读 12
+        // 封", no "简报", nothing. `children: .contain` keeps each row
+        // readable while still grouping the list as one region.
+        .accessibilityElement(children: .contain)
         .accessibilityLabel(l10n.sidebarNavigation)
     }
 
@@ -147,13 +189,12 @@ struct Sidebar: View {
     private func row(
         _ destination: SidebarDestination,
         icon: String,
-        title customTitle: String? = nil,
         count: Int? = nil
     ) -> some View {
         let resolved = count ?? destination.countKey.flatMap { counts[$0] }
         Label {
             HStack {
-                Text(customTitle ?? title(for: destination))
+                Text(title(for: destination))
                 Spacer(minLength: 4)
                 if let resolved, resolved > 0 {
                     Text("\(resolved)")
@@ -169,6 +210,15 @@ struct Sidebar: View {
         .accessibilityValue(resolved.map { "\($0)" } ?? "")
     }
 
+    /// A destination's name, as the user sees it.
+    ///
+    /// A rule's name is the **user's own** name for it, looked up in the
+    /// same `rules` list the row is built from. It used to be passed in
+    /// alongside the destination as a `customTitle`, which left this
+    /// function's `.rule` branch as dead code returning a category name
+    /// (「分组规则」) that no row ever showed — and would have shown,
+    /// wrongly, the moment a rule row was built without the override. One
+    /// place resolves the name now, and the branch is live.
     private func title(for destination: SidebarDestination) -> String {
         switch destination {
         case .briefing: return l10n.briefing
@@ -178,7 +228,11 @@ struct Sidebar: View {
         case .archived: return l10n.stackArchivedRow
         case .deleted: return l10n.sidebarDeleted
         case .sent: return l10n.sidebarSent
-        case .rule: return l10n.stackRulesHeader
+        case .rule(let id):
+            // A rule the list does not know (deleted in another window, or
+            // not yet loaded) has no name to show; the rules header is the
+            // honest stand-in rather than a blank row.
+            return rules.first { $0.rule.id == id }?.rule.name ?? l10n.stackRulesHeader
         }
     }
 }

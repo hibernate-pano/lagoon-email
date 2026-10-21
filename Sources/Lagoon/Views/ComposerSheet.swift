@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import LagoonKit
 
 /// Plain-text reply composer. To and Subject are read-only echoes of the
@@ -28,18 +29,46 @@ struct ComposerSheet: View {
     /// indicator doesn't lie about freshness.
     @State private var draftJustSaved = false
     @State private var draftSavedResetTask: Task<Void, Never>?
+    /// The pending draft write.
+    ///
+    /// Every keystroke used to write `UserDefaults` synchronously and to
+    /// cancel-and-recreate the indicator's reset task: a hundred words cost
+    /// a hundred writes and a hundred task cancellations, on the main
+    /// thread, while the user was typing. The write is debounced now — one
+    /// write per pause — and the "saved" tick is shown when the write
+    /// actually lands, so the indicator cannot claim a save that has not
+    /// happened.
+    @State private var draftWriteTask: Task<Void, Never>?
+    /// Set once the reply has been sent, so the teardown flush does not put
+    /// the body the user just sent back into the draft slot.
+    @State private var didSend = false
     /// Stable across retries; changes only when the composer is created anew.
     @State private var requestId = UUID().uuidString.lowercased()
+    /// Files to send with the reply.
+    ///
+    /// "Reply with the edited spreadsheet" is the most common reason a
+    /// person attaches a file at all, and the reply composer is where
+    /// that happens. So attachments live here, not only in the new-message
+    /// sheet.
+    @State private var attachments: [OutgoingAttachment] = []
+    /// The file picker is open.
+    @State private var isPickingFiles = false
     private let draftKey: String
     private let api = APIClient.shared
 
     /// The `To:` line split into an array for the reply-all override.
     /// A plain reply passes a single-element array (the same address the
     /// server would have derived), so the send path is uniform.
+    ///
+    /// The split goes through `AddressList`, not `split(separator: ",")`:
+    /// a comma is not always a separator — it can sit inside a quoted
+    /// display name (`"Zhang, Wei" <wei@example.com>`) — and splitting on
+    /// every comma turned one recipient into two, the second of which was
+    /// not an address at all. The server parses the same line with the
+    /// same parser, so the client and the server now agree on what the
+    /// recipient list is.
     private var toRecipients: [String] {
-        to.split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        AddressList.bareAddresses(to)
     }
 
     init(
@@ -159,6 +188,8 @@ struct ComposerSheet: View {
                 }
             }
 
+            attachmentsSection
+
             TextEditor(text: $bodyText)
                 .font(.body)
                 .frame(minHeight: 220)
@@ -177,22 +208,7 @@ struct ComposerSheet: View {
                     }
                 }
                 .onChange(of: bodyText) { _, newValue in
-                    let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if trimmed.isEmpty {
-                        UserDefaults.standard.removeObject(forKey: draftKey)
-                    } else {
-                        UserDefaults.standard.set(newValue, forKey: draftKey)
-                    }
-                    // Flash the "saved" checkmark for 1.6 s after every
-                    // keystroke. The reset task is cancelled and replaced
-                    // so rapid typing doesn't leave the indicator stuck on.
-                    draftSavedResetTask?.cancel()
-                    draftJustSaved = !trimmed.isEmpty
-                    draftSavedResetTask = Task { @MainActor in
-                        try? await Task.sleep(for: .milliseconds(1_600))
-                        guard !Task.isCancelled else { return }
-                        draftJustSaved = false
-                    }
+                    scheduleDraftWrite(newValue)
                 }
 
             if let error {
@@ -237,6 +253,147 @@ struct ComposerSheet: View {
         }
         .padding(20)
         .frame(width: 560)
+        // The sheet is closing: whatever is on screen is what belongs in the
+        // draft slot, and the debounced write may still be pending. Flushing
+        // here is what keeps a draft that was typed in the last half second
+        // from being lost.
+        .onDisappear {
+            draftWriteTask?.cancel()
+            draftWriteTask = nil
+            guard !didSend else { return }
+            writeDraft(bodyText)
+        }
+        .fileImporter(
+            isPresented: $isPickingFiles,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            handlePickedFiles(result)
+        }
+    }
+
+    // MARK: - Attachments
+
+    /// The attachment list and the button that adds to it.
+    ///
+    /// Above the body, not below it: the user needs to see what is
+    /// attached while they write, not after they have written.
+    @ViewBuilder
+    private var attachmentsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(l10n.newMessageAttachments)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if !attachments.isEmpty {
+                    Text(l10n.newMessageAttachmentCount(count: attachments.count))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+                Button {
+                    isPickingFiles = true
+                } label: {
+                    Label(l10n.newMessageAddAttachment, systemImage: "paperclip")
+                        .font(.caption)
+                }
+                .buttonStyle(.link)
+            }
+            ForEach(attachments) { attachment in
+                HStack(spacing: 6) {
+                    Image(systemName: "doc")
+                        .foregroundStyle(.secondary)
+                    Text(attachment.filename)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(attachment.displaySize)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Spacer()
+                    Button {
+                        attachments.removeAll { $0.id == attachment.id }
+                    } label: {
+                        Image(systemName: "minus.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(l10n.newMessageRemoveAttachment)
+                }
+                .font(.callout)
+            }
+        }
+    }
+
+    /// Reads the picked files and turns them into attachments.
+    ///
+    /// A file that cannot be read, or that is empty or too big, is
+    /// reported by name and skipped — the other files still go out.
+    private func handlePickedFiles(_ result: Result<[URL], Error>) {
+        switch result {
+        case .failure:
+            error = l10n.newMessageAttachmentReadFailed
+        case .success(let urls):
+            var failures: [String] = []
+            for url in urls {
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                do {
+                    let data = try Data(contentsOf: url)
+                    let name = url.lastPathComponent
+                    let attachment = OutgoingAttachment(
+                        filename: name,
+                        mimeType: NewMessageSheet.mimeType(for: url),
+                        data: data
+                    )
+                    if attachment.data.isEmpty {
+                        failures.append(l10n.newMessageAttachmentEmpty(name))
+                        continue
+                    }
+                    guard attachment.isSendable else {
+                        failures.append(l10n.newMessageAttachmentTooLarge(name))
+                        continue
+                    }
+                    attachments.append(attachment)
+                } catch {
+                    failures.append(l10n.newMessageAttachmentReadFailed)
+                }
+            }
+            error = failures.isEmpty ? nil : failures.joined(separator: "\n")
+        }
+    }
+
+    /// Schedules the draft write, debounced.
+    ///
+    /// The task is cancelled and replaced on every keystroke, so a burst of
+    /// typing produces one write — at the end of the burst — instead of one
+    /// per key press.
+    private func scheduleDraftWrite(_ text: String) {
+        draftWriteTask?.cancel()
+        draftWriteTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled else { return }
+            writeDraft(text)
+        }
+    }
+
+    /// Writes the draft to disk and confirms it.
+    private func writeDraft(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: draftKey)
+        } else {
+            UserDefaults.standard.set(text, forKey: draftKey)
+        }
+        // Flash the "saved" checkmark for 1.6 s after the write lands. The
+        // reset task is cancelled and replaced so a second write does not
+        // leave the indicator stuck on.
+        draftSavedResetTask?.cancel()
+        draftJustSaved = !trimmed.isEmpty
+        draftSavedResetTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(1_600))
+            guard !Task.isCancelled else { return }
+            draftJustSaved = false
+        }
     }
 
     private func send() async {
@@ -254,8 +411,15 @@ struct ComposerSheet: View {
                 body: trimmed,
                 requestId: requestId,
                 to: toRecipients,
-                cc: cc.isEmpty ? nil : cc
+                cc: cc.isEmpty ? nil : cc,
+                attachments: attachments
             )
+            didSend = true
+            // The pending write must not land after the send: it would put
+            // the body the user just sent back into the draft slot, and the
+            // next reply to the same message would start from the sent text.
+            draftWriteTask?.cancel()
+            draftWriteTask = nil
             UserDefaults.standard.removeObject(forKey: draftKey)
             // Subtle "Pop" confirms the send landed — the dismiss animation
             // is silent, this fills the gap between "send" and "sheet gone".

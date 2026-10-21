@@ -27,6 +27,22 @@ struct AboutSheet: View {
         return "\(short) (\(build))"
     }()
 
+    /// The data-handling disclosure, presented as its own sheet.
+    ///
+    /// A sheet rather than a paragraph in this box: the disclosure is four
+    /// paragraphs long, and burying it under a scroll view in a 360-point
+    /// dialog is the same as not shipping it.
+    @State private var showPrivacy = false
+
+    /// The data-and-backup panel.
+    ///
+    /// The other half of the privacy promise: "your data stays on this Mac"
+    /// is only half a promise, and the half it was missing was "and you can
+    /// take it with you". Same reason it is a sheet — the export alone needs
+    /// a scope picker, a progress line and a cancel button, none of which fit
+    /// under a 360-point dialog.
+    @State private var showBackup = false
+
     var body: some View {
         VStack(spacing: 16) {
             // The app icon — at 96pt it's large enough to read on a
@@ -64,7 +80,7 @@ struct AboutSheet: View {
 
             VStack(spacing: 6) {
                 Button {
-                    NSWorkspace.shared.open(URL(string: "mailto:feedback@lagoon.email")!)
+                    NSWorkspace.shared.open(LagoonHelp.feedbackMailto)
                 } label: {
                     Label(l10n.aboutFeedback, systemImage: "envelope")
                 }
@@ -76,6 +92,29 @@ struct AboutSheet: View {
                     Label(l10n.aboutWebsite, systemImage: "safari")
                 }
                 .buttonStyle(.link)
+
+                // "Your data stays on this Mac" is a claim the user cannot
+                // check for themselves, so the claim and its exceptions are
+                // one click away — including the parts that are *not*
+                // encrypted.
+                Button {
+                    showPrivacy = true
+                } label: {
+                    Label(l10n.aboutPrivacy, systemImage: "hand.raised")
+                }
+                .buttonStyle(.link)
+
+                // The other half of that promise. Until this existed the
+                // product told the user their mail was theirs and then gave
+                // them no way to take it: no export, no backup button, no
+                // path to another mail client. 「数据与备份」 is where the
+                // promise gets paid.
+                Button {
+                    showBackup = true
+                } label: {
+                    Label(l10n.backupSectionTitle, systemImage: "externaldrive")
+                }
+                .buttonStyle(.link)
             }
 
             Spacer(minLength: 0)
@@ -84,6 +123,19 @@ struct AboutSheet: View {
                 .keyboardShortcut(.defaultAction)
         }
         .padding(24)
-        .frame(width: 360, height: 360)
+        .frame(
+            width: LagoonSheetSize.compact.width,
+            height: LagoonSheetSize.compact.height
+        )
+        .sheet(isPresented: $showPrivacy) {
+            PrivacySheet()
+        }
+        .sheet(isPresented: $showBackup) {
+            // `RootView` injects `DirectoryStore` for the whole app, and this
+            // sheet is presented from inside it — so the export scope picker
+            // reads the same account list every other surface does instead of
+            // fetching its own copy.
+            BackupSheet()
+        }
     }
 }

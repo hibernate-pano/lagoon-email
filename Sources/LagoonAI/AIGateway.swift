@@ -19,6 +19,10 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
     private let logger: Logger
     public let outputLanguage: String
     private let budget: BudgetPolicy
+    /// What the user actually acts on, read-only. Nil when no preference
+    /// source is wired — the prompt then carries no few-shot examples, which
+    /// is the state the product shipped in before the learning loop existed.
+    private let preferences: (any AdvicePreferenceProviding)?
     /// Global degraded-signal timestamps (V2 C1): credit exhaustion clears
     /// on the next success, so a top-up recovers without a restart.
     private let statusLock = NSLock()
@@ -54,12 +58,14 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
         routing: [String: String],
         outputLanguage: String = AIGateway.defaultOutputLanguage,
         budget: BudgetPolicy = NoBudgetPolicy(),
+        preferences: (any AdvicePreferenceProviding)? = nil,
         logger: Logger = Logger(label: "lagoon.ai")
     ) {
         self.providers = providers
         self.routing = routing
         self.outputLanguage = outputLanguage
         self.budget = budget
+        self.preferences = preferences
         self.breaker = CircuitBreaker()
         self.logger = logger
     }
@@ -109,6 +115,7 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
         fileURL: URL? = nil,
         session: URLSession = ProviderHTTP.makeSession(),
         budget: BudgetPolicy = NoBudgetPolicy(),
+        preferences: (any AdvicePreferenceProviding)? = nil,
         logger: Logger = Logger(label: "lagoon.ai")
     ) -> AIGateway? {
         do {
@@ -123,6 +130,7 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
                 routing: routing,
                 outputLanguage: language,
                 budget: budget,
+                preferences: preferences,
                 logger: logger
             ) // fromEnvironment has no Postgres connection; budget is NoBudgetPolicy. App.swift wires the real one.
         } catch {
@@ -157,11 +165,24 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
         let provider = provider(for: .classify)
         var result: [String: ClassificationOutcome] = [:]
 
+        // What this user actually acts on, read once per call rather than
+        // once per batch: the batches differ only in which headers they
+        // carry, and the preference is a property of the account, not of the
+        // batch.
+        //
+        // The account comes from the messages themselves. `BriefingClassifying`
+        // hands the classifier an account *email*, not an id, and every
+        // message in one call belongs to the account whose feed is being
+        // classified — so the first header names the account.
+        let preferences = await acceptedPreferences(for: messages)
+
         for start in stride(from: 0, to: messages.count, by: Self.classificationBatchSize) {
             let end = min(start + Self.classificationBatchSize, messages.count)
             let batch = Array(messages[start..<end])
             let languageTag = language.flatMap { $0.isEmpty ? nil : $0 } ?? outputLanguage
-            let user = classificationPrompt(for: batch, language: languageTag)
+            let user = classificationPrompt(
+                for: batch, language: languageTag, preferences: preferences
+            )
             try await chargeBudgetPreCheck(
                 capability: .classify,
                 provider: provider,
@@ -240,11 +261,65 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
         )
     }
 
+    /// Reads the account's accepted-suggestion distribution.
+    ///
+    /// Empty when no preference source is wired, when the account has never
+    /// acted on a suggestion, or when the read failed. All three mean the
+    /// same thing to the prompt: no few-shot examples, which is exactly what
+    /// the model saw before the learning loop existed.
+    private func acceptedPreferences(
+        for messages: [MessageHeader]
+    ) async -> [AcceptedAdviceStat] {
+        guard let preferences else { return [] }
+        guard let accountId = messages.first?.accountId else { return [] }
+        return await preferences.acceptedAdviceStats(accountId: accountId)
+    }
+
+    /// The few-shot hint block: what this user has actually acted on.
+    ///
+    /// ## Why it is a hint and not a rule
+    ///
+    /// The prompt says these are *tendencies the user has shown*, never
+    /// orders. A model told "the user usually archives newsletters" and
+    /// nothing else will start over-suggesting archive for anything vaguely
+    /// marketing-shaped — so the wording has to make clear that the advice is
+    /// still the model's own judgement about the mail in front of it.
+    ///
+    /// ## Why it stays small
+    ///
+    /// The server caps this at a handful of rows. A prompt that grows with the
+    /// user's history is a cost problem: the classifier runs over the whole
+    /// feed on every refresh, and this codebase already keeps a six-hour
+    /// classification cache for exactly that reason.
+    private static func preferenceHint(_ stats: [AcceptedAdviceStat]) -> String? {
+        guard !stats.isEmpty else { return nil }
+        let lines = stats.map { stat -> String in
+            let category = stat.category?.rawValue ?? "other"
+            return "- \(category) -> \(stat.action.rawValue) (accepted \(stat.count)x)"
+        }
+        return """
+            Tendencies this user has shown by acting on past suggestions \
+            (a hint about their habits, never an order — still judge each email \
+            on its own content):
+            \(lines.joined(separator: "\n"))
+            """
+    }
+
     private func classificationPrompt(
         for messages: [MessageHeader],
-        language: String
+        language: String,
+        preferences: [AcceptedAdviceStat] = []
     ) -> String {
-        // Only headers/snippet/age — never a body (spec §6.6 rule 5).
+        // Headers, the preview and the age — never the full body.
+        //
+        // The preview is body text (it is the first lines of the body), and
+        // it does leave this machine, because the model has to see something
+        // to classify. The comment that used to stand here said "never a
+        // body (spec §6.6 rule 5)" — which was true of the *body* and false
+        // of the *preview*, and the difference is exactly what a user is
+        // entitled to know before turning the AI on. It is now stated the
+        // way it is, and the user-facing copy in the AI settings says the
+        // same thing.
         let rows: [[String: Any]] = messages.map { message in
             var row: [String: Any] = [
                 "id": message.remoteId,
@@ -293,10 +368,15 @@ public final class AIGateway: BriefingClassifying, MessageSummarizing, MessageDr
             that looks like a receipt, an invoice or anything financial.
             """
         let languageLine = "Write every rationale in \(languageName)."
+        // The hint is optional by construction: with no accepted suggestions
+        // there is nothing to say, and an empty section would be a sentence
+        // about an absence.
+        let hint = Self.preferenceHint(preferences)
+        let hintBlock = hint.map { "\($0)\n" } ?? ""
         return """
             \(languageLine)
             \(prompt)
-            Emails: \(rowsJSON)
+            \(hintBlock)Emails: \(rowsJSON)
             """
     }
 

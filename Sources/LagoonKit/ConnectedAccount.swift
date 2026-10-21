@@ -2,10 +2,11 @@ import Foundation
 
 /// Response payload of GET /api/accounts. Shared between server and client.
 ///
-/// This is the OAuth completion handshake for M0: the macOS app is a bare
-/// SwiftPM executable with no `Info.plist`, so it cannot register a custom URL
-/// scheme and the server cannot deep-link the new `accountId` back to it.
-/// Instead the client polls this endpoint while the connect screen is visible.
+/// This is the OAuth completion handshake for M0. The app *does* register a
+/// `lagoon://` URL scheme now (see `Support/Info.plist`), but the handshake
+/// itself did not need it: the server cannot deep-link a new `accountId` back
+/// to a client that may not be running yet, so the client polls this
+/// endpoint while the connect screen is visible.
 ///
 /// `isActive` is the server's single sync owner. Other accounts remain stored
 /// but dormant. `unreadCount` is the local cached count for this mailbox.

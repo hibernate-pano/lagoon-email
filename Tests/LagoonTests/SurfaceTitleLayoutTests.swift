@@ -14,6 +14,11 @@ import Foundation
 /// responded, and looked like a bug in the product rather than a layout
 /// mistake in a change made four days earlier.
 ///
+/// (The string was 全部邮件 at the time; it is 收件箱 now — the copy-honesty
+/// audit renamed it, P2-04, because the list is the inbox and not all mail.
+/// The wrapping hazard this file exists for is unchanged: a CJK title with
+/// no width constraint of its own.)
+///
 /// The fix is `fixedSize()` on both titles. This file exists because a
 /// `fixedSize()` is invisible in review and trivial to drop in a later edit,
 /// and because "the heading wrapped" is exactly the kind of regression that
@@ -36,7 +41,7 @@ final class SurfaceTitleLayoutTests: XCTestCase {
     /// The titles that must never wrap, read from the real `L10n` values.
     ///
     /// These are the titles the two surfaces actually render:
-    /// `MessageListView.surfaceTitle` (全部邮件 — the fallback case beside
+    /// `MessageListView.surfaceTitle` (收件箱 — the fallback case beside
     /// every other lens) and `BriefingFeedView`'s header.
     private func protectedTitles() -> [(chinese: String, english: String)] {
         let zh = L10n(language: .zhHans)
@@ -122,9 +127,9 @@ final class SurfaceTitleLayoutTests: XCTestCase {
         let palette = CommandPaletteView(
             onNewMessage: {}, onSearch: {}, onToggleSurface: {},
             onShowUsage: {}, onShowActionHistory: {},
-            onShowAdvice: {}, onShowSenderRanking: {},
+            onShowAdvice: {}, onShowReminders: {}, onShowSenderRanking: {},
             onCycleDensity: {}, onShowShortcuts: {}, onShowAISettings: {},
-            onRefresh: {}, onToggleSound: {}
+            onRefresh: {}, onGetNewMail: {}, onToggleSound: {}
         )
         XCTAssertTrue(
             palette.allCommands.contains { $0.id == "density" },

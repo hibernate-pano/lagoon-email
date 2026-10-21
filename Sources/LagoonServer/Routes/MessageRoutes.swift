@@ -9,6 +9,35 @@ import LagoonAI
 /// `POST /api/messages/{remoteId}/send` response.
 struct SendResponse: Codable { let ok: Bool; let providerMessageId: String? }
 
+/// One attachment in a compose request.
+///
+/// The bytes travel as base64 because JSON has no byte type; the name and
+/// the MIME type travel as plain strings. All three are remote-controlled
+/// as far as the server is concerned, and each is handled where it can do
+/// damage: the name and the type end up in MIME headers (so `MIMEBuilder`
+/// sanitises them), and the bytes are only ever written into the encoded
+/// body.
+struct ComposeAttachmentPayload: Codable, Sendable {
+    let filename: String
+    let mimeType: String
+    let dataBase64: String
+}
+
+/// What a send request may do next, decided by the claim it took (or did
+/// not get).
+private enum SendPermit {
+    /// Send the mail. `claimRowId` is the claim row to complete when the
+    /// mail is on the wire, or to release when it is not; nil when the
+    /// client sent no idempotency key, in which case there is no claim
+    /// and the audit row is written after the send, as it always was.
+    case proceed(claimRowId: Int64?)
+    /// The mail already went out under this idempotency key: replay the
+    /// stored result instead of sending it a second time.
+    case replay(providerMessageId: String?)
+    /// Another request holds this idempotency key and is still sending.
+    case conflict
+}
+
 /// Message-level M1 endpoints: full body, read state, pinning and AI summary.
 public enum MessageRoutes {
     public static func register(
@@ -415,6 +444,16 @@ public enum MessageRoutes {
                 logger: logger
             )
         }
+
+        // POST /api/messages/{remoteId}/forward?accountId=<uuid>
+        // 200 SendResponse | 400 malformed-forward | 404 unknown-message
+        // | 409 forward-too-large | 401 smtp-auth-failed | 502 smtp-send-failed
+        router.post("api/messages/:remoteId/forward") { request, context -> Response in
+            return await Self.forwardHandler(
+                request: request, context: context, db: db,
+                makeProvider: makeProvider, logger: logger
+            )
+        }
     }
 
     // MARK: - Send
@@ -430,7 +469,10 @@ public enum MessageRoutes {
         }
         let rawBody: Data
         do {
-            rawBody = try await RouteParams.collectBody(request)
+            // The attachment-sized cap: this is the one endpoint that may
+            // carry files, and 1 MB would refuse a perfectly ordinary
+            // attachment before the user ever got to see why.
+            rawBody = try await RouteParams.collectAttachmentBody(request)
         } catch {
             return RouteJSON.error(.badRequest, "malformed-compose")
         }
@@ -439,6 +481,13 @@ public enum MessageRoutes {
             let subject: String
             let body: String
             let requestId: String?
+            /// Carbon-copy recipients. Optional so an older client that only
+            /// knows `to` still works.
+            let cc: [String]?
+            /// Blind carbon-copy recipients. Optional for the same reason.
+            let bcc: [String]?
+            /// Files to attach. Optional for the same reason.
+            let attachments: [ComposeAttachmentPayload]?
         }
         guard let decoded = try? JSONDecoder().decode(ComposeRequest.self, from: rawBody)
         else {
@@ -447,12 +496,40 @@ public enum MessageRoutes {
         let to = decoded.to.trimmingCharacters(in: .whitespacesAndNewlines)
         let subject = decoded.subject.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = decoded.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard Self.isValidRecipient(to),
-              !subject.containsHeaderInjection,
-              !body.isEmpty
-        else {
+        guard !subject.containsHeaderInjection, !body.isEmpty else {
             return RouteJSON.error(.badRequest, "malformed-compose")
         }
+        // The To field is a **list**: one address per recipient, separated
+        // by commas. It used to be one address, and two addresses came back
+        // as `malformed-compose` — the user typed a perfectly ordinary
+        // "one@example.com, two@example.com" and got a 400 with nothing to
+        // act on.
+        //
+        // Each entry is validated on its own, and one bad address refuses
+        // the whole request rather than being dropped: a silently missing
+        // recipient is a mail that went to fewer people than the user
+        // asked, and nothing in the UI would say so.
+        let toAddresses = Self.recipientList(from: to)
+        guard let toAddresses, !toAddresses.isEmpty else {
+            return RouteJSON.error(.badRequest, "malformed-recipient")
+        }
+        // Cc and Bcc are lists, and each entry is validated on its own: one
+        // bad address must not invalidate the good ones, and it must not be
+        // silently dropped either. The list is rejected as a whole, with a
+        // distinct code, so the client can say "that address is not valid"
+        // instead of "the send failed".
+        let cc = Self.recipientList(decoded.cc)
+        let bcc = Self.recipientList(decoded.bcc)
+        guard cc != nil, bcc != nil else {
+            return RouteJSON.error(.badRequest, "malformed-recipient")
+        }
+        let attachments = Self.decodeAttachments(decoded.attachments)
+        guard attachments != nil else {
+            return RouteJSON.error(.badRequest, "malformed-attachment")
+        }
+        let ccAddresses = cc ?? []
+        let bccAddresses = bcc ?? []
+        let outboundAttachments = attachments ?? []
         let requestId = decoded.requestId.flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
         if decoded.requestId != nil, requestId == nil {
             return RouteJSON.error(.badRequest, "malformed-request-id")
@@ -474,6 +551,8 @@ public enum MessageRoutes {
         guard let provider = makeProvider(account) else {
             return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
         }
+        // Fast path: this requestId has already gone out. Replay the stored
+        // result instead of sending a second copy.
         if let requestId {
             do {
                 if let existing = try await AIActionStore.findSend(
@@ -495,43 +574,425 @@ public enum MessageRoutes {
             }
         }
 
+        // Claim the send before it goes out. Two requests carrying the
+        // same requestId must not both put the mail on the wire.
+        let claimRowId: Int64?
+        do {
+            switch try await Self.claimSend(
+                accountId: accountId,
+                requestId: requestId,
+                payload: ["to": to, "type": "compose"],
+                db: db
+            ) {
+            case .replay(let providerMessageId):
+                return RouteJSON.response(SendResponse(
+                    ok: true,
+                    providerMessageId: providerMessageId
+                ))
+            case .conflict:
+                return RouteJSON.error(.conflict, "send-in-flight")
+            case .proceed(let rowId):
+                claimRowId = rowId
+            }
+        } catch {
+            logger.error("compose.claimFailed", metadata: [
+                "accountId": .string(accountId.uuidString),
+                "err": .string("\(error)"),
+            ])
+            return RouteJSON.error(.internalServerError, "internal-error")
+        }
+
         let outbound = OutboundMessage(
             fromEmail: account.email,
             fromName: nil,
             to: to,
+            cc: ccAddresses,
+            bcc: bccAddresses,
             subject: subject,
             body: body,
             inReplyTo: nil,
             references: nil,
-            isReply: false
+            isReply: false,
+            attachments: outboundAttachments
         )
         let providerMessageId: String?
         do {
             providerMessageId = try await provider.send(outbound)
         } catch {
+            // The mail is not out, so the claim must go back: the user's
+            // retry with the same requestId has to be able to try again.
+            await Self.releaseClaim(
+                claimRowId, reason: Self.providerLabel(error), db: db, logger: logger
+            )
             return Self.sendError(error, logger: logger, remoteId: "compose")
         }
+        var payload = ["to": to, "type": "compose"]
+        if let providerMessageId {
+            payload["providerMessageId"] = providerMessageId
+        }
+        await Self.recordSendOutcome(
+            accountId: accountId,
+            claimRowId: claimRowId,
+            payload: payload,
+            db: db,
+            logger: logger
+        )
+        return RouteJSON.response(SendResponse(ok: true, providerMessageId: providerMessageId))
+    }
+
+    /// Forwards a message to someone else.
+    ///
+    /// ## Why this is a server route and not client-side string surgery
+    ///
+    /// The old forward took the message's plain-text body, wrapped it in
+    /// `>` characters, and sent that as a new message. The recipient got
+    /// a wall of quoted text: the original's HTML formatting was gone, its
+    /// attachments were gone, its headers were gone, and what was left
+    /// could not be replied to in the original thread.
+    ///
+    /// RFC 5322 §3.6.4 has the answer. A forwarded message travels as a
+    /// `message/rfc822` part — the **original message**, bytes and all,
+    /// wrapped inside the new one. The recipient's client renders the
+    /// original as it was and offers its attachments as the original's
+    /// attachments.
+    ///
+    /// And the original's bytes have to come from the server: only the
+    /// server has the raw RFC 5322 message. The client has a *parsed*
+    /// body — the text, the HTML and the attachment metadata — and
+    /// reassembling an original from a parse is a guess.
+    ///
+    /// So the client says "forward this message to these people with this
+    /// note", and the server fetches the original raw message, wraps it,
+    /// and sends.
+    private static func forwardHandler(
+        request: Request,
+        context: BasicRequestContext,
+        db: LagoonDB,
+        makeProvider: MailProviderFactory.Builder,
+        logger: Logger
+    ) async -> Response {
+        guard let accountId = RouteParams.accountId(from: request) else {
+            return RouteJSON.error(.badRequest, "malformed-accountId")
+        }
+        guard let remoteId = RouteParams.remoteId(from: context) else {
+            return RouteJSON.error(.badRequest, "malformed-remoteId")
+        }
+        let rawBody: Data
         do {
-            var payload = ["to": to, "type": "compose"]
-            if let requestId {
-                payload["requestId"] = requestId
-            }
-            if let providerMessageId {
-                payload["providerMessageId"] = providerMessageId
-            }
-            _ = try await AIActionStore.record(
-                accountId: accountId,
-                kind: .send,
-                payload: payload,
-                db: db
-            )
+            rawBody = try await RouteParams.collectBody(request)
         } catch {
-            logger.warning("compose.auditFailed", metadata: [
-                "to": .string(to),
+            return RouteJSON.error(.badRequest, "malformed-forward")
+        }
+        struct ForwardRequest: Decodable {
+            /// The people the original goes to.
+            let to: [String]
+            /// The user's own note above the forwarded message.
+            let body: String?
+            /// The subject of the new message. Empty means "Fwd: <original>".
+            let subject: String?
+            let cc: [String]?
+            let bcc: [String]?
+            let requestId: String?
+        }
+        guard let decoded = try? JSONDecoder().decode(ForwardRequest.self, from: rawBody),
+              !decoded.to.isEmpty
+        else {
+            return RouteJSON.error(.badRequest, "malformed-forward")
+        }
+        // Every recipient must be a routable address, and one bad address
+        // refuses the whole forward rather than silently dropping a
+        // recipient: a mail that reached fewer people than the user asked
+        // is a mail the user cannot tell was wrong.
+        for address in decoded.to where !Self.isValidRecipient(address) {
+            return RouteJSON.error(.badRequest, "malformed-recipient")
+        }
+        if let copies = decoded.cc {
+            for address in copies where !Self.isValidRecipient(address) {
+                return RouteJSON.error(.badRequest, "malformed-recipient")
+            }
+        }
+        let bcc = Self.recipientList(decoded.bcc)
+        guard bcc != nil else {
+            return RouteJSON.error(.badRequest, "malformed-recipient")
+        }
+        let requestId = decoded.requestId.flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
+        if decoded.requestId != nil, requestId == nil {
+            return RouteJSON.error(.badRequest, "malformed-request-id")
+        }
+
+        let account: Account
+        do {
+            guard let found = try await AccountStore.find(byId: accountId, db: db) else {
+                return RouteJSON.error(.notFound, "unknown-account")
+            }
+            account = found
+        } catch {
+            logger.error("forward account lookup failed", metadata: [
+                "accountId": .string(accountId.uuidString),
+                "err": .string("\(error)"),
+            ])
+            return RouteJSON.error(.internalServerError, "internal-error")
+        }
+        let stored: MessageHeader
+        do {
+            guard let found = try await MessageStore.find(
+                remoteId: remoteId, accountId: accountId, db: db
+            ) else {
+                return RouteJSON.error(.notFound, "unknown-message")
+            }
+            stored = found
+        } catch {
+            logger.error("forward message lookup failed", metadata: [
+                "accountId": .string(accountId.uuidString),
+                "remoteId": .string(remoteId),
+                "err": .string("\(error)"),
+            ])
+            return RouteJSON.error(.internalServerError, "internal-error")
+        }
+        guard let provider = makeProvider(account) else {
+            return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
+        }
+        // Fast path: this requestId has already gone out.
+        if let requestId {
+            do {
+                if let existing = try await AIActionStore.findSend(
+                    accountId: accountId,
+                    requestId: requestId,
+                    db: db
+                ) {
+                    return RouteJSON.response(SendResponse(
+                        ok: true,
+                        providerMessageId: existing.payload["providerMessageId"]
+                    ))
+                }
+            } catch {
+                logger.error("forward.idempotencyLookupFailed", metadata: [
+                    "remoteId": .string(remoteId),
+                    "err": .string("\(error)"),
+                ])
+                return RouteJSON.error(.internalServerError, "internal-error")
+            }
+        }
+
+        // The original message, verbatim. This is the whole point of the
+        // route: the bytes have to be the *original*, not a reconstruction
+        // from a parse.
+        let original: Data
+        do {
+            original = try await provider.fetchRawMessage(remoteId: remoteId)
+        } catch {
+            logger.error("forward.rawFetchFailed", metadata: [
+                "accountId": .string(accountId.uuidString),
+                "remoteId": .string(remoteId),
+                "err": .string("\(error)"),
+            ])
+            // A message that cannot be fetched cannot be forwarded, and
+            // the client needs to say *that* rather than "the send
+            // failed".
+            if let mailError = error as? MailError, mailError == .messageGone {
+                return RouteJSON.error(.gone, "message-gone")
+            }
+            return RouteJSON.error(.badGateway, "forward-original-unavailable")
+        }
+        guard !original.isEmpty else {
+            return RouteJSON.error(.badGateway, "forward-original-unavailable")
+        }
+        // A message with a 25 MB attachment in it is a message whose
+        // forward is also 25 MB — and the SMTP path has its own ceiling
+        // below that. The cap is checked *before* the send so the user
+        // gets "this one is too big to forward" rather than a send that
+        // fails halfway.
+        guard original.count <= OutboundAttachment.maxBytes else {
+            return RouteJSON.error(.conflict, "forward-too-large")
+        }
+
+        // Claim the send before it goes out.
+        let claimRowId: Int64?
+        do {
+            switch try await Self.claimSend(
+                accountId: accountId,
+                requestId: requestId,
+                payload: ["remoteId": remoteId, "type": "forward"],
+                db: db
+            ) {
+            case .replay(let providerMessageId):
+                return RouteJSON.response(SendResponse(
+                    ok: true,
+                    providerMessageId: providerMessageId
+                ))
+            case .conflict:
+                return RouteJSON.error(.conflict, "send-in-flight")
+            case .proceed(let rowId):
+                claimRowId = rowId
+            }
+        } catch {
+            logger.error("forward.claimFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "err": .string("\(error)"),
+            ])
+            return RouteJSON.error(.internalServerError, "internal-error")
+        }
+
+        // The subject. "Fwd:" once, and the original's subject kept — the
+        // same de-dup rule the reply path uses for "Re:".
+        let subject = Self.forwardSubject(decoded.subject, original: stored.subject)
+        // The user's own note. It goes in the body, above the forwarded
+        // message, and the forwarded message itself is the
+        // `message/rfc822` part.
+        let note = (decoded.body ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let filename = Self.forwardFilename(stored.subject)
+
+        let outbound = OutboundMessage(
+            fromEmail: account.email,
+            fromName: nil,
+            to: decoded.to.joined(separator: ", "),
+            cc: decoded.cc ?? [],
+            bcc: bcc ?? [],
+            subject: subject,
+            body: note,
+            inReplyTo: nil,
+            references: nil,
+            isReply: false,
+            attachments: [
+                OutboundAttachment(
+                    filename: filename,
+                    mimeType: "message/rfc822",
+                    data: original,
+                    disposition: .inline
+                )
+            ]
+        )
+        let providerMessageId: String?
+        do {
+            providerMessageId = try await provider.send(outbound)
+        } catch {
+            await Self.releaseClaim(
+                claimRowId, reason: Self.providerLabel(error), db: db, logger: logger
+            )
+            return Self.sendError(error, logger: logger, remoteId: remoteId)
+        }
+        var payload = ["remoteId": remoteId, "type": "forward"]
+        if let providerMessageId {
+            payload["providerMessageId"] = providerMessageId
+        }
+        await Self.recordSendOutcome(
+            accountId: accountId,
+            claimRowId: claimRowId,
+            payload: payload,
+            db: db,
+            logger: logger
+        )
+        return RouteJSON.response(SendResponse(ok: true, providerMessageId: providerMessageId))
+    }
+
+    /// The subject of a forwarded message.
+    ///
+    /// "Fwd:" exactly once, the original's subject kept. The de-dup rule
+    /// matters: forwarding an already-forwarded message must not produce
+    /// "Fwd: Fwd: Fwd: …".
+    static func forwardSubject(_ requested: String?, original: String?) -> String {
+        let trimmed = (requested ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = trimmed.isEmpty ? (original ?? "") : trimmed
+        if base.lowercased().hasPrefix("fwd:") { return base }
+        return base.isEmpty ? "Fwd:" : "Fwd: \(base)"
+    }
+
+    /// The file name of the forwarded original.
+    ///
+    /// It is what the recipient's client shows for the `message/rfc822`
+    /// part, so it should read like the original rather than like a blob.
+    /// A subject with a path separator in it would be a poor file name,
+    /// so the separators go.
+    static func forwardFilename(_ subject: String?) -> String {
+        let base = (subject ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleaned = base
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: "\\", with: "-")
+        let trimmed = cleaned.isEmpty ? "forwarded message" : cleaned
+        return "\(trimmed).eml"
+    }
+
+    /// Takes the claim that lets this request send, or says why it may not.
+    ///
+    /// The claim is what makes the client's idempotency key work under
+    /// concurrency. Looking the requestId up and sending when nothing is
+    /// there is a check-then-act race: two requests that arrive together
+    /// both find nothing and both put the mail on the wire, and the
+    /// recipient gets two copies. The claim is taken *before* the send and
+    /// the unique index decides its winner, so only one request may send.
+    ///
+    /// Without an idempotency key there is nothing to claim: the request
+    /// stands on its own, exactly as before.
+    private static func claimSend(
+        accountId: UUID,
+        requestId: String?,
+        payload: [String: String],
+        db: LagoonDB
+    ) async throws -> SendPermit {
+        guard let requestId else { return .proceed(claimRowId: nil) }
+        switch try await AIActionStore.claimSend(
+            accountId: accountId, requestId: requestId, payload: payload, db: db
+        ) {
+        case .claimed(let rowId):
+            return .proceed(claimRowId: rowId)
+        case .alreadySent(let action):
+            return .replay(providerMessageId: action.payload["providerMessageId"])
+        case .inFlight:
+            return .conflict
+        }
+    }
+
+    /// Records the outcome of a send.
+    ///
+    /// With an idempotency key the outcome is folded into the claim row
+    /// that was taken before the mail went out; without one there is no
+    /// claim, and the audit row is written here — after the mail is on the
+    /// wire, which is the only moment a send is worth recording.
+    ///
+    /// A failed write is logged and not raised: the mail is already out,
+    /// and turning that into an error would make the client send it again.
+    private static func recordSendOutcome(
+        accountId: UUID,
+        claimRowId: Int64?,
+        payload: [String: String],
+        db: LagoonDB,
+        logger: Logger
+    ) async {
+        do {
+            if let claimRowId {
+                try await AIActionStore.completeSend(id: claimRowId, payload: payload, db: db)
+            } else {
+                _ = try await AIActionStore.record(
+                    accountId: accountId,
+                    kind: .send,
+                    payload: payload,
+                    db: db
+                )
+            }
+        } catch {
+            logger.warning("send.auditFailed", metadata: [
                 "err": .string("\(error)"),
             ])
         }
-        return RouteJSON.response(SendResponse(ok: true, providerMessageId: providerMessageId))
+    }
+
+    /// Releases a claim whose send failed, so the next request with the
+    /// same idempotency key may take it over and try again. Without this
+    /// the key would stay locked to a mail that was never sent.
+    private static func releaseClaim(
+        _ claimRowId: Int64?,
+        reason: String,
+        db: LagoonDB,
+        logger: Logger
+    ) async {
+        guard let claimRowId else { return }
+        do {
+            try await AIActionStore.failSend(id: claimRowId, reason: reason, db: db)
+        } catch {
+            logger.error("send.claimReleaseFailed", metadata: [
+                "err": .string("\(error)"),
+            ])
+        }
     }
 
     /// New-mail recipients cross a trust boundary. This deliberately accepts
@@ -549,6 +1010,88 @@ public enum MessageRoutes {
               !value.contains(where: \.isWhitespace)
         else { return false }
         return true
+    }
+
+    /// Splits a comma-separated recipient field and validates each address.
+    ///
+    /// The split is `AddressList.split` — the RFC 5322 one — because a
+    /// comma inside a quoted display name (`"Zhang, Wei" <j@x.com>`)
+    /// belongs to the name, and cutting there produced one address and one
+    /// unusable fragment.
+    ///
+    /// Returns nil when any entry is not a plain address.
+    private static func recipientList(from raw: String) -> [String]? {
+        let pieces = AddressList.split(raw)
+        guard let result = recipientList(pieces) else { return nil }
+        return result
+    }
+
+    /// Validates a Cc/Bcc list.
+    ///
+    /// The list is a *list*: each entry is one ordinary address, the same
+    /// rule the `To:` field follows. Two things this deliberately does not
+    /// do:
+    ///
+    /// * It does not accept a comma-joined string. The client sends an
+    ///   array, so an entry that contains a comma is one address the user
+    ///   typed wrong — not two addresses.
+    /// * It does not drop the bad entries and keep the good ones. Silently
+    ///   dropping one would send a mail to fewer people than the user
+    ///   asked, with no way for them to notice. The whole list is refused
+    ///   and the client says which address was wrong.
+    ///
+    /// Returns nil when the list is valid, and nil-vs-invalid is carried by
+    /// the caller: an invalid list answers `malformed-recipient`.
+    private static func recipientList(
+        _ raw: [String]?
+    ) -> [String]? {
+        guard let raw else { return [] }
+        var result: [String] = []
+        for entry in raw {
+            let value = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            // An empty entry is a blank line in the client's list, not an
+            // address. It is skipped rather than refused: the user pressing
+            /// Enter after the last address is a normal thing to do, and it
+            // must not fail the send.
+            if value.isEmpty { continue }
+            guard isValidRecipient(value) else { return nil }
+            result.append(value)
+        }
+        return result
+    }
+
+    /// Decodes the attachment payloads.
+    ///
+    /// base64 because JSON has no byte type. A payload that does not decode,
+    /// or that is empty, or that is over the size cap, refuses the whole
+    /// request: an attachment that silently went missing would be worse
+    /// than a send that did not happen, because the user would believe the
+    /// file was on its way.
+    private static func decodeAttachments(
+        _ raw: [ComposeAttachmentPayload]?
+    ) -> [OutboundAttachment]? {
+        guard let raw else { return [] }
+        var result: [OutboundAttachment] = []
+        var total = 0
+        for entry in raw {
+            guard let data = Data(base64Encoded: entry.dataBase64),
+                  data.count <= OutboundAttachment.maxBytes
+            else { return nil }
+            total += data.count
+            // A whole-message cap, on top of the per-file one. Ten 25 MB
+            // files would be 250 MB of JSON, and the request body is already
+            // capped at 1 MB upstream — this is the honest second line of
+            // defence for the case where that cap moves.
+            guard total <= OutboundAttachment.maxBytes * 4 else { return nil }
+            let attachment = OutboundAttachment(
+                filename: entry.filename,
+                mimeType: entry.mimeType,
+                data: data
+            )
+            guard attachment.isSendable else { return nil }
+            result.append(attachment)
+        }
+        return result
     }
 
     /// Send a plain-text reply to the message's sender. Everything the wire
@@ -571,7 +1114,10 @@ public enum MessageRoutes {
         }
         let rawBody: Data
         do {
-            rawBody = try await RouteParams.collectBody(request)
+            // The attachment-sized cap: a reply can carry files, and 1 MB
+            // would refuse a perfectly ordinary one before the user ever
+            // got to see why.
+            rawBody = try await RouteParams.collectAttachmentBody(request)
         } catch {
             return RouteJSON.error(.badRequest, "malformed-body")
         }
@@ -586,6 +1132,10 @@ public enum MessageRoutes {
             let to: [String]?
             /// Reply-all Cc list. Omitted means "no Cc header".
             let cc: [String]?
+            /// Blind copies. Omitted means "no Bcc".
+            let bcc: [String]?
+            /// Files to attach. Omitted means "no attachments".
+            let attachments: [ComposeAttachmentPayload]?
         }
         guard let decoded = try? JSONDecoder().decode(SendRequest.self, from: rawBody),
               !decoded.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -603,6 +1153,14 @@ public enum MessageRoutes {
             for address in copies where !Self.isValidRecipient(address) {
                 return RouteJSON.error(.badRequest, "malformed-recipient")
             }
+        }
+        let bcc = Self.recipientList(decoded.bcc)
+        guard bcc != nil else {
+            return RouteJSON.error(.badRequest, "malformed-recipient")
+        }
+        let attachments = Self.decodeAttachments(decoded.attachments)
+        guard attachments != nil else {
+            return RouteJSON.error(.badRequest, "malformed-attachment")
         }
         let requestId = decoded.requestId.flatMap { UUID(uuidString: $0)?.uuidString.lowercased() }
         if decoded.requestId != nil, requestId == nil {
@@ -641,6 +1199,8 @@ public enum MessageRoutes {
         guard let provider = makeProvider(account) else {
             return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
         }
+        // Fast path: this requestId has already gone out. Replay the stored
+        // result instead of sending a second copy.
         if let requestId {
             do {
                 if let existing = try await AIActionStore.findSend(
@@ -660,6 +1220,34 @@ public enum MessageRoutes {
                 ])
                 return RouteJSON.error(.internalServerError, "internal-error")
             }
+        }
+
+        // Claim the send before it goes out. Two requests carrying the
+        // same requestId must not both put the reply on the wire.
+        let claimRowId: Int64?
+        do {
+            switch try await Self.claimSend(
+                accountId: accountId,
+                requestId: requestId,
+                payload: ["remoteId": remoteId, "to": stored.fromAddress],
+                db: db
+            ) {
+            case .replay(let providerMessageId):
+                return RouteJSON.response(SendResponse(
+                    ok: true,
+                    providerMessageId: providerMessageId
+                ))
+            case .conflict:
+                return RouteJSON.error(.conflict, "send-in-flight")
+            case .proceed(let rowId):
+                claimRowId = rowId
+            }
+        } catch {
+            logger.error("send.claimFailed", metadata: [
+                "remoteId": .string(remoteId),
+                "err": .string("\(error)")
+            ])
+            return RouteJSON.error(.internalServerError, "internal-error")
         }
 
         // Threading: reply to the parent's Message-ID and extend the parent's
@@ -688,43 +1276,41 @@ public enum MessageRoutes {
             fromName: nil,
             to: recipients.joined(separator: ", "),
             cc: cc,
+            bcc: bcc ?? [],
             subject: stored.subject ?? "",
             body: decoded.body,
             inReplyTo: stored.messageIdHeader,
-            references: references.isEmpty ? nil : references
+            references: references.isEmpty ? nil : references,
+            attachments: attachments ?? []
         )
 
         let providerMessageId: String?
         do {
             providerMessageId = try await provider.send(outbound)
         } catch {
+            // The reply is not out, so the claim must go back: the user's
+            // retry with the same requestId has to be able to try again.
+            await Self.releaseClaim(
+                claimRowId, reason: Self.providerLabel(error), db: db, logger: logger
+            )
             return Self.sendError(error, logger: logger, remoteId: remoteId)
         }
         // The reply is already on the wire: a failed audit write must not turn
         // a delivered message into a 500 the client would retry.
-        do {
-            var payload = [
-                "remoteId": remoteId,
-                "to": stored.fromAddress
-            ]
-            if let requestId {
-                payload["requestId"] = requestId
-            }
-            if let providerMessageId {
-                payload["providerMessageId"] = providerMessageId
-            }
-            let _ = try await AIActionStore.record(
-                accountId: accountId,
-                kind: .send,
-                payload: payload,
-                db: db
-            )
-        } catch {
-            logger.warning("send.auditFailed", metadata: [
-                "remoteId": .string(remoteId),
-                "err": .string("\(error)")
-            ])
+        var payload = [
+            "remoteId": remoteId,
+            "to": stored.fromAddress
+        ]
+        if let providerMessageId {
+            payload["providerMessageId"] = providerMessageId
         }
+        await Self.recordSendOutcome(
+            accountId: accountId,
+            claimRowId: claimRowId,
+            payload: payload,
+            db: db,
+            logger: logger
+        )
         return RouteJSON.response(SendResponse(ok: true, providerMessageId: providerMessageId))
     }
 
@@ -749,6 +1335,10 @@ public enum MessageRoutes {
             return RouteJSON.error(.serviceUnavailable, "provider-not-configured")
         case .messageGone:
             return RouteJSON.error(.gone, "message-gone")
+        case .accountMissing:
+            // The account row is gone, so there is nothing to send with. 404
+            // rather than 502: nothing about the mail server failed.
+            return RouteJSON.error(.notFound, "unknown-account")
         case .unreachable, .protocolError, .archiveUnavailable, .trashUnavailable,
             .sentUnavailable:
             return RouteJSON.error(.badGateway, "smtp-send-failed")
@@ -969,6 +1559,15 @@ public enum MessageRoutes {
             "remoteId": .string(remoteId),
             "label": .string(error.logLabel),
         ])
+        // A message whose encoded body is larger than the framing ceiling
+        // is *too big*, not broken. 25 MB of attachment travels as ~33 MB
+        // of base64, so this is a size the product promised to accept; it
+        // used to be reported as 502 "server error", which told the user
+        // the server broke and invited a retry that could never work.
+        if case .protocolError(let label) = error,
+           label == IMAPConnection.oversizeLiteralLabel {
+            return RouteJSON.error(.contentTooLarge, "attachment-too-large")
+        }
         switch error {
         case .messageGone:
             return RouteJSON.error(.gone, "message-gone")
@@ -985,6 +1584,11 @@ public enum MessageRoutes {
             // "you have sent nothing" are different answers, and only one of
             // them is true here.
             return RouteJSON.error(.notFound, "sent-unavailable")
+        case .accountMissing:
+            // Same reason as the send path: the store has no row for this
+            // account, so the failure is "unknown account", not "the mail
+            // server misbehaved".
+            return RouteJSON.error(.notFound, "unknown-account")
         case .unreachable, .protocolError:
             return RouteJSON.error(.badGateway, "provider-unreachable")
         }

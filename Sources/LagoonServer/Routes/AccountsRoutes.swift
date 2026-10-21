@@ -157,6 +157,12 @@ public enum AccountsRoutes {
                 return RouteJSON.error(.badGateway, "imap-unreachable")
             }
 
+            // `nil` means the negotiation could not complete, which is not the
+            // same answer as "this server has none of these". The routes gate
+            // archiving and deleting on the stored capabilities, so writing
+            // "no capabilities" here would switch those features off for the
+            // life of the account. The stored value is kept instead, and the
+            // sync loop negotiates again on its next round.
             let capabilities = await provider.capabilities()
             let archiveFolder = await (provider as? any ArchiveFolderResolving)?.archiveFolder()
             do {
@@ -167,9 +173,11 @@ public enum AccountsRoutes {
                     try await AccountStore.updateCredentials(
                         accountId: existing.id, credentials: sealed, db: db
                     )
-                    try await AccountStore.updateCapabilities(
-                        accountId: existing.id, capabilities: capabilities, db: db
-                    )
+                    if let capabilities {
+                        try await AccountStore.updateCapabilities(
+                            accountId: existing.id, capabilities: capabilities, db: db
+                        )
+                    }
                     var syncState = existing.syncState
                     syncState.archiveFolder = archiveFolder ?? syncState.archiveFolder
                     try await AccountStore.updateSyncState(
@@ -181,9 +189,11 @@ public enum AccountsRoutes {
                     )
                 } else {
                     try await AccountStore.upsert(account, credentials: sealed, db: db)
-                    try await AccountStore.updateCapabilities(
-                        accountId: account.id, capabilities: capabilities, db: db
-                    )
+                    if let capabilities {
+                        try await AccountStore.updateCapabilities(
+                            accountId: account.id, capabilities: capabilities, db: db
+                        )
+                    }
                     try await AccountStore.updateSyncState(
                         accountId: account.id,
                         syncState: MailSyncState(archiveFolder: archiveFolder),
@@ -227,7 +237,7 @@ public enum AccountsRoutes {
                     isActive: true,
                     unreadCount: 0,
                     syncHealth: SyncHealth(status: .ok),
-                    capabilities: capabilities
+                    capabilities: capabilities ?? persisted?.capabilities ?? .unknown
                 ),
                 status: .created
             )

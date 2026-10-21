@@ -1405,7 +1405,7 @@ final class RouteTests: XCTestCase {
         func setUnarchiveGate(_ gate: RaceGate?) { unarchiveGate = gate }
         func setRestoreGate(_ gate: RaceGate?) { restoreGate = gate }
 
-        func capabilities() async -> MailCapabilities { capabilitiesValue }
+        func capabilities() async -> MailCapabilities? { capabilitiesValue }
 
         func pullChanges(after cursor: MailSyncState, waitUpTo: Duration) async throws -> MailChangeSet {
             MailChangeSet(upserts: [], resetRequired: false, cursor: cursor)
@@ -2087,6 +2087,51 @@ final class RouteTests: XCTestCase {
         }
     }
 
+    /// An account that was **never probed** must not be treated as a settled
+    /// "cannot archive".
+    ///
+    /// This is the second half of the id-encoding defect. The account row
+    /// could not be found, so no sync round ever negotiated capabilities for
+    /// it, so the row kept the all-false default — and `archiveFolder: false`
+    /// was read as a verdict: every archive, including bulk, answered
+    /// `409 archive-unavailable` for a QQ mailbox that archives perfectly
+    /// well. The route must let the request through and let the provider
+    /// answer; `archiveUnavailable` is still what comes back when the folder
+    /// really is missing.
+    func test_postArchive_neverProbedAccountIsNotRefusedByTheGate() async throws {
+        let account = makeAccount(oauthUser: "route-\(UUID().uuidString)", email: "me-\(UUID())@example.com")
+        try await TestDatabase.withConnection(cleanup: cleanup(accountId: account.id)) { conn in
+            try await seedAccount(
+                Account(
+                    id: account.id, provider: .qq, oauthUser: account.oauthUser,
+                    email: account.email, credentials: Data([1, 2, 3]),
+                    capabilities: MailCapabilities(
+                        archiveFolder: nil, idle: true, move: true, serverSnippet: true
+                    ),
+                    isActive: false
+                ),
+                db: conn
+            )
+            let provider = StubMailProvider()
+            let router = makeMessageRouter(db: conn, makeProvider: { _ in provider })
+                ActionsRoutes.register(
+                on: router, db: conn,
+                logger: Self.testLogger, makeProvider: { _ in provider }
+            )
+            let app = Application(router: router)
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/api/messages/82/archive?accountId=\(account.id.uuidString)",
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .ok, "an unprobed account must reach the provider")
+                }
+            }
+            let archived = await provider.archivedRemoteIds
+            XCTAssertEqual(archived, ["82"], "the raw capability must not have closed the gate")
+        }
+    }
+
     // MARK: - T11: POST /api/messages/{remoteId}/send
 
     /// Registers message + action routes on one router with the same stub
@@ -2168,10 +2213,16 @@ final class RouteTests: XCTestCase {
             // The recipient is checked by two independent rules (no whitespace,
             // exactly one `@`); the subject is checked by the CR/LF guard alone,
             // which is the only field this can actually get through.
-            for body in [
-                #"{"to":"alice@example.com\r\nBcc:evil@example.com","subject":"Hi","body":"Hello"}"#,
-                #"{"to":"alice@example.com","subject":"Hi\r\nBcc:evil@example.com","body":"Hello"}"#,
-                #"{"to":"alice@example.com","subject":"Hi\nBcc:evil@example.com","body":"Hello"}"#,
+            //
+            // The two produce **different** codes, and the difference is
+            // the point: a bad recipient is the user's typo and the client
+            // can say "that address is not valid", while a bad subject is
+            // a malformed request. The client tells them apart, so the
+            // server must too.
+            for (body, expected) in [
+                (#"{"to":"alice@example.com\r\nBcc:evil@example.com","subject":"Hi","body":"Hello"}"#, "malformed-recipient"),
+                (#"{"to":"alice@example.com","subject":"Hi\r\nBcc:evil@example.com","body":"Hello"}"#, "malformed-compose"),
+                (#"{"to":"alice@example.com","subject":"Hi\nBcc:evil@example.com","body":"Hello"}"#, "malformed-compose"),
             ] {
                 try await app.test(.router) { client in
                     try await client.execute(
@@ -2181,7 +2232,10 @@ final class RouteTests: XCTestCase {
                         body: sendBody(body)
                     ) { response in
                         XCTAssertEqual(response.status, .badRequest, "body: \(body)")
-                        XCTAssertEqual(try Self.errorCode(from: response.body), "malformed-compose")
+                        XCTAssertEqual(
+                            try Self.errorCode(from: response.body), expected,
+                            "body: \(body)"
+                        )
                     }
                 }
             }
@@ -3184,7 +3238,14 @@ final class RouteTests: XCTestCase {
                     uri: "/api/messages/\(message.remoteId)/classify?accountId=\(account.id.uuidString)",
                     method: .post,
                     headers: [.contentType: "application/json"],
-                    body: sendBody(#"{"toGroup":"safeToArchive"}"#)
+                    // The scope is explicit because this test is about the
+                    // **sender** round trip: it asserts that the audit row
+                    // stores a parseable `fromGroup` so the undo can write a
+                    // counter-override that flips the sender back. A request
+                    // that omits `scope` means the narrow one (P2-13), so
+                    // leaving it out here would be asking the route to do a
+                    // broad thing while saying nothing.
+                    body: sendBody(#"{"toGroup":"safeToArchive","scope":"sender"}"#)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                 }

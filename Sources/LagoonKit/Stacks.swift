@@ -36,6 +36,33 @@ public struct StackCreateResponse: Codable, Sendable, Equatable {
     public init(stack: StackSummary) { self.stack = stack }
 }
 
+/// PATCH /api/stacks/:id — rename a group, change what it matches, or both.
+///
+/// Every field is optional on purpose: the client sends **only what the user
+/// actually changed**, and the server applies exactly that subset. A client
+/// that sent all three every time would silently rewrite the fields the user
+/// did not touch, which is how a rename would quietly change a keyword.
+public struct StackUpdateRequest: Codable, Sendable, Equatable {
+    public let name: String?
+    public let kind: StackRule.Kind?
+    public let value: String?
+
+    public init(name: String? = nil, kind: StackRule.Kind? = nil, value: String? = nil) {
+        self.name = name
+        self.kind = kind
+        self.value = value
+    }
+}
+
+/// The response to a PATCH: the updated group, with its live count.
+///
+/// The same shape POST returns, so the client can treat a create and an edit
+/// as one thing — "here is the group as it now stands".
+public struct StackUpdateResponse: Codable, Sendable, Equatable {
+    public let stack: StackSummary
+    public init(stack: StackSummary) { self.stack = stack }
+}
+
 public struct StackDeleteResponse: Codable, Sendable, Equatable {
     public let ok: Bool
     public init(ok: Bool) { self.ok = ok }

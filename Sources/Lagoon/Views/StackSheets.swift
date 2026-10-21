@@ -24,7 +24,7 @@ extension SubjectNormalizer {
     }
 }
 
-/// 聚合规则管理面板：内置「已归档」档案柜 + 用户规则列表。
+/// 聚合管理面板：内置「已归档」档案柜 + 用户分组列表。
 struct StackListSheet: View {
     @Environment(\.l10n) private var l10n
     @Environment(\.dismiss) private var dismiss
@@ -34,6 +34,9 @@ struct StackListSheet: View {
     @State private var isLoading = true
     @State private var errorBanner: ErrorBanner?
     @State private var editor: StackEditorRequest?
+    /// The group being edited, when the user picked 「编辑」 from a row's
+    /// context menu. nil means "creating a new one".
+    @State private var editing: StackEditRequest?
     @State private var openStack: StackSummary?
     @State private var showArchived = false
     private let api = APIClient.shared
@@ -88,7 +91,7 @@ struct StackListSheet: View {
                                     HStack {
                                         VStack(alignment: .leading, spacing: 2) {
                                             Text(stack.rule.name).lineLimit(1)
-                                            Text("\(l10n.stackKindLabel(stack.rule.kind.displayName)) · \(stack.rule.value)")
+                                            Text("\(l10n.stackKindLabel(l10n.stackKindName(stack.rule.kind))) · \(stack.rule.value)")
                                                 .font(.caption)
                                                 .foregroundStyle(.secondary)
                                                 .lineLimit(1)
@@ -100,6 +103,15 @@ struct StackListSheet: View {
                                     }
                                 }
                                 .contextMenu {
+                                    // The exit from "I built it on the wrong
+                                    // keyword". The menu used to offer only
+                                    // 删除, so a group could be created and
+                                    // destroyed but never changed — the one
+                                    // thing a user wants to do with a filter
+                                    // they got slightly wrong.
+                                    Button(l10n.stackEditRule) {
+                                        editing = StackEditRequest(rule: stack.rule)
+                                    }
                                     Button(l10n.stackDeleteRule, role: .destructive) {
                                         Task { await deleteRule(stack) }
                                     }
@@ -134,6 +146,19 @@ struct StackListSheet: View {
                     Task { await reload() }
                 }
             }
+            // The same editor, opened on a group that already exists. It is
+            // the *same* sheet rather than a second one so the two paths
+            // cannot drift apart in what they accept.
+            .sheet(item: $editing) { request in
+                StackRuleEditorSheet(
+                    initialKind: request.rule.kind,
+                    prefilledValue: request.rule.value,
+                    prefilledName: request.rule.name,
+                    editing: request.rule.id
+                ) { _ in
+                    Task { await reload() }
+                }
+            }
             .task { await reload() }
         }
         .frame(width: 520, height: 520)
@@ -151,7 +176,16 @@ struct StackListSheet: View {
             let archived = try await api.fetchMessages(accountId: accountId, limit: 1, archived: true)
             archivedCount = archived.totalCount ?? archived.messages.count
         } catch {
-            errorBanner = ErrorBanner(severity: .error, title: l10n.loadFailed, detail: error.lagoonUIMessage)
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.loadFailed,
+                detail: error.lagoonUIMessage,
+                // A failed load is a network / server failure — the same
+                // fetch can succeed a second later. Spec INV-4: a retryable
+                // failure gets a retry, and the retry re-runs *this* load.
+                actionLabel: l10n.retry,
+                action: { [self] in await self.reload() }
+            )
         }
     }
 
@@ -161,7 +195,16 @@ struct StackListSheet: View {
             try await api.deleteStack(id: stack.rule.id, accountId: accountId)
             stacks.removeAll { $0.rule.id == stack.rule.id }
         } catch {
-            errorBanner = ErrorBanner(severity: .error, title: l10n.loadFailed, detail: error.lagoonUIMessage)
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.deleteRuleFailed,
+                detail: error.lagoonUIMessage,
+                // A write the user asked for failed on the network, and the
+                // rule is still in the list (it is only removed on success),
+                // so the same delete can simply be tried again. Spec INV-4.
+                actionLabel: l10n.retry,
+                action: { [self] in await self.deleteRule(stack) }
+            )
         }
     }
 }
@@ -178,6 +221,7 @@ struct StackMailSheet: View {
 
     @Environment(\.l10n) private var l10n
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var undo: UndoController
     @State private var messages: [MessageHeader] = []
     /// Rows the filter matches on the server, ignoring the response cap.
     ///
@@ -206,7 +250,7 @@ struct StackMailSheet: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(title).font(.headline).lineLimit(1)
                         if case .rule(let stack) = source {
-                            Text("\(l10n.stackKindLabel(stack.rule.kind.displayName)) · \(stack.rule.value)")
+                            Text("\(l10n.stackKindLabel(l10n.stackKindName(stack.rule.kind))) · \(stack.rule.value)")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
@@ -280,11 +324,13 @@ struct StackMailSheet: View {
                     accountId: accountId,
                     header: messages.first { $0.remoteId == remoteId },
                     initiallyPinned: messages.first { $0.remoteId == remoteId }?.isPinned ?? false,
-                    siblings: messages.map(\.remoteId),
+                    siblings: messages.map {
+                        MessageRef(accountId: accountId, remoteId: $0.remoteId)
+                    },
                     onArchived: { id, _ in
                         removeRows(matching: id)
                     },
-                    onAdvanceTo: { next in path = next.map { [$0] } ?? [] },
+                    onAdvanceTo: { next in path = next.map { [$0.remoteId] } ?? [] },
                     onDelete: { id in
                         removeRows(matching: id)
                         path = []
@@ -318,7 +364,16 @@ struct StackMailSheet: View {
             messages = response.messages
             serverTotalCount = response.totalCount
         } catch {
-            errorBanner = ErrorBanner(severity: .error, title: l10n.loadFailed, detail: error.lagoonUIMessage)
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.loadFailed,
+                detail: error.lagoonUIMessage,
+                // The list is a pure read: nothing about it changed while it
+                // failed, so re-running the same fetch is the whole fix.
+                // Spec INV-4.
+                actionLabel: l10n.retry,
+                action: { [self] in await self.load() }
+            )
         }
     }
 
@@ -366,9 +421,41 @@ struct StackMailSheet: View {
             for item in response.items where item.ok {
                 removeRow(id: item.remoteId)
             }
-            if failed.isEmpty {
+            // 清扫 gets an undo toast too, with **every** action id the
+            // sweep wrote.
+            //
+            // The sweep used to report a count and offer nothing to undo,
+            // while the user guide promised that every change could be
+            // undone. The promise matters most where the sweep is
+            // biggest: "archive everything this rule matched" is one
+            // click that can move a hundred messages, and it needs a way
+            // back.
+            let actionIds = response.items.compactMap { $0.ok ? $0.actionId : nil }
+            if let first = actionIds.first {
+                undo.show(UndoItem(
+                    id: first,
+                    message: L10n.current.sweepDone(okCount),
+                    systemImage: "archivebox",
+                    extraIds: Array(actionIds.dropFirst())
+                ))
+            }
+            if failed.isEmpty, let truncated = response.truncatedCount, truncated > 0 {
+                // The sweep hit the server's per-call cap: the messages it
+                // archived are gone, but the group is NOT clear. Reporting
+                // "已归档 N 封" here would tell the user the group is empty
+                // while messages are still sitting in the inbox — the one
+                // outcome this banner must not produce.
                 ErrorCenter.shared.report(.init(
-                    severity: .info,
+                    severity: .warning,
+                    title: L10n.current.sweepTruncated(okCount, truncated),
+                    autoDismissAfter: .seconds(8)
+                ))
+            } else if failed.isEmpty {
+                ErrorCenter.shared.report(.init(
+                    // Green, not blue: the sweep worked. A blue banner reads
+                    // as "something went wrong", which is the opposite of
+                    // what the user just did.
+                    severity: .success,
                     title: L10n.current.sweepDone(okCount),
                     autoDismissAfter: .seconds(5)
                 ))
@@ -380,16 +467,33 @@ struct StackMailSheet: View {
                 ))
             }
         } catch {
-            errorBanner = ErrorBanner(severity: .error, title: l10n.loadFailed, detail: error.lagoonUIMessage)
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.loadFailed,
+                detail: error.lagoonUIMessage,
+                // 清扫 is a user-triggered write over a list that did not
+                // change, so the same sweep can simply run again.
+                // Spec INV-4.
+                actionLabel: l10n.retry,
+                action: { [self] in await self.sweep() }
+            )
         }
     }
 }
 
-/// 规则编辑器：从右键入口预填，或从管理面板空白新建。
+/// 分组编辑器：从右键入口预填，或从管理面板空白新建。
+///
+/// The same sheet edits an existing group: pass `editing` (the group's id)
+/// and the title, the button and the write all change to the edit path. One
+/// editor rather than two, because two editors would eventually disagree
+/// about what a valid group is — and the *edit* path is the one that used
+/// not to exist at all, so it is the one that has to be the same code.
 struct StackRuleEditorSheet: View {
     let initialKind: StackRule.Kind
     let prefilledValue: String
     let prefilledName: String
+    /// The group being edited, or nil when creating a new one.
+    var editing: UUID?
     var onCreated: (StackSummary) -> Void
 
     @Environment(\.l10n) private var l10n
@@ -406,20 +510,25 @@ struct StackRuleEditorSheet: View {
         initialKind: StackRule.Kind,
         prefilledValue: String,
         prefilledName: String,
+        editing: UUID? = nil,
         onCreated: @escaping (StackSummary) -> Void
     ) {
         self.initialKind = initialKind
         self.prefilledValue = prefilledValue
         self.prefilledName = prefilledName
+        self.editing = editing
         self.onCreated = onCreated
         _kind = State(initialValue: initialKind)
         _value = State(initialValue: prefilledValue)
         _name = State(initialValue: prefilledName)
     }
 
+    /// Whether this sheet creates a new group or edits an existing one.
+    private var isEditing: Bool { editing != nil }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text(l10n.stackEditorTitle).font(.headline)
+            Text(isEditing ? l10n.stackEditorEditTitle : l10n.stackEditorTitle).font(.headline)
             Picker(l10n.stackRuleKind, selection: $kind) {
                 Text(l10n.stackKindSender).tag(StackRule.Kind.sender)
                 Text(l10n.stackKindKeyword).tag(StackRule.Kind.keyword)
@@ -435,23 +544,45 @@ struct StackRuleEditorSheet: View {
             } else {
                 TextField(l10n.stackRuleValue, text: $value)
                     .textFieldStyle(.roundedBorder)
-                    .disabled(initialKind == .sender)
+                    // A sender group created from a right-click already knows
+                    // its address, so the field is locked — the user did not
+                    // type it and should not be invited to. An *edited* group
+                    // is the opposite case: the user opened it precisely to
+                    // change what it matches, so the field has to be editable
+                    // or "edit" is a lie.
+                    .disabled(initialKind == .sender && !isEditing)
                 Text(l10n.senderHint)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             TextField(l10n.stackRuleName, text: $name)
                 .textFieldStyle(.roundedBorder)
+            // The one place the difference has to be stated before the user
+            // commits: they are about to create a group, and the group they
+            // are creating will not change the Briefing's groups. Without
+            // this, the moment they most expect their rule to take effect —
+            // right after saving it — is the moment the product could have
+            // said so and did not.
+            //
+            // Shown only when *creating*. An existing group is already
+            // understood as a filter; re-stating the boundary on every edit
+            // would be noise.
+            if !isEditing {
+                Text(l10n.stackEditorScopeNote)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack {
                 Spacer()
                 Button(l10n.cancel) { dismiss() }
                 Button {
-                    Task { await create() }
+                    Task { await save() }
                 } label: {
                     if isCreating {
                         ProgressView().controlSize(.small)
                     } else {
-                        Text(l10n.stackCreate)
+                        Text(isEditing ? l10n.stackSave : l10n.stackCreate)
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -466,28 +597,58 @@ struct StackRuleEditorSheet: View {
         .noticeBanner($errorBanner)
     }
 
-    private func create() async {
+    /// Create or update, depending on what the sheet was opened for.
+    private func save() async {
         guard let accountId = accounts.accountId else { return }
         isCreating = true
         defer { isCreating = false }
+        let trimmedName = name.trimmingCharacters(in: .whitespaces)
+        let trimmedValue = value.trimmingCharacters(in: .whitespaces)
         do {
-            let response = try await api.createStack(
-                StackCreateRequest(
-                    name: name.trimmingCharacters(in: .whitespaces),
+            let stack: StackSummary
+            if let editing {
+                let response = try await api.updateStack(
+                    id: editing,
+                    name: trimmedName,
                     kind: kind,
-                    value: value.trimmingCharacters(in: .whitespaces)
-                ),
-                accountId: accountId
-            )
-            onCreated(response.stack)
+                    value: trimmedValue,
+                    accountId: accountId
+                )
+                stack = response.stack
+            } else {
+                let response = try await api.createStack(
+                    StackCreateRequest(name: trimmedName, kind: kind, value: trimmedValue),
+                    accountId: accountId
+                )
+                stack = response.stack
+            }
+            onCreated(stack)
             ErrorCenter.shared.report(.init(
-                severity: .info,
-                title: L10n.current.stackCreated(response.stack.rule.name),
+                // Green, not blue: the group was saved.
+                severity: .success,
+                title: isEditing
+                    ? L10n.current.stackUpdated(stack.rule.name)
+                    : L10n.current.stackCreated(stack.rule.name),
                 autoDismissAfter: .seconds(5)
             ))
+            // The sidebar lists the user's groups with their live counts, and
+            // the list surfaces listen for the same notification. A renamed
+            // group that only changed in the panel it was edited in would
+            // leave the sidebar showing the old name — which is the "I
+            // renamed it and nothing happened" dead end this feature exists
+            // to remove.
+            NotificationCenter.default.post(name: .lagoonDidChangeData, object: nil)
             dismiss()
         } catch {
-            errorBanner = ErrorBanner(severity: .error, title: l10n.loadFailed, detail: error.lagoonUIMessage)
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: isEditing ? l10n.updateRuleFailed : l10n.loadFailed,
+                detail: error.lagoonUIMessage,
+                // The group was not saved (the sheet is still open), so the
+                // same write can be sent again. Spec INV-4.
+                actionLabel: l10n.retry,
+                action: { [self] in await self.save() }
+            )
         }
     }
 }
@@ -498,4 +659,14 @@ struct StackEditorRequest: Identifiable {
     let value: String
     let name: String
     var id: String { "\(kind.rawValue)|\(value)" }
+}
+
+/// The group being edited, for `.sheet(item:)`.
+///
+/// Identified by the group's id, so opening the editor on a different group
+/// re-presents the sheet with the new group's values rather than keeping the
+/// ones the sheet was last opened with.
+struct StackEditRequest: Identifiable {
+    let rule: StackRule
+    var id: UUID { rule.id }
 }

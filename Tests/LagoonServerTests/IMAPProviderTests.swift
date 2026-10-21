@@ -209,10 +209,11 @@ final class IMAPProviderTests: XCTestCase {
 
             let capabilities = await provider.capabilities()
 
-            XCTAssertTrue(capabilities.archiveFolder)
-            XCTAssertTrue(capabilities.idle)
-            XCTAssertTrue(capabilities.move)
-            XCTAssertTrue(capabilities.serverSnippet)
+            let resolved = try XCTUnwrap(capabilities, "a successful negotiation must not report 'unknown'")
+            XCTAssertEqual(resolved.archiveFolder, true)
+            XCTAssertTrue(resolved.idle)
+            XCTAssertTrue(resolved.move)
+            XCTAssertTrue(resolved.serverSnippet)
             let lines = await wire(transport)
             XCTAssertTrue(lines.contains(#"A0005 CREATE "Archive""#))
 
@@ -233,8 +234,9 @@ final class IMAPProviderTests: XCTestCase {
 
             let capabilities = await provider.capabilities()
 
-            XCTAssertFalse(capabilities.archiveFolder)
-            XCTAssertTrue(capabilities.move, "the rest of the negotiation still stands")
+            let resolved = try XCTUnwrap(capabilities, "a refused CREATE is still a completed negotiation")
+            XCTAssertEqual(resolved.archiveFolder, false, "a refused CREATE is a settled no")
+            XCTAssertTrue(resolved.move, "the rest of the negotiation still stands")
         }
     }
 
@@ -1404,6 +1406,14 @@ final class IMAPProviderTests: XCTestCase {
 
     /// A server without MOVE (163 class) still archives: COPY, flag, EXPUNGE
     /// — the spec §4.3 fallback.
+    ///
+    /// The expunge is `UID EXPUNGE 7`, not a bare `EXPUNGE`. The COPY
+    /// succeeded, so the INBOX copy has to go — but a bare `EXPUNGE` removes
+    /// **every** `\Deleted`-flagged message in the folder, including mail
+    /// another client on this account had already flagged and was about to
+    /// remove. That is silent, permanent destruction of mail the user never
+    /// asked Lagoon to touch, and it happens on the *archive* path, which
+    /// people use far more often than permanent delete.
     func test_archive_withoutMoveCapability_copiesAndExpunges() async throws {
         try await TokenKeyFixture.withKeyAsync(Self.key) {
             let transport = ScriptedTransport()
@@ -1424,8 +1434,13 @@ final class IMAPProviderTests: XCTestCase {
             XCTAssertEqual(Array(lines.suffix(3)), [
                 #"A0006 UID COPY 7 "Archive""#,
                 #"A0007 UID STORE 7 +FLAGS (\Deleted)"#,
-                "A0008 EXPUNGE",
+                "A0008 UID EXPUNGE 7",
             ])
+            XCTAssertFalse(
+                lines.contains { $0.hasSuffix("EXPUNGE") && !$0.contains("UID EXPUNGE") },
+                "a bare EXPUNGE takes every \\Deleted message in the folder, "
+                    + "including other clients' pending deletions: \(lines)"
+            )
         }
     }
 

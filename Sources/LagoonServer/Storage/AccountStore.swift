@@ -240,6 +240,52 @@ public enum AccountStore {
         }
     }
 
+    /// Finds an account by id, tolerating an id stored in a different
+    /// *encoding* than the one this build writes.
+    ///
+    /// ## Why this exists
+    ///
+    /// `accounts.id` is a 16-byte BLOB, and every query binds a `UUID`, which
+    /// GRDB encodes as 16 bytes. A row whose id is stored some other way —
+    /// the 36-character text, most obviously — is therefore invisible to
+    /// `find(byId:)`, and everything downstream of it fails in a way that has
+    /// nothing to do with the user's credentials.
+    ///
+    /// The `lagoon-v5b` migration repairs that encoding, so under normal
+    /// operation this fallback never finds anything. It is here for the case
+    /// the migration cannot cover: a store whose row is in an encoding
+    /// nobody anticipated. Without it, the account is simply *gone*, and the
+    /// user is told their authorization code expired — a thing that fixing
+    /// their authorization code will never repair.
+    ///
+    /// ## What it does and does not do
+    ///
+    /// It only ever *reads*. The row's stored id is left exactly as it is,
+    /// because rewriting a primary key under a live connection is a
+    /// different operation with different risks, and the migration is the
+    /// right place for that. What this gives the user is a mailbox that works
+    /// again, and an honest reason when it does not.
+    ///
+    /// The comparison is done in SQL against the *text* form of the UUID, so
+    /// it works for a row stored as TEXT and for one stored as a BLOB that
+    /// happens to hold the text. Every value is a bound parameter.
+    public static func findToleratingIDEncoding(
+        byId id: UUID,
+        db: LagoonDB
+    ) async throws -> Account? {
+        let text = id.uuidString.lowercased()
+        let sql = """
+            \(accountColumns)
+            WHERE id = ?
+               OR replace(replace(lower(CAST(id AS TEXT)), '{', ''), '}', '') = ?
+            LIMIT 1
+        """
+        return try db.read { db in
+            try Row.fetchOne(db, sql: sql, arguments: [id, text])
+                .map { try Self.decode($0) }
+        }
+    }
+
     public static func decode(_ row: Row) throws -> Account {
         let credentials: Data? = row["credentials"]
         let rawProvider: String = row["provider"]

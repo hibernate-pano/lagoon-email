@@ -1,7 +1,7 @@
 import XCTest
 @testable import Lagoon
 
-/// `CommandPaletteView`'s constructor wires 12 callbacks. If any of them
+/// `CommandPaletteView`'s constructor wires 14 callbacks. If any of them
 /// goes non-optional or gets renamed, this test catches it before the
 /// sheet appears blank in front of the user.
 ///
@@ -17,9 +17,9 @@ final class CommandPaletteFilterTests: XCTestCase {
         CommandPaletteView(
             onNewMessage: {}, onSearch: {}, onToggleSurface: {},
             onShowUsage: {}, onShowActionHistory: {},
-            onShowAdvice: {}, onShowSenderRanking: {},
+            onShowAdvice: {}, onShowReminders: {}, onShowSenderRanking: {},
             onCycleDensity: {}, onShowShortcuts: {}, onShowAISettings: {},
-            onRefresh: {}, onToggleSound: {}
+            onRefresh: {}, onGetNewMail: {}, onToggleSound: {}
         )
     }
 
@@ -40,11 +40,13 @@ final class CommandPaletteFilterTests: XCTestCase {
             onShowUsage: record("usage"),
             onShowActionHistory: record("history"),
             onShowAdvice: record("advice"),
+            onShowReminders: record("reminders"),
             onShowSenderRanking: record("senders"),
             onCycleDensity: record("density"),
             onShowShortcuts: record("shortcuts"),
             onShowAISettings: record("ai-settings"),
             onRefresh: record("refresh"),
+            onGetNewMail: record("get-new-mail"),
             onToggleSound: record("sound")
         )
         for command in view.allCommands {
@@ -58,10 +60,11 @@ final class CommandPaletteFilterTests: XCTestCase {
 
     /// Pinned verbatim: adding a command means adding a callback *and* a row
     /// here, and removing one is a deliberate act rather than an accident.
-    func test_paletteExposesExactlyTheTwelveCommands() {
+    func test_paletteExposesExactlyTheFourteenCommands() {
         XCTAssertEqual(palette().allCommands.map(\.id), [
-            "new-message", "search", "toggle-surface", "refresh",
-            "usage", "ai-settings", "advice", "senders", "density", "history", "shortcuts", "sound"
+            "new-message", "search", "toggle-surface", "refresh", "get-new-mail",
+            "usage", "ai-settings", "advice", "reminders", "senders", "density",
+            "history", "shortcuts", "sound"
         ])
     }
 

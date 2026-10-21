@@ -250,6 +250,60 @@ public enum AdviceStore {
         }
     }
 
+    /// The suggestions this account has **acted on**, as a `(category, action)`
+    /// distribution.
+    ///
+    /// This is the learning signal constitution Phase 4 asks for: the accepted
+    /// verdicts accumulate into a read-only preference, which the classifier
+    /// prompt uses as few-shot context. Without it the `accepted` column is
+    /// written and then never read, and the loop is not a loop — it is a log.
+    ///
+    /// Only `accepted` rows count. `dismissed` is the opposite signal ("do not
+    /// suggest this again"), and `pending` is no signal at all; mixing them in
+    /// would make the distribution say something the user never said.
+    ///
+    /// Bounded by `limit` for the same reason the prompt is: the caller feeds
+    /// this into a model request, and a list that grows with the user's history
+    /// is a cost problem. The rows come back most-frequent first, so the
+    /// handful that survive the cut are the ones that actually describe the
+    /// user.
+    ///
+    /// Rows with a category the current build does not know are skipped rather
+    /// than counted as "other": a distribution that silently lumps a renamed
+    /// category into a bucket teaches the model a preference nobody has.
+    public static func acceptedStats(
+        accountId: UUID,
+        limit: Int = 5,
+        db: LagoonDB
+    ) async throws -> [AcceptedAdviceStat] {
+        let sql = """
+            SELECT category, action, COUNT(*) AS total
+            FROM advice
+            WHERE account_id = ? AND decision = ?
+            GROUP BY category, action
+            ORDER BY total DESC, category ASC, action ASC
+            LIMIT ?
+        """
+        return try db.read { raw in
+            let rows = try Row.fetchAll(
+                raw,
+                sql: sql,
+                arguments: [accountId, AdviceDecision.accepted.rawValue, max(1, limit)]
+            )
+            var stats: [AcceptedAdviceStat] = []
+            for row in rows {
+                guard let actionRaw: String = row["action"],
+                      let action = AdvisedAction(rawValue: actionRaw)
+                else { continue }
+                let category = (row["category"] as String?)
+                    .flatMap(ContentCategory.init(rawValue:))
+                let total: Int = row["total"]
+                stats.append(AcceptedAdviceStat(category: category, action: action, count: total))
+            }
+            return stats
+        }
+    }
+
     /// Drops dismissed rows older than `cutoff`. Advice is derived data that
     /// can always be regenerated from the mail, so it is the one table in the
     /// store that is safe to prune — unlike `ai_actions`, which is an audit

@@ -91,6 +91,86 @@ public enum StackStore {
         }
     }
 
+    /// Renames a group and/or changes what it matches.
+    ///
+    /// ## Why this exists
+    ///
+    /// A group used to be a one-way door: `POST` created it, `DELETE` removed
+    /// it, and there was no way to *change* it. A user who built a group on
+    /// the wrong keyword had to delete it and rebuild it — and the rebuild was
+    /// not free, because a group's name is what the sidebar row and the
+    /// sweep both refer to. That is the "I built it wrong and can't change
+    /// it" dead end.
+    ///
+    /// ## The subset rule
+    ///
+    /// Only the fields the caller actually supplies are written. A client that
+    /// sent all three every time would rewrite the fields the user did not
+    /// touch, so a rename would quietly change a keyword and a keyword edit
+    /// would quietly reset the name. `nil` therefore means "leave this alone",
+    /// not "clear it".
+    ///
+    /// ## The tenant rule
+    ///
+    /// `WHERE id = ? AND account_id = ?` — the same clause the delete uses.
+    /// Without the account scope, one account's client could rename another
+    /// account's group by guessing its id, which is exactly the cross-tenant
+    /// write the delete's scope was added to prevent. The update refuses
+    /// rather than silently no-op'ing: `nil` means "not yours (or gone)".
+    ///
+    /// ## Why a read-then-write and not a dynamic SET clause
+    ///
+    /// The obvious implementation builds `SET name = ?, kind = ?` from
+    /// whichever fields are present — but that assembles SQL text at run
+    /// time, and the one rule this repository does not bend is that no
+    /// user-supplied value ever reaches a SQL string. Building the clause
+    /// from the *field names* is safe in principle and forbidden in
+    /// practice, because "which fields are present" is a question about
+    /// user input. So the row is read first, the three values are merged in
+    /// Swift, and one static statement writes all three back. The read and
+    /// the write share a transaction, so nothing can slip between them.
+    public static func update(
+        id: UUID,
+        accountId: UUID,
+        name: String?,
+        kind: StackRule.Kind?,
+        value: String?,
+        db: LagoonDB
+    ) async throws -> StackRule? {
+        try db.write { db in
+            let existing = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT id, account_id, name, kind, value, created_at
+                    FROM stack_rules
+                    WHERE id = ? AND account_id = ?
+                    LIMIT 1
+                    """,
+                arguments: [id, accountId]
+            ).map(decode)
+            // Not yours, or gone: the caller answers 404.
+            guard let existing else { return nil }
+
+            let merged = StackRule(
+                id: existing.id,
+                accountId: existing.accountId,
+                name: name ?? existing.name,
+                kind: kind ?? existing.kind,
+                value: value ?? existing.value,
+                createdAt: existing.createdAt
+            )
+            try db.execute(
+                sql: """
+                    UPDATE stack_rules
+                    SET name = ?, kind = ?, value = ?
+                    WHERE id = ? AND account_id = ?
+                    """,
+                arguments: [merged.name, merged.kind.rawValue, merged.value, id, accountId]
+            )
+            return merged
+        }
+    }
+
     /// How many messages the rule currently matches **in the list the user sees**.
     ///
     /// Routed through `MessageStore.count` — i.e. through the shared

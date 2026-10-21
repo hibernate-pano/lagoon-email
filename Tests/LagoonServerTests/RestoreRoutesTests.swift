@@ -369,7 +369,7 @@ private actor NoArchiveProvider: MailProvider {
         self.kind = base.kind
     }
 
-    func capabilities() async -> MailCapabilities {
+    func capabilities() async -> MailCapabilities? {
         MailCapabilities(archiveFolder: false, idle: true, move: true, serverSnippet: false)
     }
 

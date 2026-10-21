@@ -24,6 +24,8 @@ struct CommandPaletteView: View {
     let onShowUsage: () -> Void
     let onShowActionHistory: () -> Void
     let onShowAdvice: () -> Void
+    /// The reminders the user set for themselves.
+    let onShowReminders: () -> Void
     /// 发件人排行 — who writes the most, ranked.
     let onShowSenderRanking: () -> Void
     /// Advances to the next density and reports which one, so the palette row
@@ -31,7 +33,11 @@ struct CommandPaletteView: View {
     let onCycleDensity: () -> Void
     let onShowShortcuts: () -> Void
     let onShowAISettings: () -> Void
+    /// Re-read what is already fetched — a local round trip.
     let onRefresh: () -> Void
+    /// Ask the server to pull from IMAP, then re-read. A different verb
+    /// from `onRefresh`, with a different latency, so it gets its own row.
+    let onGetNewMail: () -> Void
     let onToggleSound: () -> Void
 
     @State private var query = ""
@@ -60,10 +66,21 @@ struct CommandPaletteView: View {
             Command(id: "new-message", title: l10n.newMessage, shortcut: "⌘N", systemImage: "square.and.pencil", action: { run(onNewMessage) }),
             Command(id: "search", title: l10n.search, shortcut: "⌘F", systemImage: "magnifyingglass", action: { run(onSearch) }),
             Command(id: "toggle-surface", title: l10n.toggleSurface, shortcut: "⌘0", systemImage: "rectangle.grid.2x2", action: { run(onToggleSurface) }),
+            // Two refresh verbs, two rows, two keys. "刷新" re-reads what the
+            // server already has (fast, local); "获取新邮件" asks the mail
+            // server for more (slow, a network round trip). One row for both
+            // would make the fast one look broken.
             Command(id: "refresh", title: l10n.refresh, shortcut: "⌥⌘R", systemImage: "arrow.clockwise", action: { run(onRefresh) }),
+            Command(id: "get-new-mail", title: l10n.menuGetNewMail, shortcut: "⇧⌘N", systemImage: "tray.and.arrow.down", action: { run(onGetNewMail) }),
             Command(id: "usage", title: l10n.budgetThisMonth, shortcut: "⌘B", systemImage: "chart.bar", action: { run(onShowUsage) }),
             Command(id: "ai-settings", title: l10n.aiSettingsTitle, shortcut: nil, systemImage: "sparkles", action: { run(onShowAISettings) }),
             Command(id: "advice", title: l10n.adviceTitle, shortcut: "⇧⌘A", systemImage: "sparkles", action: { run(onShowAdvice) }),
+            // Next to the advice queue, because the two are the two halves
+            // of the same promise: the advice queue is what the AI suggests,
+            // and this is what the *user* set. A user who reads the
+            // suggestion "this needs a reply by Friday" and does nothing
+            // must be able to find the reminder they set for it.
+            Command(id: "reminders", title: l10n.reminderTitle, shortcut: nil, systemImage: "bell", action: { run(onShowReminders) }),
             Command(id: "senders", title: l10n.senderRankingTitle, shortcut: nil, systemImage: "person.2", action: { run(onShowSenderRanking) }),
             // Density lives here rather than in the list's own toolbar row: that
             // row was already at the point where the surface title wrapped to
@@ -100,7 +117,10 @@ struct CommandPaletteView: View {
             Divider()
             commandList
         }
-        .frame(width: 520, height: 360)
+        .frame(
+            width: LagoonSheetSize.standard.width,
+            height: LagoonSheetSize.standard.height
+        )
         .onAppear { queryFocused = true }
         // Keep the highlight in range as the user types.
         .onChange(of: query) { _, _ in
@@ -127,33 +147,56 @@ struct CommandPaletteView: View {
     }
 
     private var commandList: some View {
-        List(selection: $highlightedIndex) {
-            ForEach(Array(filtered.enumerated()), id: \.element.id) { index, command in
-                Button {
-                    command.action()
-                } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: command.systemImage)
-                            .frame(width: 22)
-                            .foregroundStyle(.secondary)
-                        Text(command.title)
-                        Spacer()
-                        if let shortcut = command.shortcut {
-                            Text(shortcut)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.tertiary)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 4))
+        Group {
+            if filtered.isEmpty {
+                // Without this the list rendered as an empty rectangle: the
+                // user typed something that matched nothing and got no
+                // explanation at all.
+                ContentUnavailableView(
+                    l10n.noMatchingCommands,
+                    systemImage: "magnifyingglass",
+                    description: Text(l10n.noMatchingCommandsHint)
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(selection: $highlightedIndex) {
+                    ForEach(Array(filtered.enumerated()), id: \.element.id) { index, command in
+                        Button {
+                            command.action()
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: command.systemImage)
+                                    .frame(width: 22)
+                                    .foregroundStyle(.secondary)
+                                Text(command.title)
+                                Spacer()
+                                if let shortcut = command.shortcut {
+                                    Text(shortcut)
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.tertiary)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 4))
+                                }
+                            }
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
+                        .tag(index)
+                        // VoiceOver read the row as "magnifyingglass" — the
+                        // SF Symbol's name — because the icon is the first
+                        // element and the label never said what the row
+                        // *does*. The row's name is the command; the symbol
+                        // is decoration and is hidden from the reader.
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(command.title)
+                        .accessibilityValue(command.shortcut ?? "")
+                        .accessibilityAddTraits(.isButton)
                     }
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .tag(index)
+                .listStyle(.plain)
             }
         }
-        .listStyle(.plain)
         .onMoveCommand { direction in
             switch direction {
             case .down: moveHighlight(by: 1)

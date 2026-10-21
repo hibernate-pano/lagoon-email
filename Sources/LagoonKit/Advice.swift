@@ -24,8 +24,24 @@ public enum AdvisedAction: String, Codable, Sendable, CaseIterable {
     /// Read-only informational mail; no action owed.
     case nothing
 
-    /// Actions that change the mailbox if the user acts on them. Used by the UI
-    /// to decide whether a suggestion needs an explicit confirmation step.
+    /// Actions that change the mailbox if the user acts on them.
+    ///
+    /// The UI uses this for two decisions, and both were decided by
+    /// *guessing* before it existed:
+    ///
+    /// * whether to offer a 「照做」 button at all — a non-mutating
+    ///   suggestion (reply, wait, remind, nothing) has no mailbox write
+    ///   to perform, so a button for it would be a button that does
+    ///   nothing;
+    /// * whether the action needs an **explicit confirmation** before it
+    ///   runs — an unsubscribe tells the publisher, and that cannot be
+    ///   taken back.
+    ///
+    /// It sat unused for a long time, and behind it sat two real defects:
+    /// a `.delete` suggestion offered a 「照做」 button whose executor had
+    /// no case for it (a dead button that made the user believe the mail
+    /// was gone), and an unsubscribe fired on a single tap with no
+    /// confirmation at all.
     public var isMutating: Bool {
         switch self {
         case .archive, .delete, .unsubscribe: true
@@ -196,6 +212,17 @@ public struct AdviceDecisionResponse: Codable, Equatable, Sendable {
     }
 }
 
+/// `GET /api/advice/accepted-stats?accountId=` response.
+///
+/// The read-only learning signal: which `(category, action)` suggestions this
+/// account has actually acted on, and how often. It is exposed as a route as
+/// well as fed into the classifier prompt, because a preference nobody can
+/// read is a preference nobody can audit.
+public struct AcceptedAdviceStatsResponse: Codable, Equatable, Sendable {
+    public let stats: [AcceptedAdviceStat]
+    public init(stats: [AcceptedAdviceStat]) { self.stats = stats }
+}
+
 /// Which advice rows a query returns. A sum type rather than an optional
 /// because `nil` would have to mean "everything", and that ambiguity is what
 /// made the route need two nested branches.
@@ -206,4 +233,43 @@ public enum AdviceDecisionQuery: Equatable, Sendable {
     case exactly(AdviceDecision)
     /// Every state, for the audit view.
     case all
+}
+
+/// One entry of the "what the user actually acts on" distribution: how often
+/// the user acted on a suggestion of this `(category, action)` shape.
+///
+/// This is the learning signal constitution Phase 4 asks for ("accepted /
+/// rejected suggestions accumulate as read-only preferences, used to improve
+/// later suggestions"). It is **read-only by construction** — a count of
+/// past verdicts, never an instruction, and never a write trigger.
+public struct AcceptedAdviceStat: Codable, Equatable, Sendable {
+    /// The suggestion's category, when the classifier gave one. Nil means the
+    /// suggestion was categorised as "other" — the shape still counts.
+    public let category: ContentCategory?
+    /// What the user was told to do, and did.
+    public let action: AdvisedAction
+    /// How many suggestions of this shape the user acted on.
+    public let count: Int
+
+    public init(category: ContentCategory?, action: AdvisedAction, count: Int) {
+        self.category = category
+        self.action = action
+        self.count = count
+    }
+}
+
+/// The read-only source of "what this user actually acts on".
+///
+/// Split out as a protocol because the classifier lives in `LagoonAI`, which
+/// must not depend on the server's storage: the AI module never touches a
+/// mailbox, a database or a route. The server implements the protocol and the
+/// gateway only ever *reads* from it — which is the same one-way edge the
+/// constitution §3 requires between the two planes.
+public protocol AdvicePreferenceProviding: Sendable {
+    /// The suggestions this account has acted on, most frequent first.
+    ///
+    /// Bounded by the implementation (the server returns the top handful):
+    /// this feeds a prompt, and a prompt that grows with the user's history
+    /// is a cost problem, not a feature.
+    func acceptedAdviceStats(accountId: UUID) async -> [AcceptedAdviceStat]
 }

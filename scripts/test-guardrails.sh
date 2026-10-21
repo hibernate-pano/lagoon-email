@@ -99,6 +99,22 @@ let comment = "SELECT is only text here" // \(not interpolation)
 let separate = "SELECT"
 let other = x + y
 SWIFT
+# Prose that happens to use a SQL verb. "Delete", "update", "select" and
+# "insert" are ordinary English words; a UI string or a test assertion
+# that says one of them and interpolates a value is not SQL. Before the
+# rule required SQL structure, this fixture was reported as
+# "sql-interpolation" — which is how a guardrail teaches its readers to
+# ignore it.
+cat > "$tmp/prose.swift" <<'SWIFT'
+let message = """
+    These localization strings are never shown. Delete them, or wire \
+    them up if they were meant to reach the screen:
+    \(keys)
+    """
+let update = "Update the list to \(count) items"
+let insert = "Insert the new \(name) at the top"
+let select = "Select one of \(options)"
+SWIFT
 
 # One report, one kind. Without the parts>1 gate the chain rule re-reports this
 # same literal under a second name, which would train a reader to ignore one of
@@ -112,6 +128,7 @@ expect_sql_caught "lowercase keyword" "$tmp/lowercase.swift"
 expect_sql_caught "raw-string interp" "$tmp/raw_string.swift"
 expect_sql_caught "bare concat"       "$tmp/concat_bare.swift"
 expect_sql_clean  "clean fixture"     "$tmp/clean.swift"
+expect_sql_clean  "prose with a verb" "$tmp/prose.swift"
 
 # ---------------------------------------------------------------------------
 # Raw-string delimiters decide what an interpolation is.

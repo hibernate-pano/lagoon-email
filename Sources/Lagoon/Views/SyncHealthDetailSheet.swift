@@ -52,11 +52,23 @@ struct SyncHealthDetailSheet: View {
                 Text(l10n.lastError)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text(lastError)
-                    .font(.system(.callout, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(8)
-                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
+                // The sentence first — this is the part the user can act on.
+                Text(SyncErrorReason.sentence(for: lastError, l10n: l10n))
+                    .font(.callout)
+                // The raw label stays, but demoted to copyable diagnostics:
+                // this is the string a bug report needs, and it is the string
+                // the user must not have to decode.
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(l10n.technicalDetails)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Text(lastError)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                .padding(8)
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
             }
 
             Text(l10n.capabilities)
@@ -65,7 +77,11 @@ struct SyncHealthDetailSheet: View {
             VStack(alignment: .leading, spacing: 4) {
                 capabilityRow(label: l10n.idleSupported, on: capabilities.idle)
                 capabilityRow(label: l10n.moveSupported, on: capabilities.move)
-                if let folder = archiveFolderName {
+                capabilityRow(label: l10n.archiveSupported, on: capabilities.archiveFolder)
+                capabilityRow(label: l10n.uidplusSupported, on: capabilities.uidplus)
+                capabilityRow(label: l10n.sentFolderSupported, on: capabilities.sentFolder)
+                capabilityRow(label: l10n.trashFolderSupported, on: capabilities.trashFolder)
+                if let folder = capabilities.archiveFolderName {
                     Text("\(l10n.archiveFolderName): \(folder)")
                         .font(.callout)
                 }
@@ -75,13 +91,36 @@ struct SyncHealthDetailSheet: View {
         .frame(minWidth: 420, maxWidth: 480)
     }
 
-    private func capabilityRow(label: String, on: Bool) -> some View {
+    /// One capability row.
+    ///
+    /// Three states, not two: "yes", "no", and "not determined". The third
+    /// is not a cosmetic distinction — it is the difference between "this
+    /// server cannot do this" (a settled fact the user can act on) and
+    /// "Lagoon has not asked yet" (which a red ✗ would misreport as the
+    /// former, and send the user looking for a problem that is not there).
+    private func capabilityRow(label: String, on: Bool?) -> some View {
         HStack(spacing: 6) {
-            Image(systemName: on ? "checkmark.circle.fill" : "xmark.circle")
-                .foregroundStyle(on ? .green : .secondary)
+            Image(systemName: Self.icon(for: on))
+                .foregroundStyle(Self.color(for: on))
             Text(label)
                 .font(.callout)
-                .foregroundStyle(on ? .primary : .secondary)
+                .foregroundStyle(on == false ? .secondary : .primary)
+        }
+    }
+
+    private static func icon(for on: Bool?) -> String {
+        switch on {
+        case .some(true): "checkmark.circle.fill"
+        case .some(false): "xmark.circle"
+        case nil: "questionmark.circle"
+        }
+    }
+
+    private static func color(for on: Bool?) -> Color {
+        switch on {
+        case .some(true): .green
+        case .some(false): .secondary
+        case nil: .secondary.opacity(0.6)
         }
     }
 
@@ -90,14 +129,8 @@ struct SyncHealthDetailSheet: View {
         case .ok: "checkmark.circle.fill"
         case .degraded: "exclamationmark.triangle.fill"
         case .needsReconnect: "key.slash"
+        case .accountMissing: "questionmark.circle"
         case .error: "exclamationmark.octagon.fill"
         }
-    }
-
-    /// Capabilities include `archiveFolder: Bool` but not the folder
-    /// name itself; the server doesn't surface it. Leave the row out
-    /// rather than fabricate a name.
-    private var archiveFolderName: String? {
-        capabilities.archiveFolder ? "✓" : nil
     }
 }

@@ -85,12 +85,20 @@ final class MailSurfaceWiringTests: XCTestCase {
     /// operation at the moment the user most needs to know what failed.
     func test_bulkDeleteFailureNamesTheOperation() throws {
         let source = try ViewSource.read("MessageListView")
-        let region = try Self.body("private func deleteAllMatching", in: source, limit: 3600)
+        // The window is measured from the *end* of the catch marker. It has
+        // to be wide enough to reach the banner: the success path above
+        // grew (the undo toast was added), which pushed the catch further
+        // down the function, and a window that stops before the banner is
+        // reached reports a missing title for a banner that is right there.
+        let region = try Self.body("private func deleteAllMatching", in: source, limit: 5200)
         let catchIndex = try XCTUnwrap(
             region.range(of: "} catch {"), "deleteAllMatching lost its catch"
         )
-        let catchBody = region[catchIndex.upperBound...].prefix(700)
-        XCTAssertTrue(catchBody.contains("l10n.bulkDeleteFailed"))
+        let catchBody = region[catchIndex.upperBound...].prefix(900)
+        XCTAssertTrue(
+            catchBody.contains("l10n.bulkDeleteFailed"),
+            "the bulk delete failure does not name the operation"
+        )
         XCTAssertFalse(
             catchBody.contains("l10n.loadFailed"),
             "the wrong-operation title is back on the bulk delete failure"
@@ -230,15 +238,32 @@ final class MailSurfaceWiringTests: XCTestCase {
     func test_userGuideDescribesTheRealBackspaceSemantics() throws {
         let url = Self.repoRoot.appendingPathComponent("docs/使用说明.md")
         let doc = try String(contentsOf: url, encoding: .utf8)
-        XCTAssertTrue(doc.contains("归档（⌫）"), "the guide no longer documents ⌫ = archive")
-        XCTAssertTrue(doc.contains("删除（⌘⌫）"), "the guide no longer documents ⌘⌫ = delete")
-        XCTAssertFalse(
-            doc.contains("归档（⌘⌫）"),
-            "the reversed mapping is back in the user guide"
+
+        // What has to stay true is the *mapping* — ⌫ archives, ⌘⌫ trashes —
+        // not the exact wording. The previous version matched on the literal
+        // "删除（⌘⌫）", so improving the copy to "移到废纸篓（⌘⌫）" failed
+        // the test even though the behaviour it protects was unchanged. A
+        // test that breaks when the words get better is a test that
+        // rewards freezing the words.
+        let lines = doc.split(separator: "\n").map(String.init)
+        let plain = lines.filter { $0.contains("⌫") && !$0.contains("⌘⌫") }
+        let command = lines.filter { $0.contains("⌘⌫") }
+
+        XCTAssertTrue(
+            plain.contains { $0.contains("归档") },
+            "the guide no longer documents ⌫ = archive: \(plain)"
+        )
+        XCTAssertTrue(
+            command.contains { $0.contains("废纸篓") || $0.contains("删除") },
+            "the guide no longer documents ⌘⌫ = move to trash: \(command)"
         )
         XCTAssertFalse(
-            doc.contains("删除（⌫）"),
-            "the reversed mapping is back in the user guide"
+            command.contains { $0.contains("归档") },
+            "the reversed mapping is back in the user guide: \(command)"
+        )
+        XCTAssertFalse(
+            plain.contains { $0.contains("废纸篓") && !$0.contains("归档") },
+            "the reversed mapping is back in the user guide: \(plain)"
         )
         XCTAssertTrue(
             doc.contains("⌘A 然后 ⌘⌫"),

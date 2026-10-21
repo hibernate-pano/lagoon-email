@@ -81,19 +81,53 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     private var inboxRemoteIdByUID: [Int64: String] = [:]
     private var inboxUIDs: Set<Int64> = []
     private var inboxIndexValid = false
+    /// Messages that left the INBOX and still need a whereabouts check.
+    ///
+    /// A message is only removed locally once the server has confirmed it is
+    /// in neither the archive folder nor the trash folder. Until then it
+    /// stays here, and the store keeps its row — which is the whole point:
+    /// the alternative was deleting mail that had merely been *filed*.
+    ///
+    /// The set survives across rounds because the INBOX index diff that
+    /// produced it is one-shot: once a UID has left the index, no later
+    /// round would rediscover it.
+    private var pendingWhereabouts: Set<String> = []
     /// The archive role is account data, not connection state: it survives a
     /// reconnect (spec §4.3).
     private var archiveResolved = false
     private var archiveName: String?
-    private var trashResolved = false
+    /// When the Trash role was last looked up, and what it resolved to.
+    ///
+    /// A *negative* answer is cached too — a LIST per delete would be real
+    /// cost — but it expires, because a LIST that missed a folder used to be
+    /// latched for the life of the provider: the user could not delete
+    /// anything until they re-authorized the account.
+    private var trashResolvedAt: Date?
     private var trashName: String?
-    private var sentResolved = false
+    /// Same contract as the Trash role.
+    private var sentResolvedAt: Date?
     private var sentName: String?
     private var cachedCapabilities: MailCapabilities?
     /// `\Seen` as last reported to the store. Flips are only reported for UIDs
     /// in here: without a baseline a rescan says nothing about what the user
     /// has already seen.
     private var reportedRead: [Int64: Bool] = [:]
+    /// How long a *negative* folder-role answer is trusted before the role is
+    /// looked up again.
+    ///
+    /// Positive answers are cached for the life of the provider — a folder
+    /// that exists does not stop existing. Negative answers are not: "this
+    /// account has no Trash folder" is also what a truncated LIST, or a
+    /// folder created a moment later, would produce — and acting on it turns
+    /// a hiccup into a feature that stays switched off until the user
+    /// re-authorizes.
+    private static let negativeFolderTTL: TimeInterval = 300
+
+    /// Whether a negative folder-role answer has gone stale.
+    private static func negativeExpired(_ resolvedAt: Date?) -> Bool {
+        guard let resolvedAt else { return true }
+        return Date().timeIntervalSince(resolvedAt) >= negativeFolderTTL
+    }
     /// The pull path is otherwise silent, which makes "connected but nothing
     /// arrived" indistinguishable from "empty mailbox" — the log only says
     /// `imap.connected`. One SELECT/backfill summary per process per account.
@@ -118,17 +152,55 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
 
     // MARK: - Capabilities
 
-    public func capabilities() async -> MailCapabilities {
+    /// Negotiates the server's capabilities.
+    ///
+    /// `nil` means the negotiation did not complete — a dead socket, a
+    /// refused LIST. It does **not** mean "this server has no capabilities":
+    /// the two answers have very different consequences, because the routes
+    /// gate archiving and deleting on the stored result. A blip that was
+    /// recorded as "no capabilities" turned a momentary network problem into
+    /// a feature that stayed off for the life of the account.
+    public func capabilities() async -> MailCapabilities? {
         do {
             let resolved = try await withClient { client -> MailCapabilities in
-                let folder = try await resolveArchiveFolder(client: client)
+                // ONE LIST, three role verdicts.
+                //
+                // The archive, trash and sent roles are all decided from
+                // the same `LIST "" "*"`. Asking the server again for the
+                // trash and sent roles would double the command cost of
+                // every capability probe (V2 A2) — and, worse, it would
+                // let the probe and the resolvers see *different* folder
+                // lists, so they could disagree about a role. A probe that
+                // said "no trash" while `resolveTrashFolder` would have
+                // found one would disable delete for a working account.
+                //
+                // So the resolvers take the mailbox list as an argument
+                // rather than fetching their own.
+                let mailboxes = try await client.listMailboxes()
+                // The *resolver*, not the side-effect-free variant: the
+                // resolver may CREATE the archive folder, and the probe's
+                // verdict has to be the one the request path will reach.
+                let folder = try await resolveArchiveFolder(client: client, mailboxes: mailboxes)
                 return MailCapabilities(
                     archiveFolder: folder != nil,
                     idle: negotiated.contains("IDLE"),
                     move: negotiated.contains("MOVE"),
                     // Every IMAP body can be sampled from its message prefix
                     // with BODY.PEEK[] and decoded by MIMEParser.
-                    serverSnippet: true
+                    serverSnippet: true,
+                    // UIDPLUS (RFC 4315) is what makes a permanent delete
+                    // safe: `UID EXPUNGE` removes exactly the message the
+                    // user picked. Without it the server refuses the delete
+                    // rather than expunge another client's flags — so the
+                    // client has to know *before* the click.
+                    uidplus: negotiated.contains("UIDPLUS"),
+                    // The role verdicts come from the *same* predicates the
+                    // resolvers use, over the *same* mailbox list.
+                    sentFolder: mailboxes.contains(where: { Self.isSentMailbox($0) }),
+                    trashFolder: mailboxes.contains(where: { Self.isTrashMailbox($0) }),
+                    // The server's own name for the archive folder — the
+                    // answer to "归档到哪儿了？". Nil when there is none.
+                    archiveFolderName: folder
                 )
             }
             cachedCapabilities = resolved
@@ -137,7 +209,7 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             // The protocol signature is non-throwing; the sync round reports
             // the failure. A previous negotiation stays valid on the account.
             logger.warning("imap.capabilitiesFailed", metadata: ["label": .string(Self.label(error))])
-            return cachedCapabilities ?? .unknown
+            return nil
         }
     }
 
@@ -329,10 +401,15 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
             // The full index builds on the next round instead of delaying the
             // first paint.
             if reconcilesInbox, cursor.lastUid != nil {
-                inboxRemoteIds = try await reconcileInboxMembership(
+                if let membership = try await reconcileInboxMembership(
                     client: client,
                     exists: inbox.exists
-                )
+                ) {
+                    inboxRemoteIds = membership.inboxRemoteIds
+                    // Everything that left the inbox now owes the server a
+                    // whereabouts check, whatever the reason it left.
+                    pendingWhereabouts.formUnion(membership.vanishedRemoteIds)
+                }
             }
 
             // Two different questions, deliberately not one:
@@ -458,6 +535,10 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                 || sent.validity == cursor.sentUidValidity
                 ? (sent.lastUid ?? cursor.sentLastUid)
                 : sent.lastUid
+            // The whereabouts check runs last, after every INBOX read is
+            // done: it SELECTs the archive and trash folders, and the round's
+            // remaining INBOX work must not run against the wrong folder.
+            let whereabouts = await locateWhereabouts(client: client)
             return MailChangeSet(
                 upserts: upserts,
                 resetRequired: false,
@@ -471,6 +552,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                     historyFloorUid: nextHistoryFloor
                 ),
                 inboxRemoteIds: inboxRemoteIds,
+                archivedRemoteIds: whereabouts.archived,
+                trashedRemoteIds: whereabouts.trashed,
+                removedRemoteIds: whereabouts.removed,
                 repliedMessageIds: sent.ids
             )
         }
@@ -872,12 +956,29 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     private func resolveArchiveFolder(client: IMAPClient) async throws -> String? {
         if archiveResolved { return archiveName }
         let mailboxes = try await client.listMailboxes()
+        return try await resolveArchiveFolder(client: client, mailboxes: mailboxes)
+    }
+
+    /// The archive role, decided from a mailbox list the caller already
+    /// holds.
+    ///
+    /// Split out so the capability probe can use the **same** list the
+    /// resolvers use. The probe's archive verdict and the resolver's answer
+    /// are then the same computation over the same data — they cannot
+    /// drift, and the probe costs no extra round trip.
+    private func resolveArchiveFolder(
+        client: IMAPClient, mailboxes: [IMAPMailbox]
+    ) async throws -> String? {
+        if archiveResolved { return archiveName }
         if let special = mailboxes.first(where: { mailbox in
             mailbox.attributes.contains { $0.caseInsensitiveCompare("\\Archive") == .orderedSame }
         }) {
             archiveName = special.name
         } else if let named = mailboxes.first(where: { mailbox in
-            ["archive", "归档"].contains(mailbox.name.lowercased())
+            // Leaf-matched, for the same reason the Trash role is: QQ nests
+            // `归档` under the account root in some locales.
+            guard let leaf = Self.roleLeaf(mailbox.name) else { return false }
+            return Self.archiveNames.contains(leaf)
         }) {
             archiveName = named.name
         } else {
@@ -902,9 +1003,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         // Piggyback the Sent role on the same LIST: the sync round needs the
         // Sent folder every round for reply detection, and a second LIST per
         // round would double the command cost (V2 A2).
-        if !sentResolved {
+        if sentResolvedAt == nil || (sentName == nil && Self.negativeExpired(sentResolvedAt)) {
             sentName = mailboxes.first(where: { Self.isSentMailbox($0) })?.name
-            sentResolved = true
+            sentResolvedAt = Date()
         }
         return archiveName
     }
@@ -914,19 +1015,16 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     /// inventing a "Trash" folder on a server that has none would fake the
     /// delete semantics; the route answers 409 delete-unavailable instead.
     private func resolveTrashFolder(client: IMAPClient) async throws -> String? {
-        if trashResolved { return trashName }
-        let mailboxes = try await client.listMailboxes()
-        if let special = mailboxes.first(where: { mailbox in
-            mailbox.attributes.contains { $0.caseInsensitiveCompare("\\Trash") == .orderedSame }
-        }) {
-            trashName = special.name
-        } else if let named = mailboxes.first(where: { mailbox in
-            ["trash", "deleted", "deleted messages", "deleted items", "已删除", "已删除邮件"]
-                .contains(mailbox.name.lowercased())
-        }) {
-            trashName = named.name
+        // The first branch does not need the timestamp — it only asks
+        // "have we resolved this before?", and binding a value it never
+        // reads is a warning the compiler is right to make.
+        if trashResolvedAt != nil, trashName != nil { return trashName }
+        if let resolvedAt = trashResolvedAt, trashName == nil, !Self.negativeExpired(resolvedAt) {
+            return nil
         }
-        trashResolved = true
+        let mailboxes = try await client.listMailboxes()
+        trashName = mailboxes.first(where: { Self.isTrashMailbox($0) })?.name
+        trashResolvedAt = Date()
         return trashName
     }
 
@@ -1018,19 +1116,69 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
     }
 
     private static func isSentMailbox(_ mailbox: IMAPMailbox) -> Bool {
-        mailbox.attributes.contains {
+        if mailbox.attributes.contains(where: {
             $0.caseInsensitiveCompare("\\Sent") == .orderedSame
-        } || ["sent", "sent messages", "已发送", "已发送邮件"].contains(
-            mailbox.name.lowercased()
-        )
+        }) { return true }
+        guard let leaf = Self.roleLeaf(mailbox.name) else { return false }
+        return Self.sentNames.contains(leaf)
+    }
+
+    /// The trash role, by the same rules `resolveTrashFolder` uses.
+    ///
+    /// It is a separate function rather than a shared one because the
+    /// resolver also *caches* the name and can latch a negative verdict;
+    /// the capability probe only needs to answer "does one exist", and it
+    /// must not disturb the cache — a probe that latched "no trash" would
+    /// turn delete off for the life of the account.
+    private static func isTrashMailbox(_ mailbox: IMAPMailbox) -> Bool {
+        if mailbox.attributes.contains(where: {
+            $0.caseInsensitiveCompare("\\Trash") == .orderedSame
+        }) { return true }
+        guard let leaf = Self.roleLeaf(mailbox.name) else { return false }
+        return Self.trashNames.contains(leaf)
+    }
+
+    /// Well-known names for the Sent role.
+    private static let sentNames: Set<String> = [
+        "sent", "sent messages", "sent items", "sent mail", "已发送", "已发送邮件",
+    ]
+
+    /// Well-known names for the Trash role.
+    private static let trashNames: Set<String> = [
+        "trash", "deleted", "deleted messages", "deleted items", "deleted mail",
+        "废纸篓", "已删除", "已删除邮件",
+    ]
+
+    /// Well-known names for the Archive role.
+    private static let archiveNames: Set<String> = ["archive", "archived", "归档"]
+
+    /// The leaf segment of a folder path, lowercased — the segment that
+    /// identifies the role.
+    ///
+    /// QQ nests `废纸篓` under the account root in some locales and at the top
+    /// level in others, so a full-path match would miss half of them. The
+    /// same reasoning is already applied in `isReservedFolder`, which is why
+    /// the two must not drift apart: a role the reserved-folder list hides
+    /// but the role resolver cannot find is a folder the user can see in
+    /// another client and cannot delete from here.
+    private static func roleLeaf(_ name: String) -> String? {
+        guard let leaf = name.split(separator: "/").last else { return nil }
+        let trimmed = leaf.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed.lowercased()
     }
 
     private func resolveSentFolder() async throws -> String? {
-        if sentResolved { return sentName }
+        // Same shape as the trash folder: the "already resolved" branch
+        // asks only whether a name exists, so it does not bind the
+        // timestamp.
+        if sentResolvedAt != nil, sentName != nil { return sentName }
+        if let resolvedAt = sentResolvedAt, sentName == nil, !Self.negativeExpired(resolvedAt) {
+            return nil
+        }
         return try await withClient { client in
             let mailboxes = try await client.listMailboxes()
             sentName = mailboxes.first(where: { Self.isSentMailbox($0) })?.name
-            sentResolved = true
+            sentResolvedAt = Date()
             return sentName
         }
     }
@@ -1040,9 +1188,14 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         do {
             try await client.move(uid: uid, to: mailbox)
         } catch MailError.protocolError(let reason) where reason == "MOVE not supported" {
+            // The server has no MOVE, so the move is copy + delete. The delete
+            // half must remove *this* message and nothing else — a plain
+            // EXPUNGE here would also remove whatever another client had
+            // flagged for deletion in the same folder. `deleteExactly` does
+            // the UID-scoped thing, or an unflag/expunge/restore dance when
+            // the server has no UID EXPUNGE either.
             try await client.copy(uid: uid, to: mailbox)
-            try await client.store(uid: uid, add: ["\\Deleted"])
-            try await client.expunge()
+            try await client.deleteExactly(uid: uid)
         }
     }
 
@@ -1059,13 +1212,30 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         uidByMessageID[remoteId] = fetched.uid
     }
 
+    /// The outcome of one membership reconcile.
+    ///
+    /// Two sets, because the round answers two different questions: what is
+    /// in the inbox *now*, and what *left* it. The second one is the
+    /// dangerous one — a message that left the inbox may have been archived
+    /// or trashed rather than deleted, and reading "not in the inbox" as
+    /// "deleted" is what made Lagoon delete mail that was still on the
+    /// server.
+    private struct InboxMembership {
+        /// Every remote ID currently in the INBOX.
+        var inboxRemoteIds: Set<String>
+        /// Remote IDs that were in the INBOX on the previous round and are
+        /// not any more. These need a whereabouts check before anything
+        /// local is removed.
+        var vanishedRemoteIds: Set<String>
+    }
+
     /// Build the complete INBOX identity view once, then reconcile it on every
     /// round with `UID SEARCH ALL`. Returning nil means the server did not
     /// provide a trustworthy complete view, so the store must not delete rows.
     private func reconcileInboxMembership(
         client: IMAPClient,
         exists: Int
-    ) async throws -> Set<String>? {
+    ) async throws -> InboxMembership? {
         if !inboxIndexValid {
             let headers = try await client.fetchHeaders(fromUid: 1)
             inboxRemoteIdByUID.removeAll(keepingCapacity: true)
@@ -1083,9 +1253,11 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
         guard !currentUIDs.isEmpty || exists == 0 else { return nil }
 
         let vanished = inboxUIDs.subtracting(currentUIDs)
+        var vanishedRemoteIds: Set<String> = []
         for uid in vanished {
             if let remoteId = inboxRemoteIdByUID.removeValue(forKey: uid) {
                 uidByMessageID[remoteId] = nil
+                vanishedRemoteIds.insert(remoteId)
             }
             reportedRead[uid] = nil
         }
@@ -1098,7 +1270,98 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                 rememberInboxHeader(header)
             }
         }
-        return Set(currentUIDs.compactMap { inboxRemoteIdByUID[$0] })
+        return InboxMembership(
+            inboxRemoteIds: Set(currentUIDs.compactMap { inboxRemoteIdByUID[$0] }),
+            vanishedRemoteIds: vanishedRemoteIds
+        )
+    }
+
+    /// Asks the server where a set of messages went.
+    ///
+    /// A message that left the INBOX has not necessarily been deleted: it may
+    /// have been archived or trashed — by Lagoon, or by another client on the
+    /// same account. The reconcile used to read "not in the inbox" as "gone"
+    /// and deleted the local row, taking its cached body and its paid-for AI
+    /// advice with it. Since the app never reads the archive or trash folders
+    /// back, that deletion was permanent: the mail was still on the server,
+    /// in a folder Lagoon does not look at, and gone from the app.
+    ///
+    /// So before removing anything, ask the two folders that can hold it. A
+    /// message found in neither really is gone.
+    ///
+    /// The lookup is by Message-ID, because that is the identity the app
+    /// stores — and the only one that survives a move between folders (a UID
+    /// is folder-local, so the same message has different UIDs in the inbox
+    /// and in the archive).
+    private func locate(
+        client: IMAPClient,
+        remoteIds: Set<String>
+    ) async throws -> (archived: Set<String>, trashed: Set<String>) {
+        var archived: Set<String> = []
+        var trashed: Set<String> = []
+        guard !remoteIds.isEmpty else { return (archived, trashed) }
+        if let folder = try await resolveArchiveFolder(client: client) {
+            selected = try await client.select(folder)
+            for remoteId in remoteIds {
+                if try await client.searchUID(messageID: remoteId) != nil {
+                    archived.insert(remoteId)
+                }
+            }
+        }
+        let rest = remoteIds.subtracting(archived)
+        if !rest.isEmpty, let folder = try await resolveTrashFolder(client: client) {
+            selected = try await client.select(folder)
+            for remoteId in rest {
+                if try await client.searchUID(messageID: remoteId) != nil {
+                    trashed.insert(remoteId)
+                }
+            }
+        }
+        // The selection now points at a filing folder. `selected = nil` says
+        // so, and the next INBOX read re-selects.
+        selected = nil
+        return (archived, trashed)
+    }
+
+    /// How many whereabouts lookups one round may run.
+    ///
+    /// Each lookup is a round trip (`SELECT` + `UID SEARCH HEADER
+    /// Message-ID`), so an unbounded set would let one busy minute — the user
+    /// clearing 300 messages in another client — hold the sync connection
+    /// for minutes. The overflow is not lost: it stays in
+    /// `pendingWhereabouts` and the next round picks it up. A message whose
+    /// whereabouts are still unknown is *not* removed locally, so the budget
+    /// costs timeliness, never data.
+    private static let whereaboutsBudget = 40
+
+    /// Runs the whereabouts check for the messages that left the inbox, and
+    /// reports what the server said.
+    ///
+    /// Best-effort by design: a server that will not open the archive folder
+    /// must not fail the sync. When the check cannot be completed the
+    /// messages stay in `pendingWhereabouts` and nothing is reported as
+    /// removed — the store then keeps the local rows, which is the safe
+    /// direction.
+    private func locateWhereabouts(
+        client: IMAPClient
+    ) async -> (archived: Set<String>, trashed: Set<String>, removed: Set<String>) {
+        guard !pendingWhereabouts.isEmpty else { return ([], [], []) }
+        let toCheck = Set(pendingWhereabouts.prefix(Self.whereaboutsBudget))
+        do {
+            let located = try await locate(client: client, remoteIds: toCheck)
+            let removed = toCheck
+                .subtracting(located.archived)
+                .subtracting(located.trashed)
+            pendingWhereabouts.subtract(toCheck)
+            return (located.archived, located.trashed, removed)
+        } catch {
+            logger.warning("imap.whereaboutsFailed", metadata: [
+                "account": .string(account.email),
+                "label": .string(Self.label(error)),
+                "pending": .string("\(pendingWhereabouts.count)"),
+            ])
+            return ([], [], [])
+        }
     }
 
     /// The folders a message can be filed into (R2).
@@ -1204,9 +1467,9 @@ public actor IMAPProvider: MailProvider, ArchiveFolderResolving {
                 try await client.copy(uid: inboxUID, to: target)
             }
             // Copy landed; the INBOX copy has to go or the message is in two
-            // places. The flag alone does nothing — `expunge` is what removes.
-            try await client.store(uid: inboxUID, add: ["\\Deleted"])
-            try await client.expunge()
+            // places. `deleteExactly` removes that one copy — a folder-wide
+            // EXPUNGE would also remove mail another client had flagged.
+            try await client.deleteExactly(uid: inboxUID)
             return true
         }
     }

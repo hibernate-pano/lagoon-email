@@ -64,7 +64,12 @@ struct MessageListView: View {
     @State private var confirmEmptyTrash = false
     @State private var isEmptyingTrash = false
     /// In-flight 彻底删除, so a second click cannot fire two purges for one row.
-    @State private var isPurging = false
+    ///
+    /// Keyed by remote id rather than one flag for the whole list: a single
+    /// flag would also lock the confirmation of every *other* message while
+    /// one delete was still on the wire, and a lock the user cannot explain
+    /// is worse than the double-click it prevents.
+    @State private var purgeGuard = PurgeGuard()
     /// 已发送 could not reach the server; the rows on screen may be out of date
     /// (R1). Kept apart from `errorBanner` because it is **not** an error the
     /// user needs to act on — it is context for what they are reading.
@@ -79,6 +84,20 @@ struct MessageListView: View {
     /// that it is *already* there. Mirrors `BriefingFeedView.adviceByRemoteId`
     /// — same key, same lifecycle rules.
     @State private var adviceByRemoteId: [String: AdviceRecord] = [:]
+    /// The derived views of the loaded messages: the grouped rows, the
+    /// on-screen row order and the remote-id index.
+    ///
+    /// Cached because `body` used to recompute all three on every
+    /// evaluation — and the grouping is not cheap: it normalizes every
+    /// subject with a regex to find the threads that belong together, so
+    /// a 500-row mailbox paid for a full regroup on every hover, every
+    /// selection change and every poll tick.
+    ///
+    /// The cache is rebuilt from `setMessages`, the one way the loaded
+    /// messages change, so the rows on screen can never be one message
+    /// behind the messages behind them.
+    @State private var index = MessageIndex()
+
     /// 空状态的三件套：图标 / 标题 / 补充说明。
     ///
     /// Split out so the title and the hint can disagree productively — most
@@ -99,7 +118,12 @@ struct MessageListView: View {
     private var emptyStateTitle: String {
         switch lens {
         case .some(.sent): return l10n.sentEmpty
-        default: return l10n.noMessagesYet
+        case .some(.archived): return l10n.emptyArchiveTitle
+        case .some(.deleted): return l10n.emptyTrashEmptyTitle
+        case .some(.unread): return l10n.emptyUnreadTitle
+        case .some(.pinned): return l10n.emptyPinnedTitle
+        case .some(.rule): return l10n.emptyRuleTitle
+        case .some(.all), .none: return l10n.noMessagesYet
         }
     }
 
@@ -108,7 +132,12 @@ struct MessageListView: View {
     private var emptyStateHint: String? {
         switch lens {
         case .some(.sent): return l10n.sentEmptyHint
-        default: return nil
+        case .some(.archived): return l10n.emptyArchiveHint
+        case .some(.deleted): return l10n.emptyTrashHint
+        case .some(.unread): return l10n.emptyUnreadHint
+        case .some(.pinned): return l10n.emptyPinnedHint
+        case .some(.rule): return l10n.emptyRuleHint
+        case .some(.all), .none: return nil
         }
     }
 
@@ -119,7 +148,7 @@ struct MessageListView: View {
     /// where they are. Same class of lie as the old `case .deleted: self =
     /// .all` — the surface said one thing and the content said another.
     private var surfaceTitle: String {
-        Self.surfaceTitle(for: lens, l10n: l10n)
+        Self.surfaceTitle(for: lens, l10n: l10n, ruleTitle: ruleTitle)
     }
 
     /// The lens → toolbar-title mapping, as a pure function.
@@ -129,12 +158,27 @@ struct MessageListView: View {
     /// only compared four `L10n` constants against each other, which stayed
     /// green even if this switch collapsed every case back to `allMessages` —
     /// i.e. it could not have caught the bug it was written for.
-    static func surfaceTitle(for lens: Lens?, l10n: L10n) -> String {
+    ///
+    /// `ruleTitle` is the **user's own name for the rule**, handed down by
+    /// `RootView` (which already holds the rule list from `/api/stacks`).
+    /// Without it the `.rule` lens said 「分组规则」 — a category, not a
+    /// place — so a user who clicked their 「工作」 group could not tell which
+    /// group they were looking at. A title that names the place is the whole
+    /// job of a title; a category name is not a name.
+    ///
+    /// The fallback is the rules header, so a rule whose name has not loaded
+    /// yet (or whose rule was deleted) still gets *a* title rather than an
+    /// empty one.
+    static func surfaceTitle(for lens: Lens?, l10n: L10n, ruleTitle: String? = nil) -> String {
         switch lens {
         case .some(.sent): return l10n.sidebarSent
         case .some(.archived): return l10n.stackArchivedRow
         case .some(.deleted): return l10n.sidebarDeleted
-        case .some(.rule): return l10n.stackRulesHeader
+        case .some(.rule):
+            // An empty name is not a name: fall back to the rules header
+            // rather than render a blank heading.
+            if let ruleTitle, !ruleTitle.isEmpty { return ruleTitle }
+            return l10n.stackRulesHeader
         case .some(.unread): return l10n.sidebarUnread
         case .some(.pinned): return l10n.sidebarPinned
         case .some(.all), .none: return l10n.allMessages
@@ -211,7 +255,17 @@ struct MessageListView: View {
     /// `$`-prefix binding needs a property wrapper; a computed property
     /// provides its own explicit Binding instead.
     private var groupingBinding: Binding<GroupingMode> {
-        Binding(get: { groupingMode }, set: { groupingMode = $0 })
+        Binding(
+            get: { groupingMode },
+            set: {
+                groupingMode = $0
+                // The grouping is a cached half of the index, so the change
+                // has to reach it here rather than waiting for a redraw to
+                // notice — otherwise the picker and the list disagree for a
+                // frame.
+                rebuildSections()
+            }
+        )
     }
     /// False when another surface is showing (RootView keeps both alive).
     /// The poll loop sleeps instead of refreshing — keep-alive costs no
@@ -233,6 +287,11 @@ struct MessageListView: View {
     /// independent flags could express "unread AND archived AND rule X", which
     /// is not a place anyone can navigate to.
     enum Lens: Equatable {
+        /// The **inbox**. The name is historical — it used to be 全部邮件 /
+        /// "All messages", but the server's `filterSQL` answers this lens
+        /// with `is_archived = FALSE AND is_deleted = FALSE AND is_sent =
+        /// FALSE`, i.e. the inbox, and *not* sent mail. The user-visible
+        /// title says 收件箱 / Inbox for exactly that reason.
         case all
         case unread
         case pinned
@@ -277,6 +336,19 @@ struct MessageListView: View {
     /// view only reads it. `nil` before the account connects.
     var lens: Lens?
 
+    /// The **user's own name** for the rule this lens selects.
+    ///
+    /// Handed down by `RootView`, which already holds the rule list from
+    /// `/api/stacks`. The list cannot look it up itself: the sidebar and the
+    /// list are two views of one destination, and the rule list is the
+    /// parent's state — a second copy here would be a second thing to keep
+    /// in sync, and would drift the moment the user renames a rule.
+    ///
+    /// `nil` when the lens is not a rule, or when the rule's name has not
+    /// loaded yet. The title then falls back to the rules header rather than
+    /// showing a blank heading.
+    var ruleTitle: String?
+
     /// The rule id this lens selects, if any.
     private var ruleId: UUID? {
         if case .rule(let id) = lens { return id }
@@ -316,8 +388,6 @@ struct MessageListView: View {
     /// request consumed — otherwise the sheet reopens on the next redraw. A
     /// one-shot value the receiver cannot clear is a value that fires forever.
     @Binding var senderFocusRequest: SenderFocus?
-    /// A sender handed in from outside to file into a 聚合规则.
-    @Binding var senderToFile: SenderSummary?
 
     private static let refreshInterval: Duration = .seconds(30)
     /// While the list is empty (fresh connect, backfill still landing) poll
@@ -374,6 +444,11 @@ struct MessageListView: View {
                             onClearLens()
                         } else {
                             unreadOnly.toggle()
+                            // The unread cut is a lens-shaped input to the
+                            // cached grouping, so it has to reach the index
+                            // now — the rows on screen have to change with the
+                            // chip, not one redraw later.
+                            rebuildSections()
                         }
                     } label: {
                         Label(l10n.unreadOnly, systemImage: unreadOnlyEffective
@@ -401,8 +476,11 @@ struct MessageListView: View {
                             } label: {
                                 Label(l10n.emptyTrash, systemImage: "trash")
                             }
-                            .disabled(messages.isEmpty)
-                            .help(l10n.emptyTrashTitle)
+                            // Emptying the trash is `UID EXPUNGE` over the whole
+                            // folder, so it needs UIDPLUS for the same reason
+                            // a single permanent delete does.
+                            .disabled(messages.isEmpty || !canPurge)
+                            .help(canPurge ? l10n.emptyTrashTitle : l10n.purgeUnavailable)
                         }
                     }
                     if isLoading {
@@ -413,19 +491,31 @@ struct MessageListView: View {
                     } label: {
                         Label(l10n.briefing, systemImage: "rectangle.grid.2x2")
                     }
-                    .keyboardShortcut("0", modifiers: .command)
+                    // No ⌘0 here: the menu bar owns it (View → 切换主界面).
+                    // A surface-level ⌘0 *and* the menu's ⌘0 both fire on the
+                    // same key press, and the switch runs twice — which lands
+                    // the user back where they started.
                     .help(l10n.backToBriefingHelp)
                     // Refresh is ⌥⌘R so it never collides with ⌘R = reply on the
                     // open message. The modifiers are disjoint, so both bindings
                     // stay live at once.
+                    //
+                    // The shortcut itself lives on the menu bar's
+                    // 邮件 → 刷新 item, not here. Two owners for one key is
+                    // two answers for one key press: whichever the system
+                    // resolves to, the other is either dead code that looks
+                    // alive or a second refresh the user did not ask for.
+                    // The menu's version is the complete one — it re-reads
+                    // the list, the counts and the account state — so the
+                    // menu is where the key belongs. Same reasoning as the
+                    // ⌘0 above.
                     refreshControl
-                        .keyboardShortcut("r", modifiers: [.command, .option])
                 }
                 .padding()
 
                 if !messages.isEmpty {
                     List(selection: $selection) {
-                        ForEach(groupedSections, id: \.bucket) { section in
+                        ForEach(index.sections, id: \.bucket) { section in
                             Section {
                                 ForEach(section.conversations) { conversation in
                                     if conversation.messages.count > 1 {
@@ -444,7 +534,9 @@ struct MessageListView: View {
                                                 lens: lens ?? .all,
                                                 onRestore: { Task { await restoreFromTrash(conversation.newest) } },
                                                 onUnarchive: { Task { await unarchive(conversation.newest) } },
-                                                onPurge: { pendingPurge = conversation.newest }
+                                                onPurge: { pendingPurge = conversation.newest },
+                                                canDelete: canDelete,
+                                                canPurge: canPurge
                                             ))
                                             .onHover { inside in
                                                 hover(inside ? conversation.newest.remoteId : nil)
@@ -510,6 +602,14 @@ struct MessageListView: View {
                             Task { await refresh() }
                         }
                     }
+                } else if isLoading && messages.isEmpty {
+                    // The first load of a 300-message mailbox has no rows to
+                    // show yet. Without this the list rendered *nothing* — the
+                    // only progress indicator was a 16pt spinner in the
+                    // toolbar, which reads as a broken app rather than a
+                    // loading one.
+                    ProgressView(l10n.loadingMessages)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if !isLoading && errorBanner == nil {
                     // Lens-aware empty state. One generic 「还没有邮件」 for
                     // every surface is a small lie in each of them: in 废纸篓
@@ -605,6 +705,12 @@ struct MessageListView: View {
             Button(l10n.purgeForever, role: .destructive) {
                 Task { await purge(message) }
             }
+            // Disabled while *this* message is being destroyed, so the second
+            // click cannot even queue a second purge. Also disabled when the
+            // server cannot do a single-message permanent delete at all —
+            // the alert is the last line of defence for the verb that has no
+            // undo behind it.
+            .disabled(purgeGuard.isPurging(message.remoteId) || !canPurge)
             Button(l10n.cancel, role: .cancel) { pendingPurge = nil }
         } message: { message in
             Text(l10n.purgeForeverConfirm(message.subject ?? l10n.noSubject))
@@ -616,6 +722,10 @@ struct MessageListView: View {
             Button(l10n.emptyTrash, role: .destructive) {
                 Task { await emptyTrashNow() }
             }
+            // The alert is the last line of defence: the toolbar button is
+            // already off without UIDPLUS, but the alert can also be reached
+            // from a state that changed after the button was drawn.
+            .disabled(!canPurge)
             Button(l10n.cancel, role: .cancel) { confirmEmptyTrash = false }
         } message: {
             // The count comes from the server's own total, not from
@@ -643,6 +753,7 @@ struct MessageListView: View {
                         }
                     },
                     canArchive: canArchive,
+                    canDelete: canDelete,
                     // Stage two, inline above the verbs. It has to be a *link*
                     // carrying the real total, not a menu item: the user is
                     // deciding how much of their mailbox to put at risk, and
@@ -677,16 +788,24 @@ struct MessageListView: View {
                 }
             }
             .keyboardShortcut("a", modifiers: .command)
+            // `.background` is a sibling layer, so the `.disabled()` RootView
+            // applies to the surface never reaches here: without this gate a
+            // hidden list still answered ⌘A on rows the user cannot see.
+            .disabled(!isVisible)
             .frame(width: 0, height: 0)
             .opacity(0)
             .focusable(false)
             .accessibilityHidden(true)
             // ⌘⌫ deletes the selected row(s) (moves to the server's Trash),
             // mirroring ⌫ = archive.
-            Button(l10n.deleteContext) {
+            Button(l10n.moveToTrash) {
                 deleteSelected()
             }
             .keyboardShortcut(.delete, modifiers: .command)
+            // The shortcut is a verb too: it must be off for the same reason
+            // the button is, or the user gets a 409 from a keystroke that
+            // looked available.
+            .disabled(!isVisible || !canDelete)
             .frame(width: 0, height: 0)
             .opacity(0)
             .focusable(false)
@@ -696,12 +815,14 @@ struct MessageListView: View {
             // affordance, so it must be reachable from anywhere in the stack.
             Button(l10n.shortcutJ) { moveSelection(direction: .down) }
                 .keyboardShortcut("j", modifiers: [])
+                .disabled(!isVisible)
                 .frame(width: 0, height: 0)
                 .opacity(0)
                 .focusable(false)
                 .accessibilityHidden(true)
             Button(l10n.shortcutK) { moveSelection(direction: .up) }
                 .keyboardShortcut("k", modifiers: [])
+                .disabled(!isVisible)
                 .frame(width: 0, height: 0)
                 .opacity(0)
                 .focusable(false)
@@ -719,6 +840,7 @@ struct MessageListView: View {
                 }
             }
             .keyboardShortcut("[", modifiers: .command)
+            .disabled(!isVisible)
             .help(l10n.backHelp)
             .frame(width: 0, height: 0)
             .opacity(0)
@@ -759,10 +881,13 @@ struct MessageListView: View {
             senderFocus = request
             senderFocusRequest = nil
         }
-        .onChange(of: senderToFile) { _, sender in
-            guard let sender else { return }
-            fileSender(sender)
-            senderToFile = nil
+        // The hover card is a delayed consequence of the pointer resting on a
+        // row. When the surface goes away — a lens change, a window close —
+        // the pending task outlives it and fires into a view that is no
+        // longer on screen, setting a hovered row nobody can see.
+        .onDisappear {
+            hoverTask?.cancel()
+            hoverTask = nil
         }
     }
 
@@ -779,7 +904,8 @@ struct MessageListView: View {
         guard selection.count == 1, let only = selection.first else { return nil }
         // A row that has left the list (archived, deleted, or gone from a
         // refresh) must not leave the pane rendering a message with no header.
-        guard messages.contains(where: { $0.remoteId == only }) else { return nil }
+        // The index answers that in one lookup instead of scanning the list.
+        guard index.byRemoteId[only] != nil else { return nil }
         return only
     }
 
@@ -838,13 +964,27 @@ struct MessageListView: View {
     /// Same gate the per-row archive button uses, so the bar can never offer a
     /// verb the server would answer 409 to.
     private var canArchive: Bool {
-        directory.active?.capabilities.archiveFolder ?? true
+        directory.active?.capabilities.allowsArchive ?? true
+    }
+
+    /// Same gate for the delete verb: an account with no trash folder cannot
+    /// delete, and the server answers 409 `delete-unavailable`. The bar must
+    /// not offer a verb the single-row menu would refuse.
+    private var canDelete: Bool {
+        directory.active?.capabilities.allowsDelete ?? true
+    }
+
+    /// 彻底删除 needs UIDPLUS — it is `UID EXPUNGE` on exactly one message.
+    /// Without it the server refuses rather than expunge another client's
+    /// pending deletions, and there is no honest way to offer the verb.
+    private var canPurge: Bool {
+        directory.active?.capabilities.allowsPurge ?? true
     }
 
     @ViewBuilder
     private func destination(for remoteId: String) -> some View {
         if let accountId = accounts.accountId {
-            let header = messages.first { $0.remoteId == remoteId }
+            let header = index.byRemoteId[remoteId]
             MessageDetailView(
                 remoteId: remoteId,
                 accountId: accountId,
@@ -858,13 +998,21 @@ struct MessageListView: View {
                 // land on the row underneath the one the user just filed, which
                 // is what the grouped lenses put there — not whatever happens
                 // to be next in `messages`.
-                siblings: visibleRowTags,
-                onArchived: { id, _ in dropRow(id) },
+                siblings: index.rowTags.map {
+                    MessageRef(accountId: accountId, remoteId: $0)
+                },
+                onArchived: { id, _ in
+                    dropRow(id)
+                    // The detail view archived the message — a user gesture
+                    // like any other. If the row carried a suggestion to
+                    // archive it, the user just agreed with the AI.
+                    Task { await recordAcceptedAdvice(remoteId: id, performed: .archive, accountId: accountId) }
+                },
                 onAdvanceTo: { next in
                     // nil means "that was the last one": clear the selection so
                     // the pane returns to its placeholder rather than holding a
                     // message that is no longer in the list.
-                    selection = next.map { [$0] } ?? []
+                    selection = next.map { [$0.remoteId] } ?? []
                 },
                 onDelete: { id in
                     dropRow(id)
@@ -875,7 +1023,10 @@ struct MessageListView: View {
                 },
                 onPinnedChanged: { _ in
                     Task { await refresh() }
-                }
+                },
+                // The other surface's detail view is still mounted, so its
+                // shortcuts would fire from a surface the user cannot see.
+                isVisible: isVisible
             )
             .id(remoteId)
         } else {
@@ -911,7 +1062,7 @@ struct MessageListView: View {
         let removed = messages.filter { $0.remoteId == remoteId }.count
         guard removed > 0 else { return }
         invalidatePendingRefresh()
-        messages.removeAll { $0.remoteId == remoteId }
+        mutateMessages { $0.removeAll { $0.remoteId == remoteId } }
         if let total = serverTotalCount {
             serverTotalCount = max(0, total - removed)
         }
@@ -926,13 +1077,14 @@ struct MessageListView: View {
     }
 
     private func setRead(remoteId: String, isRead: Bool) {
-        guard let index = messages.firstIndex(where: { $0.remoteId == remoteId }) else { return }
+        guard let position = messages.firstIndex(where: { $0.remoteId == remoteId }) else { return }
         invalidatePendingRefresh()
         // `MessageHeader.withRead` copies every other field. The
         // hand-rolled constructor this replaced silently dropped
         // `isPinned` (and the RFC threading headers), so clearing the unread
         // dot on a pinned mail un-pinned it locally.
-        messages[index] = messages[index].withRead(isRead)
+        let updated = messages[position].withRead(isRead)
+        mutateMessages { $0[position] = updated }
     }
 
     // MARK: - Sync
@@ -971,9 +1123,29 @@ struct MessageListView: View {
             // it opens a second IMAP session — so the caller may want to know
             // which one it is looking at.
             if lens?.needsSentRoute == true {
-                let sent = try await api.fetchSent(accountId: id)
+                let sent: SentResponse
+                do {
+                    sent = try await api.fetchSent(accountId: id)
+                } catch let error as APIError where error.serverErrorCode == "sent-unavailable" {
+                    // The account has no Sent folder at all. That is a
+                    // *definitive* answer, not a failed load: the generic
+                    // "couldn't load the list" banner would tell the user to
+                    // retry something that can never succeed, and the empty
+                    // state underneath would claim they have never sent
+                    // anything — a different statement, and a wrong one.
+                    guard generation == refreshGate.generation else { return }
+                    setMessages([])
+                    serverTotalCount = nil
+                    isSentStale = false
+                    errorBanner = ErrorBanner(
+                        severity: .warning,
+                        title: l10n.sentUnavailable,
+                        detail: l10n.sentUnavailableDetail
+                    )
+                    return
+                }
                 guard generation == refreshGate.generation else { return }
-                messages = sent.messages
+                setMessages(sent.messages)
                 serverTotalCount = sent.effectiveTotal
                 // Surfaced, not swallowed: a stale list that says nothing about
                 // being stale is how a user reads old mail as current.
@@ -989,13 +1161,19 @@ struct MessageListView: View {
                 accountId: id,
                 archived: lens == .archived,
                 deleted: lens?.isTrash == true,
+                // 置顶 and 未读 are server-side lenses now, so the badge in
+                // the sidebar and the list it labels are one set by
+                // construction — a client-side cut of the newest page can
+                // never be, because the page is not the mailbox.
+                pinned: lens == .pinned,
+                unread: lens == .unread,
                 stackId: ruleId
             )
             // A newer refresh started while this one was in flight; its
             // payload is at least as fresh, so committing this one would
             // resurrect rows the user has since archived or deleted.
             guard generation == refreshGate.generation else { return }
-            messages = resp.messages
+            setMessages(resp.messages)
             serverTotalCount = resp.totalCount
             accounts.setLastSync(resp)
             // Advice rides along with the list but is a separate table, so a
@@ -1006,9 +1184,13 @@ struct MessageListView: View {
             await loadAdvice()
         } catch {
             guard generation == refreshGate.generation else { return }
+            // The title says *what* failed in the user's terms — this
+            // surface loads the list, it does not sync — and the detail
+            // says what to do about it.
             errorBanner = ErrorBanner(
                 severity: .error,
-                title: l10n.syncFailed + error.lagoonUIMessage,
+                title: l10n.listLoadFailed,
+                detail: l10n.listLoadFailedDetail,
                 actionLabel: l10n.retry,
                 action: { [self] in await self.refresh() }
             )
@@ -1043,6 +1225,39 @@ struct MessageListView: View {
         } catch {
             adviceByRemoteId = [:]
         }
+    }
+
+    /// Records that the user acted on the suggestion attached to a message.
+    ///
+    /// Called *after* the mail action succeeded. The action is what the user
+    /// asked for; the verdict only means something once the action actually
+    /// happened. A failed verdict write does not undo the action — it
+    /// surfaces a banner saying exactly that, because a preference that
+    /// silently stops being written is how the learning loop looked before
+    /// it existed.
+    private func recordAcceptedAdvice(
+        remoteId: String,
+        performed: AdvisedAction,
+        accountId: UUID
+    ) async {
+        let record = adviceByRemoteId[remoteId]
+        let failure = await AdviceAcceptanceRecorder.record(
+            advice: record,
+            performedAction: performed,
+            accountId: accountId,
+            api: api
+        )
+        guard let failure else {
+            // The row is leaving the list anyway, so the accepted verdict
+            // must not keep it in the suggestion queue.
+            adviceByRemoteId.removeValue(forKey: remoteId)
+            return
+        }
+        errorBanner = ErrorBanner(
+            severity: .warning,
+            title: l10n.adviceAcceptFailedTitle,
+            detail: failure.lagoonUIMessage
+        )
     }
 
     // MARK: - Row
@@ -1125,17 +1340,52 @@ struct MessageListView: View {
 
     // MARK: - Conversation grouping (会话归集)
 
-    private struct ConversationSection: Identifiable {
+    struct ConversationSection: Identifiable {
         let bucket: DateBucket
         let conversations: [Conversation]
         var id: DateBucket { bucket }
     }
 
+    /// The derived views of the loaded messages, kept together.
+    ///
+    /// `body` used to recompute all three on every evaluation: the grouping
+    /// (a union-find merge over every loaded subject), the on-screen row
+    /// order, and the remote-id lookups. `body` re-runs on every hover, every
+    /// selection change and every poll tick, so a 500-row mailbox paid for a
+    /// full regroup several times a second to produce a result that had not
+    /// changed since the last poll.
+    ///
+    /// The index is rebuilt only when one of its inputs actually changes — the
+    /// messages, the grouping mode, the unread cut, or the set of expanded
+    /// threads — so the cost is paid once per real change instead of once per
+    /// redraw.
+    private struct MessageIndex {
+        /// The grouped rows, one entry per date bucket.
+        var sections: [ConversationSection] = []
+        /// The tag of every row on screen, in on-screen order.
+        var rowTags: [String] = []
+        /// Every loaded message by remote id.
+        ///
+        /// Built from the *loaded* messages rather than the displayed ones: a
+        /// row the unread cut hides is still a row the user can select,
+        /// preview and archive, so the lookups have to find it.
+        var byRemoteId: [String: MessageHeader] = [:]
+        /// The grouping the cached sections were built with, so a change
+        /// that does not move a row can be recognised and skipped.
+        var mode: GroupingMode?
+        /// The unread cut the cached sections were built with.
+        var unreadOnly = false
+    }
+
     /// Non-nil when the server held more rows than the response could carry.
     ///
-    /// Measured against `messages`, never `displayMessages`: the unread-only
-    /// filter is a client-side cut of the same payload, so comparing the total
-    /// against it would claim truncation on a list that simply hid some rows.
+    /// Measured against `messages`, never `displayMessages`: the unread cut is
+    /// a filter over the same payload, so comparing the total against the cut
+    /// would claim truncation on a list that simply hid some rows.
+    ///
+    /// The server's own total is now counted under the same lens the list was
+    /// fetched with, so the number on the right is the number the lens
+    /// actually holds — the badge in the sidebar and this notice are one set.
     private var truncated: String? {
         guard let total = serverTotalCount, total > messages.count else { return nil }
         return l10n.listTruncated(messages.count, total)
@@ -1146,6 +1396,12 @@ struct MessageListView: View {
     /// Reads `unreadOnlyEffective`, not the stored flag, so the sidebar's 未读
     /// destination and this filter are one control rather than two that can
     /// disagree.
+    ///
+    /// The server now filters 未读 too (`?unread=true`), so for that lens this
+    /// second pass removes nothing — it is the same condition applied twice,
+    /// which is idempotent. It stays because the lens can also arrive as
+    /// `nil` with the in-list chip driving the flag, and that path has no
+    /// server-side filter to lean on.
     private var displayMessages: [MessageHeader] {
         unreadOnlyEffective ? messages.filter { !$0.isRead } : messages
     }
@@ -1155,10 +1411,16 @@ struct MessageListView: View {
     /// bucket of its newest message — so a thread spanning midnight stays
     /// one row instead of splitting in two. The `.date` lens flattens to
     /// singleton rows (the count==1 row path renders them exactly as before).
-    private var groupedSections: [ConversationSection] {
-        switch groupingMode {
+    ///
+    /// A pure function of the messages and the lens, so it can be cached
+    /// and rebuilt only when one of them changes.
+    static func groupSections(
+        _ messages: [MessageHeader],
+        mode: GroupingMode
+    ) -> [ConversationSection] {
+        switch mode {
         case .date:
-            let groups = Dictionary(grouping: displayMessages) { $0.receivedAt.dateBucket }
+            let groups = Dictionary(grouping: messages) { $0.receivedAt.dateBucket }
             return DateBucket.allCases.compactMap { bucket in
                 guard let items = groups[bucket], !items.isEmpty else { return nil }
                 let conversations = items
@@ -1167,13 +1429,107 @@ struct MessageListView: View {
                 return ConversationSection(bucket: bucket, conversations: conversations)
             }
         case .conversation, .sender:
-            let conversations = ConversationGrouper.group(displayMessages, mode: groupingMode.mode)
+            let conversations = ConversationGrouper.group(messages, mode: mode.mode)
             let groups = Dictionary(grouping: conversations) { $0.newest.receivedAt.dateBucket }
             return DateBucket.allCases.compactMap { bucket in
                 guard let items = groups[bucket], !items.isEmpty else { return nil }
                 return ConversationSection(bucket: bucket, conversations: items)
             }
         }
+    }
+
+    /// The tag of every row on screen, in on-screen order. A collapsed
+    /// conversation contributes only its newest message (that is the single
+    /// row rendered, and `RowChrome` tags it with that id); an expanded one
+    /// contributes the header plus each member, and the header shares the
+    /// newest member's tag, so duplicates collapse here.
+    ///
+    /// Cached next to the grouping it is derived from: the j/k walk asks for
+    /// it on every keypress, and it used to rebuild the whole grouping to
+    /// answer.
+    static func rowTags(
+        _ sections: [ConversationSection],
+        expanded: Set<String>
+    ) -> [String] {
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for section in sections {
+            for conversation in section.conversations {
+                let isExpanded = conversation.messages.count > 1
+                    && expanded.contains(conversation.threadId)
+                let ids = isExpanded
+                    ? conversation.messages.map(\.remoteId)
+                    : [conversation.newest.remoteId]
+                for id in ids where seen.insert(id).inserted {
+                    ordered.append(id)
+                }
+            }
+        }
+        return ordered
+    }
+
+    /// The one way the loaded messages change.
+    ///
+    /// Every mutation goes through here so the cached grouping can never
+    /// disagree with the messages behind it. A second invalidation path
+    /// (an `.onChange`, a version counter) is a path somebody eventually
+    /// forgets, and a list showing rows the messages no longer contain is
+    /// exactly the kind of quiet lie this project keeps having to undo.
+    private func setMessages(_ updated: [MessageHeader]) {
+        messages = updated
+        rebuildIndex()
+    }
+
+    /// The same, for an in-place change to the loaded messages.
+    private func mutateMessages(_ change: (inout [MessageHeader]) -> Void) {
+        var updated = messages
+        change(&updated)
+        setMessages(updated)
+    }
+
+    /// Rebuilds the cached views of the loaded messages.
+    ///
+    /// The single place the index is filled, so the rows on screen can never
+    /// disagree with the messages behind them. Every input that can move them
+    /// routes through here: the messages themselves, the grouping mode, the
+    /// unread cut and the expanded threads.
+    private func rebuildIndex() {
+        // One pass over the loaded messages. The lookups this replaces were
+        // a scan per hover and a scan per keystroke — the hover card, the
+        // preview and the j/k walk all asked the same question.
+        index.byRemoteId = Dictionary(
+            messages.map { ($0.remoteId, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        index.sections = Self.groupSections(displayMessages, mode: groupingMode)
+        index.mode = groupingMode
+        index.unreadOnly = unreadOnlyEffective
+        index.rowTags = Self.rowTags(index.sections, expanded: expandedThreads)
+    }
+
+    /// Rebuilds the grouped rows when the lens-shaped inputs change.
+    ///
+    /// The grouping is the expensive half of the index — it normalizes every
+    /// subject with a regex and merges the threads that belong together — so
+    /// it is skipped when neither the grouping mode nor the unread cut moved.
+    /// Most changes to this view move no row at all, and those should not pay
+    /// for a regroup.
+    private func rebuildSections() {
+        let mode = groupingMode
+        let unread = unreadOnlyEffective
+        guard index.mode != mode || index.unreadOnly != unread else { return }
+        index.sections = Self.groupSections(displayMessages, mode: mode)
+        index.mode = mode
+        index.unreadOnly = unread
+        index.rowTags = Self.rowTags(index.sections, expanded: expandedThreads)
+    }
+
+    /// The row order alone changed — a thread was expanded or collapsed.
+    ///
+    /// The grouping itself is untouched by an expansion, so the expensive half
+    /// of the index stays put and only the order is recomputed.
+    private func rebuildRowOrder() {
+        index.rowTags = Self.rowTags(index.sections, expanded: expandedThreads)
     }
 
     /// Collapsed thread: one row per conversation with a count badge and
@@ -1185,11 +1541,7 @@ struct MessageListView: View {
         let isExpanded = expandedThreads.contains(conversation.threadId)
         return VStack(spacing: 0) {
             Button {
-                if isExpanded {
-                    expandedThreads.remove(conversation.threadId)
-                } else {
-                    expandedThreads.insert(conversation.threadId)
-                }
+                toggleThread(conversation.threadId)
             } label: {
                 HStack(alignment: .top, spacing: 8) {
                     if conversation.hasUnread {
@@ -1247,7 +1599,9 @@ struct MessageListView: View {
                 lens: lens ?? .all,
                 onRestore: { Task { await restoreFromTrash(newest) } },
                 onUnarchive: { Task { await unarchive(newest) } },
-                onPurge: { pendingPurge = newest }
+                onPurge: { pendingPurge = newest },
+                canDelete: canDelete,
+                canPurge: canPurge
             ))
             if isExpanded {
                 ForEach(conversation.messages) { m in
@@ -1264,7 +1618,9 @@ struct MessageListView: View {
                             lens: lens ?? .all,
                             onRestore: { Task { await restoreFromTrash(m) } },
                             onUnarchive: { Task { await unarchive(m) } },
-                            onPurge: { pendingPurge = m }
+                            onPurge: { pendingPurge = m },
+                            canDelete: canDelete,
+                            canPurge: canPurge
                         ))
                         .padding(.leading, 14)
                 }
@@ -1273,6 +1629,21 @@ struct MessageListView: View {
     }
 
     // MARK: - Actions
+
+    /// Expands or collapses one thread.
+    ///
+    /// The row order is part of the cached index, so an expansion has to
+    /// refresh it: the j/k walk and "archive & next" both read that order,
+    /// and a stale one would walk the user to a row that is no longer where
+    /// it was.
+    private func toggleThread(_ threadId: String) {
+        if expandedThreads.contains(threadId) {
+            expandedThreads.remove(threadId)
+        } else {
+            expandedThreads.insert(threadId)
+        }
+        rebuildRowOrder()
+    }
 
     private func archive(_ m: MessageHeader) async {
         // Any local mutation retires the in-flight poll. Without this the
@@ -1289,16 +1660,33 @@ struct MessageListView: View {
             SoundEffects.archive()
             undo.show(UndoItem(
                 id: response.actionId,
-                message: l10n.archived,
+                message: l10n.archivedToast,
                 systemImage: "tray.and.arrow.down"
             ))
+            // The mail is filed. If it carried a suggestion to archive it,
+            // the user just agreed with the AI — which is the signal the
+            // server reads back to sharpen the next suggestion. Best-effort:
+            // the archive already happened, so a failed preference write must
+            // not fail it — but it is surfaced, not swallowed.
+            await recordAcceptedAdvice(remoteId: m.remoteId, performed: .archive, accountId: m.accountId)
         } catch APIError.badStatus(let code, _) where code == 409 {
             // The account negotiated no archive-capable folder, so the
             // server refuses every archive. Retrying cannot help — say so
             // instead of filing a generic failure.
             errorBanner = ErrorBanner(
                 severity: .error,
-                title: l10n.archiveUnavailable
+                title: l10n.archiveUnavailable,
+                detail: l10n.archiveUnavailableDetail,
+                // Retrying cannot fix this — the account negotiated no
+                // archive-capable folder. Spec INV-5: a failure with no
+                // retry gets a way out instead. The link opens a mail that
+                // already says what failed, so the reply does not have to
+                // start from "it didn't work".
+                helpURL: LagoonHelp.bannerMailto(
+                    failure: l10n.archiveUnavailable,
+                    detail: l10n.archiveUnavailableDetail,
+                    l10n: l10n
+                )
             )
         } catch {
             errorBanner = ErrorBanner(
@@ -1321,12 +1709,14 @@ struct MessageListView: View {
         // safety net, not a licence to guess — every mutation has to be one
         // the user actually aimed at.
         guard !selection.isEmpty else { return }
+        // One sweep at a time: a second ⌫ mid-sweep would double every
+        // request in the first one.
+        guard !isBulkBusy else { return }
         let ids = selection
         let targets = messages.filter { ids.contains($0.remoteId) }
         selection.removeAll()
-        for m in targets {
-            Task { await archive(m) }
-        }
+        isBulkBusy = true
+        Task { await runBulk(targets) { await archive($0) } }
     }
 
     /// The verbs behind the bulk bar's mark-read buttons.
@@ -1339,23 +1729,95 @@ struct MessageListView: View {
     /// succeeded.
     private func markSelected(isRead: Bool) {
         guard !selection.isEmpty else { return }
+        guard !isBulkBusy else { return }
         let ids = selection
         let targets = messages.filter { ids.contains($0.remoteId) }
         selection.removeAll()
-        for m in targets {
-            Task {
-                do {
-                    _ = try await api.markRead(
-                        remoteId: m.remoteId, accountId: m.accountId, isRead: isRead
-                    )
-                    setRead(remoteId: m.remoteId, isRead: isRead)
-                } catch {
-                    errorBanner = ErrorBanner(
-                        severity: .error,
-                        title: l10n.markReadFailedTitle,
-                        detail: error.lagoonUIMessage
-                    )
-                }
+        isBulkBusy = true
+        Task {
+            await runBulk(targets) { m in
+                await self.markReadOne(m, isRead: isRead)
+            }
+        }
+    }
+
+    /// Marks one message read/unread remotely, then writes the result into
+    /// the loaded list.
+    ///
+    /// The bulk sweep and the failure banner's retry both go through here,
+    /// so the retry is *the same request* — same message, same direction —
+    /// rather than a lookalike that happens to hit the same endpoint. A
+    /// retry button that re-ran something else would be a lie about what
+    /// the button does.
+    ///
+    /// `@MainActor` because the local write lands in the loaded list: the
+    /// sweep's own closure is main-actor bound, and the retry must not move
+    /// that write off it.
+    @MainActor
+    private func markReadOne(_ m: MessageHeader, isRead: Bool) async {
+        do {
+            _ = try await api.markRead(
+                remoteId: m.remoteId, accountId: m.accountId, isRead: isRead
+            )
+            setRead(remoteId: m.remoteId, isRead: isRead)
+        } catch {
+            // Each message carries its own request and its own failure, so
+            // the retry is per message: re-running the whole sweep would
+            // re-write the messages that already landed.
+            errorBanner = ErrorBanner(
+                severity: .error,
+                title: l10n.markReadFailedTitle,
+                detail: error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.markReadOne(m, isRead: isRead) }
+            )
+        }
+    }
+
+    // MARK: - Bulk fan-out
+
+    /// How many bulk requests may be on the wire at once.
+    ///
+    /// Bounded on purpose. Every one of these is a real IMAP write behind
+    /// the server's HTTP door, and the same server answers the 30s poll and
+    /// every other screen: a 500-row sweep fired as 500 simultaneous
+    /// requests queues 500 writes in front of the poll and stalls it.
+    ///
+    /// Eight keeps the pipe full without flooding it — the fan-out is
+    /// latency-bound, not CPU-bound, so more in flight buys nothing but
+    /// queue depth.
+    private static let bulkConcurrency = 8
+
+    /// Runs one verb over many messages, with a bounded number of requests
+    /// in flight.
+    ///
+    /// `withTaskGroup` has no concurrency limit of its own, so "one task per
+    /// message" is exactly as unbounded as the loop it replaced. The window
+    /// is the whole point of this helper: at most `bulkConcurrency`
+    /// requests are outstanding, and each completion admits one more.
+    ///
+    /// The work runs on the main actor because that is where the row
+    /// bookkeeping lives — but the network round trip suspends, so the actor
+    /// is free while the requests are in flight.
+    private func runBulk(
+        _ targets: [MessageHeader],
+        _ body: @escaping @Sendable @MainActor (MessageHeader) async -> Void
+    ) async {
+        defer { isBulkBusy = false }
+        await withTaskGroup(of: Void.self) { group in
+            var next = 0
+            // Fill the window first, then keep it full: one new task per
+            // completion, so the number outstanding never exceeds the limit.
+            while next < min(Self.bulkConcurrency, targets.count) {
+                let target = targets[next]
+                next += 1
+                group.addTask { @MainActor in await body(target) }
+            }
+            while await group.next() != nil {
+                guard next < targets.count else { continue }
+                let target = targets[next]
+                next += 1
+                group.addTask { @MainActor in await body(target) }
             }
         }
     }
@@ -1368,9 +1830,7 @@ struct MessageListView: View {
     private func toggleRead(_ m: MessageHeader) async {
         let target = !m.isRead
         invalidatePendingRefresh()
-        if let index = messages.firstIndex(where: { $0.remoteId == m.remoteId }) {
-            messages[index] = m.withRead(target)
-        }
+        applyRead(m, target)
         do {
             let actionId = try await api.markRead(
                 remoteId: m.remoteId, accountId: m.accountId, isRead: target, record: true
@@ -1383,13 +1843,10 @@ struct MessageListView: View {
                 ))
             }
         } catch {
-            if let index = messages.firstIndex(where: { $0.remoteId == m.remoteId }) {
-                messages[index] = m.withRead(m.isRead)
-            }
-            // Not silent (UX-03). A revert with no explanation reads as "the
-            // app ignored the click". Same banner shape as the Briefing
-            // feed's twin toggle: what failed, and a retry that re-attempts
-            // the flip.
+            applyRead(m, m.isRead)
+            // Not silent (UX-03): a revert with no explanation reads as
+            // "the app ignored the click". The banner's retry re-attempts
+            // the same flip.
             errorBanner = ErrorBanner(
                 severity: .error,
                 title: l10n.markReadFailedTitle,
@@ -1398,6 +1855,18 @@ struct MessageListView: View {
                 action: { [self] in await self.toggleRead(m) }
             )
         }
+    }
+
+    /// Writes the read state into the loaded list.
+    ///
+    /// The optimistic flip and its revert go through one place, the same
+    /// shape as `applyPin`: the revert restores the read state and nothing
+    /// else, so a failed toggle cannot roll back a pin the user set in the
+    /// meantime.
+    private func applyRead(_ m: MessageHeader, _ isRead: Bool) {
+        guard let position = messages.firstIndex(where: { $0.remoteId == m.remoteId }) else { return }
+        let updated = messages[position].withRead(isRead)
+        mutateMessages { $0[position] = updated }
     }
 
     /// Pin/unpin a row, optimistically with revert — the same shape as
@@ -1426,6 +1895,7 @@ struct MessageListView: View {
             errorBanner = ErrorBanner(
                 severity: .error,
                 title: target ? l10n.pinFailed : l10n.unpinFailed,
+                detail: target ? l10n.pinFailedDetail : l10n.unpinFailedDetail,
                 actionLabel: l10n.retry,
                 action: { [self] in await self.togglePin(m) }
             )
@@ -1433,8 +1903,9 @@ struct MessageListView: View {
     }
 
     private func applyPin(_ m: MessageHeader, _ pinned: Bool) {
-        guard let index = messages.firstIndex(where: { $0.remoteId == m.remoteId }) else { return }
-        messages[index] = messages[index].withPinned(pinned)
+        guard let position = messages.firstIndex(where: { $0.remoteId == m.remoteId }) else { return }
+        let updated = messages[position].withPinned(pinned)
+        mutateMessages { $0[position] = updated }
     }
 
     /// 取消归档：把邮件移回收件箱，并从当前（档案柜）列表里移除。
@@ -1512,7 +1983,7 @@ struct MessageListView: View {
         invalidatePendingRefresh()
         let removed = messages.filter { $0.remoteId == remoteId }.count
         guard removed > 0 else { return }
-        messages.removeAll { $0.remoteId == remoteId }
+        mutateMessages { $0.removeAll { $0.remoteId == remoteId } }
         selection.remove(remoteId)
         if let total = serverTotalCount {
             serverTotalCount = max(0, total - removed)
@@ -1525,14 +1996,26 @@ struct MessageListView: View {
     /// this file is the point: showing one here would be a lie about what the
     /// user can get back.
     private func purge(_ m: MessageHeader) async {
-        pendingPurge = nil
-        isPurging = true
-        defer { isPurging = false }
         let remoteId = m.remoteId
+        // Dismiss first: the alert belongs to the message being destroyed,
+        // and leaving it up over a delete that already ran would offer a
+        // button that does nothing.
+        pendingPurge = nil
+        // The second-click guard. Two concurrent purges for one row would
+        // destroy the message twice and report the second one as a failure
+        // — on the only verb in the product with no undo behind it.
+        guard purgeGuard.claim(remoteId) else { return }
+        defer { purgeGuard.release(remoteId) }
         do {
             _ = try await api.permanentlyDelete(
                 remoteId: remoteId, accountId: m.accountId
             )
+            // The mail is gone for good, so its reminder is gone with it —
+            // and the server's foreign key takes the row away, but the
+            // *notification* lives in the system's queue, and the system
+            // does not know the mail is gone. The client is the only
+            // place that can close that gap.
+            MailNotificationService.shared.cancelReminders(forRemoteId: remoteId)
             // Removed only after the server confirms. On failure the row stays
             // put, because it *is* still there — a permanent delete that failed
             // must not look like it succeeded.
@@ -1543,10 +2026,14 @@ struct MessageListView: View {
                 autoDismissAfter: .seconds(3)
             ))
         } catch {
+            // Nothing was destroyed — the row is still there — so the retry
+            // is safe, and it re-runs this same purge.
             errorBanner = ErrorBanner(
                 severity: .error,
                 title: l10n.purgeFailedTitle,
-                detail: error.lagoonUIMessage
+                detail: error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.purge(m) }
             )
         }
     }
@@ -1557,6 +2044,10 @@ struct MessageListView: View {
         confirmEmptyTrash = false
         isEmptyingTrash = true
         defer { isEmptyingTrash = false }
+        // The ids of the mail this sweep is about to destroy. Taken
+        // *before* the request, because afterwards the rows are gone and
+        // there is nothing left to ask about.
+        let doomedRemoteIds = messages.map(\.remoteId)
         do {
             let response = try await api.emptyTrash(accountId: accountId)
             // Invalidate *before* the mutation, not after: the guard in
@@ -1567,7 +2058,14 @@ struct MessageListView: View {
             // in this file carries this call — 清空废纸篓 was the one that did
             // not, and it is the only one where the removal cannot be undone.
             invalidatePendingRefresh()
-            messages.removeAll()
+            // The mail is gone for good, and so is its reminder row — but
+            // the *notification* lives in the system's queue, and the
+            // system does not know the mail is gone. The client is the
+            // only place that can close that gap.
+            for remoteId in doomedRemoteIds {
+                MailNotificationService.shared.cancelReminders(forRemoteId: remoteId)
+            }
+            mutateMessages { $0.removeAll() }
             selection.removeAll()
             serverTotalCount = nil
             // The count is reported, not toasted away: "permanently deleted 12
@@ -1578,10 +2076,14 @@ struct MessageListView: View {
                 autoDismissAfter: .seconds(4)
             ))
         } catch {
+            // The sweep did not run: the trash is still full, so the retry
+            // re-runs this same 清空废纸篓.
             errorBanner = ErrorBanner(
                 severity: .error,
                 title: l10n.purgeFailedTitle,
-                detail: error.lagoonUIMessage
+                detail: error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.emptyTrashNow() }
             )
         }
     }
@@ -1605,7 +2107,7 @@ struct MessageListView: View {
         // also removed, and appending would send the mail to the bottom of a
         // newest-first list.
         let newer = messages.filter { $0.receivedAt > m.receivedAt }.count
-        messages.insert(m, at: min(newer, messages.count))
+        mutateMessages { $0.insert(m, at: min(newer, $0.count)) }
         if let total = serverTotalCount { serverTotalCount = total + 1 }
     }
 
@@ -1615,6 +2117,12 @@ struct MessageListView: View {
         invalidatePendingRefresh()
         do {
             let response = try await api.deleteMessage(remoteId: m.remoteId, accountId: m.accountId)
+            // A reminder about a mail the user threw away must not still
+            // be able to ring. The server hides such a reminder from the
+            // list, but the notification lives in the *system's* queue,
+            // and the system does not know the mail is gone. The client
+            // is the only place that can close that gap.
+            MailNotificationService.shared.cancelReminders(forRemoteId: m.remoteId)
             withAnimation(.snappy) {
                 removeRows(matching: m.remoteId)
             }
@@ -1623,11 +2131,19 @@ struct MessageListView: View {
                 message: l10n.deleted,
                 systemImage: "trash"
             ))
+            // The mail is in the trash. If it carried a suggestion to delete
+            // it, the user just agreed with the AI. Best-effort, like every
+            // other acceptance write: the delete already happened.
+            await recordAcceptedAdvice(remoteId: m.remoteId, performed: .delete, accountId: m.accountId)
         } catch {
+            // The server never moved the row, so the row is still in the
+            // list — the retry re-runs this same delete.
             errorBanner = ErrorBanner(
                 severity: .error,
                 title: l10n.deleteFailedTitle,
-                detail: error.lagoonUIMessage
+                detail: error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.delete(m) }
             )
         }
     }
@@ -1636,6 +2152,7 @@ struct MessageListView: View {
     private func deleteSelected() {
         // Same rule as `archiveSelected`: an empty selection does nothing.
         guard !selection.isEmpty else { return }
+        guard !isBulkBusy else { return }
         // Stage two hands the whole job to the server in **one** request. The
         // per-message loop below is the stage-one path and is deliberately not
         // used here: firing 3,000 single deletes would take minutes and would
@@ -1647,9 +2164,8 @@ struct MessageListView: View {
         let ids = selection
         let targets = messages.filter { ids.contains($0.remoteId) }
         selection.removeAll()
-        for m in targets {
-            Task { await delete(m) }
-        }
+        isBulkBusy = true
+        Task { await runBulk(targets) { await delete($0) } }
     }
 
     /// 阶段二：删除筛选条件下的**全部**邮件，由服务端解析。
@@ -1659,12 +2175,23 @@ struct MessageListView: View {
     /// is a query rather than a longer array — and the reason the server
     /// resolves it through the same filter the list uses.
     private func deleteAllMatching() async {
+        await deleteAllMatching(in: lensScope)
+    }
+
+    /// Stage two, aimed at a *fixed* scope.
+    ///
+    /// The scope is captured when the delete starts and passed into the
+    /// retry, so "重试" deletes exactly what this attempt was aimed at.
+    /// Reading the lens again inside the retry would delete whatever the
+    /// sidebar points at *now* — a different set of mail than the one the
+    /// user confirmed, reached through a button labelled "retry".
+    private func deleteAllMatching(in scope: DeleteBulkRequest.LensScope) async {
         guard let accountId = accounts.accountId else { return }
         isBulkBusy = true
         defer { isBulkBusy = false }
         do {
             let response = try await api.deleteBulk(
-                DeleteBulkRequest(allMatchingIn: lensScope), accountId: accountId
+                DeleteBulkRequest(allMatchingIn: scope), accountId: accountId
             )
             // Whatever came back as ok is gone; whatever came back as failed is
             // still here. Reporting the split is the point — a bulk bar that
@@ -1678,10 +2205,30 @@ struct MessageListView: View {
             // back.
             invalidatePendingRefresh()
             withAnimation(.snappy) {
-                messages.removeAll { !failedIds.contains($0.remoteId) }
+                mutateMessages { $0.removeAll { !failedIds.contains($0.remoteId) } }
             }
             selection.removeAll()
             selectedAllOnServer = false
+            // The undo toast, with **every** action id the sweep produced.
+            //
+            // This path used to report a bare "deleted N" line and offer no
+            // undo at all — while the user guide promised that every change
+            // could be undone. The promise is most load-bearing exactly here,
+            // where the blast radius is largest: a user who selects "all
+            // matching" and deletes 3,000 messages needs a way back more than
+            // anyone else does.
+            //
+            // Only the actions the server actually wrote are offered, so the
+            // undo covers the sweep and not the messages that failed.
+            let actionIds = response.items.compactMap { $0.ok ? $0.actionId : nil }
+            if let first = actionIds.first {
+                undo.show(UndoItem(
+                    id: first,
+                    message: l10n.bulkDeletedToast(succeeded),
+                    systemImage: "trash",
+                    extraIds: Array(actionIds.dropFirst())
+                ))
+            }
             if let truncated = response.truncatedCount, truncated > 0 {
                 ErrorCenter.shared.report(.init(
                     severity: .warning,
@@ -1704,7 +2251,12 @@ struct MessageListView: View {
             errorBanner = ErrorBanner(
                 severity: .error,
                 title: l10n.bulkDeleteFailed,
-                detail: error.lagoonUIMessage
+                detail: error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                // Re-runs the same stage-two delete against the same
+                // scope: the server resolves the filter, so the retry is
+                // the same query the user aimed at.
+                action: { [self] in await self.deleteAllMatching(in: scope) }
             )
         }
     }
@@ -1729,7 +2281,7 @@ struct MessageListView: View {
     @ViewBuilder
     private var hoverCard: some View {
         if let hoveredRemoteId,
-           let message = messages.first(where: { $0.remoteId == hoveredRemoteId }) {
+           let message = index.byRemoteId[hoveredRemoteId] {
             RowHoverPreview(message: message, advice: adviceByRemoteId[message.remoteId])
                 .padding(12)
                 // No animation on the card itself: it appears only after the
@@ -1741,35 +2293,12 @@ struct MessageListView: View {
 
     // MARK: - Keyboard navigation
 
-    /// The tag of every row on screen, in on-screen order. A collapsed
-    /// conversation contributes only its newest message (that is the single
-    /// row rendered, and `RowChrome` tags it with that id); an expanded one
-    /// contributes the header plus each member, and the header shares the
-    /// newest member's tag, so duplicates collapse here.
-    private var visibleRowTags: [String] {
-        var seen = Set<String>()
-        var ordered: [String] = []
-        for section in groupedSections {
-            for conversation in section.conversations {
-                let isExpanded = conversation.messages.count > 1
-                    && expandedThreads.contains(conversation.threadId)
-                let ids = isExpanded
-                    ? conversation.messages.map(\.remoteId)
-                    : [conversation.newest.remoteId]
-                for id in ids where seen.insert(id).inserted {
-                    ordered.append(id)
-                }
-            }
-        }
-        return ordered
-    }
-
     /// j/k walk one row at a time. `selection` is a Set because the list is
     /// multi-select, so the walk starts from the first selected row in
     /// screen order; with nothing selected the first press lands on the
     /// first (down) or last (up) row rather than skipping one.
     private func moveSelection(direction: MoveCommandDirection) {
-        let tags = visibleRowTags
+        let tags = index.rowTags
         guard !tags.isEmpty else { return }
         guard let current = tags.firstIndex(where: { selection.contains($0) }) else {
             select(tags[direction == .up ? tags.count - 1 : 0])
@@ -1805,19 +2334,37 @@ struct MessageListView: View {
             stackEditor = StackEditorRequest(kind: .keyword, value: suggestion, name: suggestion)
         }
     }
+}
 
-    /// Opens the sender-rule editor for one address, pre-filled.
-    ///
-    /// The seam between the 发件人排行 panel and the aggregation feature: the
-    /// panel finds the sender worth filing, this turns that into a rule through
-    /// the same editor a row's context menu uses. Neither invents a second way
-    /// to create a rule, so both produce identical rules.
-    func fileSender(_ sender: SenderSummary) {
-        stackEditor = StackEditorRequest(
-            kind: .sender,
-            value: sender.address,
-            name: sender.displayName ?? sender.address
-        )
+// MARK: - Purge guard
+
+/// The in-flight 彻底删除 guard.
+///
+/// 彻底删除 is the only verb in the product with no undo behind it, so the
+/// one thing that must never happen is two deletes for the same message:
+/// the second request would land on a row that is already gone and report
+/// a failure for work that actually succeeded.
+///
+/// The guard is keyed by remote id rather than being a single flag, because
+/// "this message is already being destroyed" is the only fact that has to
+/// be remembered. A global flag would also block a *different* message's
+/// confirmation while the first delete was still on the wire.
+struct PurgeGuard: Equatable {
+    private(set) var inFlight: Set<String> = []
+
+    /// Claims the row for a purge. False when one is already running.
+    mutating func claim(_ remoteId: String) -> Bool {
+        inFlight.insert(remoteId).inserted
+    }
+
+    /// Releases the row once its purge has finished — or failed.
+    mutating func release(_ remoteId: String) {
+        inFlight.remove(remoteId)
+    }
+
+    /// Whether this row is being destroyed right now.
+    func isPurging(_ remoteId: String) -> Bool {
+        inFlight.contains(remoteId)
     }
 }
 
@@ -1827,7 +2374,7 @@ struct MessageListView: View {
 /// `/read?isRead=false` clears `\\Seen` remotely and writes FALSE locally,
 /// so both directions are live controls.
 func readVerbTitle(_ message: MessageHeader, l10n: L10n) -> String {
-    message.isRead ? l10n.markAsUnread : l10n.markAsRead
+    message.isRead ? l10n.markUnread : l10n.markRead
 }
 
 /// Tag + triage gestures shared by every tappable row (single message or
@@ -1854,6 +2401,10 @@ private struct RowChrome: ViewModifier {
     let onUnarchive: () -> Void
     /// 彻底删除：不可撤销，调用方必须先弹确认.
     let onPurge: () -> Void
+    /// Whether the account has a trash folder — without one, delete is a 409.
+    var canDelete: Bool = true
+    /// Whether the server supports UIDPLUS — without it, 彻底删除 is a 409.
+    var canPurge: Bool = true
     @Environment(\.l10n) private var l10n
 
     @ViewBuilder
@@ -1879,7 +2430,7 @@ private struct RowChrome: ViewModifier {
                     .tint(.green)
                 } else {
                     Button(role: .destructive) { onArchive() } label: {
-                        Label(l10n.archived, systemImage: "tray.and.arrow.down")
+                        Label(l10n.archiveAction, systemImage: "tray.and.arrow.down")
                     }
                 }
             }
@@ -1906,6 +2457,12 @@ private struct RowChrome: ViewModifier {
                     // the message. A destructive-looking row is not enough when
                     // there is no undo behind it.
                     Button(l10n.purgeForever, role: .destructive) { onPurge() }
+                        // Without UIDPLUS the server refuses a single-message
+                        // permanent delete rather than expunge another
+                        // client's pending deletions, so the verb is not
+                        // offered at all.
+                        .disabled(!canPurge)
+                        .help(canPurge ? l10n.purgeForever : l10n.purgeUnavailable)
                 } else if lens == .archived {
                     // 档案柜: the way back out is the first item, and delete
                     // stays available because "archive this by accident, then
@@ -1914,11 +2471,13 @@ private struct RowChrome: ViewModifier {
                     Button(readVerbTitle(message, l10n: l10n)) { onToggleRead() }
                     Button(message.isPinned ? l10n.unpin : l10n.pin) { onTogglePin() }
                     Divider()
-                    Button(l10n.deleteContext, role: .destructive) { onDelete() }
+                    Button(l10n.moveToTrash, role: .destructive) { onDelete() }
+                        .disabled(!canDelete)
+                        .help(canDelete ? l10n.moveToTrash : l10n.deleteUnavailable)
                 } else {
                     Button(readVerbTitle(message, l10n: l10n)) { onToggleRead() }
                     Button(message.isPinned ? l10n.unpin : l10n.pin) { onTogglePin() }
-                    Button(l10n.archived) { onArchive() }
+                    Button(l10n.archiveAction) { onArchive() }
                     Divider()
                     // 聚合: seed a persistent rule from this row — one tap for the
                     // sender rule, the editor for a subject keyword.
@@ -1928,7 +2487,9 @@ private struct RowChrome: ViewModifier {
                     }
                     Button(l10n.senderMailContext) { onShowSender() }
                     Divider()
-                    Button(l10n.deleteContext, role: .destructive) { onDelete() }
+                    Button(l10n.moveToTrash, role: .destructive) { onDelete() }
+                        .disabled(!canDelete)
+                        .help(canDelete ? l10n.moveToTrash : l10n.deleteUnavailable)
                 }
             }
     }

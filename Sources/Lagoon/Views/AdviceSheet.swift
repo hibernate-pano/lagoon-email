@@ -26,6 +26,10 @@ struct AdviceSheet: View {
     @State private var isLoading = true
     @State private var errorBanner: ErrorBanner?
     @State private var busyId: Int64?
+    /// No account is connected, so there is nothing to advise on. Kept
+    /// separate from "the queue is empty" — the two have different causes and
+    /// the user can only act on one of them.
+    @State private var isDisconnected = false
 
     private let api = APIClient.shared
 
@@ -37,7 +41,18 @@ struct AdviceSheet: View {
             Divider()
             content
         }
-        .frame(width: 560, height: 520)
+        // The error banner needs a home that does not depend on the list
+        // being empty. It used to render only inside the `records.isEmpty`
+        // branch, which meant the "忽略建议失败" error — set in `dismiss_` —
+        // never appeared while the queue had rows: the user pressed 忽略,
+        // nothing happened, and no explanation was ever shown. This view was
+        // the only one in the app that set an `errorBanner` without a
+        // `.noticeBanner` modifier to render it.
+        .noticeBanner($errorBanner)
+        .frame(
+            width: LagoonSheetSize.standard.width,
+            height: LagoonSheetSize.standard.height
+        )
         .task { await load() }
     }
 
@@ -94,17 +109,18 @@ struct AdviceSheet: View {
     private var content: some View {
         if isLoading, records.isEmpty {
             ProgressView().padding(30)
-        } else if let errorBanner, records.isEmpty {
-            NoticeBannerView(banner: errorBanner) { self.errorBanner = nil }
-                .padding(16)
+        } else if isDisconnected {
+            ContentUnavailableView(
+                l10n.notConnected,
+                systemImage: "envelope.badge",
+                description: Text(l10n.notConnectedHint)
+            )
         } else if records.isEmpty {
-            VStack(spacing: 8) {
-                Text(l10n.adviceEmpty)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(30)
+            ContentUnavailableView(
+                l10n.emptyAdvice,
+                systemImage: "sparkles",
+                description: Text(l10n.emptyAdviceHint)
+            )
         } else {
             List {
                 ForEach(records) { record in
@@ -194,9 +210,14 @@ struct AdviceSheet: View {
 
     private func load() async {
         guard let accountId = accounts.accountId else {
+            // "Not connected" is not "no advice": saying the latter would
+            // tell the user their mailbox has nothing to triage when the
+            // truth is that Lagoon has no mailbox to look at.
+            isDisconnected = true
             isLoading = false
             return
         }
+        isDisconnected = false
         isLoading = records.isEmpty
         do {
             records = try await api.fetchAdvice(accountId: accountId)
@@ -205,7 +226,9 @@ struct AdviceSheet: View {
             errorBanner = ErrorBanner(
                 severity: .error,
                 title: l10n.adviceLoadFailed,
-                detail: error.lagoonUIMessage
+                detail: error.lagoonUIMessage,
+                actionLabel: l10n.retry,
+                action: { [self] in await self.load() }
             )
         }
         isLoading = false
