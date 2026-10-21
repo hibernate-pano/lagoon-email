@@ -970,7 +970,7 @@ struct RootView: View {
                 title: l10n.healthAccountMissing,
                 detail: reason,
                 actionLabel: l10n.reconnect,
-                action: { [self] in reconnect() }
+                action: { [self] in await self.reconnect() }
             )
         case .ok:
             return nil

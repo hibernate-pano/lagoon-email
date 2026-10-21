@@ -2015,7 +2015,12 @@ public enum ActionsRoutes {
                 // The broad scope's undo writes a counter-override at the
                 // **same** scope: the rule it reverses reached every mail
                 // from that sender, so the inverse must too.
-                try await AIActionStore.insertOverride(
+                //
+                // The new row's id is deliberately not kept: the counter-row
+                // wins by being **newer**, not by being named, and an undo is
+                // terminal (`.undo` is not undoable), so there is no second
+                // round that would need to point at *this* row.
+                _ = try await AIActionStore.insertOverride(
                     accountId: account.id, remoteId: remoteId,
                     fromGroup: to, toGroup: from, scope: scope, db: db
                 )

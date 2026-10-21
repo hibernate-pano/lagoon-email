@@ -72,7 +72,7 @@ final class DraftSealTests: XCTestCase {
 
     /// The raw `variants` column, read straight out of SQLite.
     private func rawVariants(accountId: UUID, remoteId: String, db: LagoonDB) async throws -> String {
-        try await db.read { db in
+        try db.read { db in
             let row = try Row.fetchOne(
                 db,
                 sql: "SELECT variants FROM draft_replies WHERE account_id = ? AND remote_id = ?",
@@ -143,7 +143,7 @@ final class DraftSealTests: XCTestCase {
             let draft = try await DraftReplyStore.create(
                 accountId: account.id, remoteId: "m1", variants: variants, db: conn
             )
-            try await conn.write { db in
+            try conn.write { db in
                 try db.execute(
                     sql: "UPDATE draft_replies SET chosen_variant = ? WHERE id = ?",
                     arguments: [2, draft.id]
@@ -172,7 +172,7 @@ final class DraftSealTests: XCTestCase {
         let account = makeAccount()
         try await TestDatabase.withConnection { conn in
             try await seedAccount(account, db: conn)
-            try await conn.write { db in
+            try conn.write { db in
                 try db.execute(
                     sql: """
                         INSERT INTO draft_replies (account_id, remote_id, variants)
@@ -200,7 +200,7 @@ final class DraftSealTests: XCTestCase {
         let foreign = try BodyCipher.seal("[\"别人的草稿\"]", using: otherKey)
         try await TestDatabase.withConnection { conn in
             try await seedAccount(account, db: conn)
-            try await conn.write { db in
+            try conn.write { db in
                 try db.execute(
                     sql: """
                         INSERT INTO draft_replies (account_id, remote_id, variants)
@@ -269,7 +269,7 @@ final class DraftSealTests: XCTestCase {
         defer { try? pool.close() }
         let db = LagoonDB(pool)
 
-        let raw = try await db.read { db -> String in
+        let raw = try db.read { db -> String in
             let row = try Row.fetchOne(
                 db,
                 sql: "SELECT variants FROM draft_replies WHERE remote_id = ?",
@@ -328,7 +328,7 @@ final class DraftSealTests: XCTestCase {
         let draft = try await DraftReplyStore.create(
             accountId: accountId, remoteId: "m1", variants: ["第一版", "第二版"], db: db
         )
-        let before = try await db.read { db -> String in
+        let before = try db.read { db -> String in
             let row = try Row.fetchOne(
                 db, sql: "SELECT variants FROM draft_replies WHERE id = ?",
                 arguments: [draft.id]
@@ -350,7 +350,7 @@ final class DraftSealTests: XCTestCase {
         let pool2 = try LagoonDatabase.open(path: path)
         defer { try? pool2.close() }
         let db2 = LagoonDB(pool2)
-        let after = try await db2.read { db -> String in
+        let after = try db2.read { db -> String in
             let row = try Row.fetchOne(
                 db, sql: "SELECT variants FROM draft_replies WHERE id = ?",
                 arguments: [draft.id]
@@ -377,14 +377,14 @@ final class DraftSealTests: XCTestCase {
         defer { try? pool.close() }
         let db = LagoonDB(pool)
 
-        let drafts = try await db.read { db -> Int in
+        let drafts = try db.read { db -> Int in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM draft_replies") ?? -1
         }
         XCTAssertEqual(drafts, 0)
 
         // The notice table exists and is empty: nothing was dropped, so
         // nothing has to be reported.
-        let notices = try await db.read { db -> Int in
+        let notices = try db.read { db -> Int in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM store_notices") ?? -1
         }
         XCTAssertEqual(notices, 0)
@@ -427,7 +427,9 @@ final class DraftSealTests: XCTestCase {
                     INSERT INTO draft_replies (account_id, remote_id, variants)
                     VALUES (?, ?, ?)
                     """,
-                arguments: [accountId, "nk-1", "[\"没有密钥时写下的草稿\"]"]
+                // The plaintext is `secret` — one source of truth, so the
+                // string the test names is the string that gets written.
+                arguments: [accountId, "nk-1", "[\"\(secret)\"]"]
             )
         }
         try legacy.close()
@@ -441,7 +443,7 @@ final class DraftSealTests: XCTestCase {
         defer { try? pool.close() }
         let db = LagoonDB(pool)
 
-        let remaining = try await db.read { db -> Int in
+        let remaining = try db.read { db -> Int in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM draft_replies") ?? -1
         }
         XCTAssertEqual(remaining, 0, "a draft that cannot be sealed must not survive")
@@ -498,7 +500,7 @@ final class DraftSealTests: XCTestCase {
 
         // Run the sealing step again by hand: the condition recurred, and
         // the notice must not be duplicated.
-        try await db.write { db in
+        try db.write { db in
             try DraftCipher.sealLegacyRows(in: db)
         }
         let notices = try await StoreNoticeStore.list(db: db)
