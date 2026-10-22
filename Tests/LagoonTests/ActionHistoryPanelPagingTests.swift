@@ -90,15 +90,76 @@ final class ActionHistoryPanelPagingTests: XCTestCase {
         )
     }
 
-    /// The number shown must be "total minus shown", not the page size and
-    /// not the total. A footer that said "还有 250 条" over a 100-row list
-    /// that the server had already delivered 100 of would overstate the
+    /// The number shown must be "total minus *loaded*", not the page size
+    /// and not the total. A footer that said "还有 250 条" over a 100-row
+    /// list that the server had already delivered 100 of would overstate the
     /// withheld rows by exactly the page.
-    func test_theRemainingCountIsTotalMinusShown() throws {
+    ///
+    /// "Loaded", not "shown": the two come apart the moment the user undoes
+    /// something. The undo retires a row from the list, so the number of
+    /// rows *shown* drops by one — while the server's total stays where it
+    /// was, because an undo replaces the action with an undo row: one out,
+    /// one in. Subtracting the shown count therefore made the footer claim
+    /// one more older entry after every undo, and a session of five undos
+    /// made it claim five more. The panel has *covered* as much of the
+    /// server's history as it has fetched.
+    func test_theRemainingCountIsTotalMinusLoaded() throws {
         let source = try sheetSource()
         XCTAssertTrue(
+            source.contains("HistoryRemaining.count(total: totalCount, loaded: loadedCount)"),
+            "the remaining count must be the difference against what the panel has loaded"
+        )
+        XCTAssertFalse(
             source.contains("max(0, totalCount - actions.count)"),
-            "the remaining count must be the difference, or the footer overstates what is missing"
+            "subtracting the *shown* count makes the footer grow by one after every undo"
+        )
+    }
+
+    /// The rule itself, on the real type.
+    ///
+    /// The arithmetic is the whole point of the fix, so it is tested as
+    /// arithmetic rather than as a string.
+    func test_theRemainingCountIsTheDifferenceAgainstWhatWasLoaded() {
+        XCTAssertEqual(HistoryRemaining.count(total: 250, loaded: 100), 150)
+        XCTAssertEqual(HistoryRemaining.count(total: 100, loaded: 100), 0)
+        // A panel that loaded more than the server counted (a row that
+        // arrived between the count and the fetch) must not show a
+        // negative number of older entries.
+        XCTAssertEqual(HistoryRemaining.count(total: 10, loaded: 100), 0)
+        // A server that did not report a total yields no number at all:
+        // the panel withholds the figure rather than inventing one.
+        XCTAssertNil(HistoryRemaining.count(total: nil, loaded: 100))
+    }
+
+    /// An undo must not change what the panel has loaded.
+    ///
+    /// This is the source-level half of the same property: the undo handler
+    /// retires the row it reverses and touches nothing else. If it ever
+    /// decrements the loaded count, the footer starts claiming fewer older
+    /// entries than exist — the mirror of the bug this file exists to keep
+    /// out.
+    func test_anUndoDoesNotChangeWhatThePanelHasLoaded() throws {
+        let source = try sheetSource()
+        let removal = try XCTUnwrap(
+            source.range(of: "actions.removeAll { ids.contains($0.id) }"),
+            "the undo handler moved"
+        )
+        let end = try XCTUnwrap(
+            source.range(of: "// MARK: - Rows"),
+            "the rows section moved"
+        )
+        let body = ViewSource.code(
+            after: removal.lowerBound,
+            in: source[removal.lowerBound..<end.lowerBound],
+            limit: 2_000
+        )
+        XCTAssertFalse(
+            body.contains("loadedCount"),
+            "an undo retires a row the panel is showing; it does not un-cover history"
+        )
+        XCTAssertFalse(
+            body.contains("totalCount"),
+            "an undo replaces a row with an undo row; the server's total does not shrink"
         )
     }
 

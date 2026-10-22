@@ -82,14 +82,14 @@ final class LocalizationTests: XCTestCase {
 
     func test_qqConnectStrings_existInBothLanguages() {
         let zhStrings = [
-            zh.connectQQTab, zh.connectQQTitle, zh.qqEmailPlaceholder, zh.qqAuthCodePlaceholder,
+            zh.connectQQTitle, zh.qqEmailPlaceholder, zh.qqAuthCodePlaceholder,
             zh.qqHelp, zh.qqConnectButton, zh.qqMissingFields, zh.qqAuthFailed,
             zh.qqUnreachable, zh.qqAccountExists, zh.connectFailed,
             zh.useThisAccount, zh.qqProviderNotConfigured, zh.qqInternalError,
             zh.serverTimedOut, zh.serverUnreachable,
         ]
         let enStrings = [
-            en.connectQQTab, en.connectQQTitle, en.qqEmailPlaceholder, en.qqAuthCodePlaceholder,
+            en.connectQQTitle, en.qqEmailPlaceholder, en.qqAuthCodePlaceholder,
             en.qqHelp, en.qqConnectButton, en.qqMissingFields, en.qqAuthFailed,
             en.qqUnreachable, en.qqAccountExists, en.connectFailed,
             en.useThisAccount, en.qqProviderNotConfigured, en.qqInternalError,

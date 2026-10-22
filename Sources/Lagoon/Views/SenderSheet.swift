@@ -58,7 +58,7 @@ struct SenderSheet: View {
         NavigationStack(path: $path) {
             VStack(spacing: 0) {
                 HStack {
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: LagoonMetrics.spaceXS) {
                         Text(senderName ?? senderAddress)
                             .font(.headline)
                             .lineLimit(1)
@@ -73,38 +73,46 @@ struct SenderSheet: View {
                     Spacer()
                     Button(l10n.close) { dismiss() }
                 }
-                .padding(12)
+                .padding(LagoonMetrics.spaceMD)
                 Divider()
                 if !messages.isEmpty {
                     bulkBar
                 }
                 if isLoading {
-                    ProgressView().padding(20)
+                    ProgressView().padding(LagoonMetrics.spaceXL)
                 } else if messages.isEmpty, let outcome = emptiedBy {
                     emptiedView(outcome)
                 } else if messages.isEmpty {
-                    Text(l10n.senderMailEmpty)
-                        .foregroundStyle(.secondary)
-                        .padding(20)
+                    ContentUnavailableView {
+                        Label(l10n.senderMailEmpty, systemImage: "envelope")
+                    }
                 } else {
                     List(messages) { m in
                         NavigationLink(value: m.remoteId) {
-                            VStack(alignment: .leading, spacing: 3) {
-                                HStack(alignment: .firstTextBaseline) {
+                            VStack(alignment: .leading, spacing: LagoonTypography.rowSpacing) {
+                                HStack(alignment: .firstTextBaseline, spacing: LagoonMetrics.spaceSM) {
+                                    UnreadMarker(isUnread: !m.isRead)
                                     Text(m.subject ?? l10n.noSubject)
-                                        .font(.body)
+                                        .font(LagoonTypography.rowSubject)
                                         .bold(!m.isRead)
-                                        .lineLimit(1)
+                                        .lineLimit(LagoonTypography.rowSubjectLines)
                                     Spacer()
-                                    Text(m.receivedAt.formatted(date: .abbreviated, time: .shortened))
-                                        .font(.caption2)
+                                    Text(LagoonTypography.rowTimestamp(m.receivedAt))
+                                        .font(LagoonTypography.rowTime)
                                         .foregroundStyle(.secondary)
                                 }
                                 if let snippet = m.snippet, !snippet.isEmpty {
                                     Text(snippet)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(2)
+                                        .font(LagoonTypography.rowSnippet)
+                                        // Tertiary, not secondary: on macOS
+                                        // `.caption` and `.caption2` are the
+                                        // same size, so the snippet's step
+                                        // below the subject has to be a
+                                        // colour step. Two greys that are
+                                        // the same grey are not a
+                                        // hierarchy.
+                                        .foregroundStyle(.tertiary)
+                                        .lineLimit(LagoonTypography.rowSnippetLines)
                                 }
                             }
                         }
@@ -121,8 +129,8 @@ struct SenderSheet: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
+                                .padding(.horizontal, LagoonMetrics.spaceMD)
+                                .padding(.vertical, LagoonMetrics.spaceSM)
                                 .background(.bar)
                                 .overlay(alignment: .top) { Divider() }
                                 .accessibilityLabel(truncationNotice)
@@ -151,7 +159,10 @@ struct SenderSheet: View {
                 .id(remoteId)
             }
         }
-        .frame(width: 640, height: 560)
+        .frame(
+            width: LagoonSheetSize.wide.width,
+            height: LagoonSheetSize.wide.height
+        )
         .noticeBanner($errorBanner)
         .task { await load() }
     }
@@ -204,11 +215,35 @@ struct SenderSheet: View {
         ListTruncationNotice.text(shown: messages.count, total: totalCount, l10n: l10n)
     }
 
+    /// What the bulk verbs cover, when that is less than everything the
+    /// sender has.
+    ///
+    /// The bar used to state the server's total — "312 封邮件" — while the
+    /// buttons acted on the rows the response carried. The user was told
+    /// 312 and operated on 200, and the only hint that the list was a
+    /// window arrived at the *bottom* of the list, long after the action.
+    ///
+    /// The bar is where the user reads before pressing a button, so the
+    /// scope belongs there.
+    private var scopeNotice: String? {
+        guard let totalCount, totalCount > messages.count else { return nil }
+        return l10n.senderBulkScope(shown: messages.count, total: totalCount)
+    }
+
     private var bulkBar: some View {
-        HStack(spacing: 10) {
-            Text(l10n.senderCount(totalCount ?? messages.count))
+        HStack(spacing: LagoonMetrics.spaceMD) {
+            // The number the buttons below act on — not the sender's whole
+            // history. The two come apart the moment the server's window
+            // is smaller than the sender's mailbox, and the bar is the
+            // only place the user reads before pressing a button.
+            Text(l10n.senderCount(messages.count))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if let scopeNotice {
+                Text(scopeNotice)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
             Spacer()
             if bulkInFlight {
                 ProgressView().controlSize(.small)
@@ -239,18 +274,18 @@ struct SenderSheet: View {
                 }
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, LagoonMetrics.spaceMD)
+        .padding(.vertical, LagoonMetrics.spaceSM)
         .background(.quaternary.opacity(0.35))
         .confirmationDialog(
-            // The delete confirmation carries the live count: the blast radius
-            // should be visible before the user commits, and Trash is the
-            // honest destination name.
+            // Every confirmation carries the count the verb will actually
+            // move: the blast radius should be visible before the user
+            // commits, and the delete path names the honest destination.
             pendingConfirm == .deleteAll
                 ? l10n.senderAllDeleteConfirm(archivableIds.count)
                 : (pendingConfirm == .archive
-                    ? l10n.senderAllArchiveConfirm
-                    : l10n.senderAllReadConfirm),
+                    ? l10n.senderAllArchiveConfirm(archivableIds.count)
+                    : l10n.senderAllReadConfirm(unreadIds.count)),
             isPresented: Binding(
                 get: { pendingConfirm != nil },
                 set: { if !$0 { pendingConfirm = nil } }
@@ -405,35 +440,36 @@ struct SenderSheet: View {
     }
 
     /// The sheet after a full archive: success, the number, the undo window,
-    /// and the way out. Centered like the empty state it replaces, but with
-    /// the checkmark and tint that say "this worked".
+    /// and the way out.
+    ///
+    /// It is a `ContentUnavailableView` like every other empty state in the
+    /// app, not a hand-rolled one. The hand-rolled version drew its symbol
+    /// at a fixed 40pt — a size that does not move with the reader's text
+    /// size, so the one state that reports success was the one that broke
+    /// first under a large accessibility font.
     private func emptiedView(_ outcome: EmptiedOutcome) -> some View {
         let wasDelete = outcome.verb == .deleteAll
-        return VStack(spacing: 12) {
-            Image(systemName: wasDelete ? "trash.circle" : "checkmark.circle")
-                .font(.system(size: 40, weight: .light))
-                .foregroundStyle(.green)
-            Text(
+        return ContentUnavailableView {
+            Label(
                 wasDelete
                     ? l10n.senderAllDeletedEmptyTitle(outcome.count)
-                    : l10n.senderAllArchivedEmptyTitle(outcome.count)
+                    : l10n.senderAllArchivedEmptyTitle(outcome.count),
+                systemImage: wasDelete ? "trash.circle" : "checkmark.circle"
             )
-                .font(.headline)
+            // The success colour from the one severity scale, not a bare
+            // `.green` beside it: two greens for one meaning is how a
+            // palette starts to drift.
+            .foregroundStyle(LagoonTheme.Severity.success.color)
+        } description: {
             Text(
                 wasDelete
                     ? l10n.senderAllDeletedEmptyDetail
                     : l10n.senderAllArchivedEmptyDetail
             )
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+        } actions: {
             Button(l10n.done) { dismiss() }
                 .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .padding(.top, 6)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(30)
     }
 
     private func markAllRead() async {

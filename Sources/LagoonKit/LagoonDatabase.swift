@@ -198,6 +198,40 @@ public enum LagoonDatabase {
     /// runs. GRDB orders migrations by *registration*, not by identifier, so
     /// the identifier is documentation, not a schedule.
     public static let accountIDRepairVersion = "lagoon-v5b"
+    /// Gives an override the sender it is about.
+    ///
+    /// ## The defect
+    ///
+    /// An override row was keyed by the **mail** the user acted on, and the
+    /// sender it applied to was recovered by joining `message_headers`. That
+    /// join is an inner join, so the rule stopped existing the moment its
+    /// sample mail was deleted — silently, with nothing said, and without
+    /// the user's 「把这个发件人的邮件归到 X 组」 gesture anywhere in the
+    /// product. The row was still in the table; it had simply stopped
+    /// applying to anything.
+    ///
+    /// ## Why a column and not a second table
+    ///
+    /// The rule is about a **sender**; the mail was only ever the sample the
+    /// user acted on. Storing the sender makes the rule stand on its own,
+    /// which is the only way it can outlive the sample.
+    ///
+    /// ## Why the column is absent from `schema`
+    ///
+    /// SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so a column
+    /// that appears in `schema` (which only `lagoon-v1` runs, on a fresh
+    /// install) would make this statement fail with "duplicate column name"
+    /// on every fresh install while succeeding on every existing one — the
+    /// same trap `is_sent` and `scope` documented.
+    ///
+    /// ## Why the backfill cannot save every row
+    ///
+    /// The address is recovered from the sample mail, so a row whose sample
+    /// is already gone stays unattributed. That rule was lost before this
+    /// migration ran; what this migration stops is the next one from being
+    /// lost the same way. The backfill says so in the log rather than
+    /// pretending the row is whole.
+    public static let overrideSenderVersion = "lagoon-v10"
 
     public static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
@@ -265,6 +299,9 @@ public enum LagoonDatabase {
             // either every draft is an envelope or the migration rolls back.
             try DraftCipher.sealLegacyRows(in: db)
         }
+        migrator.registerMigration(overrideSenderVersion) { db in
+            try db.execute(sql: Self.overrideSenderReconciliation)
+        }
         return migrator
     }
 
@@ -289,6 +326,35 @@ public enum LagoonDatabase {
     /// already has keep the meaning they had.
     public static let overrideScopeReconciliation = """
         ALTER TABLE ai_overrides ADD COLUMN scope TEXT NOT NULL DEFAULT 'sender';
+    """
+
+    /// Gives every override the sender it is about, and indexes the lookups.
+    ///
+    /// The backfill reads the address off the sample mail the rule was
+    /// written from. A rule whose sample is already gone cannot be
+    /// attributed — the address was never stored anywhere else — so it stays
+    /// unattributed, and the sender-level lookup skips it. That rule was
+    /// lost before this migration ran; what this migration stops is the
+    /// next one from being lost the same way.
+    ///
+    /// The index carries the columns the sender-level lookup reads
+    /// (`account_id`, `scope`, `from_address`, `created_at`, `to_group`),
+    /// so the ranking runs off the index instead of scanning the table and
+    /// sorting what it finds.
+    public static let overrideSenderReconciliation = """
+        ALTER TABLE ai_overrides ADD COLUMN from_address TEXT;
+        -- statement
+        UPDATE ai_overrides
+        SET from_address = (
+            SELECT m.from_address
+            FROM message_headers m
+            WHERE m.account_id = ai_overrides.account_id
+              AND m.remote_id = ai_overrides.remote_id
+        )
+        WHERE from_address IS NULL;
+        -- statement
+        CREATE INDEX IF NOT EXISTS ai_overrides_account_scope_idx
+            ON ai_overrides (account_id, scope, from_address, created_at, to_group);
     """
 
     /// Adds the reminder table to an already-migrated install.

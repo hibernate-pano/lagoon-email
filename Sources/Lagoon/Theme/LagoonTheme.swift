@@ -19,10 +19,12 @@ import LagoonKit
 ///
 /// ## What is here now
 ///
-/// Three brand colours, all used, plus one severity scale that every
-/// surface reads from. A colour earns its place by being *the* colour for
-/// one meaning; a second colour for the same meaning is a bug, not a
-/// variation.
+/// Two brand colours and one semantic marker, all of them used, plus one
+/// severity scale that every surface reads from. A colour earns its place by
+/// being *the* colour for one meaning; a second colour for the same meaning
+/// is a bug, not a variation — which is why the pin's orange and the
+/// "warning" alias were deleted rather than left to rot beside the scale
+/// that already says what they mean.
 enum LagoonTheme {
     // MARK: - Brand
 
@@ -30,20 +32,6 @@ enum LagoonTheme {
     /// bottom. Used for `.tint` on the root WindowGroup and as the
     /// sender-avatar accent stripe.
     static let brand = Color(red: 0.12, green: 0.43, blue: 0.52) // #1F6F84
-
-    /// Deep teal from the icon's gradient top — the **unread** marker.
-    ///
-    /// Not `.tint`: `.tint` follows the system accent colour, and in dark
-    /// mode a light-blue dot on a dark row is close to invisible. This is a
-    /// fixed dark teal that holds its contrast in both appearances.
-    static let deepTeal = Color(red: 0.05, green: 0.23, blue: 0.29) // #0E3A4A
-
-    /// Sundown orange from the icon's outermost ripple arc — the **pin**.
-    ///
-    /// A pin is a deliberate keep, not a warning, so it does not wear a
-    /// severity colour. Orange is the one warm colour in the palette, and
-    /// using it for exactly one meaning makes it legible at a glance.
-    static let accent = Color(red: 0.91, green: 0.64, blue: 0.36) // #E8A35C
 
     // MARK: - Severity
 
@@ -98,18 +86,40 @@ enum LagoonTheme {
 
     // MARK: - Semantic colours
 
-    /// The colour of an unread row's leading stripe and dot.
+    /// The colour of an unread row's marker.
     ///
-    /// `deepTeal` rather than `brand`: the stripe sits on a row background
-    /// that is already carrying `brand` in the tint, so the two must differ
-    /// to read as two things.
-    static let unreadMarker = deepTeal
+    /// ## Why it follows the appearance
+    ///
+    /// The marker is drawn on the row's own background, and that background
+    /// is near-black in dark mode. The old fixed deep teal (#0E3A4A) was
+    /// therefore *invisible* there — the one thing that says "unread" was
+    /// the thing a dark-mode user could not see, and the comment above it
+    /// claimed the opposite.
+    ///
+    /// So the light appearance keeps the icon's deep teal and the dark
+    /// appearance gets a light teal that holds its contrast. The marker's
+    /// *shape* (a 7pt dot) and the row's bold subject carry the state
+    /// without colour, so the dot is the second signal, not the only one.
+    static let unreadMarker = Color(nsColor: unreadMarkerColor)
+
+    /// The unread marker's colour, as an `NSColor`.
+    ///
+    /// Kept beside the SwiftUI colour so the appearance resolver can hand
+    /// the system the right value for the current appearance — and so a
+    /// test can ask what the marker actually looks like in the dark.
+    static let unreadMarkerColor = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(red: 0.45, green: 0.80, blue: 0.87, alpha: 1)
+            : NSColor(red: 0.05, green: 0.23, blue: 0.29, alpha: 1)
+    }
 
     /// The colour of a destructive action (彻底删除, 退订).
+    ///
+    /// Named rather than left to `role: .destructive` so the destructive
+    /// buttons in the app all wear the same red — a destructive action that
+    /// borrows the system accent colour is a destructive action the user
+    /// cannot recognise.
     static let danger = Color.red
-
-    /// The colour of a warning action.
-    static let warning = Color.orange
 
     // MARK: - Sync health
 

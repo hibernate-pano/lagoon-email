@@ -21,7 +21,22 @@ SECRET_RULES=(
 )
 
 # ---------------------------------------------------------------------------
-# Rule 1: SQL string interpolation outside SQLBuilder.swift.
+# Rule 1: SQL string interpolation -- no value may reach SQL text.
+#
+# The contract is the one this codebase already follows (see
+# MessageStore.filterSQL): SQL text carries NO values. Static fragments are
+# joined with `[literal, whereClause].joined(...)` and every value is bound
+# as a parameter.
+#
+# There is no exempt file, and there must not be one. The rule used to exempt
+# a file named SQLBuilder.swift -- a file that has not existed since the V3
+# rebuild (ea4118b), so the exemption covered nothing while still teaching
+# every reader that interpolation had a sanctioned home. Worse, the
+# exemption matched on the FILE NAME, so any file with that name anywhere
+# under Sources/ or Tests/ would have been skipped silently, and the
+# self-test that was supposed to cover it was itself guarded by
+# `[ -f Sources/LagoonKit/SQLBuilder.swift ]` -- so it never ran, and the
+# one exemption the rule had was the one exemption nobody checked.
 #
 # A Swift string literal is a violation when it contains BOTH a SQL keyword
 # (SELECT/INSERT/UPDATE/DELETE, case-insensitive) AND interpolation (`\(` or a
@@ -505,6 +520,33 @@ PERL
 }
 
 # ---------------------------------------------------------------------------
+# Rule 1 file selection: which files the SQL scan reads.
+#
+# Returns 0 = scanned by rule 1, 1 = not scanned.
+#
+# There is NO exempt file, and there must not be one. The rule used to skip
+# any file named SQLBuilder.swift, on the theory that such a file was the
+# sanctioned home for interpolated SQL. That file was deleted in the V3
+# rebuild (ea4118b) and never came back, so the exemption covered nothing --
+# while still matching on the BASE NAME, so any file called SQLBuilder.swift
+# anywhere under Sources/ or Tests/ would have been skipped silently,
+# including one that interpolated user data. The exemption also had no
+# self-test: the one fixture covering it was guarded by `[ -f ... ]`, so it
+# never ran. An exemption nobody exercises is an exemption nobody checks.
+#
+# The contract is the one the code already follows (MessageStore.filterSQL):
+# SQL text carries no values. Static fragments are joined with
+# `[literal, whereClause].joined(...)` and every value is bound as a
+# parameter. There is no file where interpolation is allowed.
+# ---------------------------------------------------------------------------
+sql_path_scanned() {
+  case "${1##*/}" in
+    *.swift) return 0 ;;
+  esac
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Rule 1b: IMAP command assembly under Sources/LagoonServer/IMAP/.
 #
 # Why this rule exists. Rule 1 watches for SQL, and an IMAP command line is not
@@ -787,10 +829,7 @@ run_all_checks() {
   local -a all_files=()
   while IFS= read -r f; do
     all_files+=("$f")
-    case "${f##*/}" in
-      SQLBuilder.swift) ;;
-      *.swift) sql_files+=("$f") ;;
-    esac
+    if sql_path_scanned "$f"; then sql_files+=("$f"); fi
     # Rule 1b is scoped to the IMAP command-ASSEMBLY layer: IMAPClient (which
     # owns the quoted() contract) and IMAPProvider. IMAPConnection is excluded
     # on purpose -- it is the raw transport whose own documented contract is
@@ -806,7 +845,7 @@ run_all_checks() {
   hits="$(sql_hits_for_files "${sql_files[@]}")" && rc=0 || rc=$?
   case "$rc" in
     0)
-      echo "FAIL: SQL string interpolation detected outside SQLBuilder.swift" >&2
+      echo "FAIL: SQL string interpolation detected -- values must be bound, not spliced into SQL text" >&2
       printf '%s\n' "$hits" >&2
       fail=1
       ;;

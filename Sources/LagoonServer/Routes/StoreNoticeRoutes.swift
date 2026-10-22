@@ -32,6 +32,7 @@ public enum StoreNoticeRoutes {
     ) {
         router.get("api/store-notices") { _, _ -> Response in
             do {
+                try await Self.raiseBodyKeyNoticeIfNeeded(db: db, logger: logger)
                 let notices = try await StoreNoticeStore.list(db: db)
                 return RouteJSON.response(StoreNoticeListResponse(notices: notices))
             } catch {
@@ -57,6 +58,44 @@ public enum StoreNoticeRoutes {
                 )
             }
         }
+    }
+
+    /// Raises the "the body key is gone" notice when the store is in that
+    /// state.
+    ///
+    /// ## Why the store raises it, and why here
+    ///
+    /// The condition is a fact about the store and the keychain together:
+    /// the store holds sealed values, and the key that could open them is
+    /// not the one this process has. The store is the only side that can see
+    /// both halves — the app knows about the keychain, but it does not hold
+    /// the database.
+    ///
+    /// The check is deliberately cheap in the healthy case: a store with a
+    /// key is never in this state, and the sealed-value query is the
+    /// expensive one. `BodyCipher.hasKey` is a closure call, so the common
+    /// path costs nothing measurable.
+    ///
+    /// ## Why it is raised on a read
+    ///
+    /// The app cannot know the keychain has answered until the app's own
+    /// Keychain read comes back, and the server is already serving by then.
+    /// Waiting for a "the app is done" signal would mean a new route for a
+    /// condition that the store can see for itself. The client polls this
+    /// route anyway, so the notice is raised the first time somebody asks.
+    private static func raiseBodyKeyNoticeIfNeeded(
+        db: LagoonDB,
+        logger: Logger
+    ) async throws {
+        guard !BodyCipher.hasKey else { return }
+        guard try await BodyStore.hasSealedValues(db: db) else { return }
+        let count = (try? await BodyStore.bodyCount(db: db)) ?? 0
+        try await StoreNoticeStore.record(
+            id: StoreNotice.bodyKeyLostID,
+            detail: String(count),
+            db: db
+        )
+        logger.error("body key unavailable: the store holds sealed values that cannot be opened")
     }
 }
 

@@ -52,6 +52,15 @@ struct BulkActionBar: View {
     /// 批量动词进行中。Every verb here is one remote round trip per message, so
     /// a second click mid-sweep would double-fire it.
     var isBusy: Bool = false
+    /// 这批动词实际会作用到哪些邮件。
+    ///
+    /// The count on the bar is a claim about the blast radius, and the claim
+    /// is only true for the verbs that can reach it: the raw list's second
+    /// stage asks the server to resolve the whole lens, but only the delete
+    /// has an endpoint that means "everything". The bar says which is which
+    /// instead of letting a count of 3,142 travel with an action that
+    /// moves 200.
+    var scopeNote: String? = nil
 
     @Environment(\.l10n) private var l10n
 
@@ -79,6 +88,15 @@ struct BulkActionBar: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
+            if let scopeNote {
+                // The scope of the verbs, in words. A count the user cannot
+                // reconcile with what the buttons do is a count they will
+                // not trust next time either.
+                Text(scopeNote)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack(spacing: 12) {
                 Text(l10n.selectedCount(count))
                     .font(.callout.weight(.medium))
@@ -90,24 +108,24 @@ struct BulkActionBar: View {
                 Button(action: onMarkRead) {
                     Label(l10n.markRead, systemImage: "envelope.open")
                 }
-                .help(l10n.markReadFailedTitle)
+                .help(l10n.bulkMarkReadHelp)
 
                 Button(action: onMarkUnread) {
                     Label(l10n.markUnread, systemImage: "envelope")
                 }
-                .help(l10n.markUnread)
+                .help(l10n.bulkMarkUnreadHelp)
 
                 Button(action: onArchive) {
                     Label(l10n.archiveSelectedTitle, systemImage: "archivebox")
                 }
                 .disabled(!canArchive)
-                .help(canArchive ? l10n.archiveFailed : l10n.archiveUnavailable)
+                .help(canArchive ? l10n.bulkArchiveHelp : l10n.archiveUnavailable)
 
                 Button(role: .destructive, action: onDelete) {
                     Label(l10n.deleteSelectedTitle, systemImage: "trash")
                 }
                 .disabled(!canDelete)
-                .help(canDelete ? l10n.moveToTrash : l10n.deleteUnavailable)
+                .help(canDelete ? l10n.bulkDeleteHelp : l10n.deleteUnavailable)
 
                 Spacer(minLength: 0)
 

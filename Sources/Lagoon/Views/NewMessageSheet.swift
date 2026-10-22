@@ -22,18 +22,14 @@ struct NewMessageSheet: View {
     @Environment(\.l10n) private var l10n
     @Environment(\.dismiss) private var dismiss
 
-    private struct Draft: Codable, Equatable {
-        var to = ""
-        var cc = ""
-        var bcc = ""
-        var subject = ""
-        var body = ""
-    }
-
-    @State private var draft: Draft
+    @State private var draft: ComposeFlow.Draft
     @State private var attachments: [OutgoingAttachment] = []
     @State private var isSending = false
     @State private var error: String?
+    /// Why the last send failed, when it did. Drives whether the failure
+    /// row offers a retry: some failures cannot be retried, and a retry
+    /// button that cannot work is a lie about what the product can do.
+    @State private var sendFailure: ComposeFlow.Failure?
     @State private var requestId = UUID().uuidString.lowercased()
     /// The pending draft write.
     ///
@@ -42,17 +38,24 @@ struct NewMessageSheet: View {
     /// `JSONEncoder` each time. The write is debounced now: one encode and
     /// one write per pause in typing.
     @State private var draftWriteTask: Task<Void, Never>?
+    /// True briefly after each save lands — the "saved" tick. The sheet
+    /// promises that the draft is kept, so it shows the proof.
+    @State private var draftJustSaved = false
+    @State private var draftSavedResetTask: Task<Void, Never>?
     /// Set once the message has been sent, so the teardown flush does not
     /// put the body the user just sent back into the draft slot.
     @State private var didSend = false
+    /// Set when the user chose to throw the draft away.
+    @State private var didDiscard = false
+    /// True once the user has written something in this session — the
+    /// answer to "is there unfinished work here?".
+    @State private var hasEdited = false
+    /// The "this mail is not finished" prompt.
+    @State private var showUnsavedAlert = false
     /// The file picker is open.
     @State private var isPickingFiles = false
-    private let draftKey: String
+    private let draftSlot: ComposeFlow.DraftSlot
     private let api = APIClient.shared
-    /// One encoder for the sheet's lifetime. `JSONEncoder` is a class, and
-    /// building a new one per keystroke allocated a fresh object to do the
-    /// same work.
-    private let draftEncoder = JSONEncoder()
 
     /// - Parameters:
     ///   - prefillTo: Recipient to seed the To field with. Empty for a
@@ -77,15 +80,9 @@ struct NewMessageSheet: View {
         self.accountId = accountId
         self.onSent = onSent
         let key = "lagoon.compose.\(accountId.uuidString)"
-        self.draftKey = key
-        let seeded: Draft
-        if let data = UserDefaults.standard.data(forKey: key),
-           let saved = try? JSONDecoder().decode(Draft.self, from: data) {
-            seeded = saved
-        } else {
-            seeded = Draft()
-        }
-        var initial = seeded
+        let slot = ComposeFlow.DraftSlot(key: key)
+        self.draftSlot = slot
+        var initial = slot.load() ?? ComposeFlow.Draft()
         if let prefillTo { initial.to = prefillTo }
         if let prefillSubject { initial.subject = prefillSubject }
         if let prefillBody { initial.body = prefillBody }
@@ -98,7 +95,7 @@ struct NewMessageSheet: View {
                 Label(l10n.newMessageTitle, systemImage: "square.and.pencil")
                     .font(.headline)
                 Spacer()
-                Button { dismiss() } label: {
+                Button { requestClose() } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
                         .padding(4)
@@ -109,25 +106,17 @@ struct NewMessageSheet: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text(l10n.newMessageToLabel)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    // The count only appears when it is more than one, so a
-                    // single-recipient mail looks exactly as it did before.
-                    if recipientCount > 1 {
-                        Text(l10n.newMessageRecipientsCount(count: recipientCount))
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
-                }
+                Text(l10n.newMessageToLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 TextField(l10n.newMessageToPlaceholder, text: $draft.to)
                     .textFieldStyle(.roundedBorder)
                     .accessibilityLabel(l10n.newMessageToLabel)
                 // The hint appears only once the field holds more than one
-                // address: before that it is noise.
-                if recipientCount > 1 {
+                // address: before that it is noise. It is about *this*
+                // field — a mail to one person with three on Cc is not a
+                // mail that needs commas here.
+                if toAddresses.count > 1 {
                     Text(l10n.newMessageMultipleRecipientsHelp)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
@@ -188,17 +177,35 @@ struct NewMessageSheet: View {
                 }
 
             if let error {
-                Text(error)
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .textSelection(.enabled)
+                failureRow(error)
             }
 
-            HStack {
+            HStack(spacing: 10) {
                 Text(l10n.shortcutSend).font(.caption).foregroundStyle(.secondary)
-                Text(l10n.draftSaved).font(.caption2).foregroundStyle(.secondary)
+                // The same live indicator the reply composer uses. The sheet
+                // promises the draft is kept, so it shows the proof rather
+                // than a static sentence about it.
+                HStack(spacing: 4) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .opacity(draftJustSaved ? 1 : 0)
+                    Text(draftJustSaved ? l10n.draftSavedNow : l10n.draftSaved)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .animation(.easeOut(duration: 0.25), value: draftJustSaved)
                 Spacer()
-                Button(l10n.cancel) { dismiss() }
+                // How many people the whole envelope reaches. It sits with
+                // the send button rather than with the To label: it counts
+                // To *and* Cc *and* Bcc, and a number next to a field it
+                // does not describe is a number the user cannot trust.
+                if recipientCount > 1 {
+                    Text(l10n.newMessageTotalRecipients(count: recipientCount))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                Button(l10n.closeComposer) { requestClose() }
                     .keyboardShortcut(.cancelAction)
                 Button {
                     Task { await send() }
@@ -214,22 +221,29 @@ struct NewMessageSheet: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.return, modifiers: .command)
-                .disabled(isSending)
+                .disabled(isSending || !canSend)
+                .help(canSend ? l10n.send : l10n.sendNeedsRecipient)
             }
         }
         .padding(20)
         .frame(width: 620)
         .onChange(of: draft) { _, newValue in
+            hasEdited = true
             scheduleDraftWrite(newValue)
         }
         // The sheet is closing: whatever is on screen is what belongs in the
         // draft slot, and the debounced write may still be pending. Flushing
         // here is what keeps a draft typed in the last half second from
         // being lost.
+        //
+        // The flush only happens if the user wrote something: a sheet that
+        // was opened and closed without a word must not leave a draft
+        // behind for the next one to find.
         .onDisappear {
             draftWriteTask?.cancel()
             draftWriteTask = nil
-            guard !didSend else { return }
+            guard !didSend, !didDiscard else { return }
+            guard hasEdited else { return }
             writeDraft(draft)
         }
         .fileImporter(
@@ -238,6 +252,16 @@ struct NewMessageSheet: View {
             allowsMultipleSelection: true
         ) { result in
             handlePickedFiles(result)
+        }
+        // The prompt for a mail that is not finished. Closing keeps the
+        // draft, so the question is never "are you sure you want to lose
+        // it" — it is whether the draft should be kept or thrown away.
+        .alert(l10n.unsavedMailTitle, isPresented: $showUnsavedAlert) {
+            Button(l10n.keepWriting, role: .cancel) { }
+            Button(l10n.discardDraft, role: .destructive) { discardAndClose() }
+            Button(l10n.closeAndKeepDraft) { dismiss() }
+        } message: {
+            Text(l10n.unsavedMailMessage)
         }
     }
 
@@ -256,6 +280,11 @@ struct NewMessageSheet: View {
                     .foregroundStyle(.secondary)
                 if !attachments.isEmpty {
                     Text(l10n.newMessageAttachmentCount(count: attachments.count))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    // The size of the whole set, because the server's limit
+                    // is on the whole set.
+                    Text(l10n.newMessageAttachmentTotalSize(size: totalAttachmentSize))
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -293,6 +322,14 @@ struct NewMessageSheet: View {
         }
     }
 
+    /// The size of every attachment together, as a human-readable string.
+    private var totalAttachmentSize: String {
+        ByteCountFormatter.string(
+            fromByteCount: Int64(ComposeFlow.Attachments.totalBytes(attachments)),
+            countStyle: .file
+        )
+    }
+
     // MARK: - Recipients
 
     /// The addresses the To/Cc/Bcc fields hold, split the way RFC 5322
@@ -316,7 +353,25 @@ struct NewMessageSheet: View {
 
     /// Every recipient the mail goes to.
     private var recipientCount: Int {
-        toAddresses.count + ccAddresses.count + bccAddresses.count
+        Self.recipientCount(to: draft.to, cc: draft.cc, bcc: draft.bcc)
+    }
+
+    /// How many people the whole envelope reaches.
+    ///
+    /// To, Cc and Bcc together. The number belongs next to the send
+    /// button — the button that reaches all of them — and not next to the
+    /// To label, which counts only one of the three fields.
+    static func recipientCount(to: String, cc: String, bcc: String) -> Int {
+        AddressList.split(to).count + AddressList.split(cc).count + AddressList.split(bcc).count
+    }
+
+    /// Whether the mail has somebody to go to.
+    ///
+    /// The send button says so before the user presses it, rather than
+    /// after: the user learns from the disabled button and its tooltip,
+    /// not from a failed action.
+    private var canSend: Bool {
+        !toAddresses.isEmpty
     }
 
     // MARK: - Draft persistence
@@ -326,7 +381,7 @@ struct NewMessageSheet: View {
     /// The task is cancelled and replaced on every keystroke, so a burst of
     /// typing produces one encode and one write — at the end of the burst —
     /// instead of one per key press.
-    private func scheduleDraftWrite(_ value: Draft) {
+    private func scheduleDraftWrite(_ value: ComposeFlow.Draft) {
         draftWriteTask?.cancel()
         draftWriteTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(500))
@@ -335,24 +390,47 @@ struct NewMessageSheet: View {
         }
     }
 
-    /// Writes the draft to disk.
-    private func writeDraft(_ value: Draft) {
-        if value.to.isEmpty, value.cc.isEmpty, value.bcc.isEmpty,
-           value.subject.isEmpty, value.body.isEmpty {
-            UserDefaults.standard.removeObject(forKey: draftKey)
-        } else if let data = try? draftEncoder.encode(value) {
-            UserDefaults.standard.set(data, forKey: draftKey)
+    /// Writes the draft to disk and confirms it.
+    private func writeDraft(_ value: ComposeFlow.Draft) {
+        draftSlot.save(value)
+        // Flash the "saved" checkmark for 1.6 s after the write lands.
+        draftSavedResetTask?.cancel()
+        draftJustSaved = !value.isEmpty
+        draftSavedResetTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(1_600))
+            guard !Task.isCancelled else { return }
+            draftJustSaved = false
         }
+    }
+
+    // MARK: - Leaving
+
+    /// Closes the sheet — keeping the draft, or asking first.
+    private func requestClose() {
+        guard hasEdited else {
+            dismiss()
+            return
+        }
+        showUnsavedAlert = true
+    }
+
+    /// Throws the draft away and closes.
+    private func discardAndClose() {
+        didDiscard = true
+        draftWriteTask?.cancel()
+        draftWriteTask = nil
+        draftSlot.clear()
+        dismiss()
     }
 
     // MARK: - File picking
 
     /// Reads the picked files and turns them into attachments.
     ///
-    /// A file that cannot be read, or that is empty or too big, is reported
-    /// by name and skipped — the other files still go out, because refusing
-    /// the whole batch for one bad file would be a worse answer than the
-    /// user could act on.
+    /// A file that cannot be read, or that is empty or too big, is
+    /// reported by name and skipped — the other files still go out,
+    /// because refusing the whole batch for one bad file would be a worse
+    /// answer than the user could act on.
     private func handlePickedFiles(_ result: Result<[URL], Error>) {
         switch result {
         case .failure:
@@ -376,6 +454,14 @@ struct NewMessageSheet: View {
                     }
                     guard attachment.isSendable else {
                         failures.append(l10n.newMessageAttachmentTooLarge(name))
+                        continue
+                    }
+                    // The server caps the *total* as well as each file.
+                    guard ComposeFlow.Attachments.fits(
+                        attachment.data.count,
+                        alongside: attachments
+                    ) else {
+                        failures.append(l10n.newMessageAttachmentTotalTooLarge(name: name))
                         continue
                     }
                     attachments.append(attachment)
@@ -402,6 +488,44 @@ struct NewMessageSheet: View {
 
     private func removeAttachment(_ attachment: OutgoingAttachment) {
         attachments.removeAll { $0.id == attachment.id }
+    }
+
+    // MARK: - Failures
+
+    /// The failure line under the body: the cause, named, and a retry when
+    /// retrying can work.
+    private func failureRow(_ message: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.red)
+                .textSelection(.enabled)
+            Spacer(minLength: 8)
+            if sendFailure?.canRetry == true {
+                Button(l10n.retry) {
+                    Task { await send() }
+                }
+                .buttonStyle(.link)
+                .disabled(isSending)
+            }
+        }
+    }
+
+    /// The text for a failure, in the user's terms.
+    private func message(for failure: ComposeFlow.Failure, error: Error) -> String {
+        switch failure {
+        case .authFailed: return l10n.sendFailedAuth
+        case .notConfigured: return l10n.sendFailedNotConfigured
+        case .messageGone: return l10n.sendFailedMessageGone
+        case .accountMissing: return l10n.sendFailedAccountMissing
+        case .malformedRecipient: return l10n.sendFailedMalformedRecipient
+        case .malformedAttachment: return l10n.sendFailedMalformedAttachment
+        case .forwardTooLarge: return l10n.sendFailedForwardTooLarge
+        case .inFlight: return l10n.sendFailedInFlight
+        case .rejected: return l10n.sendRejected
+        case .transport: return l10n.sendFailedTransport
+        case .unknown: return l10n.sendFailed + error.lagoonUIMessage
+        }
     }
 
     // MARK: - Send
@@ -435,6 +559,7 @@ struct NewMessageSheet: View {
 
         isSending = true
         error = nil
+        sendFailure = nil
         do {
             let response = try await api.sendNewMessage(
                 to: to,
@@ -446,18 +571,29 @@ struct NewMessageSheet: View {
                 bcc: bccAddresses,
                 attachments: attachments
             )
-            didSend = true
-            // The pending write must not land after the send: it would put
-            // the message the user just sent back into the draft slot, and
-            // the next compose would start from the sent text.
-            draftWriteTask?.cancel()
-            draftWriteTask = nil
-            UserDefaults.standard.removeObject(forKey: draftKey)
-            SoundEffects.send()
-            onSent(response.providerMessageId)
-            dismiss()
+            // The server's own answer decides. A 200 with `ok: false` is a
+            // refusal wearing a success's clothes, and announcing "sent"
+            // on it is a promise the user will not check.
+            switch ComposeFlow.outcome(of: response) {
+            case .rejected:
+                sendFailure = .rejected
+                error = l10n.sendRejected
+            case .accepted(let providerMessageId):
+                didSend = true
+                // The pending write must not land after the send: it would put
+                // the message the user just sent back into the draft slot, and the
+                // next compose would start from the sent text.
+                draftWriteTask?.cancel()
+                draftWriteTask = nil
+                draftSlot.clear()
+                SoundEffects.send()
+                onSent(providerMessageId)
+                dismiss()
+            }
         } catch {
-            self.error = l10n.sendFailed + error.lagoonUIMessage
+            let failure = ComposeFlow.Failure.classify(error)
+            sendFailure = failure
+            self.error = message(for: failure, error: error)
         }
         isSending = false
     }

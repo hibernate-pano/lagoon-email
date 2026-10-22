@@ -39,6 +39,14 @@ struct StackListSheet: View {
     @State private var editing: StackEditRequest?
     @State private var openStack: StackSummary?
     @State private var showArchived = false
+    /// The group waiting for the user to confirm its deletion.
+    ///
+    /// A group is not a message: deleting one does not remove mail, it
+    /// re-routes an endless future stream of it, and there is no undo for
+    /// it. That is a bigger blast radius than deleting a single mail, and
+    /// it used to have a smaller safety net — one right-click and no
+    /// confirmation at all.
+    @State private var pendingDeleteRule: StackSummary?
     private let api = APIClient.shared
 
     var body: some View {
@@ -52,10 +60,10 @@ struct StackListSheet: View {
                     }
                     Button(l10n.close) { dismiss() }
                 }
-                .padding(12)
+                .padding(LagoonMetrics.spaceMD)
                 Divider()
                 if isLoading {
-                    ProgressView().padding(20)
+                    ProgressView().padding(LagoonMetrics.spaceXL)
                 } else {
                     List {
                         Section {
@@ -89,7 +97,7 @@ struct StackListSheet: View {
                                     openStack = stack
                                 } label: {
                                     HStack {
-                                        VStack(alignment: .leading, spacing: 2) {
+                                        VStack(alignment: .leading, spacing: LagoonMetrics.spaceXS) {
                                             Text(stack.rule.name).lineLimit(1)
                                             Text("\(l10n.stackKindLabel(l10n.stackKindName(stack.rule.kind))) · \(stack.rule.value)")
                                                 .font(.caption)
@@ -113,7 +121,7 @@ struct StackListSheet: View {
                                         editing = StackEditRequest(rule: stack.rule)
                                     }
                                     Button(l10n.stackDeleteRule, role: .destructive) {
-                                        Task { await deleteRule(stack) }
+                                        pendingDeleteRule = stack
                                     }
                                 }
                             }
@@ -160,8 +168,51 @@ struct StackListSheet: View {
                 }
             }
             .task { await reload() }
+            // The delete confirmation. It names the group and how much mail
+            // is currently matching it, because the number is what tells
+            // the user how much re-routing they are about to cause.
+            .confirmationDialog(
+                l10n.stackDeleteRuleConfirmTitle(name(of: pendingDeleteRule)),
+                isPresented: Binding(
+                    get: { pendingDeleteRule != nil },
+                    set: { if !$0 { pendingDeleteRule = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button(l10n.stackDeleteRule, role: .destructive) {
+                    guard let stack = pendingDeleteRule else { return }
+                    pendingDeleteRule = nil
+                    Task { await deleteRule(stack) }
+                }
+                .tint(LagoonTheme.danger)
+                Button(l10n.cancel, role: .cancel) { pendingDeleteRule = nil }
+            } message: {
+                Text(
+                    l10n.stackDeleteRuleConfirmMessage(
+                        name(of: pendingDeleteRule),
+                        count(of: pendingDeleteRule)
+                    )
+                )
+            }
         }
-        .frame(width: 520, height: 520)
+        .frame(
+            width: LagoonSheetSize.standard.width,
+            height: LagoonSheetSize.standard.height
+        )
+    }
+
+    /// The group's name, for the confirmation that deletes it.
+    private func name(of stack: StackSummary?) -> String {
+        guard let stack else { return "" }
+        return stack.rule.name
+    }
+
+    /// How many mails the group currently matches, for the same
+    /// confirmation. The count is already on the row — the sheet does not
+    /// have to go and ask the server again.
+    private func count(of stack: StackSummary?) -> Int {
+        guard let stack else { return 0 }
+        return stack.count
     }
 
     private func reload() async {
@@ -247,7 +298,7 @@ struct StackMailSheet: View {
         NavigationStack(path: $path) {
             VStack(spacing: 0) {
                 HStack {
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: LagoonMetrics.spaceXS) {
                         Text(title).font(.headline).lineLimit(1)
                         if case .rule(let stack) = source {
                             Text("\(l10n.stackKindLabel(l10n.stackKindName(stack.rule.kind))) · \(stack.rule.value)")
@@ -272,30 +323,33 @@ struct StackMailSheet: View {
                     }
                     Button(l10n.close) { dismiss() }
                 }
-                .padding(12)
+                .padding(LagoonMetrics.spaceMD)
                 Divider()
                 if isLoading {
-                    ProgressView().padding(20)
+                    ProgressView().padding(LagoonMetrics.spaceXL)
                 } else if messages.isEmpty {
-                    Text(l10n.senderMailEmpty).foregroundStyle(.secondary).padding(20)
+                    ContentUnavailableView {
+                        Label(emptyStateText, systemImage: emptyStateIcon)
+                    }
                 } else {
                     List(messages) { m in
                         NavigationLink(value: m.remoteId) {
-                            VStack(alignment: .leading, spacing: 3) {
-                                HStack(alignment: .firstTextBaseline) {
+                            VStack(alignment: .leading, spacing: LagoonTypography.rowSpacing) {
+                                HStack(alignment: .firstTextBaseline, spacing: LagoonMetrics.spaceSM) {
+                                    UnreadMarker(isUnread: !m.isRead)
                                     Text(m.subject ?? L10n.current.noSubject)
-                                        .font(.body)
+                                        .font(LagoonTypography.rowSubject)
                                         .bold(!m.isRead)
-                                        .lineLimit(1)
+                                        .lineLimit(LagoonTypography.rowSubjectLines)
                                     Spacer()
-                                    Text(m.receivedAt.formatted(date: .abbreviated, time: .shortened))
-                                        .font(.caption2)
+                                    Text(LagoonTypography.rowTimestamp(m.receivedAt))
+                                        .font(LagoonTypography.rowTime)
                                         .foregroundStyle(.secondary)
                                 }
                                 Text(m.fromName ?? m.fromAddress)
-                                    .font(.caption)
+                                    .font(LagoonTypography.rowSender)
                                     .foregroundStyle(.secondary)
-                                    .lineLimit(1)
+                                    .lineLimit(LagoonTypography.rowSubjectLines)
                             }
                         }
                     }
@@ -309,8 +363,8 @@ struct StackMailSheet: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
+                                .padding(.horizontal, LagoonMetrics.spaceMD)
+                                .padding(.vertical, LagoonMetrics.spaceSM)
                                 .background(.bar)
                                 .overlay(alignment: .top) { Divider() }
                                 .accessibilityLabel(truncatedNotice)
@@ -339,9 +393,38 @@ struct StackMailSheet: View {
                 .id(remoteId)
             }
         }
-        .frame(width: 640, height: 560)
+        .frame(
+            width: LagoonSheetSize.wide.width,
+            height: LagoonSheetSize.wide.height
+        )
         .noticeBanner($errorBanner)
         .task { await load() }
+    }
+
+    /// The empty state, in the words of what is actually empty.
+    ///
+    /// The sheet used to say 「没有来自此发件人的邮件」 for both of its
+    /// sources — but one of them is the built-in archive cabinet and the
+    /// other is a group the user wrote, which may match on a *keyword*. A
+    /// user who just created a keyword group was told, in those words,
+    /// that they have no mail from a sender: an explanation of something
+    /// that was never asked, and one that is simply false.
+    private var emptyStateText: String {
+        switch source {
+        case .archived:
+            return l10n.stackArchivedEmpty
+        case .rule(let stack):
+            return l10n.stackGroupEmpty(stack.rule.name)
+        }
+    }
+
+    /// The symbol that goes with the empty state: the cabinet for the
+    /// built-in archive, a folder for a group the user wrote.
+    private var emptyStateIcon: String {
+        switch source {
+        case .archived: return "archivebox"
+        case .rule: return "folder"
+        }
     }
 
     private func load() async {
@@ -527,7 +610,7 @@ struct StackRuleEditorSheet: View {
     private var isEditing: Bool { editing != nil }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: LagoonMetrics.spaceLG) {
             Text(isEditing ? l10n.stackEditorEditTitle : l10n.stackEditorTitle).font(.headline)
             Picker(l10n.stackRuleKind, selection: $kind) {
                 Text(l10n.stackKindSender).tag(StackRule.Kind.sender)
@@ -592,8 +675,8 @@ struct StackRuleEditorSheet: View {
                 .keyboardShortcut(.defaultAction)
             }
         }
-        .padding(18)
-        .frame(width: 440)
+        .padding(LagoonMetrics.spaceLG)
+        .frame(width: LagoonSheetSize.compact.width)
         .noticeBanner($errorBanner)
     }
 

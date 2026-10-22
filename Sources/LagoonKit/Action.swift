@@ -220,16 +220,40 @@ public struct SearchResponse: Codable, Sendable, Equatable {
     public let totalCount: Int?
     /// True when the server stopped at its cap and more matched.
     public let truncated: Bool?
+    /// How many messages were **not** searched inside their sealed text.
+    ///
+    /// The body and the preview are encrypted at rest, so finding a word
+    /// inside one costs an AES-GCM open. The server opens a bounded number
+    /// of them per request — the newest first — and when the mailbox holds
+    /// more than that budget, the rest were not searched.
+    ///
+    /// This is how many of those messages there were. A search that quietly
+    /// stopped early reads as a complete search, and "no match" is the
+    /// answer a user is least able to check for themselves.
+    ///
+    /// Nil means "the server did not say" — an older server that searches
+    /// everything and has no budget to report.
+    public let bodyScanSkipped: Int?
+    /// The body-scan budget this request ran under.
+    ///
+    /// The number of sealed bodies the server was willing to open. Together
+    /// with `bodyScanSkipped` it says what was searched: the newest
+    /// `bodyScanLimit` of them, minus the ones that matched nothing.
+    public let bodyScanLimit: Int?
     public init(
         results: [MessageHeader],
         query: String,
         totalCount: Int? = nil,
-        truncated: Bool? = nil
+        truncated: Bool? = nil,
+        bodyScanSkipped: Int? = nil,
+        bodyScanLimit: Int? = nil
     ) {
         self.results = results
         self.query = query
         self.totalCount = totalCount
         self.truncated = truncated
+        self.bodyScanSkipped = bodyScanSkipped
+        self.bodyScanLimit = bodyScanLimit
     }
 }
 

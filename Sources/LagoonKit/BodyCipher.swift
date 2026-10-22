@@ -99,6 +99,22 @@ public enum BodyCipher {
         value.hasPrefix(envelopePrefix)
     }
 
+    /// Whether `text` contains `needle`, case-insensitively.
+    ///
+    /// The rule every search arm agrees on, in one place. The SQL function
+    /// `lagoon_cipher_contains` decides it inside SQLite; the batched body
+    /// scan decides it in Swift, and the two must not disagree — a search
+    /// that matched a body through one path and not the other would return a
+    /// different set depending on which arm reached the row first.
+    ///
+    /// Case-insensitive, like the `LIKE` arms it sits next to. SQLite's
+    /// `LIKE` folds ASCII only; this folds Unicode, which is a superset — a
+    /// search that finds *more* is never a lie, and the extra hits are
+    /// correct for CJK text that `LIKE` treated as case-sensitive anyway.
+    public static func matches(_ text: String, _ needle: String) -> Bool {
+        text.range(of: needle, options: [.caseInsensitive]) != nil
+    }
+
     private static func loadKey() throws -> SymmetricKey {
         guard let keyProvider else { throw BodyCipherError.missingKey }
         return try keyProvider()
@@ -194,10 +210,15 @@ extension BodyCipher {
     /// still applies to the final result, and no plaintext ever leaves the
     /// process boundary.
     ///
-    /// Case-insensitive, like the `LIKE` arms it replaces. SQLite's `LIKE`
-    /// folds ASCII only; this folds Unicode, which is a superset — a search
-    /// that finds *more* is never a lie, and the extra hits are correct for
-    /// CJK text that `LIKE` treated as case-sensitive anyway.
+    /// ## Where it is used
+    ///
+    /// The search no longer leans on it: the body and the preview are
+    /// matched in Swift, under a budget, because SQLite evaluates an `OR`
+    /// chain per row and a sealed arm inside one opens every cached body in
+    /// the account. The function stays registered — it is the one place the
+    /// "sealed text contains this word" question is asked inside SQL, and it
+    /// answers it with the same rule (`BodyCipher.matches`) the Swift side
+    /// uses, so the two can never drift.
     public static let containsFunction = DatabaseFunction(
         "lagoon_cipher_contains",
         argumentCount: 2,
@@ -211,7 +232,7 @@ extension BodyCipher {
         guard let needle = String.fromDatabaseValue(arguments[1]) else { return 1 }
         if needle.isEmpty { return 1 }
         let text = try BodyCipher.open(cipher)
-        return text.range(of: needle, options: [.caseInsensitive]) != nil ? 1 : 0
+        return BodyCipher.matches(text, needle) ? 1 : 0
     }
 
     /// `lagoon_cipher_seal(plaintext)` — seals a value inside SQL.

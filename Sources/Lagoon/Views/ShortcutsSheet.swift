@@ -80,7 +80,12 @@ struct ShortcutsSheet: View {
     var entries: [Entry] {
         [
             // Navigation
-            Entry(id: "back", keys: "⌘[", description: l10n.backHelp, scope: .global),
+            // ⌘[ is Mail.app's "back" muscle memory, re-pointed at the one
+            // thing it can mean on a mail-list surface: clear the
+            // selection. The row used to describe it as 「返回上一级」 —
+            // a gesture the list surfaces do not have, taught with the
+            // certainty of a key that is bound everywhere.
+            Entry(id: "back", keys: "⌘[", description: l10n.deselectHelp, scope: .lists),
             Entry(id: "briefing", keys: "⌘0", description: l10n.surfaceHelp, scope: .global),
             Entry(id: "groupJump", keys: "⌘1–⌘\(BriefingGroup.allCases.count)", description: l10n.shortcutGroupJump, scope: .briefing),
             Entry(id: "search", keys: "⌘F", description: l10n.shortcutSearch, scope: .global),
@@ -105,7 +110,10 @@ struct ShortcutsSheet: View {
             Entry(id: "reply", keys: "⌘R", description: l10n.replyHelp, scope: .reader),
             Entry(id: "replyAll", keys: "⇧⌘R", description: l10n.replyAllHelp, scope: .reader),
             Entry(id: "forward", keys: "⇧⌘F", description: l10n.forwardHelp, scope: .reader),
-            Entry(id: "send", keys: "⌘↩", description: l10n.shortcutSend, scope: .composer),
+            // The row names the surface, not just the key: "⌘↩" on its
+            // own is a gesture the reader cannot perform, and a cheatsheet
+            // that teaches it there teaches a key that does nothing.
+            Entry(id: "send", keys: "⌘↩", description: l10n.shortcutSendScope, scope: .composer),
             // ⇧⌘P, not ⌘P: on macOS ⌘P is print, and a mail client that
             // hijacks it silently changes the message's state when the user
             // meant to print it.

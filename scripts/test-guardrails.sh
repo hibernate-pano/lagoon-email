@@ -41,6 +41,18 @@ expect_sql_kinds() {
   else bad "$name reported [$got], expected [$want]"; fi
 }
 
+# Rule 1 has no exemption point, so the file SELECTION is part of the rule's
+# contract and is asserted like any other part of it: a Swift file is scanned
+# whatever it is called, and a non-Swift file is not.
+expect_sql_scanned() {
+  local name="$1" file="$2"
+  if sql_path_scanned "$file"; then ok "$name scanned"; else bad "$name NOT scanned"; fi
+}
+expect_sql_not_scanned() {
+  local name="$1" file="$2"
+  if sql_path_scanned "$file"; then bad "$name wrongly scanned"; else ok "$name not scanned"; fi
+}
+
 expect_imap_caught() {
   local name="$1" file="$2"
   if imap_command_hits_for_files "$file" >/dev/null; then ok "imap/$name caught"; else bad "imap/$name NOT caught"; fi
@@ -314,10 +326,56 @@ expect_sql_clean "chain: bare keyword constant (selectVerb)" "$tmp/chain_clean_k
 expect_sql_clean "chain NEG(mutation): no context marker" "$tmp/chain_neg_no_context_marker.swift"
 expect_sql_clean "chain NEG(mutation): no value spliced"  "$tmp/chain_neg_no_splice.swift"
 
-# SQLBuilder.swift is the one allowed home for interpolation; the main scan
-# filters it out, so the rule must still flag it.
-if [ -f Sources/LagoonKit/SQLBuilder.swift ]; then
-  expect_sql_caught "SQLBuilder.swift (excluded by main scan)" Sources/LagoonKit/SQLBuilder.swift
+# ---------------------------------------------------------------------------
+# Rule 1 has NO exemption point.
+#
+# The rule used to exempt a file named SQLBuilder.swift -- a file that has not
+# existed since the V3 rebuild (ea4118b), so the exemption covered nothing --
+# while still matching on the BASE NAME, so any file with that name anywhere
+# under Sources/ or Tests/ would have been skipped silently. The one fixture
+# covering the exemption was itself guarded by `[ -f ... ]`, so it never ran:
+# the only exemption the rule had was the one exemption nobody checked.
+#
+# The contract is now "no exemption at all", and these assertions are what
+# hold it there. The old self-test would not have caught the regression it was
+# written for: it asserted the SCANNER flags the file, which is a property of
+# the scanner, not of the selection that skipped it. A rule that exempts a
+# file is a rule about SELECTION, so the selection is what gets asserted.
+# ---------------------------------------------------------------------------
+# MUST STAY SCANNED: the file the old rule used to exempt, and any file with
+# that base name at any path. A regression that re-adds the exclusion turns
+# these red.
+expect_sql_scanned "SQLBuilder.swift (no longer exempt)" "Sources/LagoonKit/SQLBuilder.swift"
+expect_sql_scanned "SQLBuilder.swift at another path"     "Sources/LagoonServer/SQLBuilder.swift"
+expect_sql_scanned "an ordinary Swift file"               "Sources/LagoonKit/MessageStore.swift"
+# MUST STAY UNSCANNED: a non-Swift file. Without this the selection would
+# also "pass" by scanning everything, and the assertions above would prove
+# nothing.
+expect_sql_not_scanned "a non-Swift file" "Sources/LagoonKit/README.md"
+
+# END TO END, on a file with the ex-exempt NAME. The two assertions above
+# check the selection and the scanner separately; this one walks the whole
+# path a real violation takes -- select, then scan -- for exactly the file
+# name the old rule skipped. This is the regression the audit describes: the
+# day somebody creates a file called SQLBuilder.swift and moves interpolation
+# into it, the guard must still catch it.
+cat > "$tmp/SQLBuilder.swift" <<'SWIFT'
+let sql = "SELECT * FROM accounts WHERE id = \(userInput)"
+SWIFT
+if sql_path_scanned "$tmp/SQLBuilder.swift" && sql_hits_for_files "$tmp/SQLBuilder.swift" >/dev/null; then
+  ok "a file named SQLBuilder.swift is selected AND flagged"
+else
+  bad "a file named SQLBuilder.swift escapes rule 1"
+fi
+
+# The exemption is gone from the REPO too, not just from the rule: the file
+# itself must not reappear, because a same-named file is exactly what made
+# the exclusion dangerous. It was deleted in ea4118b and nothing brought it
+# back.
+if [ -e Sources/LagoonKit/SQLBuilder.swift ]; then
+  bad "Sources/LagoonKit/SQLBuilder.swift exists -- rule 1 has no exempt file"
+else
+  ok "no Sources/LagoonKit/SQLBuilder.swift in the repo"
 fi
 
 echo "== IMAP command assembly rule (rule 1b) =="

@@ -119,7 +119,7 @@ extension L10n {
     /// have left off. The caveat belongs in the sheet, where the user
     /// can act on it.
     public func reminderSetConfirmation(_ date: Date) -> String {
-        let when = Self.reminderDateFormatter.string(from: date)
+        let when = reminderDateFormatter.string(from: date)
         return pick("已设好提醒，\(when)。", "Reminder set for \(when).")
     }
 }

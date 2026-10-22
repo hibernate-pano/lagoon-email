@@ -282,6 +282,28 @@ public enum DraftRoutes {
 // MARK: - Search
 
 public enum SearchRoutes {
+    /// How many sealed bodies one search may open.
+    ///
+    /// The body arm of the search is the expensive one: every candidate
+    /// costs an AES-GCM open, and a body is tens of kilobytes. Without a
+    /// budget, a query whose word only appears inside a body opened
+    /// **every** cached body in the account — 5,000 messages is 100 MB of
+    /// decryption on the request path, and it grew with the mailbox.
+    ///
+    /// The budget counts rows rather than bytes because a row count is the
+    /// thing that can be *stated*: the response reports how many rows were
+    /// left out, so a capped search never reads as a complete one.
+    static let bodyScanLimit = 1000
+
+    /// How many candidate rows one batch opens.
+    ///
+    /// Batches keep the memory flat: a batch of bodies is a few megabytes in
+    /// flight, not the whole mailbox.
+    static let bodyScanBatchSize = 200
+
+    /// How many rows the response carries.
+    static let resultLimit = 100
+
     public static func register(
         on router: Router<BasicRequestContext>, db: LagoonDB, logger: Logger
     ) {
@@ -304,23 +326,32 @@ public enum SearchRoutes {
             }
             let q = request.uri.queryParameters["q"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !q.isEmpty else {
-                return RouteJSON.response(SearchResponse(results: [], query: q, totalCount: 0, truncated: false))
+                return RouteJSON.response(SearchResponse(
+                    results: [], query: q, totalCount: 0, truncated: false,
+                    bodyScanSkipped: 0, bodyScanLimit: bodyScanLimit
+                ))
             }
             let sender = request.uri.queryParameters["sender"].map(String.init)
             let since = parseSince(request.uri.queryParameters["since"].map(String.init))
             do {
-                let (results, total) = try await search(
+                let outcome = try await search(
                     scope: scope,
                     q: q, sender: sender, since: since, db: db
                 )
                 // The count travels with the rows. A search that silently
                 // stopped at its cap is indistinguishable from a search that
                 // found everything, and the user has no other way to tell.
+                //
+                // The skipped count travels with them for the same reason:
+                // a body scan that stopped at its budget would otherwise
+                // read as "this word is not in my mail".
                 return RouteJSON.response(SearchResponse(
-                    results: results,
+                    results: outcome.results,
                     query: q,
-                    totalCount: total,
-                    truncated: total > results.count
+                    totalCount: outcome.totalCount,
+                    truncated: outcome.totalCount > outcome.results.count,
+                    bodyScanSkipped: outcome.bodyScanSkipped,
+                    bodyScanLimit: bodyScanLimit
                 ))
             } catch {
                 return RouteJSON.failure(
@@ -338,169 +369,291 @@ public enum SearchRoutes {
         return f.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
     }
 
+    /// One row the search matched, before its header is fetched.
+    private struct Match {
+        var id: UUID
+        var receivedAt: Date
+    }
+
+    /// The rows, the number of rows that matched, and what the body scan
+    /// could not reach.
+    private struct SearchOutcome {
+        var results: [MessageHeader]
+        var totalCount: Int
+        var bodyScanSkipped: Int
+    }
+
     /// The rows and the number of rows that matched.
     ///
-    /// The count is a second query over the same predicate. It is not free,
-    /// and it is not free *on purpose*: the alternative was a silent cap,
-    /// and a silent cap is a lie the user cannot detect. The count query
-    /// skips the `LIMIT`, so it is the only way to say "there are 3,140
-    /// matches; here are the first hundred".
+    /// ## Two passes, because the arms cost wildly different amounts
+    ///
+    /// The old predicate ORed seven arms into one statement, two of which
+    /// were `lagoon_cipher_contains(...)` — and that function is a complete
+    /// AES-GCM open. SQLite evaluates an `OR` chain per row, so a query
+    /// whose word only appears inside a body opened **every** cached body in
+    /// the account — and the count query, which ran over the same predicate
+    /// without the `LIMIT`, opened them all again.
+    ///
+    /// The arms are split by what they cost:
+    ///
+    /// * The **cheap** arms — subject, sender, and the AI's own verdict on
+    ///   the message — are columns. They stay in SQL, where a comparison
+    ///   costs nothing, and a row that matches one of them never has to be
+    ///   opened at all.
+    /// * The **sealed** arms — the preview and the body — cost an open each.
+    ///   They get their own pass, in Swift, under a budget.
+    ///
+    /// Both passes read the same rows, so the count describes exactly what
+    /// was searched. The budget is the only thing that can make the two
+    /// disagree, and the response says how much it left out.
+    ///
+    /// ## The count
+    ///
+    /// The count is not a second query over the predicate any more: it is
+    /// the size of the merged result of the two passes, which is exact by
+    /// construction. A count that does not describe the rows it counts is
+    /// worse than no count at all: the user is told "3,140 matched" and
+    /// shown a different set.
     private static func search(
         scope: SearchScope, q: String, sender: String?, since: Date?, db: LagoonDB
-    ) async throws -> ([MessageHeader], Int) {
+    ) async throws -> SearchOutcome {
         // LIKE specials in the query are data, not wildcards. This used to be
         // a second, hand-maintained copy of the escaping — a twin is exactly
         // what lets a fix land on one side only — so the route calls the
         // shared `MessageStore.likePattern(containing:)` now.
         let pattern = MessageStore.likePattern(containing: q)
-        // One path, one recall: substrings over subject/snippet/from/body.
-        // The Postgres build ORed a plainto_tsquery arm into this predicate for
-        // English inflection recall; SQLite has no tsvector and the body arm
-        // already covers the same text, so the arm is gone rather than
-        // emulated. Optional sender/since filters are appended as static
-        // fragments (never user text) so binding stays positional.
-        //
-        // The body and the preview are sealed at rest, so their arms are
-        // `lagoon_cipher_contains(...)` rather than `LIKE` — see
-        // `BodyCipher.containsFunction` for why the decision stays inside
-        // SQLite instead of moving into Swift.
-        //
-        // What replaced it is cheaper and more honest: the `advice` arm. Lagoon
-        // has already paid a model to classify every message it has seen, and
-        // that verdict is stored in columns rather than prose. Matching on it
-        // means searching "marketing" or "archive" finds mail by what the AI
-        // *concluded* about it — which is the question a user asking "show me
-        // the marketing" is really asking — with no extra inference, no
-        // embedding index, and no per-query token spend.
-        //
-        // It deliberately does **not** match `a.rationale`: the rationale is the
-        // model's own English/Chinese sentence, so a LIKE against it would be
-        // accidental translation rather than a real filter. Only the enum-
-        // shaped columns participate, and the UI labels them as AI-derived so
-        // the user knows why the hit appeared.
-        // `m.is_sent` is selected because `decode` can only carry the flag it
-        // is given: without it, a sent reply opened from search results reads
-        // as received mail end to end — the display lies, and its detail
-        // actions resolve the UID in the INBOX scope and fail. `find()` states
-        // the same reason (its column-list omission was invisible for the
-        // identical reason: the nil-tolerant decode defaults it to false).
-        //
-        // ## One predicate, two queries
-        //
-        // The rows and the count are assembled from **one** list of
-        // fragments and **one** list of arguments. They used to be two
-        // hand-written statements, and they had already drifted: the count
-        // still pinned `m.account_id = ?` while the rows had made the
-        // account optional — so a cross-account search counted a mailbox
-        // that was never queried, and a single-account search bound its
-        // account id to the *subject* placeholder while the account
-        // predicate was handed the last pattern in the list.
-        //
-        // A count that does not describe the rows it counts is worse than no
-        // count at all: the user is told "3,140 matched" and shown a
-        // different set. Sharing the fragments makes that impossible — the
-        // two statements cannot disagree about a predicate they both hold.
-        var predicate: [String] = []
-        var arguments: [DatabaseValueConvertible?] = []
 
-        predicate.append("WHERE m.is_deleted = FALSE")
+        // The cheap arms. Subject, sender, and the AI's own verdict on the
+        // message are all columns, and a column comparison costs nothing —
+        // so they stay in SQL, and a row that matches one of them never has
+        // to be opened at all.
+        //
+        // What the full-text arm used to be is cheaper and more honest now:
+        // the `advice` arm. Lagoon has already paid a model to classify
+        // every message it has seen, and that verdict is stored in columns
+        // rather than prose. Matching on it means searching "marketing" or
+        // "archive" finds mail by what the AI *concluded* about it — which
+        // is the question a user asking "show me the marketing" is really
+        // asking — with no extra inference, no embedding index, and no
+        // per-query token spend.
+        //
+        // It deliberately does **not** match `a.rationale`: the rationale is
+        // the model's own English/Chinese sentence, so a LIKE against it
+        // would be accidental translation rather than a real filter. Only
+        // the enum-shaped columns participate, and the UI labels them as
+        // AI-derived so the user knows why the hit appeared.
+        let cheapArms = """
+            (m.subject LIKE ? ESCAPE '\\'
+             OR m.from_name LIKE ? ESCAPE '\\'
+             OR m.from_address LIKE ? ESCAPE '\\'
+             OR a.category LIKE ? ESCAPE '\\'
+             OR a.action LIKE ? ESCAPE '\\')
+            """
+        let cheapArguments: [DatabaseValueConvertible?] = [
+            pattern, pattern, pattern, pattern, pattern
+        ]
 
+        // The filters both passes share. They narrow the mailbox before any
+        // arm is evaluated, so a scoped search never even looks at another
+        // account's mail. Optional sender/since filters are appended as
+        // static fragments (never user text) so binding stays positional.
+        var filters = ["m.is_deleted = FALSE"]
+        var filterArguments: [DatabaseValueConvertible?] = []
         // The account narrows to one mailbox, or is absent for a
-        // cross-account search. It comes first so the account value is the
-        // account value: the position of a `?` in the statement is the
-        // position of its value in the argument list, and the two are built
-        // together here so they cannot drift.
+        // cross-account search.
         if let accountId = scope.accountId {
-            predicate.append("AND m.account_id = ?")
-            arguments.append(accountId)
+            filters.append("AND m.account_id = ?")
+            filterArguments.append(accountId)
         }
-
-        // The two sealed columns cannot be matched with `LIKE` — the stored
-        // value is ciphertext, not text — so they are matched by the
-        // registered function instead, which opens the envelope and does the
-        // substring test. Those two arms take the **raw** query; the `LIKE`
-        // arms take the escaped pattern, which is the same substring test
-        // written for SQL.
-        predicate.append("""
-            AND (m.subject LIKE ? ESCAPE '\\'
-                 OR lagoon_cipher_contains(m.snippet_cipher, ?)
-                 OR m.from_name LIKE ? ESCAPE '\\' OR m.from_address LIKE ? ESCAPE '\\'
-                 OR lagoon_cipher_contains(b.body_cipher, ?)
-                 OR a.category LIKE ? ESCAPE '\\'
-                 OR a.action LIKE ? ESCAPE '\\')
-            """)
-        arguments.append(contentsOf: [
-            pattern, q, pattern, pattern, q, pattern, pattern
-        ])
-
         if let sender {
-            predicate.append("AND m.from_address = ?")
-            arguments.append(sender)
+            filters.append("AND m.from_address = ?")
+            filterArguments.append(sender)
         }
         if let since {
-            predicate.append("AND m.received_at >= ?")
-            arguments.append(since)
+            filters.append("AND m.received_at >= ?")
+            filterArguments.append(since)
         }
-
-        // The statement is a list of fragments joined with a newline, not a
-        // string built with `+=`. Every fragment is static text and every
-        // value is bound; nothing reaches the SQL text but a literal.
-        var sqlParts: [String] = [
-            """
-            SELECT m.id, m.account_id, m.remote_id, m.thread_id,
-                   m.from_address,
-                   NULLIF(m.from_name, '') as from_name,
-                   NULLIF(m.subject, '') as subject,
-                   NULLIF(m.snippet_cipher, '') as snippet_cipher,
-                   m.received_at, m.is_read, m.is_archived, m.is_deleted, m.is_sent,
-                   m.message_id_header, m.in_reply_to, m.references_header
-            FROM message_headers m
-            LEFT JOIN message_bodies b
-              ON b.account_id = m.account_id AND b.remote_id = m.remote_id
-            -- The advice table joins in for recall only. Nothing here reads the
-            -- model's own words: it matches on the *structured* fields Lagoon
-            -- already derived (category, action), so a search for "营销" or
-            -- "archive" finds mail by what the AI concluded about it rather than
-            -- only by what it happened to write. `rationale` is deliberately
-            -- excluded — see the note below.
-            LEFT JOIN advice a
-              ON a.account_id = m.account_id AND a.remote_id = m.remote_id
-            """
-        ]
-        sqlParts.append(contentsOf: predicate)
-        sqlParts.append("ORDER BY m.received_at DESC")
-        sqlParts.append("LIMIT 100")
-        let sql = sqlParts.joined(separator: "\n")
-
-        // The count runs over the same predicate without the `LIMIT`. It is
-        // the only way to say "3,140 matched; here are the first hundred" —
-        // and a search that silently stops at its cap is indistinguishable
-        // from a search that found everything.
-        //
-        // The two joins cannot multiply rows: `message_bodies` is keyed by
-        // (account_id, remote_id) and `advice` is UNIQUE on the same pair,
-        // so every message contributes at most one row to the count.
-        var countParts: [String] = [
-            """
-            SELECT COUNT(*)
-            FROM message_headers m
-            LEFT JOIN message_bodies b
-              ON b.account_id = m.account_id AND b.remote_id = m.remote_id
-            LEFT JOIN advice a
-              ON a.account_id = m.account_id AND a.remote_id = m.remote_id
-            """
-        ]
-        countParts.append(contentsOf: predicate)
-        let countSQL = countParts.joined(separator: "\n")
+        let whereClause = filters.joined(separator: "\n")
 
         return try db.read { db in
-            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
-                .map { try MessageStore.decode($0) }
-            let count = try Int.fetchOne(
-                db, sql: countSQL, arguments: StatementArguments(arguments)
-            ) ?? rows.count
-            return (rows, count)
+            // Pass A — the cheap arms, in SQL.
+            //
+            // The advice table joins in for recall only. Nothing here reads
+            // the model's own words: it matches on the *structured* fields
+            // Lagoon already derived (category, action). `advice` is UNIQUE
+            // on (account_id, remote_id), so the join cannot multiply rows.
+            let cheapSQL = """
+                SELECT m.id, m.received_at
+                FROM message_headers m
+                LEFT JOIN advice a
+                  ON a.account_id = m.account_id AND a.remote_id = m.remote_id
+                WHERE \(whereClause)
+                  AND \(cheapArms)
+                """
+            let cheapHits = try Row.fetchAll(
+                db, sql: cheapSQL,
+                arguments: StatementArguments(filterArguments + cheapArguments)
+            ).map { Match(id: $0["id"], receivedAt: $0["received_at"]) }
+
+            // Pass B — the sealed arms, in Swift, under a budget.
+            //
+            // The candidates are the rows the cheap arms did **not** match:
+            // a row that already matched is in the result set, and opening
+            // its body would only cost time.
+            //
+            // `COALESCE(..., 0)` matters. A subject, a sender name or an AI
+            // verdict can be NULL, and NULL propagates through an OR chain:
+            // the chain would be NULL rather than false, `NOT NULL` is not
+            // true, and the row would drop out of the scan and never be
+            // searched at all.
+            let scanSQL = """
+                SELECT m.id, m.received_at,
+                       NULLIF(m.snippet_cipher, '') AS snippet_cipher,
+                       NULLIF(b.body_cipher, '') AS body_cipher
+                FROM message_headers m
+                LEFT JOIN message_bodies b
+                  ON b.account_id = m.account_id AND b.remote_id = m.remote_id
+                WHERE \(whereClause)
+                  AND COALESCE(\(cheapArms), 0) = 0
+                  AND (NULLIF(m.snippet_cipher, '') IS NOT NULL
+                       OR NULLIF(b.body_cipher, '') IS NOT NULL)
+                ORDER BY m.received_at DESC, m.id DESC
+                LIMIT ? OFFSET ?
+                """
+            var sealedHits: [Match] = []
+            var scanned = 0
+            var reachedTheEnd = false
+            while scanned < bodyScanLimit {
+                let batchSize = min(bodyScanBatchSize, bodyScanLimit - scanned)
+                var arguments = filterArguments + cheapArguments
+                arguments.append(batchSize)
+                arguments.append(scanned)
+                let rows = try Row.fetchAll(
+                    db, sql: scanSQL, arguments: StatementArguments(arguments)
+                )
+                for row in rows {
+                    if try Self.matchesSealedText(row: row, needle: q) {
+                        sealedHits.append(
+                            Match(id: row["id"], receivedAt: row["received_at"])
+                        )
+                    }
+                }
+                scanned += rows.count
+                if rows.count < batchSize {
+                    // The mailbox ended before the budget did: nothing was
+                    // left out.
+                    reachedTheEnd = true
+                    break
+                }
+            }
+
+            // How much of the mailbox the budget did not reach.
+            //
+            // The count is only needed when the budget actually cut the scan
+            // short. When the mailbox ended first, nothing was skipped and
+            // the answer is zero.
+            var bodyScanSkipped = 0
+            if !reachedTheEnd {
+                let candidateSQL = """
+                    SELECT COUNT(*)
+                    FROM message_headers m
+                    LEFT JOIN message_bodies b
+                      ON b.account_id = m.account_id AND b.remote_id = m.remote_id
+                    WHERE \(whereClause)
+                      AND COALESCE(\(cheapArms), 0) = 0
+                      AND (NULLIF(m.snippet_cipher, '') IS NOT NULL
+                           OR NULLIF(b.body_cipher, '') IS NOT NULL)
+                    """
+                let candidates = try Int.fetchOne(
+                    db, sql: candidateSQL,
+                    arguments: StatementArguments(filterArguments + cheapArguments)
+                ) ?? scanned
+                bodyScanSkipped = max(0, candidates - scanned)
+            }
+
+            // The two passes found disjoint sets — the scan skips the rows
+            // the cheap arms already matched — so the merge is a sort.
+            var seen = Set<UUID>()
+            var ordered: [Match] = []
+            for hit in (cheapHits + sealedHits).sorted(by: Self.isNewer) {
+                if seen.insert(hit.id).inserted {
+                    ordered.append(hit)
+                }
+            }
+
+            // The rows themselves, in one statement.
+            //
+            // The placeholder list is built from the number of ids — no user
+            // text reaches the SQL, only the count of the `?`s.
+            //
+            // `m.is_sent` is selected because `decode` can only carry the
+            // flag it is given: without it, a sent reply opened from search
+            // results reads as received mail end to end — the display lies,
+            // and its detail actions resolve the UID in the INBOX scope and
+            // fail. `find()` states the same reason (its column-list
+            // omission was invisible for the identical reason: the
+            // nil-tolerant decode defaults it to false).
+            let top = Array(ordered.prefix(resultLimit))
+            guard !top.isEmpty else {
+                return SearchOutcome(
+                    results: [], totalCount: ordered.count,
+                    bodyScanSkipped: bodyScanSkipped
+                )
+            }
+            let placeholders = Array(repeating: "?", count: top.count)
+                .joined(separator: ", ")
+            let headerSQL = """
+                SELECT m.id, m.account_id, m.remote_id, m.thread_id,
+                       m.from_address,
+                       NULLIF(m.from_name, '') as from_name,
+                       NULLIF(m.subject, '') as subject,
+                       NULLIF(m.snippet_cipher, '') as snippet_cipher,
+                       m.received_at, m.is_read, m.is_archived, m.is_deleted, m.is_sent,
+                       m.message_id_header, m.in_reply_to, m.references_header
+                FROM message_headers m
+                WHERE m.id IN (\(placeholders))
+                ORDER BY m.received_at DESC, m.id DESC
+                """
+            let rows = try Row.fetchAll(
+                db, sql: headerSQL, arguments: StatementArguments(top.map(\.id))
+            )
+            let results = try rows.map { try MessageStore.decode($0) }
+            return SearchOutcome(
+                results: results,
+                totalCount: ordered.count,
+                bodyScanSkipped: bodyScanSkipped
+            )
         }
+    }
+
+    /// Whether the sealed text of one row contains the needle.
+    ///
+    /// The preview is checked first and the body second, the same order the
+    /// old OR chain used: a preview that matches ends the row, so the body
+    /// is not opened for nothing.
+    ///
+    /// Each envelope is opened once, and only for a row the scan actually
+    /// reached. A preview or a body that will not open is a broken store,
+    /// not a row that does not match — the error travels up rather than
+    /// being swallowed into a quiet "no results".
+    private static func matchesSealedText(row: Row, needle: String) throws -> Bool {
+        if let preview = row.optionalText("snippet_cipher"),
+           BodyCipher.matches(try BodyCipher.open(preview), needle) {
+            return true
+        }
+        if let body = row.optionalText("body_cipher"),
+           BodyCipher.matches(try BodyCipher.open(body), needle) {
+            return true
+        }
+        return false
+    }
+
+    /// Newest first, with the id as the tiebreaker so two rows that arrived
+    /// in the same millisecond keep a stable order.
+    private static func isNewer(_ lhs: Match, _ rhs: Match) -> Bool {
+        lhs.receivedAt == rhs.receivedAt
+            ? lhs.id.uuidString > rhs.id.uuidString
+            : lhs.receivedAt > rhs.receivedAt
     }
 }
 

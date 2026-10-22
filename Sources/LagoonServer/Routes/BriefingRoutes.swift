@@ -122,21 +122,18 @@ public enum BriefingRoutes {
             /// them".
             let backlogTotal: Int
             do {
-                messages = try await MessageStore.recent(
-                    forAccount: accountId,
+                // The rows and the numbers that describe them, from one
+                // snapshot — see `snapshot`.
+                let snapshot = try Self.snapshot(
+                    accountId: accountId,
+                    windowStart: windowStart,
                     limit: limit,
-                    receivedAfter: windowStart,
                     db: db
                 )
-                // Only needed when the cap actually truncated the window;
-                // counting is a second query, so it is skipped on the common
-                // path where the feed came back short of the limit.
-                let inWindow = try await MessageStore.count(
-                    forAccount: accountId,
-                    receivedAfter: windowStart,
-                    db: db
-                )
-                omitted = max(0, inWindow - messages.count)
+                messages = snapshot.messages
+                omitted = snapshot.omitted
+                backlog = snapshot.backlog
+                backlogTotal = snapshot.backlogTotal
                 pinned = try await MessageStore.pinnedIds(forAccount: accountId, db: db)
                 listUnsubscribe = try await MessageStore.listUnsubscribeIds(forAccount: accountId, db: db)
                 replied = try await AIActionStore.repliedRemoteIds(accountId: accountId, db: db)
@@ -144,21 +141,6 @@ public enum BriefingRoutes {
                 // pins once and the resolver's copy is the same one.
                 resolver = try await BriefingGroupResolver.load(
                     accountId: accountId,
-                    db: db
-                )
-                // The backlog. It is bounded by its own cap, because a
-                // mailbox with three years of unanswered mail must not be
-                // able to blow the response up — the same safety valve the
-                // window's own cap is.
-                backlog = try await MessageStore.unresolvedOlderThan(
-                    forAccount: accountId,
-                    receivedBefore: windowStart,
-                    limit: Self.maxBacklogItems,
-                    db: db
-                )
-                backlogTotal = try await MessageStore.unresolvedOlderThanCount(
-                    forAccount: accountId,
-                    receivedBefore: windowStart,
                     db: db
                 )
             } catch {
@@ -413,6 +395,163 @@ public enum BriefingRoutes {
             ])
         }
     }
+
+    /// The window's rows, the backlog's rows, and the counts that describe
+    /// them — read from **one** snapshot.
+    ///
+    /// Four queries, one transaction. A row list and the number that
+    /// describes it have to come from the same snapshot: two separate reads
+    /// can straddle a write, and the response would then say "另有 N 封未纳入
+    /// 简报" about a feed that had nothing left out — the mail that landed in
+    /// between was never left out, it simply arrived after the list was
+    /// taken. The other direction is worse: a mail that left the window in
+    /// between made the count smaller than the list, so a window the cap had
+    /// really truncated reported no truncation at all. `AIActionStore.page` and
+    /// the search route read their rows and their count this way for the same
+    /// reason.
+    ///
+    /// The queries live here rather than in `MessageStore` because the
+    /// store's `recent` and `count` are two asynchronous reads: they cannot
+    /// share a `db.read` closure, and that gap *is* the bug. The predicates
+    /// still come from the store (`MessageStore.filterSQL`), so the axes are
+    /// authored in one place and the count below cannot describe a different
+    /// set of rows than the list above shows.
+    private static func snapshot(
+        accountId: UUID,
+        windowStart: Date,
+        limit: Int,
+        db: LagoonDB
+    ) throws -> BriefingSnapshot {
+        // The window: the inbox, and mail received since the window opened.
+        let (windowClause, windowArguments) = MessageStore.filterSQL(
+            accountId: accountId,
+            sender: nil,
+            archived: false,
+            deleted: false,
+            sent: false,
+            stackMatch: nil,
+            receivedAfter: windowStart,
+            pinned: false,
+            unread: false
+        )
+        // The backlog: the same inbox axes, unread, and older than the
+        // window. `filterSQL` has no upper time bound, so the cutoff is the
+        // one clause added here — the axes stay authored in one place.
+        let (backlogAxes, backlogBaseArguments) = MessageStore.filterSQL(
+            accountId: accountId,
+            sender: nil,
+            archived: false,
+            deleted: false,
+            sent: false,
+            stackMatch: nil,
+            receivedAfter: nil,
+            pinned: false,
+            unread: true
+        )
+        let backlogClause = [
+            backlogAxes,
+            "AND h.received_at < ?",
+        ].joined(separator: "\n")
+
+        var windowRowsArguments = windowArguments
+        windowRowsArguments.append(limit)
+        var backlogArguments = backlogBaseArguments
+        // The cutoff the clause above binds.
+        backlogArguments.append(windowStart)
+        var backlogRowsArguments = backlogArguments
+        backlogRowsArguments.append(maxBacklogItems)
+
+        let windowRowsSQL = [
+            Self.messageRowsSQL,
+            windowClause,
+            "ORDER BY h.received_at DESC",
+            "LIMIT ?",
+        ].joined(separator: "\n")
+        let windowCountSQL = [
+            "SELECT COUNT(*) FROM message_headers h",
+            windowClause,
+        ].joined(separator: "\n")
+        let backlogRowsSQL = [
+            Self.messageRowsSQL,
+            backlogClause,
+            "ORDER BY h.received_at ASC",
+            "LIMIT ?",
+        ].joined(separator: "\n")
+        let backlogCountSQL = [
+            "SELECT COUNT(*) FROM message_headers h",
+            backlogClause,
+        ].joined(separator: "\n")
+
+        return try db.read { raw in
+            let messages = try Row.fetchAll(
+                raw,
+                sql: windowRowsSQL,
+                arguments: StatementArguments(windowRowsArguments)
+            ).map { try MessageStore.decode($0) }
+            // The count runs over the same predicate without the LIMIT. The
+            // `message_pins` join cannot multiply rows — that table is keyed
+            // by (account_id, remote_id) — so it counts the rows the list
+            // above shows.
+            let windowTotal = try Int.fetchOne(
+                raw,
+                sql: windowCountSQL,
+                arguments: StatementArguments(windowArguments)
+            ) ?? messages.count
+            let backlog = try Row.fetchAll(
+                raw,
+                sql: backlogRowsSQL,
+                arguments: StatementArguments(backlogRowsArguments)
+            ).map { try MessageStore.decode($0) }
+            let backlogTotal = try Int.fetchOne(
+                raw,
+                sql: backlogCountSQL,
+                arguments: StatementArguments(backlogArguments)
+            ) ?? backlog.count
+            return BriefingSnapshot(
+                messages: messages,
+                windowTotal: windowTotal,
+                backlog: backlog,
+                backlogTotal: backlogTotal
+            )
+        }
+    }
+
+    /// The columns the briefing's rows are made of.
+    ///
+    /// Literal, like every other query in the codebase: the CI guardrail
+    /// forbids interpolation inside SQL literals, even for constants.
+    private static let messageRowsSQL = """
+        SELECT h.id, h.account_id, h.remote_id, h.thread_id, h.from_address,
+               NULLIF(h.from_name, '') AS from_name,
+               NULLIF(h.subject, '') AS subject,
+               NULLIF(h.snippet_cipher, '') AS snippet_cipher,
+               h.received_at, h.is_read, h.is_archived, h.is_deleted, h.is_sent,
+               h.message_id_header, h.in_reply_to, h.references_header,
+               (message_pins.account_id IS NOT NULL) AS is_pinned
+        FROM message_headers h
+        LEFT JOIN message_pins
+               ON message_pins.account_id = h.account_id
+              AND message_pins.remote_id = h.remote_id
+        """
+}
+
+/// The briefing's rows and the numbers that describe them, from one snapshot.
+private struct BriefingSnapshot {
+    /// The window's rows, capped at the requested limit.
+    let messages: [MessageHeader]
+    /// How many rows the window holds in total.
+    let windowTotal: Int
+    /// The backlog's rows: old mail that is still waiting.
+    let backlog: [MessageHeader]
+    /// How many rows the backlog holds in total.
+    let backlogTotal: Int
+
+    /// How many of the window's rows the cap left out.
+    ///
+    /// Zero when the window fit: the field's presence means "the window
+    /// overflowed", and a client that only checks for a non-nil value must
+    /// not show an "0 more" line.
+    var omitted: Int { max(0, windowTotal - messages.count) }
 }
 
 /// A managed queue for the briefing's background classification.

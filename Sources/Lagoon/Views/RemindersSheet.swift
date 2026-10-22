@@ -42,6 +42,14 @@ struct RemindersSheet: View {
     @State private var busyId: Int64?
     /// Whether the dismissed ones are shown too.
     @State private var showDismissed = false
+    /// The reminder waiting for the user to confirm its deletion.
+    ///
+    /// A delete here is a hard delete — the row is destroyed, not marked
+    /// done — and it happens in a context menu, which is exactly where a
+    /// mis-click lands. The panel's own argument for 「完成」 being
+    /// different from a delete is that a mis-click can be recovered; the
+    /// delete path used to throw that away.
+    @State private var pendingDelete: Reminder?
     /// No account is connected, so there is nothing to remind about.
     @State private var isDisconnected = false
 
@@ -69,6 +77,27 @@ struct RemindersSheet: View {
             height: LagoonSheetSize.standard.height
         )
         .task { await load() }
+        // The delete confirmation. It names the reminder, because "delete
+        // this" in a context menu is ambiguous the moment the menu is open
+        // over a list of rows that all look alike.
+        .confirmationDialog(
+            l10n.reminderDeleteConfirmTitle,
+            isPresented: Binding(
+                get: { pendingDelete != nil },
+                set: { if !$0 { pendingDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(l10n.reminderDelete, role: .destructive) {
+                guard let reminder = pendingDelete else { return }
+                pendingDelete = nil
+                Task { await delete(reminder) }
+            }
+            .tint(LagoonTheme.danger)
+            Button(l10n.cancel, role: .cancel) { pendingDelete = nil }
+        } message: {
+            Text(l10n.reminderDeleteConfirmMessage(subject(of: pendingDelete)))
+        }
         // The arming failure is the scheduler's own finding, and it is
         // published for exactly this: a view that shows it. The banner
         // slot holds one message at a time, so it is the arming failure
@@ -118,7 +147,7 @@ struct RemindersSheet: View {
     // MARK: - Chrome
 
     private var header: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: LagoonMetrics.spaceMD) {
             Label(l10n.reminderTitle, systemImage: "bell")
                 .font(.headline)
             Spacer()
@@ -147,13 +176,13 @@ struct RemindersSheet: View {
             Button { dismiss() } label: {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundStyle(.secondary)
-                    .padding(4)
+                    .padding(LagoonMetrics.spaceXS)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel(l10n.dismiss)
         }
-        .padding(16)
+        .padding(LagoonMetrics.spaceLG)
     }
 
     // MARK: - Content
@@ -165,8 +194,8 @@ struct RemindersSheet: View {
     /// strip that only states a problem makes them go looking for the
     /// settings themselves.
     private var notArmedStrip: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: LagoonMetrics.spaceSM) {
+            HStack(spacing: LagoonMetrics.spaceSM) {
                 Image(systemName: "bell.slash")
                     .accessibilityHidden(true)
                 Text(l10n.reminderNotArmedTitle)
@@ -186,8 +215,8 @@ struct RemindersSheet: View {
             .buttonStyle(.link)
             .font(.caption)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, LagoonMetrics.spaceMD)
+        .padding(.vertical, LagoonMetrics.spaceSM)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(LagoonTheme.Severity.warning.color.opacity(0.12))
         .overlay(alignment: .bottom) {
@@ -211,7 +240,7 @@ struct RemindersSheet: View {
     @ViewBuilder
     private var content: some View {
         if isLoading, reminders.isEmpty {
-            ProgressView().padding(30)
+            ProgressView().padding(LagoonMetrics.spaceXXL)
         } else if isDisconnected {
             ContentUnavailableView(
                 l10n.notConnected,
@@ -236,7 +265,7 @@ struct RemindersSheet: View {
                     row(for: reminder)
                 }
             } footer: {
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: LagoonMetrics.spaceXS) {
                     Text(l10n.reminderHelp)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -254,14 +283,14 @@ struct RemindersSheet: View {
     }
 
     private func row(for reminder: Reminder) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .top, spacing: LagoonMetrics.spaceMD) {
             Image(systemName: reminder.isActive ? "bell" : "bell.slash")
                 .foregroundStyle(reminder.isActive ? LagoonTheme.brand : .secondary)
-                .frame(width: 20)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(reminder.subject?.isEmpty == false ? reminder.subject! : l10n.reminderNoSubject)
+                .frame(width: LagoonMetrics.iconColumnWidth)
+            VStack(alignment: .leading, spacing: LagoonMetrics.spaceXS) {
+                Text(subject(of: reminder))
                     .lineLimit(2)
-                HStack(spacing: 6) {
+                HStack(spacing: LagoonMetrics.spaceSM) {
                     Text(l10n.reminderDueAt(reminder.dueAt))
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -291,16 +320,29 @@ struct RemindersSheet: View {
             Spacer(minLength: 8)
             actions(for: reminder)
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, LagoonMetrics.spaceXS)
         .opacity(reminder.isActive ? 1 : 0.55)
         .contextMenu {
             // A reminder the user set and then decided was never going to
             // happen needs a way out that is not "mark it done" — that
             // would keep it in the list forever, marked as finished.
+            //
+            // The delete is a hard delete, so it asks first.
             Button(l10n.reminderDelete, role: .destructive) {
-                Task { await delete(reminder) }
+                pendingDelete = reminder
             }
         }
+    }
+
+    /// The reminder's subject, or the placeholder when it has none. The
+    /// confirmation names the thing being deleted, and a confirmation that
+    /// says "this" is not a confirmation.
+    private func subject(of reminder: Reminder?) -> String {
+        guard let reminder else { return l10n.reminderNoSubject }
+        guard let subject = reminder.subject, !subject.isEmpty else {
+            return l10n.reminderNoSubject
+        }
+        return subject
     }
 
     @ViewBuilder

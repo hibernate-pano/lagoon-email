@@ -74,6 +74,14 @@ enum LagoonMetrics {
     /// 28pt. The sender avatar in the Briefing feed.
     static let avatarSize: CGFloat = 28
 
+    /// 20pt. The column a row's leading icon occupies.
+    ///
+    /// One width for every row that opens with an SF Symbol. The action
+    /// history used 20pt, the reminders 20pt and the command palette 22pt
+    /// — so the same icon sat in a slightly wider column in one panel than
+    /// in another, and the text after it did not line up across panels.
+    static let iconColumnWidth: CGFloat = 20
+
     /// The default width of the reading pane's text column.
     ///
     /// Capped so a line of body text does not run past the point where the

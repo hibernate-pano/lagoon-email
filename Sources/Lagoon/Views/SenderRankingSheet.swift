@@ -64,7 +64,10 @@ struct SenderRankingSheet: View {
             Divider()
             content
         }
-        .frame(width: 620, height: 520)
+        .frame(
+            width: LagoonSheetSize.wide.width,
+            height: LagoonSheetSize.wide.height
+        )
         .task { await load() }
         // The rule editor, presented by the panel itself.
         //
@@ -92,7 +95,7 @@ struct SenderRankingSheet: View {
     // MARK: - Chrome
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: LagoonMetrics.spaceSM) {
             HStack {
                 Label(l10n.senderRankingTitle, systemImage: "person.2")
                     .font(.headline)
@@ -107,7 +110,7 @@ struct SenderRankingSheet: View {
                 Button { dismiss() } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
-                        .padding(4)
+                        .padding(LagoonMetrics.spaceXS)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -121,11 +124,11 @@ struct SenderRankingSheet: View {
                 .fixedSize(horizontal: false, vertical: true)
             searchField
         }
-        .padding(16)
+        .padding(LagoonMetrics.spaceLG)
     }
 
     private var searchField: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: LagoonMetrics.spaceSM) {
             Image(systemName: "magnifyingglass")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -144,9 +147,9 @@ struct SenderRankingSheet: View {
                 .help(l10n.clearSelection)
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 6))
+        .padding(.horizontal, LagoonMetrics.spaceSM)
+        .padding(.vertical, LagoonMetrics.spaceSM)
+        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: LagoonMetrics.radiusMedium))
     }
 
     // MARK: - Content
@@ -155,17 +158,17 @@ struct SenderRankingSheet: View {
     private var content: some View {
         if let errorBanner, senders.isEmpty {
             NoticeBannerView(banner: errorBanner) { self.errorBanner = nil }
-                .padding(16)
+                .padding(LagoonMetrics.spaceLG)
         } else if isLoading, senders.isEmpty {
-            ProgressView().padding(30)
+            ProgressView().padding(LagoonMetrics.spaceXXL)
         } else if senders.isEmpty {
-            VStack(spacing: 8) {
+            VStack(spacing: LagoonMetrics.spaceSM) {
                 Text(isFiltered ? l10n.senderRankingNoMatch : l10n.senderRankingEmpty)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(30)
+            .padding(LagoonMetrics.spaceXXL)
         } else {
             List {
                 ForEach(senders) { sender in
@@ -177,11 +180,11 @@ struct SenderRankingSheet: View {
     }
 
     private func row(_ sender: SenderSummary) -> some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .top, spacing: LagoonMetrics.spaceMD) {
             SenderAvatar(email: sender.address, displayName: sender.displayName)
 
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
+            VStack(alignment: .leading, spacing: LagoonMetrics.spaceXS) {
+                HStack(alignment: .firstTextBaseline, spacing: LagoonMetrics.spaceSM) {
                     Text(sender.displayName ?? sender.address)
                         .font(.body)
                         .bold(sender.unreadCount > 0)
@@ -197,7 +200,7 @@ struct SenderRankingSheet: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                HStack(spacing: 8) {
+                HStack(spacing: LagoonMetrics.spaceSM) {
                     if sender.unreadCount > 0 {
                         Label(
                             l10n.senderUnreadCount(sender.unreadCount),
@@ -231,7 +234,7 @@ struct SenderRankingSheet: View {
                     .font(.caption)
             }
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, LagoonMetrics.spaceXS)
         .contentShape(Rectangle())
     }
 

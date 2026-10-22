@@ -1,4 +1,5 @@
 import Foundation
+import Logging
 import GRDB
 import LagoonKit
 
@@ -113,7 +114,13 @@ public enum AdviceStore {
             // affected none — which here means the header it points at is gone.
             return nil
         }
-        return try decode(row)
+        guard case .readable(let record) = decode(row) else {
+            // The row was written from typed enums a moment ago, so it cannot
+            // be unreadable. If it is, the database is not what we think it
+            // is, and handing back a half-understood row would hide that.
+            throw StoreError.insertFailed
+        }
+        return record
     }
 
     /// Records the user's verdict on one suggestion.
@@ -150,11 +157,14 @@ public enum AdviceStore {
     /// One query for all three filters: the predicate and its argument are
     /// chosen together, so there is no way for a caller to pair `.all` with a
     /// bound `decision` or `.pending` with none.
+    ///
+    /// A row this build cannot read is skipped, not raised: see `decode`.
     public static func list(
         accountId: UUID,
         filter: AdviceDecisionQuery,
         limit: Int = 200,
-        db: LagoonDB
+        db: LagoonDB,
+        logger: Logger = Logger(label: "lagoon.advice.store")
     ) async throws -> [AdviceRecord] {
         let predicate: String
         var arguments: [DatabaseValueConvertible?] = [accountId]
@@ -182,21 +192,26 @@ public enum AdviceStore {
         ].joined(separator: "\n")
         arguments.append(limit)
         return try db.read { raw in
-            try Row.fetchAll(
+            let rows = try Row.fetchAll(
                 raw,
                 sql: sql,
                 arguments: StatementArguments(arguments)
-            ).map { try decode($0) }
+            )
+            return decodeAll(rows, logger: logger)
         }
     }
 
     /// Advice for one message, whatever its decision state. The detail view
     /// reads this so a mail the user already decided on still shows what was
     /// suggested and what they chose.
+    ///
+    /// A row this build cannot read reads as "no advice", the same answer the
+    /// caller gets for a message that never had any.
     public static func find(
         remoteId: String,
         accountId: UUID,
-        db: LagoonDB
+        db: LagoonDB,
+        logger: Logger = Logger(label: "lagoon.advice.store")
     ) async throws -> AdviceRecord? {
         let sql = """
             SELECT id, account_id, remote_id, action, category, confidence,
@@ -205,17 +220,28 @@ public enum AdviceStore {
             WHERE account_id = ? AND remote_id = ?
         """
         return try db.read { raw in
-            try Row.fetchOne(raw, sql: sql, arguments: [accountId, remoteId])
-                .map { try decode($0) }
+            guard let row = try Row.fetchOne(
+                raw, sql: sql, arguments: [accountId, remoteId]
+            ) else { return nil }
+            switch decode(row) {
+            case .readable(let record):
+                return record
+            case .unreadable(let reason):
+                report(row, reason: reason, logger: logger)
+                return nil
+            }
         }
     }
 
     /// Advice for many messages in one query, so a feed of 100 rows costs one
     /// round trip instead of a hundred.
+    ///
+    /// A row this build cannot read is skipped, not raised: see `decode`.
     public static func byRemoteIds(
         _ remoteIds: Set<String>,
         accountId: UUID,
-        db: LagoonDB
+        db: LagoonDB,
+        logger: Logger = Logger(label: "lagoon.advice.store")
     ) async throws -> [String: AdviceRecord] {
         guard !remoteIds.isEmpty else { return [:] }
         let ids = Array(remoteIds)
@@ -243,8 +269,12 @@ public enum AdviceStore {
             )
             var result: [String: AdviceRecord] = [:]
             for row in rows {
-                let record = try decode(row)
-                result[record.remoteId] = record
+                switch decode(row) {
+                case .readable(let record):
+                    result[record.remoteId] = record
+                case .unreadable(let reason):
+                    report(row, reason: reason, logger: logger)
+                }
             }
             return result
         }
@@ -268,40 +298,97 @@ public enum AdviceStore {
     /// handful that survive the cut are the ones that actually describe the
     /// user.
     ///
-    /// Rows with a category the current build does not know are skipped rather
-    /// than counted as "other": a distribution that silently lumps a renamed
-    /// category into a bucket teaches the model a preference nobody has.
+    /// Rows this build cannot read are skipped rather than counted: the
+    /// distribution says what the user did, and a row the store cannot even
+    /// explain is not a thing the user did. The same goes for a category the
+    /// current build does not know — counting it as "other" would teach the
+    /// model a preference nobody has.
     public static func acceptedStats(
         accountId: UUID,
         limit: Int = 5,
-        db: LagoonDB
+        db: LagoonDB,
+        logger: Logger = Logger(label: "lagoon.advice.store")
     ) async throws -> [AcceptedAdviceStat] {
+        // The rows are counted here rather than grouped in SQL, because a
+        // group can mix a readable row with an unreadable one: the count
+        // would then include a row this build cannot explain, and a group
+        // that is entirely unreadable would still take a slot of the limit.
+        // The read is bounded by the number of accepted rows, which grows
+        // with the actions the user actually took — an acceptance is written
+        // by a gesture, not by a classifier run.
         let sql = """
-            SELECT category, action, COUNT(*) AS total
+            SELECT id, account_id, remote_id, action, category, confidence,
+                   rationale, due_text, source, model, decision, created_at, decided_at
             FROM advice
             WHERE account_id = ? AND decision = ?
-            GROUP BY category, action
-            ORDER BY total DESC, category ASC, action ASC
-            LIMIT ?
-        """
+            """
         return try db.read { raw in
             let rows = try Row.fetchAll(
                 raw,
                 sql: sql,
-                arguments: [accountId, AdviceDecision.accepted.rawValue, max(1, limit)]
+                arguments: [accountId, AdviceDecision.accepted.rawValue]
             )
-            var stats: [AcceptedAdviceStat] = []
+            var counts: [Shape: Int] = [:]
             for row in rows {
-                guard let actionRaw: String = row["action"],
-                      let action = AdvisedAction(rawValue: actionRaw)
-                else { continue }
-                let category = (row["category"] as String?)
-                    .flatMap(ContentCategory.init(rawValue:))
-                let total: Int = row["total"]
-                stats.append(AcceptedAdviceStat(category: category, action: action, count: total))
+                switch decode(row) {
+                case .unreadable(let reason):
+                    report(row, reason: reason, logger: logger)
+                case .readable(let record):
+                    // A category this build does not know is not "no
+                    // category": the row is about a category that no longer
+                    // exists here, and counting it as uncategorised would
+                    // invent a shape the user never expressed.
+                    let rawCategory: String? = row["category"]
+                    if let rawCategory, ContentCategory(rawValue: rawCategory) == nil {
+                        report(
+                            row,
+                            reason: "category '\(rawCategory)' is not a category this build knows",
+                            logger: logger
+                        )
+                        continue
+                    }
+                    let shape = Shape(
+                        category: record.advice.category,
+                        action: record.advice.action
+                    )
+                    counts[shape, default: 0] += 1
+                }
             }
-            return stats
+            let stats = counts
+                .map {
+                    AcceptedAdviceStat(
+                        category: $0.key.category,
+                        action: $0.key.action,
+                        count: $0.value
+                    )
+                }
+                .sorted(by: orderedByFrequency)
+            return Array(stats.prefix(max(1, limit)))
         }
+    }
+
+    /// One `(category, action)` shape — the unit the distribution counts.
+    private struct Shape: Hashable {
+        let category: ContentCategory?
+        let action: AdvisedAction
+    }
+
+    /// Most frequent first, then the tie-break the SQL used to apply: category
+    /// and action ascending, with a suggestion that has no category before one
+    /// that has.
+    private static func orderedByFrequency(
+        _ lhs: AcceptedAdviceStat,
+        _ rhs: AcceptedAdviceStat
+    ) -> Bool {
+        if lhs.count != rhs.count { return lhs.count > rhs.count }
+        switch (lhs.category, rhs.category) {
+        case (nil, nil): break
+        case (nil, _): return true
+        case (_, nil): return false
+        case let (left?, right?):
+            if left.rawValue != right.rawValue { return left.rawValue < right.rawValue }
+        }
+        return lhs.action.rawValue < rhs.action.rawValue
     }
 
     /// Drops dismissed rows older than `cutoff`. Advice is derived data that
@@ -324,40 +411,107 @@ public enum AdviceStore {
 
     // MARK: - Decoding
 
-    static func decode(_ row: Row) throws -> AdviceRecord {
-        guard let actionRaw: String = row["action"],
-              let action = AdvisedAction(rawValue: actionRaw),
-              let confidenceRaw: String = row["confidence"],
-              let confidence = AdviceConfidence(rawValue: confidenceRaw),
-              let sourceRaw: String = row["source"],
-              let source = AdviceSource(rawValue: sourceRaw),
-              let decisionRaw: String = row["decision"],
-              let decision = AdviceDecision(rawValue: decisionRaw)
-        else {
-            // A row whose enum no longer decodes is either corrupt or written
-            // by a newer build. Raising here would turn one unreadable
-            // suggestion into a 500 for the whole queue; the caller cannot
-            // show it, so skipping is the honest answer.
-            throw StoreError.insertFailed
+    /// One `advice` row, decoded — or the reason it could not be.
+    ///
+    /// A row whose enum columns hold a value this build does not know — an
+    /// action a later build added, a renamed case, a value mangled on disk —
+    /// is not a failure of the query. It is a row this build cannot show:
+    /// `AdviceRecord` has no way to carry an unknown action, so the client
+    /// could not display it either. Raising here would turn one unreadable
+    /// suggestion into a 500 for the whole queue, which is the opposite of
+    /// what the row deserves.
+    ///
+    /// The reason travels with the row so that a skip can be reported
+    /// instead of swallowed — see `report`.
+    enum Decoded {
+        case readable(AdviceRecord)
+        case unreadable(reason: String)
+    }
+
+    /// Decodes one `advice` row.
+    ///
+    /// The category is the one column read leniently: a row whose category
+    /// this build does not know is still a suggestion about a message, and
+    /// the queue shows it without a category. The distribution is stricter
+    /// about it, because a distribution that invents a shape teaches the
+    /// model a preference nobody expressed — see `acceptedStats`.
+    static func decode(_ row: Row) -> Decoded {
+        let actionRaw: String? = row["action"]
+        let confidenceRaw: String? = row["confidence"]
+        let sourceRaw: String? = row["source"]
+        let decisionRaw: String? = row["decision"]
+        guard let action = actionRaw.flatMap(AdvisedAction.init(rawValue:)) else {
+            return .unreadable(
+                reason: "action '\(actionRaw ?? "null")' is not an action this build knows"
+            )
+        }
+        guard let confidence = confidenceRaw.flatMap(AdviceConfidence.init(rawValue:)) else {
+            return .unreadable(
+                reason: "confidence '\(confidenceRaw ?? "null")' is not a confidence this build knows"
+            )
+        }
+        guard let source = sourceRaw.flatMap(AdviceSource.init(rawValue:)) else {
+            return .unreadable(
+                reason: "source '\(sourceRaw ?? "null")' is not a source this build knows"
+            )
+        }
+        guard let decision = decisionRaw.flatMap(AdviceDecision.init(rawValue:)) else {
+            return .unreadable(
+                reason: "decision '\(decisionRaw ?? "null")' is not a decision this build knows"
+            )
         }
         let category = (row["category"] as String?)
             .flatMap(ContentCategory.init(rawValue:))
-        return AdviceRecord(
-            id: row["id"],
-            accountId: row["account_id"],
-            remoteId: row["remote_id"],
-            advice: Advice(
-                action: action,
-                category: category,
-                confidence: confidence,
-                rationale: row.optionalText("rationale"),
-                dueText: row.optionalText("due_text")
-            ),
-            source: source,
-            model: row.optionalText("model"),
-            decision: decision,
-            createdAt: row["created_at"],
-            decidedAt: row["decided_at"]
+        return .readable(
+            AdviceRecord(
+                id: row["id"],
+                accountId: row["account_id"],
+                remoteId: row["remote_id"],
+                advice: Advice(
+                    action: action,
+                    category: category,
+                    confidence: confidence,
+                    rationale: row.optionalText("rationale"),
+                    dueText: row.optionalText("due_text")
+                ),
+                source: source,
+                model: row.optionalText("model"),
+                decision: decision,
+                createdAt: row["created_at"],
+                decidedAt: row["decided_at"]
+            )
+        )
+    }
+
+    /// Decodes rows, skipping the ones this build cannot read.
+    private static func decodeAll(_ rows: [Row], logger: Logger) -> [AdviceRecord] {
+        var records: [AdviceRecord] = []
+        records.reserveCapacity(rows.count)
+        for row in rows {
+            switch decode(row) {
+            case .readable(let record):
+                records.append(record)
+            case .unreadable(let reason):
+                report(row, reason: reason, logger: logger)
+            }
+        }
+        return records
+    }
+
+    /// Reports a row this build could not read.
+    ///
+    /// The skip is never silent: a suggestion that vanishes from the queue
+    /// without a word is indistinguishable from one that was never written,
+    /// and that difference is exactly what is needed when a suggestion goes
+    /// missing.
+    private static func report(_ row: Row, reason: String, logger: Logger) {
+        let id: Int64? = row["id"]
+        logger.warning(
+            "advice.rowUnreadable",
+            metadata: [
+                "id": .string(id.map { "\($0)" } ?? "unknown"),
+                "reason": .string(reason),
+            ]
         )
     }
 }

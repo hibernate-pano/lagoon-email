@@ -49,16 +49,37 @@ else
   echo "WARNING: Support/Lagoon.icns missing — run scripts/build-icon.py first" >&2
 fi
 
-# Signing: ad-hoc, deliberately. Signing with the local Apple Development
-# identity (stable TeamIdentifier, fixes the Keychain ACL prompt loop) was
-# tried on 2026-09-28 and macOS XProtect immediately flagged the bundle as
-# malware and moved it to Trash on launch — personal-team certs are on a
-# blocklist. The ad-hoc cost: every rebuild mints a new cdhash, so the first
-# launch after a rebuild may pop Keychain consent dialogs for the lagoon.*
-# secrets (click 始终允许; an unanswered dialog looks like a blank hang).
-# The real fix is Developer ID signing + notarization at distribution time.
+# Signing.
+#
+# The signature identity decides whether the user's saved secrets survive
+# the next rebuild, so this is not a packaging detail:
+#
+#   * ad-hoc  → the designated requirement is this build's cdhash. A rebuild
+#     mints a new one, the stored Keychain access lists stop matching, and
+#     macOS asks a background SecurityAgent for permission it can never
+#     show. The read blocks forever: the app sits on 「服务器启动中」 with
+#     no window and no listening port. This is the reported hang.
+#   * signed with a certificate → the requirement is
+#     `identifier "com.lagoon.email" and anchor apple generic and
+#     certificate leaf[subject.CN] = "…"` — stable across rebuilds, so the
+#     Keychain items keep matching and nothing prompts.
+#
+# The old comment here said that signing with the local Apple Development
+# identity made XProtect flag the bundle as malware. That was not what was
+# happening: the machine carries **two** certificates with the same
+# "Apple Development" name, and the one that was picked by name was
+# **revoked**. An app signed with a revoked certificate is killed by the OS
+# (SIGKILL) the moment it touches the Keychain — which looks like a crash
+# and reads like a malware verdict. scripts/sign-app.sh now selects the
+# identity by SHA-1 fingerprint and checks revocation with the system's own
+# evaluator before using it.
+#
+# See scripts/sign-app.sh for the full reasoning; it falls back to ad-hoc
+# with a loud warning when no usable certificate exists.
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --sign - "$APP"
+  bash scripts/sign-app.sh "$APP"
+else
+  echo "WARNING: codesign not found — $APP is unsigned and will not run." >&2
 fi
 
 echo "Built $APP (version $VERSION)"

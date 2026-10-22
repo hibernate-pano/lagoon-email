@@ -48,12 +48,45 @@ enum EmbeddedServer {
             await migrateLegacyEnvIfNeeded()
         }
 
+        // `urls(for:in:)` answers with `~/Library/Application Support`, which
+        // macOS always provides — but "always" is not a guarantee, and this
+        // line is on the launch path, where a force unwrap is a crash the
+        // user sees as "the app won't open" with no explanation.
+        //
+        // The alternative — falling back to a temporary directory — was worse:
+        // the app would start and silently put the database somewhere the OS
+        // is free to delete, so the user's mail would appear to vanish on
+        // the next relaunch. Failing loudly puts the problem on the boot
+        // screen with a retry, which is the honest outcome.
+        //
+        // The path itself comes from `LagoonDataPaths` — the same answer the
+        // Settings window shows and the About sheet opens. It used to be
+        // spelled out here, and the two copies were free to drift: the moment
+        // the directory moved, this server would open a database somewhere
+        // else while the UI pointed the user at a folder that was empty.
+        guard let dbURL = LagoonDataPaths.databaseURL else {
+            throw EmbeddedServerError.appSupportUnavailable
+        }
+        let dbPath = dbURL.path
+
+        // What the store already holds, before the server opens it.
+        //
+        // This is asked **before** the server starts, not beside it: the
+        // store's own migration runs when the server opens it, and a probe
+        // that raced the migration would be reading a half-migrated file.
+        //
+        // It is a local file read on a detached task, so it costs the launch
+        // path a few milliseconds and never the main thread.
+        let storeState = await Task.detached(priority: .userInitiated) {
+            SealedStoreProbe.state(dbPath: dbPath)
+        }.value
+
         // Resolve the secrets in the background. Every read is bounded by
         // `KeychainReader`'s deadline, so none of them can wedge the app —
         // the whole point of the deadline is that a blocked Keychain
         // produces an answer instead of a hang.
         let secrets = Task.detached(priority: .userInitiated) {
-            await resolveAllSecrets()
+            await resolveAllSecrets(storeState: storeState)
         }
 
         // The API token. A dev-set env var wins (so `swift run` against the
@@ -131,11 +164,6 @@ enum EmbeddedServer {
         // spelled out here, and the two copies were free to drift: the moment
         // the directory moved, this server would open a database somewhere
         // else while the UI pointed the user at a folder that was empty.
-        guard let dbURL = LagoonDataPaths.databaseURL else {
-            throw EmbeddedServerError.appSupportUnavailable
-        }
-        let dbPath = dbURL.path
-
         let pinnedPort = env["LAGOON_SERVER_PORT"].flatMap(Int.init)
             ?? UserDefaults.standard.object(forKey: "lagoon.serverPort") as? Int
         let candidatePorts: [Int]
@@ -201,6 +229,10 @@ enum EmbeddedServer {
         var bodyKey: String?
         var apiToken: String?
         var environment: [String: String]
+        /// The store holds sealed values and the key that sealed them is
+        /// gone. The body layer goes read-only in this state, and the user
+        /// is told through the store's notice.
+        var bodyKeyUnavailable: Bool = false
     }
 
     /// Resolves every secret, off the critical path.
@@ -209,9 +241,25 @@ enum EmbeddedServer {
     /// body key from being read, and one failure does not abort the rest.
     /// Every read is bounded by `KeychainReader`'s deadline, so this
     /// function always returns.
-    static func resolveAllSecrets() async -> ResolvedSecrets {
+    ///
+    /// ## Why the store's state decides what may be written
+    ///
+    /// A key that is missing from the Keychain is not automatically a key
+    /// that may be replaced. If the store already holds values sealed with
+    /// the key that is gone, a freshly generated one puts those values out
+    /// of reach for good — the rows stay in the database, they simply never
+    /// open again, and the user is told nothing.
+    ///
+    /// So the store is asked first, and only a store that holds nothing
+    /// sealed permits a new key. "I could not read the store" is not an
+    /// answer that permits writing: absence has to be proven, not assumed.
+    static func resolveAllSecrets(storeState: SealedStoreProbe.State) async -> ResolvedSecrets {
+        let mayGenerateBodyKey = storeState == .empty
         async let tokenKey = resolveString(service: tokenKeyService) { randomKeyBase64() }
-        async let bodyKey = resolveString(service: bodyKeyService) { randomKeyBase64() }
+        async let bodyKey = resolveString(
+            service: bodyKeyService,
+            mayGenerate: mayGenerateBodyKey
+        ) { randomKeyBase64() }
         async let apiToken = resolveAPIToken()
         async let environment = resolveEnvironment()
 
@@ -221,7 +269,8 @@ enum EmbeddedServer {
             tokenKey: resolvedTokenKey,
             bodyKey: resolvedBodyKey,
             apiToken: resolvedAPIToken,
-            environment: resolvedEnvironment
+            environment: resolvedEnvironment,
+            bodyKeyUnavailable: resolvedBodyKey == nil && !mayGenerateBodyKey
         )
     }
 
@@ -266,7 +315,15 @@ enum EmbeddedServer {
     /// `nil` and no new secret is generated, because generating one would
     /// silently orphan whatever the user already has (a new token key
     /// cannot decrypt the credentials already sealed with the old one).
-    static func resolveString(service: String, generate: () -> String) async -> String? {
+    ///
+    /// `mayGenerate` is the second half of the same rule. "Nothing stored"
+    /// is only permission to write when the store holds nothing this key
+    /// would have sealed — otherwise the write is what destroys the data.
+    static func resolveString(
+        service: String,
+        mayGenerate: Bool = true,
+        generate: () -> String
+    ) async -> String? {
         switch await KeychainReader.readString(service: service) {
         case .found(let value):
             return value
@@ -276,6 +333,14 @@ enum EmbeddedServer {
             // and overwriting would destroy the user's data.
             return nil
         case .missing:
+            guard mayGenerate else {
+                // Nothing stored, and the store holds values this key would
+                // have sealed. Writing a new one here would put those values
+                // out of reach for good, so the honest answer is "no key" —
+                // and the caller keeps the body layer read-only until the
+                // real key is back.
+                return nil
+            }
             // Nothing stored: create one. This is the only case where
             // writing is safe — the absence is proven, not assumed.
             let generated = generate()
@@ -307,12 +372,23 @@ enum EmbeddedServer {
     /// deliberate: a missing key must fail closed and loudly (the app
     /// shows the Keychain screen), never be replaced by a freshly
     /// generated one — a new key cannot open what the old one sealed.
+    ///
+    /// The one exception is the body key when the store holds sealed values.
+    /// There the placeholder has to go: it would seal every body the app
+    /// fetches from now on with a key that is not the user's, and the
+    /// recovery that would give those bodies back would then leave them
+    /// sealed under a key nobody has. With no key at all the body layer is
+    /// read-only — a fetched body is served but not cached, and nothing new
+    /// is written in a form nobody can open. The mail still reads; the
+    /// store's notice says what is dark.
     static func installResolvedKeys(_ secrets: ResolvedSecrets) {
         if let tokenKey = secrets.tokenKey {
             CipherKeyInstaller.installTokenKey(base64: tokenKey)
         }
         if let bodyKey = secrets.bodyKey {
             CipherKeyInstaller.installBodyKey(base64: bodyKey)
+        } else if secrets.bodyKeyUnavailable {
+            BodyCipher.keyProvider = nil
         }
     }
 

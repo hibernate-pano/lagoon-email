@@ -60,10 +60,16 @@ final class CommandPaletteFilterTests: XCTestCase {
 
     /// Pinned verbatim: adding a command means adding a callback *and* a row
     /// here, and removing one is a deliberate act rather than an accident.
+    ///
+    /// The order is part of the contract: the palette is ordered by how
+    /// often a row is used, so a row that moves down is a statement about
+    /// how often it is used. 「列表密度」 moved up past the three panels
+    /// behind it — it changes how every other row looks, and they are
+    /// destinations.
     func test_paletteExposesExactlyTheFourteenCommands() {
         XCTAssertEqual(palette().allCommands.map(\.id), [
             "new-message", "search", "toggle-surface", "refresh", "get-new-mail",
-            "usage", "ai-settings", "advice", "reminders", "senders", "density",
+            "usage", "density", "ai-settings", "advice", "reminders", "senders",
             "history", "shortcuts", "sound"
         ])
     }

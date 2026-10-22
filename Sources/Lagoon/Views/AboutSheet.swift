@@ -10,9 +10,10 @@ import AppKit
 ///   `CFBundleVersion` so it tracks whatever the build emits).
 /// - One-line tagline summarising the product so a new user understands
 ///   what they're looking at without reading the README.
-/// - A "Send feedback" mailto link + the project repo URL. Both are
-///   opened with `NSWorkspace.shared.open` so the user's default
-///   browser / mail client is used.
+/// - A "Send feedback" mailto link + the project repo URL, when the
+///   product has those channels configured. Both are opened with
+///   `NSWorkspace.shared.open` so the user's default browser / mail
+///   client is used; neither is rendered when there is nothing to open.
 struct AboutSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.l10n) private var l10n
@@ -79,19 +80,28 @@ struct AboutSheet: View {
             Divider().padding(.vertical, 4)
 
             VStack(spacing: 6) {
-                Button {
-                    NSWorkspace.shared.open(LagoonHelp.feedbackMailto)
-                } label: {
-                    Label(l10n.aboutFeedback, systemImage: "envelope")
+                // A link is a claim that the other end exists. The product
+                // ships without a support address and without a website, so
+                // these two buttons are not rendered at all — an
+                // unconfigured channel is not a broken one, and a button
+                // that opens a page nobody wrote is worse than no button.
+                if let feedbackMailto = LagoonHelp.feedbackMailto {
+                    Button {
+                        NSWorkspace.shared.open(feedbackMailto)
+                    } label: {
+                        Label(l10n.aboutFeedback, systemImage: "envelope")
+                    }
+                    .buttonStyle(.link)
                 }
-                .buttonStyle(.link)
 
-                Button {
-                    NSWorkspace.shared.open(URL(string: "https://lagoon.email")!)
-                } label: {
-                    Label(l10n.aboutWebsite, systemImage: "safari")
+                if let siteURL = LagoonHelp.siteURL {
+                    Button {
+                        NSWorkspace.shared.open(siteURL)
+                    } label: {
+                        Label(l10n.aboutWebsite, systemImage: "safari")
+                    }
+                    .buttonStyle(.link)
                 }
-                .buttonStyle(.link)
 
                 // "Your data stays on this Mac" is a claim the user cannot
                 // check for themselves, so the claim and its exceptions are

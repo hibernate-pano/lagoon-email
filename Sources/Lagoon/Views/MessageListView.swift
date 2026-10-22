@@ -36,6 +36,12 @@ struct MessageListView: View {
     /// 批量操作进行中。Bulk verbs are one remote round trip per message, so a
     /// second click mid-sweep would double-fire them.
     @State private var isBulkBusy = false
+    /// 「全部标为已读」正在跑。
+    ///
+    /// Its own flag rather than `isBulkBusy`: the sweep marks every loaded
+    /// unread message, which is not the same set the bulk bar works on, and
+    /// the two can be in flight at the same time.
+    @State private var isMarkingAllRead = false
     /// Thread rows the user expanded (会话归集). Collapsed by default so a
     /// 400-message inbox still scans as one row per conversation.
     @State private var expandedThreads: Set<String> = []
@@ -47,7 +53,7 @@ struct MessageListView: View {
     /// 归集维度: conversations (thread + affinity), per-sender, or flat.
     /// Persisted — the lens the user picked should survive relaunch.
     @AppStorage("lagoon.grouping") private var groupingRaw = GroupingMode.conversation.rawValue
-    @AppStorage("lagoon.unreadOnly") private var unreadOnly = false
+
     /// Row density, shared by both mail surfaces through `UserDefaults` so the
     /// Briefing feed and the raw list cannot end up at different densities —
     /// they are two views of one mailbox.
@@ -357,17 +363,19 @@ struct MessageListView: View {
 
     /// The unread-only cut, which the lens owns when it says `.unread`.
     ///
-    /// The sidebar and the in-list filter chip are the same control seen from
-    /// two places: picking 未读 in the sidebar must light the chip, and
-    /// unchecking the chip must not leave the sidebar claiming a filter the
-    /// list is no longer applying.
+    /// The **sidebar** is the only way in. The list used to carry a second
+    /// control — a 「仅未读」 chip in the toolbar — whose action was "leave
+    /// the lens", not "show unread": in the inbox it did nothing, and in
+    /// the Trash it navigated to the inbox. A control whose label and
+    /// action disagree is worse than no control, and one entry per filter
+    /// is easier to reason about than two.
     private var unreadOnlyEffective: Bool {
         switch lens {
         case .some(.unread): return true
         case .some(.pinned), .some(.archived), .some(.sent), .some(.deleted),
             .some(.rule), .some(.all):
             return false
-        case nil: return unreadOnly
+        case nil: return false
         }
     }
 
@@ -436,25 +444,24 @@ struct MessageListView: View {
                     .layoutPriority(0)
                     Spacer()
                     Button {
-                        // With the sidebar driving 未读, the chip reflects that
-                        // lens instead of toggling a second flag — otherwise
-                        // unchecking it would silently do nothing and the row
-                        // would stay filtered.
-                        if lens != nil {
-                            onClearLens()
-                        } else {
-                            unreadOnly.toggle()
-                            // The unread cut is a lens-shaped input to the
-                            // cached grouping, so it has to reach the index
-                            // now — the rows on screen have to change with the
-                            // chip, not one redraw later.
-                            rebuildSections()
-                        }
+                        Task { await markAllReadInList() }
                     } label: {
-                        Label(l10n.unreadOnly, systemImage: unreadOnlyEffective
-                            ? "envelope.badge.fill" : "envelope.badge")
+                        if isMarkingAllRead {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Label(l10n.markAllRead, systemImage: "envelope.open")
+                        }
                     }
-                    .help(l10n.unreadOnlyHelp)
+                    // The same key the Briefing feed binds. Two surfaces, one
+                    // verb, one shortcut — the same reasoning as ⌘A / ⌫ /
+                    // ⌘⌫, which both surfaces already share.
+                    .keyboardShortcut("k", modifiers: [.command, .shift])
+                    // Off when there is nothing unread: a button that is live
+                    // and does nothing is the "looks broken" shape this
+                    // audit keeps finding. Off when the surface is hidden,
+                    // for the reason every other shortcut here carries.
+                    .disabled(isMarkingAllRead || index.unreadCount == 0 || !isVisible)
+                    .help(l10n.markAllReadListHelp(index.unreadCount))
                     Button {
                         showStackList = true
                     } label: {
@@ -524,12 +531,12 @@ struct MessageListView: View {
                                         messageRow(conversation.newest)
                                             .modifier(RowChrome(
                                                 message: conversation.newest,
-                                                onArchive: { Task { await archive(conversation.newest) } },
+                                                onArchive: { Task { await archiveOne(conversation.newest) } },
                                                 onToggleRead: { Task { await toggleRead(conversation.newest) } },
                                                 onShowSender: { senderFocus = SenderFocus(from: conversation.newest) },
                                                 onAggregateSender: { openAggregateEditor(kind: .sender, for: conversation.newest) },
                                                 onAggregateKeyword: { openAggregateEditor(kind: .keyword, for: conversation.newest) },
-                                                onDelete: { Task { await delete(conversation.newest) } },
+                                                onDelete: { Task { await deleteOne(conversation.newest) } },
                                                 onTogglePin: { Task { await togglePin(conversation.newest) } },
                                                 lens: lens ?? .all,
                                                 onRestore: { Task { await restoreFromTrash(conversation.newest) } },
@@ -764,7 +771,11 @@ struct MessageListView: View {
                     // Shown whenever the selection reaches past what is loaded,
                     // because the user is about to act on mail they cannot see.
                     selectionReachesUnloaded: selectedAllOnServer,
-                    isBusy: isBulkBusy
+                    isBusy: isBulkBusy,
+                    // What each verb really covers. In stage two the count
+                    // is the server's total, but only the delete can reach
+                    // it — the bar has to say so.
+                    scopeNote: bulkScopeNote
                 )
             }
         }
@@ -939,6 +950,18 @@ struct MessageListView: View {
         return total > messages.count
     }
 
+    /// What the bulk verbs will really cover, in words.
+    ///
+    /// Stage two claims the server's total, and only one verb can reach it:
+    /// the delete goes to the server as a query over the lens. Archiving
+    /// and marking read still work on the loaded messages, so the bar says
+    /// so — a count of 3,142 travelling with an action that moves 200 is
+    /// exactly the kind of number a user stops trusting.
+    private var bulkScopeNote: String? {
+        guard selectedAllOnServer, let total = serverTotalCount else { return nil }
+        return l10n.bulkStageTwoScope(messages.count, total)
+    }
+
     /// The lens as the server-side filter vocabulary understands it.
     ///
     /// Expressed as a `LensScope` rather than passed as ids, because stage two
@@ -1041,7 +1064,7 @@ struct MessageListView: View {
     /// The detail view's archive/delete callback. Delegates so the
     /// removal invariants live in exactly one place.
     private func dropRow(_ remoteId: String) {
-        removeRows(matching: remoteId)
+        removeRows(matching: [remoteId])
     }
 
     /// The only way rows leave the list locally, and the only place that
@@ -1058,11 +1081,11 @@ struct MessageListView: View {
     ///   list into one claiming it is truncated. The next poll rewrites both
     ///   from one response and an undo refreshes, so this only has to hold for
     ///   the interval in between.
-    private func removeRows(matching remoteId: String) {
-        let removed = messages.filter { $0.remoteId == remoteId }.count
+    private func removeRows(matching remoteIds: Set<String>) {
+        let removed = messages.filter { remoteIds.contains($0.remoteId) }.count
         guard removed > 0 else { return }
         invalidatePendingRefresh()
-        mutateMessages { $0.removeAll { $0.remoteId == remoteId } }
+        mutateMessages { $0.removeAll { remoteIds.contains($0.remoteId) } }
         if let total = serverTotalCount {
             serverTotalCount = max(0, total - removed)
         }
@@ -1302,7 +1325,7 @@ struct MessageListView: View {
                             .bold(!m.isRead)
                             .lineLimit(1)
                         Spacer(minLength: 4)
-                        Text(m.receivedAt.formatted(date: .omitted, time: .shortened))
+                        Text(LagoonTypography.rowTimestamp(m.receivedAt))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -1314,7 +1337,7 @@ struct MessageListView: View {
                                 .bold(!m.isRead)
                                 .lineLimit(1)
                             Spacer()
-                            Text(m.receivedAt.formatted(date: .omitted, time: .shortened))
+                            Text(LagoonTypography.rowTimestamp(m.receivedAt))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -1375,6 +1398,12 @@ struct MessageListView: View {
         var mode: GroupingMode?
         /// The unread cut the cached sections were built with.
         var unreadOnly = false
+        /// How many loaded messages are unread.
+        ///
+        /// Kept next to the grouping it is derived from: the 「全部标为已读」
+        /// button needs the number to say what it will do, and it needs it
+        /// to be the number it will really touch.
+        var unreadCount = 0
     }
 
     /// Non-nil when the server held more rows than the response could carry.
@@ -1505,6 +1534,7 @@ struct MessageListView: View {
         index.mode = groupingMode
         index.unreadOnly = unreadOnlyEffective
         index.rowTags = Self.rowTags(index.sections, expanded: expandedThreads)
+        index.unreadCount = messages.filter { !$0.isRead }.count
     }
 
     /// Rebuilds the grouped rows when the lens-shaped inputs change.
@@ -1589,12 +1619,12 @@ struct MessageListView: View {
             .accessibilityLabel(l10n.threadRowLabel(conversation.messages.count))
             .modifier(RowChrome(
                 message: newest,
-                onArchive: { Task { await archive(newest) } },
+                onArchive: { Task { await archiveOne(newest) } },
                 onToggleRead: { Task { await toggleRead(newest) } },
                 onShowSender: { senderFocus = SenderFocus(from: newest) },
                 onAggregateSender: { openAggregateEditor(kind: .sender, for: newest) },
                 onAggregateKeyword: { openAggregateEditor(kind: .keyword, for: newest) },
-                onDelete: { Task { await delete(newest) } },
+                onDelete: { Task { await deleteOne(newest) } },
                 onTogglePin: { Task { await togglePin(newest) } },
                 lens: lens ?? .all,
                 onRestore: { Task { await restoreFromTrash(newest) } },
@@ -1608,12 +1638,12 @@ struct MessageListView: View {
                     messageRow(m)
                         .modifier(RowChrome(
                             message: m,
-                            onArchive: { Task { await archive(m) } },
+                            onArchive: { Task { await archiveOne(m) } },
                             onToggleRead: { Task { await toggleRead(m) } },
                             onShowSender: { senderFocus = SenderFocus(from: m) },
                             onAggregateSender: { openAggregateEditor(kind: .sender, for: m) },
                             onAggregateKeyword: { openAggregateEditor(kind: .keyword, for: m) },
-                            onDelete: { Task { await delete(m) } },
+                            onDelete: { Task { await deleteOne(m) } },
                             onTogglePin: { Task { await togglePin(m) } },
                             lens: lens ?? .all,
                             onRestore: { Task { await restoreFromTrash(m) } },
@@ -1645,7 +1675,20 @@ struct MessageListView: View {
         rebuildRowOrder()
     }
 
-    private func archive(_ m: MessageHeader) async {
+    /// Archives one message.
+    ///
+    /// The row leaves the list in the **caller**: a bulk sweep takes every
+    /// archived row out in one mutation, because removing them one at a
+    /// time rebuilt the cached grouping once per message — a quadratic
+    /// sweep over the whole mailbox for a change the user sees in one
+    /// frame. The Briefing feed's `archiveBulk` has always done it this
+    /// way.
+    ///
+    /// `sound` is off inside a bulk sweep. The sound belongs to the action
+    /// the user took, not to each request inside it: a 40-mail sweep used
+    /// to play the archive sound 40 times.
+    @discardableResult
+    private func archive(_ m: MessageHeader, sound: Bool = true) async -> Bool {
         // Any local mutation retires the in-flight poll. Without this the
         // generation counter only ever guards refresh-vs-refresh — which
         // `guard !isLoading` already serialises — so the real race stayed
@@ -1654,10 +1697,7 @@ struct MessageListView: View {
         invalidatePendingRefresh()
         do {
             let response = try await api.archiveMessage(remoteId: m.remoteId, accountId: m.accountId)
-            withAnimation(.snappy) {
-                removeRows(matching: m.remoteId)
-            }
-            SoundEffects.archive()
+            if sound { SoundEffects.archive() }
             undo.show(UndoItem(
                 id: response.actionId,
                 message: l10n.archivedToast,
@@ -1669,6 +1709,7 @@ struct MessageListView: View {
             // the archive already happened, so a failed preference write must
             // not fail it — but it is surfaced, not swallowed.
             await recordAcceptedAdvice(remoteId: m.remoteId, performed: .archive, accountId: m.accountId)
+            return true
         } catch APIError.badStatus(let code, _) where code == 409 {
             // The account negotiated no archive-capable folder, so the
             // server refuses every archive. Retrying cannot help — say so
@@ -1688,14 +1729,24 @@ struct MessageListView: View {
                     l10n: l10n
                 )
             )
+            return false
         } catch {
             errorBanner = ErrorBanner(
                 severity: .error,
-                title: l10n.archiveFailed,
+                title: l10n.archiveFailedTitle,
                 detail: error.lagoonUIMessage,
                 actionLabel: l10n.retry,
-                action: { [self] in await self.archive(m) }
+                action: { [self] in await self.archiveOne(m) }
             )
+            return false
+        }
+    }
+
+    /// Archive one row: the request, then the row leaves the list.
+    private func archiveOne(_ m: MessageHeader) async {
+        guard await archive(m) else { return }
+        withAnimation(.snappy) {
+            removeRows(matching: [m.remoteId])
         }
     }
 
@@ -1716,7 +1767,20 @@ struct MessageListView: View {
         let targets = messages.filter { ids.contains($0.remoteId) }
         selection.removeAll()
         isBulkBusy = true
-        Task { await runBulk(targets) { await archive($0) } }
+        Task {
+            let outcomes = await runBulk(targets) { m in
+                let ok = await self.archive(m, sound: false)
+                return BulkOutcome(remoteId: m.remoteId, ok: ok)
+            }
+            let archived = Set(outcomes.filter(\.ok).map(\.remoteId))
+            guard !archived.isEmpty else { return }
+            // One removal for the whole sweep, and one sound for the whole
+            // action.
+            withAnimation(.snappy) {
+                removeRows(matching: archived)
+            }
+            SoundEffects.archive()
+        }
     }
 
     /// The verbs behind the bulk bar's mark-read buttons.
@@ -1735,43 +1799,122 @@ struct MessageListView: View {
         selection.removeAll()
         isBulkBusy = true
         Task {
-            await runBulk(targets) { m in
-                await self.markReadOne(m, isRead: isRead)
+            let outcomes = await runBulk(targets) { m in
+                await self.markReadRemotely(m, isRead: isRead)
+            }
+            self.applyMarkReadOutcome(outcomes, isRead: isRead)
+        }
+    }
+
+    /// Marks one message read/unread **remotely**.
+    ///
+    /// The local write is the caller's, and that split is the point: the
+    /// sweep marks every message that landed in **one** mutation, because
+    /// writing one row at a time rebuilt the cached grouping once per row —
+    /// a quadratic sweep over the whole mailbox for a change the user sees
+    /// in one frame. The Briefing feed's `markBulk` has always done it this
+    /// way.
+    ///
+    /// The failure comes back as an outcome rather than as a banner: a
+    /// batch has one banner, and the retry covers exactly the rows that
+    /// failed — re-running the whole sweep would re-write the messages that
+    /// already landed.
+    @MainActor
+    private func markReadRemotely(_ m: MessageHeader, isRead: Bool) async -> BulkOutcome {
+        do {
+            let actionId = try await api.markRead(
+                remoteId: m.remoteId, accountId: m.accountId, isRead: isRead, record: true
+            )
+            return BulkOutcome(remoteId: m.remoteId, ok: true, actionId: actionId)
+        } catch {
+            return BulkOutcome(
+                remoteId: m.remoteId, ok: false, failureMessage: error.lagoonUIMessage
+            )
+        }
+    }
+
+    /// The result of a bulk mark-read sweep: one local write, one undo
+    /// toast, one banner.
+    private func applyMarkReadOutcome(_ outcomes: [BulkOutcome], isRead: Bool) {
+        let landed = outcomes.filter(\.ok)
+        applyReadToLoaded(Set(landed.map(\.remoteId)), isRead: isRead)
+        let actionIds = landed.compactMap(\.actionId)
+        if let first = actionIds.first {
+            undo.show(UndoItem(
+                id: first,
+                message: isRead
+                    ? l10n.markedAllReadToast(actionIds.count)
+                    : l10n.markedAsUnreadToast,
+                systemImage: "envelope.open",
+                extraIds: Array(actionIds.dropFirst())
+            ))
+        }
+        let failures = outcomes.filter { !$0.ok }
+        guard !failures.isEmpty else { return }
+        // The rows that failed did not change state, so they are still on
+        // screen — and the retry covers exactly those.
+        let failedIds = Set(failures.map(\.remoteId))
+        errorBanner = ErrorBanner(
+            severity: .warning,
+            title: landed.isEmpty ? l10n.bulkMarkReadFailed : l10n.markAllReadPartial,
+            detail: failures.compactMap(\.failureMessage).first ?? l10n.unknownError,
+            actionLabel: l10n.retry,
+            action: { [self] in await self.retryMarkRead(failedIds, isRead: isRead) }
+        )
+    }
+
+    /// The retry of a bulk mark-read: the same request, aimed at the rows
+    /// that failed.
+    private func retryMarkRead(_ remoteIds: Set<String>, isRead: Bool) async {
+        let targets = messages.filter { remoteIds.contains($0.remoteId) }
+        guard !targets.isEmpty else { return }
+        isBulkBusy = true
+        let outcomes = await runBulk(targets) { m in
+            await self.markReadRemotely(m, isRead: isRead)
+        }
+        applyMarkReadOutcome(outcomes, isRead: isRead)
+    }
+
+    /// Writes the read state of a set of loaded messages in **one** mutation.
+    ///
+    /// One mutation, one rebuild of the cached grouping. The rows that
+    /// failed keep their old state — they were never written.
+    private func applyReadToLoaded(_ remoteIds: Set<String>, isRead: Bool) {
+        guard !remoteIds.isEmpty else { return }
+        invalidatePendingRefresh()
+        mutateMessages { rows in
+            for i in rows.indices where remoteIds.contains(rows[i].remoteId) {
+                rows[i] = rows[i].withRead(isRead)
             }
         }
     }
 
-    /// Marks one message read/unread remotely, then writes the result into
-    /// the loaded list.
+    /// 全部标为已读：把当前列表里已加载的未读邮件全部标为已读。
     ///
-    /// The bulk sweep and the failure banner's retry both go through here,
-    /// so the retry is *the same request* — same message, same direction —
-    /// rather than a lookalike that happens to hit the same endpoint. A
-    /// retry button that re-ran something else would be a lie about what
-    /// the button does.
+    /// The scope is the **loaded** messages, and the button says so: the
+    /// list is a window of the mailbox, and there is no server endpoint
+    /// that means "every unread message in this mailbox" — a client-side
+    /// loop over ids it does not have would promise more than it does.
     ///
-    /// `@MainActor` because the local write lands in the loaded list: the
-    /// sweep's own closure is main-actor bound, and the retry must not move
-    /// that write off it.
-    @MainActor
-    private func markReadOne(_ m: MessageHeader, isRead: Bool) async {
-        do {
-            _ = try await api.markRead(
-                remoteId: m.remoteId, accountId: m.accountId, isRead: isRead
-            )
-            setRead(remoteId: m.remoteId, isRead: isRead)
-        } catch {
-            // Each message carries its own request and its own failure, so
-            // the retry is per message: re-running the whole sweep would
-            // re-write the messages that already landed.
-            errorBanner = ErrorBanner(
-                severity: .error,
-                title: l10n.markReadFailedTitle,
-                detail: error.lagoonUIMessage,
-                actionLabel: l10n.retry,
-                action: { [self] in await self.markReadOne(m, isRead: isRead) }
-            )
+    /// The Briefing feed's button is the same verb over the same kind of
+    /// window, which is why both surfaces bind ⇧⌘K and both say what they
+    /// will really touch.
+    private func markAllReadInList() async {
+        guard !isMarkingAllRead, !isBulkBusy else { return }
+        let unread = messages.filter { !$0.isRead }
+        guard !unread.isEmpty else { return }
+        isMarkingAllRead = true
+        defer { isMarkingAllRead = false }
+        // The sweep shares the bulk lock: two sweeps at once would double
+        // every request in both.
+        isBulkBusy = true
+        // Optimistic, so the unread dots go away at once — and in one
+        // mutation, for the same reason as every other batch write.
+        applyReadToLoaded(Set(unread.map(\.remoteId)), isRead: true)
+        let outcomes = await runBulk(unread) { m in
+            await self.markReadRemotely(m, isRead: true)
         }
+        applyMarkReadOutcome(outcomes, isRead: true)
     }
 
     // MARK: - Bulk fan-out
@@ -1788,8 +1931,35 @@ struct MessageListView: View {
     /// queue depth.
     private static let bulkConcurrency = 8
 
+    /// What one bulk request came back with.
+    ///
+    /// The id travels with the outcome because `withTaskGroup` hands the
+    /// results back in completion order — a bare list of booleans could
+    /// not say *which* messages landed, and the local write needs exactly
+    /// those.
+    ///
+    /// The failure travels as a **sentence**, not as an `Error`: the
+    /// outcome has to be `Sendable` to cross the task group, and an
+    /// arbitrary `Error` is not.
+    private struct BulkOutcome: Sendable {
+        let remoteId: String
+        let ok: Bool
+        /// The audit row the server wrote, when it wrote one. It is what
+        /// the undo toast needs.
+        let actionId: Int64?
+        /// Why the request failed, in words.
+        let failureMessage: String?
+
+        init(remoteId: String, ok: Bool, actionId: Int64? = nil, failureMessage: String? = nil) {
+            self.remoteId = remoteId
+            self.ok = ok
+            self.actionId = actionId
+            self.failureMessage = failureMessage
+        }
+    }
+
     /// Runs one verb over many messages, with a bounded number of requests
-    /// in flight.
+    /// in flight, and reports what each one came back with.
     ///
     /// `withTaskGroup` has no concurrency limit of its own, so "one task per
     /// message" is exactly as unbounded as the loop it replaced. The window
@@ -1801,10 +1971,11 @@ struct MessageListView: View {
     /// is free while the requests are in flight.
     private func runBulk(
         _ targets: [MessageHeader],
-        _ body: @escaping @Sendable @MainActor (MessageHeader) async -> Void
-    ) async {
+        _ body: @escaping @Sendable @MainActor (MessageHeader) async -> BulkOutcome
+    ) async -> [BulkOutcome] {
         defer { isBulkBusy = false }
-        await withTaskGroup(of: Void.self) { group in
+        return await withTaskGroup(of: BulkOutcome.self) { group in
+            var outcomes: [BulkOutcome] = []
             var next = 0
             // Fill the window first, then keep it full: one new task per
             // completion, so the number outstanding never exceeds the limit.
@@ -1813,12 +1984,14 @@ struct MessageListView: View {
                 next += 1
                 group.addTask { @MainActor in await body(target) }
             }
-            while await group.next() != nil {
+            while let outcome = await group.next() {
+                outcomes.append(outcome)
                 guard next < targets.count else { continue }
                 let target = targets[next]
                 next += 1
                 group.addTask { @MainActor in await body(target) }
             }
+            return outcomes
         }
     }
 
@@ -2113,7 +2286,7 @@ struct MessageListView: View {
 
     /// 删除 = 移入服务器废纸篓（provider.trash），可 ⌘Z 撤销（restore）。
     /// 本地行为与归档一致：行立刻离开列表，toast 承接撤销入口。
-    private func delete(_ m: MessageHeader) async {
+    private func delete(_ m: MessageHeader) async -> Bool {
         invalidatePendingRefresh()
         do {
             let response = try await api.deleteMessage(remoteId: m.remoteId, accountId: m.accountId)
@@ -2123,9 +2296,6 @@ struct MessageListView: View {
             // and the system does not know the mail is gone. The client
             // is the only place that can close that gap.
             MailNotificationService.shared.cancelReminders(forRemoteId: m.remoteId)
-            withAnimation(.snappy) {
-                removeRows(matching: m.remoteId)
-            }
             undo.show(UndoItem(
                 id: response.actionId,
                 message: l10n.deleted,
@@ -2135,6 +2305,7 @@ struct MessageListView: View {
             // it, the user just agreed with the AI. Best-effort, like every
             // other acceptance write: the delete already happened.
             await recordAcceptedAdvice(remoteId: m.remoteId, performed: .delete, accountId: m.accountId)
+            return true
         } catch {
             // The server never moved the row, so the row is still in the
             // list — the retry re-runs this same delete.
@@ -2143,8 +2314,21 @@ struct MessageListView: View {
                 title: l10n.deleteFailedTitle,
                 detail: error.lagoonUIMessage,
                 actionLabel: l10n.retry,
-                action: { [self] in await self.delete(m) }
+                action: { [self] in await self.deleteOne(m) }
             )
+            return false
+        }
+    }
+
+    /// Delete one row: the request, then the row leaves the list.
+    ///
+    /// The row leaves the list in the caller for the same reason it does
+    /// for archiving: a bulk sweep removes every deleted row in one
+    /// mutation.
+    private func deleteOne(_ m: MessageHeader) async {
+        guard await delete(m) else { return }
+        withAnimation(.snappy) {
+            removeRows(matching: [m.remoteId])
         }
     }
 
@@ -2165,7 +2349,18 @@ struct MessageListView: View {
         let targets = messages.filter { ids.contains($0.remoteId) }
         selection.removeAll()
         isBulkBusy = true
-        Task { await runBulk(targets) { await delete($0) } }
+        Task {
+            let outcomes = await runBulk(targets) { m in
+                let ok = await self.delete(m)
+                return BulkOutcome(remoteId: m.remoteId, ok: ok)
+            }
+            let deleted = Set(outcomes.filter(\.ok).map(\.remoteId))
+            guard !deleted.isEmpty else { return }
+            // One removal for the whole sweep.
+            withAnimation(.snappy) {
+                removeRows(matching: deleted)
+            }
+        }
     }
 
     /// 阶段二：删除筛选条件下的**全部**邮件，由服务端解析。

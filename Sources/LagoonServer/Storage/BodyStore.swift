@@ -19,6 +19,36 @@ public enum BodyStoreError: Error {
 }
 
 public enum BodyStore {
+    /// Whether the store holds any sealed value.
+    ///
+    /// The store cannot answer "does this install have the key that sealed
+    /// these rows?" on its own — a `lgb1:` envelope names no key. The
+    /// caller pairs this with `BodyCipher.hasKey`: a key plus sealed rows
+    /// is a healthy store, no key plus sealed rows is a store that has
+    /// gone dark.
+    ///
+    /// The query stops at the first match. A store that holds sealed values
+    /// has one among its first rows, and a store that holds none has
+    /// nothing to scan — so the common case costs a single row read.
+    public static func hasSealedValues(db: LagoonDB) async throws -> Bool {
+        try db.read { db in
+            try Bool.fetchOne(
+                db,
+                sql: "SELECT EXISTS(SELECT 1 FROM message_bodies WHERE body_cipher LIKE 'lgb1:%')"
+            ) ?? false
+        }
+    }
+
+    /// How many bodies the store holds.
+    ///
+    /// A row count, not a byte count: it is the number of mails whose text
+    /// the user cannot open, and it is the number the notice carries.
+    public static func bodyCount(db: LagoonDB) async throws -> Int {
+        try db.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM message_bodies") ?? 0
+        }
+    }
+
     public static func get(
         accountId: UUID,
         remoteId: String,

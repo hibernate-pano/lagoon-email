@@ -49,9 +49,15 @@ extension L10n {
     /// enum: every new case has to be added to it, and adding a case is an
     /// account-shaped change. Keeping it beside the account copy means the
     /// person adding a status edits one file, not two.
+    ///
+    /// The healthy case borrows `syncStatusOk` instead of repeating it:
+    /// the same state had two names — 「同步正常」 in the account menu and
+    /// "Syncing" in the health panel — and "Syncing" names a movement
+    /// rather than a state, so the account looked busy at rest. One
+    /// string, both surfaces.
     public func healthStatusText(_ status: SyncHealth.Status) -> String {
         switch status {
-        case .ok: return pick("同步正常", "Syncing")
+        case .ok: return syncStatusOk
         case .degraded: return pick("同步不稳定", "Sync degraded")
         case .needsReconnect: return pick("需要重新连接", "Reconnect needed")
         case .accountMissing: return pick("账户丢失", "Account missing")

@@ -32,7 +32,6 @@ struct SearchSheet: View {
     /// inventing one.
     @State private var totalCount: Int?
     @State private var isLoading = false
-    @State private var errorBanner: ErrorBanner?
     @State private var path: [MessageRef] = []
     /// Whether a search has actually been run.
     ///
@@ -41,6 +40,13 @@ struct SearchSheet: View {
     /// not searched yet" are different states and the copy has to say which
     /// one it is.
     @State private var hasSearched = false
+    /// Whether the last search failed.
+    ///
+    /// A failed search is not an empty one: "the server did not answer" and
+    /// "nothing matched" are different answers, and the panel used to give
+    /// both at once — 「没找到匹配邮件」 in the results area *and* a
+    /// 「搜索失败」 banner on top of it.
+    @State private var searchFailed = false
     /// Which mailboxes the search covers.
     ///
     /// The default is **the active mailbox only**, because that is what
@@ -90,6 +96,7 @@ struct SearchSheet: View {
                             // Back to "you have not searched yet", not
                             // "nothing matched".
                             hasSearched = false
+                            searchFailed = false
                         } label: {
                             Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                         }
@@ -139,8 +146,10 @@ struct SearchSheet: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12)
                     .padding(.bottom, 6)
-                if isLoading { ProgressView().padding(20) }
-                else if !hasSearched {
+                switch resultsPhase {
+                case .loading:
+                    ProgressView().padding(20)
+                case .notSearched:
                     // Nothing has been searched yet — this is an invitation,
                     // not a result.
                     ContentUnavailableView(
@@ -149,16 +158,28 @@ struct SearchSheet: View {
                         description: Text(l10n.emptySearchPromptHint)
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-                else if results.isEmpty {
+                case .failed:
+                    // The failure is the answer, and it is given in the place
+                    // where the results would be. The panel used to say it in
+                    // a banner and then say 「没找到匹配邮件」 underneath —
+                    // two answers to one question.
+                    ContentUnavailableView {
+                        Label(l10n.searchFailedTitle, systemImage: "exclamationmark.triangle")
+                    } description: {
+                        VStack(spacing: 8) {
+                            Text(l10n.searchFailedDetail)
+                            Button(l10n.retry) { Task { await run() } }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .empty:
                     ContentUnavailableView(
                         l10n.noResults,
                         systemImage: "magnifyingglass",
                         description: Text(l10n.emptySearchHint)
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-                else {
+                case .results:
                     // The count, and what it means when the list is only a
                     // window. The search used to stop at the server's cap
                     // with nothing said, so a truncated result and a
@@ -196,7 +217,7 @@ struct SearchSheet: View {
                                         color: .secondary
                                     )
                                     .lineLimit(1)
-                                    Text(m.receivedAt.formatted(date: .abbreviated, time: .shortened))
+                                    Text(LagoonTypography.rowTimestamp(m.receivedAt))
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
                                     // Which mailbox this hit came from.
@@ -270,7 +291,6 @@ struct SearchSheet: View {
                 }
             }
         }
-        .noticeBanner($errorBanner)
         .frame(
             width: LagoonSheetSize.wide.width,
             height: LagoonSheetSize.wide.height
@@ -331,26 +351,70 @@ struct SearchSheet: View {
         let scope = currentScope()
         activeScope = SearchScopeChoice(rawValue: scopeChoice) ?? .active
         isLoading = true
-        errorBanner = nil
         hasSearched = true
         do {
             let page = try await api.searchPage(query: query, scope: scope)
             results = page.results
             totalCount = page.totalCount
+            searchFailed = false
         } catch {
             results = []
             // A failed search has no count to report, and claiming the last
             // one would be a number about a different question.
             totalCount = nil
-            errorBanner = ErrorBanner(
-                severity: .error,
-                title: l10n.searchFailedTitle,
-                detail: l10n.searchFailedDetail,
-                actionLabel: l10n.retry,
-                action: { [self] in await self.run() }
-            )
+            // The failure is *not* an empty result. The results area says
+            // so itself, in the place where the results would be — so it
+            // must not also say 「没找到匹配邮件」.
+            searchFailed = true
         }
         isLoading = false
+    }
+
+    // MARK: - The results area's state
+
+    /// The states the results area can be in.
+    ///
+    /// Separate values, not a pile of booleans: the panel once had to say
+    /// 「没找到匹配邮件」 and 「搜索失败」 at the same time, and a pile of
+    /// booleans is how that happens — one of them is checked a moment
+    /// before the other.
+    enum ResultsPhase: Equatable {
+        /// A search is running.
+        case loading
+        /// Nothing has been searched yet.
+        case notSearched
+        /// The search failed — the answer is unknown, not empty.
+        case failed
+        /// The search ran and matched nothing.
+        case empty
+        /// The search ran and matched.
+        case results
+    }
+
+    /// The phase of the results area, as a pure function.
+    ///
+    /// Extracted so the rule can be tested without a window: a failed
+    /// search must never fall through to the "nothing matched" state.
+    static func resultsPhase(
+        isLoading: Bool,
+        hasSearched: Bool,
+        hasFailed: Bool,
+        resultCount: Int
+    ) -> ResultsPhase {
+        if isLoading { return .loading }
+        if !hasSearched { return .notSearched }
+        if hasFailed { return .failed }
+        return resultCount == 0 ? .empty : .results
+    }
+
+    /// The phase the panel is in right now.
+    private var resultsPhase: ResultsPhase {
+        Self.resultsPhase(
+            isLoading: isLoading,
+            hasSearched: hasSearched,
+            hasFailed: searchFailed,
+            resultCount: results.count
+        )
     }
 
     /// Render `text` with every case-insensitive occurrence of `term`

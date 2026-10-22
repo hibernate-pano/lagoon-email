@@ -43,14 +43,25 @@ struct DraftPickerSheet: View {
                     .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
             }
             .frame(minHeight: 120, maxHeight: 240)
+            // What choosing a variant does. The button used to read
+            // 「选这个 → 发送」 and promised a send that did not happen:
+            // picking a variant opens the composer with that text in it,
+            // and the mail goes out only when the user presses send.
+            Text(l10n.useDraftVariantHelp)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
             HStack {
                 Spacer()
-                Button(l10n.chooseAndSend) {
+                Button(l10n.useDraftVariant) {
                     onPick(selected)
                     dismiss()
                 }
                 .lineLimit(1)
-                .keyboardShortcut(.defaultAction)
+                // No Return binding: the variant text is selectable, and a
+                // Return inside a text selection ended the selection by
+                // submitting the variant. The composer — where the mail is
+                // actually sent — is where the send key lives.
                 .disabled(draft.variants.isEmpty)
             }
         }

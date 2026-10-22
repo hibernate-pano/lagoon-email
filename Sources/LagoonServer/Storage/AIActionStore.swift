@@ -193,6 +193,7 @@ public enum AIActionStore {
                 AND u.kind = 'undo'
                 AND json_extract(u.payload, '$.undoOf') = ai_actions.id
           )
+          AND NOT (kind = 'send' AND json_extract(payload, '$.sentFolder') IS NOT NULL)
           AND (
               kind <> 'send'
               OR json_extract(payload, '$.status') IS NULL
@@ -211,6 +212,7 @@ public enum AIActionStore {
                 AND u.kind = 'undo'
                 AND json_extract(u.payload, '$.undoOf') = ai_actions.id
           )
+          AND NOT (kind = 'send' AND json_extract(payload, '$.sentFolder') IS NOT NULL)
           AND (
               kind <> 'send'
               OR json_extract(payload, '$.status') IS NULL
@@ -743,17 +745,28 @@ public enum AIActionStore {
     ///
     /// Rows written before the scope column existed default to `sender`, so
     /// every existing install behaves exactly as it did.
+    ///
+    /// ## Why the rule does not need its sample mail
+    ///
+    /// The rule names the sender itself (`from_address`), so the lookup
+    /// reads one table. It used to recover the sender by joining
+    /// `message_headers` — an inner join, which meant the rule stopped
+    /// applying the moment its sample mail was deleted, with nothing said.
+    /// A rule the user taught the app must outlive the mail they taught it
+    /// on.
+    ///
+    /// A row with no sender is skipped: it is a rule whose sample is
+    /// already gone, and there is no address to apply it to.
     public static func overridesBySender(
         accountId: UUID,
         db: LagoonDB
     ) async throws -> [String: BriefingGroup] {
         let sql = """
             WITH ranked AS (
-                SELECT o.to_group, m.from_address, o.created_at,
-                    row_number() OVER (PARTITION BY m.from_address ORDER BY o.created_at DESC, o.rowid DESC) AS rn
+                SELECT o.to_group, o.from_address, o.created_at,
+                    row_number() OVER (PARTITION BY o.from_address ORDER BY o.created_at DESC, o.rowid DESC) AS rn
                 FROM ai_overrides o
-                JOIN message_headers m ON m.remote_id = o.remote_id AND m.account_id = o.account_id
-                WHERE o.account_id = ? AND o.scope = 'sender'
+                WHERE o.account_id = ? AND o.scope = 'sender' AND o.from_address IS NOT NULL
             )
             SELECT from_address, to_group FROM ranked WHERE rn = 1
         """
@@ -771,6 +784,38 @@ public enum AIActionStore {
                 }
             }
             return result
+        }
+    }
+
+    /// The sender a rule belongs to.
+    ///
+    /// The rule knows its own sender now, so the answer is on the rule row.
+    /// It is what lets an undo write a counter-row for a rule whose sample
+    /// mail is gone — the case where the old join-based lookup could not
+    /// even name the sender it was supposed to reverse.
+    ///
+    /// Falls back to the sample mail's own address, for a rule written
+    /// before the column existed and whose row has no address yet.
+    public static func overrideSenderAddress(
+        accountId: UUID,
+        remoteId: String,
+        overrideId: Int64?,
+        db: LagoonDB
+    ) async throws -> String? {
+        try db.read { db in
+            if let overrideId,
+               let address = try String.fetchOne(
+                   db,
+                   sql: "SELECT from_address FROM ai_overrides WHERE id = ? AND account_id = ?",
+                   arguments: [overrideId, accountId]
+               ) {
+                return address
+            }
+            return try String.fetchOne(
+                db,
+                sql: "SELECT from_address FROM message_headers WHERE account_id = ? AND remote_id = ?",
+                arguments: [accountId, remoteId]
+            )
         }
     }
 
@@ -819,6 +864,7 @@ public enum AIActionStore {
     public static func insertOverride(
         accountId: UUID,
         remoteId: String,
+        fromAddress: String?,
         fromGroup: BriefingGroup,
         toGroup: BriefingGroup,
         scope: OverrideScope = .sender,
@@ -826,7 +872,7 @@ public enum AIActionStore {
     ) async throws -> Int64 {
         try db.write {
             try insertOverrideSync(
-                accountId: accountId, remoteId: remoteId,
+                accountId: accountId, remoteId: remoteId, fromAddress: fromAddress,
                 fromGroup: fromGroup, toGroup: toGroup, scope: scope, db: $0
             )
         }
@@ -841,6 +887,16 @@ public enum AIActionStore {
     /// override reaches every mail from that address. For a message-scoped
     /// override the same id is the *subject* of the rule. Nothing in the row
     /// distinguishes the two on its own, so the scope is stored with it.
+    ///
+    /// ## Why the sender is written too
+    ///
+    /// The rule is about a sender, and the sender is written down with it.
+    /// It used to be recovered by joining the sample mail, which meant the
+    /// rule stopped applying as soon as that mail was deleted — a rule the
+    /// user taught the app, vanishing with one mail and saying nothing.
+    /// The sample stays in the row because it is what the undo and the
+    /// audit trail point at; the sender is there because it is what the
+    /// rule *means*.
     ///
     /// ## Why the sender scope's undo is "write a counter-row"
     ///
@@ -865,6 +921,7 @@ public enum AIActionStore {
     public static func insertOverrideSync(
         accountId: UUID,
         remoteId: String,
+        fromAddress: String?,
         fromGroup: BriefingGroup,
         toGroup: BriefingGroup,
         scope: OverrideScope = .sender,
@@ -873,11 +930,14 @@ public enum AIActionStore {
         guard let id = try Int64.fetchOne(
             db,
             sql: """
-                INSERT INTO ai_overrides (account_id, remote_id, from_group, to_group, scope)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO ai_overrides (account_id, remote_id, from_address, from_group, to_group, scope)
+                VALUES (?, ?, ?, ?, ?, ?)
                 RETURNING id
                 """,
-            arguments: [accountId, remoteId, fromGroup.rawValue, toGroup.rawValue, scope.rawValue]
+            arguments: [
+                accountId, remoteId, fromAddress,
+                fromGroup.rawValue, toGroup.rawValue, scope.rawValue,
+            ]
         ) else {
             throw StoreError.insertFailed
         }

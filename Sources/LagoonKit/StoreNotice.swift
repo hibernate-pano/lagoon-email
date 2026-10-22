@@ -44,6 +44,20 @@ public struct StoreNotice: Codable, Sendable, Equatable, Identifiable {
     /// The id is fixed so that the row is written at most once per install:
     /// the condition is "there was no key", which happens at most once.
     public static let draftsDroppedID = "drafts-dropped-no-key"
+
+    /// The notice raised when the store holds sealed values and the key that
+    /// sealed them is not the one this install has.
+    ///
+    /// Unlike the drafts notice, this one is not about something that was
+    /// deleted: the rows are still there, and they are still the user's mail.
+    /// What is missing is the key — so the store cannot open them, and the
+    /// app stays read-only until the key comes back. The detail carries how
+    /// many bodies are affected, so the client can say how much of the
+    /// mailbox is dark.
+    ///
+    /// The id is stable for the same reason as the one above: the condition
+    /// is a state, not an event, and it holds until the key is restored.
+    public static let bodyKeyLostID = "body-key-lost"
 }
 
 /// `GET /api/store-notices` response.

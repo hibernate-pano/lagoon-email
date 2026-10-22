@@ -42,6 +42,15 @@ struct ActionHistorySheet: View {
     /// means the server did not say — and unknown is *not* zero, so the
     /// panel withholds the number rather than inventing one.
     @State private var totalCount: Int?
+    /// How many rows of the server's history this panel has fetched.
+    ///
+    /// This is *not* `actions.count`. The two drift apart the moment the
+    /// user undoes something: the undo retires a row from the list, so the
+    /// displayed count drops by one, while the server's total stays where
+    /// it was. The footer owes the user "how many entries have I not
+    /// covered yet", and what the panel has covered is what it has
+    /// *fetched*.
+    @State private var loadedCount = 0
     /// Whether an older page exists. Measured by the server; a nil here is
     /// an older server that cannot answer, and the panel then offers the
     /// button rather than assuming the end of the list.
@@ -63,7 +72,7 @@ struct ActionHistorySheet: View {
                 Label(l10n.actionHistory, systemImage: "clock.arrow.circlepath")
                     .font(.headline)
                 Spacer()
-                HStack(spacing: 6) {
+                HStack(spacing: LagoonMetrics.spaceSM) {
                     Button(l10n.refresh) { Task { await load() } }
                         .disabled(isLoading)
                     if isLoading {
@@ -73,18 +82,18 @@ struct ActionHistorySheet: View {
                 Button { dismiss() } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
-                        .padding(4)
+                        .padding(LagoonMetrics.spaceXS)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(l10n.dismiss)
             }
-            .padding(16)
+            .padding(LagoonMetrics.spaceLG)
 
             Divider()
 
             if isLoading, actions.isEmpty {
-                ProgressView().padding(30)
+                ProgressView().padding(LagoonMetrics.spaceXXL)
             } else if isDisconnected {
                 ContentUnavailableView(
                     l10n.notConnected,
@@ -134,6 +143,13 @@ struct ActionHistorySheet: View {
             // the undo row takes its place: one out, one in. The total is
             // therefore unchanged, and decrementing it here would make the
             // footer claim fewer older entries than exist.
+            //
+            // The number of rows the panel has *loaded* is left alone for
+            // the same reason: the server's history still holds the same
+            // rows in the same place, so the panel has covered exactly as
+            // much of it as before. What the undo retired is one row the
+            // panel was *showing* — and the footer counts what it has
+            // covered, not what it is showing.
         }
     }
 
@@ -141,13 +157,17 @@ struct ActionHistorySheet: View {
 
     @ViewBuilder
     private func row(_ action: AIAction) -> some View {
-        HStack(spacing: 12) {
+        HStack(spacing: LagoonMetrics.spaceMD) {
             Image(systemName: icon(for: action.kind))
                 .foregroundStyle(.secondary)
-                .frame(width: 20)
-            VStack(alignment: .leading, spacing: 2) {
+                .frame(width: LagoonMetrics.iconColumnWidth)
+            VStack(alignment: .leading, spacing: LagoonMetrics.spaceXS) {
                 Text(l10n.actionTitle(action.kind))
-                Text(action.createdAt.formatted(date: .abbreviated, time: .shortened))
+                // The same timestamp rule every row in the app uses: today
+                // is the time alone, this week is the weekday, older is the
+                // date. One rule, so the user's eye does not have to
+                // relearn it in every surface.
+                Text(LagoonTypography.rowTimestamp(action.createdAt))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -172,7 +192,7 @@ struct ActionHistorySheet: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .padding(.vertical, 3)
+        .padding(.vertical, LagoonMetrics.spaceXS)
     }
 
     /// The end of the list, where the panel either offers the next page or
@@ -181,7 +201,7 @@ struct ActionHistorySheet: View {
     @ViewBuilder
     private var footer: some View {
         if hasMore {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: LagoonMetrics.spaceSM) {
                 HStack {
                     Button {
                         Task { await loadMore() }
@@ -204,7 +224,7 @@ struct ActionHistorySheet: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
-            .padding(.vertical, 6)
+            .padding(.vertical, LagoonMetrics.spaceSM)
         }
     }
 
@@ -214,8 +234,7 @@ struct ActionHistorySheet: View {
     /// total: a made-up "还有 N 条" is worse than no number, because the user
     /// would act on it.
     private var remainingCount: Int? {
-        guard let totalCount else { return nil }
-        return max(0, totalCount - actions.count)
+        HistoryRemaining.count(total: totalCount, loaded: loadedCount)
     }
 
     // MARK: - Loading
@@ -257,6 +276,9 @@ struct ActionHistorySheet: View {
             )
             actions = page.actions
             totalCount = page.totalCount
+            // A fresh first page replaces everything the panel had, so the
+            // number of rows it has covered is the size of that page.
+            loadedCount = page.actions.count
             // An older server sends neither field. `?? true` would claim more
             // exists; `?? false` would claim it does not. The button is the
             // safer of the two: pressing it either loads the next page or
@@ -296,7 +318,12 @@ struct ActionHistorySheet: View {
             // the cursor's row was removed between pages; showing it twice
             // would make the count in the footer disagree with the list.
             let known = Set(actions.map(\.id))
-            actions.append(contentsOf: page.actions.filter { !known.contains($0.id) })
+            let fresh = page.actions.filter { !known.contains($0.id) }
+            actions.append(contentsOf: fresh)
+            // What the panel has *covered* grows by the rows it actually
+            // took — not by the rows the server sent, which may include one
+            // it already had.
+            loadedCount += fresh.count
             if let serverTotal = page.totalCount {
                 totalCount = serverTotal
             }
@@ -370,5 +397,31 @@ struct ActionHistorySheet: View {
         // able to tell at a glance which one is the irreversible one.
         case .purge: "trash.slash"
         }
+    }
+}
+
+/// How many entries of the server's history the panel has not covered yet.
+///
+/// ## Why this is not `total - shown`
+///
+/// The two numbers come apart the moment the user undoes something. The
+/// undo retires a row from the list, so the number of rows *shown* drops by
+/// one — while the server's total stays where it was, because an undo
+/// replaces the action with an undo row: one row leaves, one arrives.
+/// Subtracting the shown count from the total therefore made the footer
+/// claim one more older entry after every undo, and five undos in a session
+/// made it claim five more.
+///
+/// The number the footer owes the user is "how much of the server's history
+/// have I not covered yet", and what the panel has covered is what it has
+/// *fetched* — not what it is currently showing.
+enum HistoryRemaining {
+    /// `total` is the server's count for the whole window; `loaded` is how
+    /// many rows the panel has fetched. A server that did not report a
+    /// total yields nil: the panel withholds the number rather than
+    /// inventing one.
+    static func count(total: Int?, loaded: Int) -> Int? {
+        guard let total else { return nil }
+        return max(0, total - loaded)
     }
 }

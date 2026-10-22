@@ -82,9 +82,9 @@ struct OverrideScopeSheet: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 20)
-            .padding(.bottom, 12)
+            .padding(.horizontal, LagoonMetrics.spaceLG)
+            .padding(.top, LagoonMetrics.spaceXL)
+            .padding(.bottom, LagoonMetrics.spaceMD)
 
             Divider()
 
@@ -94,8 +94,8 @@ struct OverrideScopeSheet: View {
             }
             .pickerStyle(.radioGroup)
             .labelsHidden()
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
+            .padding(.horizontal, LagoonMetrics.spaceLG)
+            .padding(.vertical, LagoonMetrics.spaceMD)
 
             Divider()
 
@@ -109,8 +109,8 @@ struct OverrideScopeSheet: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
+            .padding(.horizontal, LagoonMetrics.spaceLG)
+            .padding(.vertical, LagoonMetrics.spaceMD)
 
             // The pointer to the other grouping mechanism. 「改分组」 and the
             // sidebar's 「我的分组」 both group mail, but they are two
@@ -120,8 +120,8 @@ struct OverrideScopeSheet: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 20)
-                .padding(.bottom, 12)
+                .padding(.horizontal, LagoonMetrics.spaceLG)
+                .padding(.bottom, LagoonMetrics.spaceMD)
 
             Divider()
 
@@ -144,9 +144,9 @@ struct OverrideScopeSheet: View {
                 }
                     .keyboardShortcut(.defaultAction)
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
+            .padding(.horizontal, LagoonMetrics.spaceLG)
+            .padding(.vertical, LagoonMetrics.spaceMD)
         }
-        .frame(width: 460)
+        .frame(width: LagoonSheetSize.compact.width)
     }
 }

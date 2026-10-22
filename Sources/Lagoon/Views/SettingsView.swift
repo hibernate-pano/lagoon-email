@@ -30,7 +30,6 @@ import LagoonKit
 /// feature, not an app-wide preference, and putting a password field in a
 /// tab called "General" is how credentials end up in screenshots.
 struct SettingsView: View {
-    @Environment(\.l10n) private var l10n
     /// The language preference is app-wide and written straight to
     /// `UserDefaults`; the app's own `RootView` reads the same key, so
     /// changing it here takes effect without a relaunch.
@@ -42,6 +41,22 @@ struct SettingsView: View {
     @StateObject private var notifications = MailNotificationService.shared
     @State private var accounts: [ConnectedAccount] = []
     @State private var isLoadingAccount = false
+
+    /// The localizer for this window.
+    ///
+    /// The Settings window is a **sibling scene**, not a child of the main
+    /// window: the main window's `.environment(\.l10n, …)` never reaches
+    /// it, so this window used to read the environment's default — a
+    /// hardcoded Chinese localizer. That is why the window stayed in
+    /// Chinese no matter what the user picked, including in the very
+    /// picker that changes the language.
+    ///
+    /// The preference is already in `UserDefaults` — this window is where
+    /// the user changes it — so the window reads it directly, and the
+    /// picker re-renders the window in the new language as it is used.
+    private var l10n: L10n {
+        L10n.forStoredTag(languageTag)
+    }
 
     var body: some View {
         TabView {

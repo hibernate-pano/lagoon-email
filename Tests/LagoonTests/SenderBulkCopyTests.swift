@@ -24,24 +24,28 @@ final class SenderBulkCopyTests: XCTestCase {
     /// means anything for unread mail, while archive must survive "mark all
     /// read, then archive all" — the flow whose first half used to hide the
     /// second half's button.
+    ///
+    /// The scope is now the *count* of the rows the response carried, so
+    /// the number is what the copy states — "所有" would be a promise the
+    /// sheet cannot keep.
     func test_confirmCopy_statesTheScope() {
-        XCTAssertTrue(zh.senderAllReadConfirm.contains("所有未读邮件"))
-        XCTAssertTrue(en.senderAllReadConfirm.lowercased().contains("all unread"))
+        XCTAssertTrue(zh.senderAllReadConfirm(3).contains("3 封未读邮件"))
+        XCTAssertTrue(en.senderAllReadConfirm(3).lowercased().contains("3 unread"))
         // Archive covers everything from this sender — unread or not.
-        XCTAssertTrue(zh.senderAllArchiveConfirm.contains("所有邮件"))
-        XCTAssertTrue(en.senderAllArchiveConfirm.lowercased().contains("all mail"))
+        XCTAssertTrue(zh.senderAllArchiveConfirm(3).contains("3 封邮件"))
+        XCTAssertTrue(en.senderAllArchiveConfirm(3).lowercased().contains("3 messages"))
     }
 
     /// The archive confirmation must say the action is undoable — that is the
     /// difference between a scary bulk verb and a routine one, and undo is a
     /// real guarantee the archive route ships (per-message audit rows).
     func test_archiveConfirm_mentionsUndo() {
-        XCTAssertTrue(zh.senderAllArchiveConfirm.contains("撤销"))
-        XCTAssertTrue(en.senderAllArchiveConfirm.lowercased().contains("undo"))
+        XCTAssertTrue(zh.senderAllArchiveConfirm(3).contains("撤销"))
+        XCTAssertTrue(en.senderAllArchiveConfirm(3).lowercased().contains("undo"))
         // ...and the read confirmation must NOT promise what markRead never
         // offered: it records audit rows too, but read/unread undo is a
         // different toast; the copy stays neutral rather than over-promising.
-        XCTAssertFalse(zh.senderAllReadConfirm.contains("撤销"))
+        XCTAssertFalse(zh.senderAllReadConfirm(3).contains("撤销"))
     }
 
     func test_done_toasts_carryTheCount() {

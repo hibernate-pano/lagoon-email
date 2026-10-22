@@ -1449,6 +1449,11 @@ public enum ActionsRoutes {
             return errorResponse(.internalServerError, "internal-error", logger: logger, error: error)
         }
         let fromGroup: BriefingGroup
+        // The sender the rule is about. It is written into the rule itself
+        // so the rule does not depend on the sample mail still being there:
+        // a 「改这个发件人的分组」 the user taught the app must outlive the
+        // mail they taught it on.
+        var senderAddress = ""
         do {
             guard let message = try await MessageStore.find(
                 remoteId: remoteId,
@@ -1457,6 +1462,7 @@ public enum ActionsRoutes {
             ) else {
                 return RouteJSON.error(.notFound, "unknown-message")
             }
+            senderAddress = message.fromAddress
             // The maps that decide where this mail sits, read the same way
             // the briefing reads them — see `BriefingGroupResolver`.
             let resolver = try await BriefingGroupResolver.load(
@@ -1541,6 +1547,7 @@ public enum ActionsRoutes {
                 let overrideId = try AIActionStore.insertOverrideSync(
                     accountId: accountId,
                     remoteId: remoteId,
+                    fromAddress: senderAddress,
                     fromGroup: fromGroup,
                     toGroup: toGroup,
                     scope: scope,
@@ -1564,6 +1571,12 @@ public enum ActionsRoutes {
                         // two rules, and undoing the older one must not take
                         // the newer one's rule with it.
                         "overrideId": String(overrideId),
+                        // The sender the rule is about, so the undo can
+                        // write a counter-row for a rule whose sample mail
+                        // is gone. Without it, undoing a rule for a deleted
+                        // mail wrote a counter-row nobody could attribute
+                        // — and the sender stayed re-filed.
+                        "fromAddress": senderAddress,
                     ],
                     db: raw
                 )
@@ -2020,8 +2033,27 @@ public enum ActionsRoutes {
                 // wins by being **newer**, not by being named, and an undo is
                 // terminal (`.undo` is not undoable), so there is no second
                 // round that would need to point at *this* row.
+                //
+                // The counter-row needs the sender, or it is a rule nobody
+                // can attribute and the sender stays re-filed. The audit
+                // payload carries it; the rule row is the fallback for an
+                // action written before the payload did.
+                // `??` takes an autoclosure, which cannot hold an `await`,
+                // so the fallback is resolved first and then chosen.
+                let senderAddress: String?
+                if let recorded = action.payload["fromAddress"] {
+                    senderAddress = recorded
+                } else {
+                    senderAddress = try? await AIActionStore.overrideSenderAddress(
+                        accountId: account.id,
+                        remoteId: remoteId,
+                        overrideId: action.payload["overrideId"].flatMap(Int64.init),
+                        db: db
+                    )
+                }
                 _ = try await AIActionStore.insertOverride(
                     accountId: account.id, remoteId: remoteId,
+                    fromAddress: senderAddress,
                     fromGroup: to, toGroup: from, scope: scope, db: db
                 )
             }

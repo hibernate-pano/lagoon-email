@@ -43,7 +43,11 @@ enum LagoonTypography {
     ///
     /// 4pt everywhere. The raw list used 2pt, which is tight enough that a
     /// three-line row reads as a wall of text rather than as three facts.
-    static let rowSpacing: CGFloat = 4
+    ///
+    /// It is the scale's smallest rung rather than a second name for 4pt:
+    /// a row's spacing is a gap, and every gap in the app is a rung of the
+    /// one scale.
+    static let rowSpacing: CGFloat = LagoonMetrics.spaceXS
 
     /// How many lines of snippet a row shows.
     static let rowSnippetLines = 2

@@ -98,6 +98,13 @@ struct BriefingFeedView: View {
     /// left the Briefing could never build a group, which is the one
     /// thing the Briefing is for.
     @State private var stackEditor: StackEditorRequest?
+    /// The 发件人归集 panel, opened from a row's 「来自此发件人的邮件…」。
+    ///
+    /// The raw list has offered this all along. A user who triages in the
+    /// Briefing and then wants the whole history of one sender had to
+    /// leave the Briefing for it — the same "a verb exists in only half the
+    /// product" gap the row menus keep having.
+    @State private var senderFocus: SenderFocus?
     /// False when another surface is showing (RootView keeps both alive).
     /// The poll loop sleeps instead of refreshing, and hidden shortcuts
     /// are disabled by the parent — keep-alive without traffic or hotkeys.
@@ -293,7 +300,11 @@ struct BriefingFeedView: View {
                     // 归档文件夹时，批量条不能提供一个服务器会拒绝的动词。
                     canArchive: canArchive,
                     canDelete: canDelete,
-                    isBusy: isBulkBusy
+                    isBusy: isBulkBusy,
+                    // 简报页没有「服务器上的全部」这个口径——服务端窗口还没
+                    // 做——所以批量条说清楚它会作用到哪些邮件，而不是让用户
+                    // 以为「已选 N 封」等于整个邮箱。
+                    scopeNote: l10n.briefingBulkScope(items.count)
                 )
             }
         }
@@ -383,6 +394,17 @@ struct BriefingFeedView: View {
                 Task { await refresh() }
             }
         }
+        // The sender's whole mail history, from the row's 「来自此发件人的
+        // 邮件…」. The same panel the raw list opens, on the same route.
+        .sheet(item: $senderFocus) { focus in
+            if let accountId = accounts.accountId {
+                SenderSheet(
+                    accountId: accountId,
+                    senderAddress: focus.address,
+                    senderName: focus.name
+                )
+            }
+        }
         // The advice panel asks the feed to reveal a message. The feed owns
         // its selection, so it does the revealing; the switch to the Briefing
         // surface belongs to RootView, which listens for the same notification.
@@ -437,7 +459,11 @@ struct BriefingFeedView: View {
                 }
             }
             .keyboardShortcut("k", modifiers: [.command, .shift])
-            .disabled(isMarkingAllRead || items.isEmpty)
+            // Off when there is nothing unread: the button used to be live
+            // and did nothing — a click that looks like a broken app.
+            // Off when the surface is hidden, for the reason every other
+            // shortcut on this surface carries.
+            .disabled(isMarkingAllRead || index.unreadCount == 0 || !isVisible)
             .help(l10n.markAllReadHelp)
             Button { onShowAllMessages() } label: {
                 Label(l10n.allMessages, systemImage: "list.bullet")
@@ -562,14 +588,15 @@ struct BriefingFeedView: View {
                                 // Mouse users have no swipe gesture; expose
                                 // the same two verbs via right-click.
                                 .contextMenu {
-                                    Button(l10n.archiveAction) { Task { await archiveAndUndo(item) } }
-                                        .disabled(!canArchive)
-                                    Button(item.group == .pinned ? l10n.unpin : l10n.pin) {
-                                        togglePin(item: item)
-                                    }
                                     Button(readVerbTitle(item.message, l10n: l10n)) {
                                         Task { await toggleRead(item) }
                                     }
+                                    Button(item.group == .pinned ? l10n.unpin : l10n.pin) {
+                                        togglePin(item: item)
+                                    }
+                                    Button(l10n.archiveAction) { Task { await archiveAndUndo(item) } }
+                                        .disabled(!canArchive)
+                                    Divider()
                                     // 「分组…」 — the same two rules the raw
                                     // list offers, so the Briefing is not a
                                     // place where you cannot organize mail.
@@ -581,8 +608,15 @@ struct BriefingFeedView: View {
                                             openAggregateEditor(kind: .keyword, for: item.message)
                                         }
                                     }
+                                    // 「来自此发件人的邮件…」 — the raw list
+                                    // has offered it all along, so a user who
+                                    // triages here and then wants the whole
+                                    // history of one sender did not have to
+                                    // leave the Briefing for it.
+                                    Button(l10n.senderMailContext) {
+                                        senderFocus = SenderFocus(from: item.message)
+                                    }
                                     if item.group == .subscriptionNoise {
-                                        Divider()
                                         // 一键退订 lives with the noise rows:
                                         // messages carrying List-Unsubscribe
                                         // land in this group, and making the
@@ -594,6 +628,19 @@ struct BriefingFeedView: View {
                                             Task { await unsubscribeFrom(item) }
                                         }
                                     }
+                                    Divider()
+                                    // 移到废纸篓 — the last item, and the
+                                    // only one here that cannot be undone by
+                                    // a second click. The raw list's menu has
+                                    // always ended with it; a menu that can
+                                    // file a mail but not bin it is a menu
+                                    // that sends the user to the other
+                                    // surface to finish the job.
+                                    Button(l10n.moveToTrash, role: .destructive) {
+                                        Task { await deleteOne(item) }
+                                    }
+                                    .disabled(!canDelete)
+                                    .help(canDelete ? l10n.moveToTrash : l10n.deleteUnavailable)
                                 }
                             }
                         }
@@ -689,7 +736,20 @@ struct BriefingFeedView: View {
 
     private var emptyState: some View {
         Group {
-            if directory.active?.syncHealth.lastSyncAt == nil {
+            if let status = directory.active?.syncHealth.status, status != .ok {
+                // The sync is not working. The old test was
+                // `lastSyncAt == nil`, and a failed sync leaves `lastSyncAt`
+                // nil forever — so a *failure* was rendered as "still
+                // syncing", with a spinner that never stopped. The status
+                // says what is actually true, and the retry is the way out.
+                ContentUnavailableView {
+                    Label(l10n.healthStatusText(status), systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(l10n.syncFailedDetail)
+                } actions: {
+                    Button(l10n.retry) { Task { await refresh() } }
+                }
+            } else if directory.active?.syncHealth.lastSyncAt == nil {
                 VStack(spacing: 10) {
                     ProgressView()
                     // Show a running count once the server has classified
@@ -768,6 +828,7 @@ struct BriefingFeedView: View {
             uniquingKeysWith: { first, _ in first }
         )
         rebuilt.orderedIds = items.map(\.message.remoteId)
+        rebuilt.unreadCount = items.filter { !$0.message.isRead }.count
         rebuilt.visibleIds = items
             .filter { !collapsedGroups.contains($0.group) }
             .map(\.message.remoteId)
@@ -929,6 +990,12 @@ struct BriefingFeedView: View {
     private func jump(to group: BriefingGroup) {
 
         collapsedGroups.remove(group)
+
+        // The index holds the rows the user can reach: a collapsed group's
+        // rows are not in the j/k walk. Expanding the group without
+        // rebuilding the index left those rows unreachable — the group was
+        // open on screen and the walk still skipped it.
+        rebuildIndex()
 
         withAnimation { scrollProxy?.scrollTo(group, anchor: .top) }
 
@@ -1154,7 +1221,7 @@ struct BriefingFeedView: View {
                 if let actionId {
                     undo.show(UndoItem(
                         id: actionId,
-                        message: toPinned ? l10n.pinnedToast : l10n.unpinnedToast,
+                        message: toPinned ? l10n.pinnedMovedToast : l10n.unpinnedToast,
                         systemImage: "pin"
                     ))
                 }
@@ -1322,7 +1389,7 @@ struct BriefingFeedView: View {
         } catch {
             errorBanner = ErrorBanner(
                 severity: .error,
-                title: l10n.archiveFailed,
+                title: l10n.archiveFailedTitle,
                 detail: error.lagoonUIMessage,
                 actionLabel: l10n.retry,
                 action: { [self] in await self.archiveAndUndo(byId: remoteId) }
@@ -1428,7 +1495,7 @@ struct BriefingFeedView: View {
             if !failed.isEmpty {
                 errorBanner = ErrorBanner(
                     severity: .warning,
-                    title: l10n.senderBulkPartial,
+                    title: l10n.bulkArchivePartial,
                     // 失败原因 + 现在的状态。裸错误串（「网络连接失败」）说了
                     // 出了什么错，但没说失败的邮件现在在哪儿——而重试按钮
                     // 只在用户知道它会重跑哪些的时候才算诚实。
@@ -1446,12 +1513,12 @@ struct BriefingFeedView: View {
                 // 「看起来完成了、其实缺了一块」。
                 errorBanner = ErrorBanner(
                     severity: .warning,
-                    title: l10n.senderBulkPartial,
+                    title: l10n.bulkArchivePartial,
                     detail: l10n.senderTruncatedDetail(truncated),
                     actionLabel: l10n.retry,
                     action: { [self] in await self.archiveBulk(ids: ids) }
                 )
-            } else if errorBanner?.title == l10n.senderBulkPartial {
+            } else if errorBanner?.title == l10n.bulkArchivePartial {
                 // 这次全过了：上一轮的「部分失败」横幅否则会一直要求用户
                 // 再点一次一个已经不存在的批次。
                 errorBanner = nil
@@ -1472,7 +1539,7 @@ struct BriefingFeedView: View {
         } catch {
             errorBanner = ErrorBanner(
                 severity: .error,
-                title: l10n.archiveFailed,
+                title: l10n.bulkArchiveFailed,
                 detail: error.lagoonUIMessage,
                 // 整批没动，重跑同一批就是全部的修复。规范 INV-4。
                 actionLabel: l10n.retry,
@@ -1492,6 +1559,15 @@ struct BriefingFeedView: View {
         selection.removeAll()
         isBulkBusy = true
         Task { await deleteBulk(ids: ids) }
+    }
+
+    /// 移到废纸篓：单封。
+    ///
+    /// The same server route the bulk path uses, with one id. There is one
+    /// trash verb in this app; a second one for the Briefing would be a
+    /// second opinion about what "delete" means, and the two would drift.
+    private func deleteOne(_ item: BriefingItem) async {
+        await deleteBulk(ids: [item.message.remoteId])
     }
 
     /// 批量删除的执行体。重试走的是同一个方法、同一批 id。
@@ -1522,7 +1598,7 @@ struct BriefingFeedView: View {
             if !failed.isEmpty {
                 errorBanner = ErrorBanner(
                     severity: .warning,
-                    title: l10n.senderBulkPartial,
+                    title: l10n.bulkDeletePartial,
                     detail: l10n.senderBulkPartialDetail(bulkFailureReason(failed)),
                     // 重试覆盖的是**失败的那几封**：成功的已经移进废纸篓了。
                     actionLabel: l10n.retry,
@@ -1533,12 +1609,12 @@ struct BriefingFeedView: View {
             } else if let truncated = response.truncatedCount, truncated > 0 {
                 errorBanner = ErrorBanner(
                     severity: .warning,
-                    title: l10n.senderBulkPartial,
+                    title: l10n.bulkDeletePartial,
                     detail: l10n.senderTruncatedDetail(truncated),
                     actionLabel: l10n.retry,
                     action: { [self] in await self.deleteBulk(ids: ids) }
                 )
-            } else if errorBanner?.title == l10n.senderBulkPartial {
+            } else if errorBanner?.title == l10n.bulkDeletePartial {
                 errorBanner = nil
             }
         } catch {
@@ -2048,8 +2124,11 @@ struct BriefingFeedView: View {
             }
             if let firstError {
                 errorBanner = ErrorBanner(
-                    severity: .warning,
-                    title: l10n.markAllReadPartial,
+                    severity: actionIds.isEmpty ? .error : .warning,
+                    // 「部分失败」 is the wrong sentence when *nothing*
+                    // landed — the user would read "some failed" as "the
+                    // rest worked".
+                    title: actionIds.isEmpty ? l10n.markAllReadFailed : l10n.markAllReadPartial,
                     detail: firstError.lagoonUIMessage,
                     // The retry is real: the messages that *did* land are
                     // read now, so re-running the sweep covers exactly the
@@ -2161,7 +2240,7 @@ private struct BriefingRow: View {
                 .bold(!item.message.isRead)
                 .lineLimit(1)
             Spacer(minLength: 4)
-            Text(item.message.receivedAt.formatted(date: .omitted, time: .shortened))
+            Text(LagoonTypography.rowTimestamp(item.message.receivedAt))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
@@ -2191,7 +2270,7 @@ private struct BriefingRow: View {
 
                 Spacer(minLength: 8)
 
-                Text(item.message.receivedAt.formatted(date: .abbreviated, time: .shortened))
+                Text(LagoonTypography.rowTimestamp(item.message.receivedAt))
 
                     .font(.caption2).foregroundStyle(.secondary)
 
@@ -2330,6 +2409,12 @@ struct FeedIndex {
     /// rebuilt on every body evaluation — 500 pointer copies and 500 string
     /// comparisons per redraw — to answer a yes/no question.
     var revision: Int = 0
+    /// How many rows are unread.
+    ///
+    /// Kept next to the rows it is derived from: the 「全部标为已读」 button
+    /// has to know whether there is anything to mark, and the count is
+    /// cheaper here than on every redraw of the body.
+    var unreadCount: Int = 0
 }
 
 // MARK: - Optimistic read-flip helpers

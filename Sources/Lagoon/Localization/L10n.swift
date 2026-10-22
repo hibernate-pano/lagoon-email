@@ -29,6 +29,17 @@ public struct L10n: Sendable, Equatable {
     /// SwiftUI environment. Views get theirs injected instead.
     public static var current: L10n { L10n(language: LanguagePreference.stored) }
 
+    /// The localizer for a stored language tag.
+    ///
+    /// The scenes that cannot inherit the main window's environment — the
+    /// menu bar, the settings window, the first-run screen — read the
+    /// language preference themselves. This is the one place that turns a
+    /// stored tag into a localizer, so those surfaces cannot disagree
+    /// about what an unknown tag means.
+    public static func forStoredTag(_ tag: String) -> L10n {
+        L10n(language: AppLanguage(rawValue: tag) ?? .zhHans)
+    }
+
     /// Picks the string for the current language.
     ///
     /// Internal rather than private so that a feature can add its strings
@@ -41,6 +52,17 @@ public struct L10n: Sendable, Equatable {
     /// strings that live in a file it does not read.
     func pick(_ zh: String, _ en: String) -> String {
         language == .zhHans ? zh : en
+    }
+
+    /// Picks the string for the current language and renders its Markdown.
+    ///
+    /// A plain `Text` does not read `**bold**` as emphasis — it prints the
+    /// asterisks. A sentence that asks for emphasis has to become an
+    /// `AttributedString` before the view shows it, or the markers are
+    /// what the user reads instead of the emphasis.
+    func pickMarkdown(_ zh: String, _ en: String) -> AttributedString {
+        let raw = language == .zhHans ? zh : en
+        return (try? AttributedString(markdown: raw)) ?? AttributedString(raw)
     }
 
     // MARK: - Briefing groups
@@ -141,20 +163,30 @@ public struct L10n: Sendable, Equatable {
     public var languageLabel: String { pick("语言", "Language") }
     public var surface: String { pick("界面", "Surface") }
     public var surfaceHelp: String {
-        pick("在简报和收件箱之间切换", "Switch between the Briefing Feed and the raw message list")
+        pick("在简报和收件箱之间切换", "Switch between the Briefing Feed and the Inbox")
     }
 
     // MARK: - Briefing feed
 
     public var showRawListHelp: String {
-        pick("查看收件箱列表（⌘0）", "Show the raw message list (⌘0)")
+        pick("查看收件箱（⌘0）", "Show the Inbox (⌘0)")
     }
     public var backToBriefingHelp: String {
         pick("返回简报（⌘0）", "Back to the Briefing Feed (⌘0)")
     }
     public var back: String { pick("返回", "Back") }
+    /// The tooltip of a control that really does go back one level.
     public var backHelp: String {
         pick("返回上一级（⌘[）", "Back one level (⌘[)")
+    }
+    /// What ⌘[ does in the two mail-list surfaces.
+    ///
+    /// It is not "back" there: it clears the selection and returns the
+    /// reading pane to its placeholder. A cheatsheet that teaches the key
+    /// as 「返回上一级」 teaches a gesture the list surfaces cannot
+    /// perform — and the user concludes the key is broken.
+    public var deselectHelp: String {
+        pick("取消选择（⌘[）", "Clear the selection (⌘[)")
     }
     public var loadingBriefing: String { pick("正在加载简报…", "Loading briefing…") }
     /// Shown only when the 30-day window held more mail than the response cap
@@ -455,7 +487,6 @@ public struct L10n: Sendable, Equatable {
 
     // MARK: - Connect (QQ / IMAP)
 
-    public var connectQQTab: String { pick("QQ 邮箱", "QQ Mail") }
     public var connectQQTitle: String { pick("连接 QQ 邮箱", "Connect QQ Mail") }
     public var qqEmailPlaceholder: String { pick("QQ 邮箱地址", "QQ email address") }
     public var qqAuthCodePlaceholder: String { pick("授权码", "Authorization code") }
@@ -574,12 +605,20 @@ public struct L10n: Sendable, Equatable {
     public var deleteAccountFailed: String { pick("删除这个账号失败：", "Could not remove this account: ") }
     public var removeAccount: String { pick("移除这个账号", "Remove this account") }
     public var removeAccountConfirmTitle: String { pick("移除账号？", "Remove this account?") }
+    /// The body of the account-removal confirmation.
+    ///
+    /// The second line is the reassurance the user needs before clicking a
+    /// destructive button: the mail on the server stays where it is. It
+    /// used to ask for that line to be bold with `**` — which a plain
+    /// `Text` prints as asterisks, so the user read 「**服务器上的邮件不会
+    /// 被删除**」 instead of a sentence. The emphasis now rides on the
+    /// line break: the reassurance is the last thing on screen.
     public var removeAccountConfirmMessage: String {
         pick(
             "会删掉这个账号在 Lagoon 里的本地缓存（邮件、建议、撤销记录）。\n"
-                + "**服务器上的邮件不会被删除**——它们还在 QQ 邮箱里，随时可以再连回来。",
+                + "服务器上的邮件不会被删除——它们还在 QQ 邮箱里，随时可以再连回来。",
             "This removes the account's local cache in Lagoon (mail, advice, undo history).\n"
-                + "**Your mail on the server is not touched** — it stays in QQ Mail, and you can connect it again."
+                + "Your mail on the server is not touched — it stays in QQ Mail, and you can connect it again."
         )
     }
     public var removeAccountConfirmButton: String { pick("移除", "Remove") }
@@ -806,7 +845,6 @@ public struct L10n: Sendable, Equatable {
     public var archiveAction: String { pick("归档", "Archive") }
     /// 完成态专用：出现在操作成功后的提示里。
     public var archivedToast: String { pick("已归档", "Archived") }
-    public var archived: String { pick("已归档", "Archived") }
     public var unsubscribed: String { pick("已退订", "Unsubscribed") }
     public var unsubscribe: String { pick("退订", "Unsubscribe") }
     // MARK: 会话归集 / 发件人归集
@@ -823,12 +861,19 @@ public struct L10n: Sendable, Equatable {
     }
     public var senderAllRead: String { pick("全部已读", "Mark all read") }
     public var senderAllArchive: String { pick("全部归档", "Archive all") }
-    public var senderAllReadConfirm: String {
-        pick("把该发件人的所有未读邮件标记为已读？", "Mark all unread mail from this sender as read?")
+    /// Names the count the verb will actually move.
+    ///
+    /// The bulk verbs on one sender operate on the rows the response
+    /// carried, which is not always the sender's whole history — so the
+    /// confirmation says how many mails are about to change, the same way
+    /// the delete confirmation does. "所有" would be a promise the sheet
+    /// cannot keep.
+    public func senderAllReadConfirm(_ count: Int) -> String {
+        pick("把这 \(count) 封未读邮件标记为已读？", "Mark \(count) unread messages as read?")
     }
-    public var senderAllArchiveConfirm: String {
-        pick("把该发件人的所有邮件归档？（可在 30 天内撤销）",
-             "Archive all mail from this sender? (Undoable for 30 days)")
+    public func senderAllArchiveConfirm(_ count: Int) -> String {
+        pick("把这 \(count) 封邮件归档？（可在 30 天内撤销）",
+             "Archive \(count) messages? (Undoable for 30 days)")
     }
     public var senderAllDelete: String { pick("全部删除", "Delete all") }
     /// Names the destination and the count. "移入废纸篓" is the honest verb —
@@ -1069,8 +1114,13 @@ public struct L10n: Sendable, Equatable {
         pick("确认退订？", "Unsubscribe for sure?")
     }
     /// 确认对话框的正文：说清会发生什么、不可逆、以及谁会收到通知。
-    public var adviceAcceptConfirmBody: String {
-        pick(
+    ///
+    /// The emphasis is part of the sentence: 「不可撤销」 is the one word
+    /// the user has to read before agreeing. That is why this is an
+    /// `AttributedString` — a plain `Text` prints the `**` instead of
+    /// making the word bold, and the asterisks are what the user reads.
+    public var adviceAcceptConfirmBody: AttributedString {
+        pickMarkdown(
             "退订是**不可撤销**的：会向发布方发出请求，他们之后就不会再给你发这类的邮件了。"
                 + " Lagoon 不会再替你点第二次。",
             "Unsubscribing **cannot be undone**: a request goes to the publisher, and they will stop sending you this mail. "
@@ -1132,7 +1182,13 @@ public struct L10n: Sendable, Equatable {
     public func senderUnreadCount(_ n: Int) -> String { pick("\(n) 封未读", "\(n) unread") }
     public var senderViewMail: String { pick("查看邮件", "View mail") }
     public var senderFile: String { pick("归入分组", "File into a group") }
-    public var senderFiled: String { pick("已归入分组", "Group created") }
+    /// The confirmation that the group was created.
+    ///
+    /// The two languages used to say two different things: 中文 said the
+    /// mail had been filed, English said a group had been created. What
+    /// actually happened is the second one — the sender became a group —
+    /// and the first one promised a filing that never happens.
+    public var senderFiled: String { pick("已创建分组", "Group created") }
 
     // MARK: 恢复与取消归档
     public var restoreFromTrash: String { pick("恢复到收件箱", "Restore to inbox") }
@@ -1344,7 +1400,6 @@ public struct L10n: Sendable, Equatable {
 
     public var pinning: String { pick("正在置顶…", "Pinning…") }
     public var draftVariants: String { pick("AI 草稿（3 个版本）", "AI drafts (3 variants)") }
-    public var chooseAndSend: String { pick("选这个 → 发送", "Use this → send") }
     public var generatingDrafts: String { pick("正在生成 3 个草稿…", "Generating 3 drafts…") }
     public var draftFailed: String { pick("生成草稿失败：", "Draft generation failed: ") }
     public var pickOne: String { pick("选一个版本", "Pick a version") }
@@ -1418,8 +1473,8 @@ public struct L10n: Sendable, Equatable {
     }
     public var notConnectedHint: String {
         pick(
-            "先在侧边栏连接一个邮箱账号。",
-            "Connect a mailbox from the sidebar first."
+            "先从工具栏的「账号」菜单里添加一个邮箱账号。",
+            "Add a mailbox from the account menu in the toolbar."
         )
     }
 
@@ -1600,13 +1655,37 @@ public struct L10n: Sendable, Equatable {
         pick("已过期", "Overdue")
     }
     public func reminderDueAt(_ date: Date) -> String {
-        pick("\(Self.reminderDateFormatter.string(from: date)) 提醒", "Remind me at \(Self.reminderDateFormatter.string(from: date))")
+        let when = reminderDateFormatter.string(from: date)
+        return pick("\(when) 提醒", "Remind me at \(when)")
     }
-    /// The formatted date shown on a reminder row.
-    static let reminderDateFormatter: DateFormatter = {
+    /// The formatter for a reminder's due time, in the app's own language.
+    ///
+    /// A date format is not a localized resource: `M月d日 HH:mm` prints
+    /// 「月」 and 「日」 under every locale, and `locale = .current` does
+    /// not change that — the pattern is read literally. So an English
+    /// window showed 「10月8日 09:00」 next to English labels, and a
+    /// Chinese window on an English Mac showed the same. The format
+    /// follows the language the user picked in the app, not the system's.
+    var reminderDateFormatter: DateFormatter {
+        switch language {
+        case .zhHans: return Self.reminderDateFormatterZH
+        case .english: return Self.reminderDateFormatterEN
+        }
+    }
+
+    /// The Chinese pattern: 「10月8日 09:00」.
+    private static let reminderDateFormatterZH: DateFormatter = {
         let formatter = DateFormatter()
-        formatter.locale = .current
+        formatter.locale = Locale(identifier: "zh_Hans_CN")
         formatter.dateFormat = "M月d日 HH:mm"
+        return formatter
+    }()
+
+    /// The English pattern: 「Oct 8, 09:00」.
+    private static let reminderDateFormatterEN: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.dateFormat = "MMM d, HH:mm"
         return formatter
     }()
 
@@ -1629,8 +1708,18 @@ public struct L10n: Sendable, Equatable {
     public var markUnread: String { pick("标为未读", "Mark unread") }
     public var opening: String { pick("正在打开…", "Opening…") }
     public var inboxZero: String { pick("收件箱已清空", "Inbox zero") }
+    /// The line under 「收件箱已清空」.
+    ///
+    /// It used to say 「添加一个邮箱账号，让 Lagoon 开始同步」 — the
+    /// advice for the *first run*, shown in the state that means the
+    /// opposite: every message is already handled, and there is no
+    /// account to add. The key name is historical; the text is what the
+    /// user reads.
     public var tapToSync: String {
-        pick("添加一个邮箱账号，让 Lagoon 开始同步。", "Add an email account to start syncing.")
+        pick(
+            "所有邮件都处理完了。有新邮件时 Lagoon 会自动同步。",
+            "Everything is handled. New mail syncs on its own."
+        )
     }
     public var commandPalette: String { pick("命令面板", "Command palette") }
     public var commandPalettePlaceholder: String {
@@ -1930,7 +2019,20 @@ public extension L10n {
 // MARK: - SwiftUI environment
 
 private struct L10nEnvironmentKey: EnvironmentKey {
-    static let defaultValue = L10n(language: .zhHans)
+    /// The language for surfaces nobody injected a localizer into.
+    ///
+    /// The main window sets `.environment(\.l10n, …)` on its own content,
+    /// but the menu bar, the settings window and the first-run screen are
+    /// **sibling scenes**: a scene is not a child of the window, so the
+    /// window's environment never reaches them. A hardcoded default
+    /// therefore left every one of those surfaces in Chinese, whatever
+    /// the user had chosen.
+    ///
+    /// Reading the stored preference means those surfaces at least *start*
+    /// in the user's language. Changing the language while they are open
+    /// is a different problem — the scene has to be told — and it is
+    /// solved where the scene is built, not here.
+    static var defaultValue: L10n { L10n(language: LanguagePreference.stored) }
 }
 
 public extension EnvironmentValues {

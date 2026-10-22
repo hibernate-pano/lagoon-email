@@ -10,8 +10,10 @@ import LagoonKit
 /// the mailbox before storing anything.
 struct ConnectView: View {
     @EnvironmentObject var accounts: AccountStore
-    @Environment(\.l10n) private var l10n
     @Environment(\.dismiss) private var dismiss
+
+    /// The language preference, read straight from `UserDefaults`.
+    @AppStorage(LanguagePreference.defaultsKey) private var languageTag = AppLanguage.zhHans.rawValue
 
     /// RootView presents this as a sheet (connect/reconnect while accounts
     /// exist) — there `dismiss()` closes the sheet. As the WindowGroup root
@@ -63,6 +65,18 @@ struct ConnectView: View {
     }
 
     private let api = APIClient.shared
+
+    /// The localizer for this screen.
+    ///
+    /// The first run is a **sibling scene** of the main window, so the
+    /// main window's `.environment(\.l10n, …)` never reaches it — every
+    /// label on the onboarding form was Chinese whatever the user had
+    /// chosen, including for a user who had already chosen English.
+    /// The preference is in `UserDefaults` and this screen can change it,
+    /// so the screen reads it directly.
+    private var l10n: L10n {
+        L10n.forStoredTag(languageTag)
+    }
 
     /// QQ Mail's web interface — where the authorization code is generated.
     ///
@@ -119,6 +133,28 @@ struct ConnectView: View {
                 }
                 .keyboardShortcut(.cancelAction)
             }
+
+            // The language picker, on the one screen a new user cannot
+            // leave without reading.
+            //
+            // The settings window is where the language normally lives,
+            // and the settings window cannot be reached until an account
+            // is connected. So the first run was the one screen where a
+            // user who does not read the app's language had no way out —
+            // every label was in a language they could not read, and the
+            // only control that could change it was on a screen they
+            // could not reach yet.
+            HStack {
+                Spacer()
+                Picker(l10n.languageLabel, selection: $languageTag) {
+                    ForEach(AppLanguage.allCases) { language in
+                        Text(language.displayName).tag(language.rawValue)
+                    }
+                }
+                .pickerStyle(.menu)
+                .accessibilityLabel(l10n.languageLabel)
+            }
+            .frame(maxWidth: 360)
         }
         .padding(40)
         .frame(minWidth: 460, maxWidth: 460, minHeight: 380)

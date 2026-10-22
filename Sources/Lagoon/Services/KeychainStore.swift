@@ -290,19 +290,62 @@ public enum KeychainStore {
     }
 
     /// Writes the raw bytes to a specific location (used by the migration).
+    ///
+    /// ## The access list, and why it is sometimes omitted
+    ///
+    /// On the **file-based** keychain an item carries an access list, and
+    /// the default one is "the application that created me" — which macOS
+    /// resolves through the creator's *designated requirement*. When that
+    /// requirement is a cdhash (an ad-hoc build), the list is bound to one
+    /// specific build and stops matching after the next rebuild.
+    ///
+    /// This store sets an **explicit** access list, built from
+    /// `SecTrustedApplicationCreateFromPath`, so the trust anchor is
+    /// written down rather than implied. But — and this is the measured
+    /// part — an explicit list is only worth anything when the requirement
+    /// it captures is stable:
+    ///
+    /// | build | access list | read after a rebuild |
+    /// |---|---|---|
+    /// | ad-hoc | default | hung (5 of 5) |
+    /// | ad-hoc | explicit | hung (5 of 5) |
+    /// | certificate | default | ok (5 of 5) |
+    /// | certificate | explicit | ok (5 of 5) |
+    ///
+    /// `SecTrustedApplicationCreateFromPath` on ad-hoc code captures the
+    /// *cdhash* requirement, so an explicit list on an ad-hoc build is
+    /// exactly as unstable as the default one — an item that looks
+    /// durably anchored and is not. So the list is set only when the
+    /// running build's requirement is certificate-anchored
+    /// (`KeychainTrust.isStable`); otherwise the item is written with the
+    /// default list and the fact is reported, not hidden.
+    ///
+    /// ## The two locations are not the same mechanism
+    ///
+    /// `kSecAttrAccess` (an access *list*) is a **file-keychain**
+    /// attribute. The data-protection keychain uses
+    /// `kSecAttrAccessible` (an accessibility *class*) instead, and
+    /// mixing them is not a matter of style: `SecItemAdd` with a
+    /// `kSecAttrAccess` on a data-protection query **crashes the
+    /// process** (SIGTRAP, exit 133 — measured). The two attribute
+    /// families are kept strictly apart here.
     static func save(data: Data, service: String, location: KeychainLocation) throws {
         let query = baseQuery(service: service, location: location)
-        let attributes: [String: Any] = [
+        var attributes: [String: Any] = [
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
         ]
+        if location == .file {
+            if let access = accessListForCurrentBuild() {
+                attributes[kSecAttrAccess as String] = access
+            }
+        }
 
         // Update in place when the item exists; only add on the first save.
         let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if updateStatus == errSecItemNotFound {
             var add = query
-            add[kSecValueData as String] = data
-            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            for (key, value) in attributes { add[key] = value }
             let addStatus = SecItemAdd(add as CFDictionary, nil)
             guard addStatus == errSecSuccess else {
                 throw KeychainError.unexpectedStatus(addStatus)
@@ -310,5 +353,25 @@ public enum KeychainStore {
         } else if updateStatus != errSecSuccess {
             throw KeychainError.unexpectedStatus(updateStatus)
         }
+    }
+
+    /// The access list to write a file-keychain item with, or `nil` when
+    /// this build cannot provide a stable one.
+    ///
+    /// `nil` is a real answer, not a gap: it means "this build's
+    /// requirement is a cdhash, so an explicit list would be a cdhash list
+    /// wearing a durable-looking label". The item is then written with the
+    /// platform default, which is equally cdhash-bound — and
+    /// `KeychainTrust.current.isStable` is what the app consults to tell
+    /// the user that their secrets are tied to this build.
+    static func accessListForCurrentBuild() -> SecAccess? {
+        guard KeychainTrust.current.isStable else { return nil }
+        var trusted: SecTrustedApplication?
+        guard SecTrustedApplicationCreateFromPath(nil, &trusted) == errSecSuccess,
+              let trusted else { return nil }
+        var access: SecAccess?
+        guard SecAccessCreate("Lagoon" as CFString, [trusted] as CFArray, &access) == errSecSuccess,
+              let access else { return nil }
+        return access
     }
 }

@@ -81,7 +81,19 @@ public enum MessageStore {
             // shown in the list — so it is sealed with the body. An empty
             // snippet stays empty: the `CASE` above reads that as "this sync
             // round carried no preview" and keeps the stored one.
-            let sealedSnippet = try m.snippet.flatMap { $0.isEmpty ? nil : try BodyCipher.seal($0) } ?? ""
+            //
+            // With no key at all the preview cannot be sealed, and the
+            // honest answer is an empty one: the row still syncs and the
+            // list still shows it, only the grey line is missing. Letting
+            // the seal throw would take the **headers** down over a
+            // preview — a far larger loss than the preview itself, and one
+            // the user would read as "my mail is gone".
+            let sealedSnippet: String
+            if let snippet = m.snippet, !snippet.isEmpty, BodyCipher.hasKey {
+                sealedSnippet = try BodyCipher.seal(snippet)
+            } else {
+                sealedSnippet = ""
+            }
             try db.execute(sql: sql, arguments: [
                 m.id, m.accountId, m.remoteId, m.threadId,
                 m.fromAddress, m.fromName ?? "", m.subject ?? "", sealedSnippet,

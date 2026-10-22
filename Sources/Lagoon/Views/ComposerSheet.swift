@@ -24,7 +24,11 @@ struct ComposerSheet: View {
     @State private var bodyText: String
     @State private var isSending = false
     @State private var error: String?
-    /// True briefly after each save fires — drives the "Draft saved ✓"
+    /// Why the last send failed, when it did. Drives whether the failure
+    /// row offers a retry: some failures cannot be retried, and a retry
+    /// button that cannot work is a lie about what the product can do.
+    @State private var sendFailure: ComposeFlow.Failure?
+    /// True briefly after each save fires — drives the "Saved ✓"
     /// checkmark animation. Reset when the user types again so the
     /// indicator doesn't lie about freshness.
     @State private var draftJustSaved = false
@@ -42,7 +46,26 @@ struct ComposerSheet: View {
     /// Set once the reply has been sent, so the teardown flush does not put
     /// the body the user just sent back into the draft slot.
     @State private var didSend = false
+    /// Set when the user chose to throw the draft away, so the teardown
+    /// flush does not put it back either.
+    @State private var didDiscard = false
+    /// True once the user has written something in this session.
+    ///
+    /// The body starts out holding the quoted original, so "is the field
+    /// empty" is the wrong question — it would ask the user about work
+    /// they never did. This asks the question they actually care about:
+    /// did *I* write anything?
+    @State private var hasEdited = false
+    /// True when the composer brought back a draft from an earlier
+    /// session, so the sheet can say so.
+    @State private var restoredDraft = false
+    /// The "this mail is not finished" prompt.
+    @State private var showUnsavedAlert = false
     /// Stable across retries; changes only when the composer is created anew.
+    ///
+    /// The server treats the request id as an idempotency key, so a retry
+    /// with the same id either replays the first attempt's answer or
+    /// proceeds — it can never send the same mail twice.
     @State private var requestId = UUID().uuidString.lowercased()
     /// Files to send with the reply.
     ///
@@ -53,7 +76,7 @@ struct ComposerSheet: View {
     @State private var attachments: [OutgoingAttachment] = []
     /// The file picker is open.
     @State private var isPickingFiles = false
-    private let draftKey: String
+    private let draftSlot: ComposeFlow.DraftSlot
     private let api = APIClient.shared
 
     /// The `To:` line split into an array for the reply-all override.
@@ -69,6 +92,19 @@ struct ComposerSheet: View {
     /// recipient list is.
     private var toRecipients: [String] {
         AddressList.bareAddresses(to)
+    }
+
+    /// How many people this reply reaches.
+    private var recipientCount: Int {
+        Self.recipientCount(to: to, cc: cc)
+    }
+
+    /// How many people this reply reaches.
+    ///
+    /// The To line and the Cc line together. A reply to forty people is
+    /// a wall of addresses; the number is what makes it readable.
+    static func recipientCount(to: String, cc: [String]) -> Int {
+        AddressList.bareAddresses(to).count + cc.count
     }
 
     init(
@@ -89,22 +125,51 @@ struct ComposerSheet: View {
         self.quotedText = quotedText
         self.onSent = onSent
         let key = "lagoon.composer.\(accountId.uuidString).\(remoteId)"
-        self.draftKey = key
-        let saved = UserDefaults.standard.string(forKey: key) ?? ""
+        let slot = ComposeFlow.DraftSlot(key: key)
+        self.draftSlot = slot
+        let saved = slot.load()?.body ?? ""
         // When the user is replying, prepend the original message as a
         // quoted block so they have the context right where they type.
         // The standard "top-post" convention is `\n\n` separator + `> `
         // prefix; line wrapping keeps the quote from exploding sideways
         // on long lines.
-        let prefill: String
-        if !initialBody.isEmpty {
-            prefill = initialBody
-        } else if !quotedText.isEmpty {
-            prefill = Self.formatQuotedReply(quotedText)
-        } else {
-            prefill = saved
-        }
+        let prefill = Self.restoredBody(
+            initialBody: initialBody,
+            saved: saved,
+            quotedText: quotedText
+        )
         _bodyText = State(initialValue: prefill)
+        _restoredDraft = State(
+            initialValue: initialBody.isEmpty && Self.isUserDraft(saved: saved, quotedText: quotedText)
+        )
+    }
+
+    /// True when the saved draft is something the user actually wrote.
+    ///
+    /// The body starts out holding the quoted original, and a slot that
+    /// holds only the quote is not a draft — it is the prefill. Saying
+    /// "your last draft was restored" about it would be a lie.
+    static func isUserDraft(saved: String, quotedText: String) -> Bool {
+        guard !saved.isEmpty else { return false }
+        guard !quotedText.isEmpty else { return true }
+        return saved != formatQuotedReply(quotedText)
+    }
+
+    /// What the body starts out holding.
+    ///
+    /// The order matters: the user's own writing comes before the quoted
+    /// original. The quoted block used to win, which meant the draft slot
+    /// was filled but never read — the reply a user typed was shadowed by
+    /// the mail they were replying to, and "the draft saves automatically"
+    /// was a promise the product could not keep.
+    ///
+    /// An explicitly chosen AI variant still wins over everything: the user
+    /// picked it a moment ago.
+    static func restoredBody(initialBody: String, saved: String, quotedText: String) -> String {
+        if !initialBody.isEmpty { return initialBody }
+        if !saved.isEmpty { return saved }
+        if !quotedText.isEmpty { return Self.formatQuotedReply(quotedText) }
+        return ""
     }
 
     /// Format the original message body as a quoted block. Top-post
@@ -141,9 +206,9 @@ struct ComposerSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Label(l10n.replyTitle, systemImage: "arrowshape.turn.up.left").font(.headline)
+                Label(l10n.replyRecipientsFixed, systemImage: "arrowshape.turn.up.left").font(.headline)
                 Spacer()
-                Button { dismiss() } label: {
+                Button { requestClose() } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
                         .padding(4)
@@ -154,7 +219,18 @@ struct ComposerSheet: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(l10n.replyTo).font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Text(l10n.replyTo).font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    // The count belongs next to the people it counts. A
+                    // reply to forty people is a wall of addresses; the
+                    // number is what makes it readable.
+                    if recipientCount > 1 {
+                        Text(l10n.newMessageRecipientsCount(count: recipientCount))
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
                 Text(to).font(.callout).textSelection(.enabled)
                 if !cc.isEmpty {
                     Text(l10n.replyCc).font(.caption).foregroundStyle(.secondary)
@@ -164,6 +240,18 @@ struct ComposerSheet: View {
                         .textSelection(.enabled)
                 }
                 Text(subject).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                // These fields cannot be edited, and the sheet used to
+                // look like a form that had gone wrong. One line says why.
+                Text(l10n.replyTitle)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if restoredDraft {
+                Label(l10n.draftRestored, systemImage: "arrow.counterclockwise")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
 
             if !quotedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -208,11 +296,12 @@ struct ComposerSheet: View {
                     }
                 }
                 .onChange(of: bodyText) { _, newValue in
+                    hasEdited = true
                     scheduleDraftWrite(newValue)
                 }
 
             if let error {
-                Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+                failureRow(error)
             }
 
             HStack(spacing: 10) {
@@ -226,13 +315,13 @@ struct ComposerSheet: View {
                         .font(.caption)
                         .foregroundStyle(.green)
                         .opacity(draftJustSaved ? 1 : 0)
-                    Text(l10n.draftSaved)
+                    Text(draftJustSaved ? l10n.draftSavedNow : l10n.draftSaved)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
                 .animation(.easeOut(duration: 0.25), value: draftJustSaved)
                 Spacer()
-                Button(l10n.closeComposer) { dismiss() }
+                Button(l10n.closeComposer) { requestClose() }
                     .keyboardShortcut(.cancelAction)
                 Button {
                     Task { await send() }
@@ -257,10 +346,15 @@ struct ComposerSheet: View {
         // draft slot, and the debounced write may still be pending. Flushing
         // here is what keeps a draft that was typed in the last half second
         // from being lost.
+        //
+        // The flush only happens if the user wrote something. The body
+        // starts out holding the quoted original, and a slot full of
+        // somebody else's mail is not a draft.
         .onDisappear {
             draftWriteTask?.cancel()
             draftWriteTask = nil
-            guard !didSend else { return }
+            guard !didSend, !didDiscard else { return }
+            guard hasEdited else { return }
             writeDraft(bodyText)
         }
         .fileImporter(
@@ -269,6 +363,18 @@ struct ComposerSheet: View {
             allowsMultipleSelection: true
         ) { result in
             handlePickedFiles(result)
+        }
+        // The prompt for a mail that is not finished. Closing keeps the
+        // draft — that is the promise the sheet makes — so the question is
+        // never "are you sure you want to lose it". It is whether the user
+        // wants to keep the draft or throw it away, and only the second
+        // one is a decision worth interrupting for.
+        .alert(l10n.unsavedMailTitle, isPresented: $showUnsavedAlert) {
+            Button(l10n.keepWriting, role: .cancel) { }
+            Button(l10n.discardDraft, role: .destructive) { discardAndClose() }
+            Button(l10n.closeAndKeepDraft) { dismiss() }
+        } message: {
+            Text(l10n.unsavedMailMessage)
         }
     }
 
@@ -287,6 +393,13 @@ struct ComposerSheet: View {
                     .foregroundStyle(.secondary)
                 if !attachments.isEmpty {
                     Text(l10n.newMessageAttachmentCount(count: attachments.count))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    // The size of the whole set, because the server's limit
+                    // is on the whole set. A row of file sizes that each
+                    // look fine is how four of them add up to a send that
+                    // fails at the last moment.
+                    Text(l10n.newMessageAttachmentTotalSize(size: totalAttachmentSize))
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -324,6 +437,14 @@ struct ComposerSheet: View {
         }
     }
 
+    /// The size of every attachment together, as a human-readable string.
+    private var totalAttachmentSize: String {
+        ByteCountFormatter.string(
+            fromByteCount: Int64(ComposeFlow.Attachments.totalBytes(attachments)),
+            countStyle: .file
+        )
+    }
+
     /// Reads the picked files and turns them into attachments.
     ///
     /// A file that cannot be read, or that is empty or too big, is
@@ -353,6 +474,17 @@ struct ComposerSheet: View {
                         failures.append(l10n.newMessageAttachmentTooLarge(name))
                         continue
                     }
+                    // The server caps the *total* as well as each file.
+                    // Checking only the file meant four 24 MB attachments
+                    // all passed here and the send failed at the server
+                    // with nothing to point at.
+                    guard ComposeFlow.Attachments.fits(
+                        attachment.data.count,
+                        alongside: attachments
+                    ) else {
+                        failures.append(l10n.newMessageAttachmentTotalTooLarge(name: name))
+                        continue
+                    }
                     attachments.append(attachment)
                 } catch {
                     failures.append(l10n.newMessageAttachmentReadFailed)
@@ -378,23 +510,87 @@ struct ComposerSheet: View {
 
     /// Writes the draft to disk and confirms it.
     private func writeDraft(_ text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            UserDefaults.standard.removeObject(forKey: draftKey)
-        } else {
-            UserDefaults.standard.set(text, forKey: draftKey)
-        }
+        var draft = ComposeFlow.Draft()
+        draft.body = text
+        draftSlot.save(draft)
         // Flash the "saved" checkmark for 1.6 s after the write lands. The
         // reset task is cancelled and replaced so a second write does not
         // leave the indicator stuck on.
         draftSavedResetTask?.cancel()
-        draftJustSaved = !trimmed.isEmpty
+        draftJustSaved = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         draftSavedResetTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(1_600))
             guard !Task.isCancelled else { return }
             draftJustSaved = false
         }
     }
+
+    // MARK: - Leaving
+
+    /// Closes the sheet — keeping the draft, or asking first.
+    ///
+    /// The button, the ✕ and the Escape key all come through here, so
+    /// there is one way to leave and one promise about what happens to
+    /// the work.
+    private func requestClose() {
+        guard hasEdited else {
+            dismiss()
+            return
+        }
+        showUnsavedAlert = true
+    }
+
+    /// Throws the draft away and closes.
+    private func discardAndClose() {
+        didDiscard = true
+        draftWriteTask?.cancel()
+        draftWriteTask = nil
+        draftSlot.clear()
+        dismiss()
+    }
+
+    // MARK: - Failures
+
+    /// The failure line under the body.
+    ///
+    /// The message names the cause, because "server returned HTTP 401"
+    /// tells the user nothing they can act on. The retry button is only
+    /// there when retrying can actually work.
+    private func failureRow(_ message: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.red)
+                .textSelection(.enabled)
+            Spacer(minLength: 8)
+            if sendFailure?.canRetry == true {
+                Button(l10n.retry) {
+                    Task { await send() }
+                }
+                .buttonStyle(.link)
+                .disabled(isSending)
+            }
+        }
+    }
+
+    /// The text for a failure, in the user's terms.
+    private func message(for failure: ComposeFlow.Failure, error: Error) -> String {
+        switch failure {
+        case .authFailed: return l10n.sendFailedAuth
+        case .notConfigured: return l10n.sendFailedNotConfigured
+        case .messageGone: return l10n.sendFailedMessageGone
+        case .accountMissing: return l10n.sendFailedAccountMissing
+        case .malformedRecipient: return l10n.sendFailedMalformedRecipient
+        case .malformedAttachment: return l10n.sendFailedMalformedAttachment
+        case .forwardTooLarge: return l10n.sendFailedForwardTooLarge
+        case .inFlight: return l10n.sendFailedInFlight
+        case .rejected: return l10n.sendRejected
+        case .transport: return l10n.sendFailedTransport
+        case .unknown: return l10n.sendFailed + error.lagoonUIMessage
+        }
+    }
+
+    // MARK: - Send
 
     private func send() async {
         let trimmed = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -404,6 +600,7 @@ struct ComposerSheet: View {
         }
         isSending = true
         error = nil
+        sendFailure = nil
         do {
             let response = try await api.sendReply(
                 remoteId: remoteId,
@@ -414,21 +611,32 @@ struct ComposerSheet: View {
                 cc: cc.isEmpty ? nil : cc,
                 attachments: attachments
             )
-            didSend = true
-            // The pending write must not land after the send: it would put
-            // the body the user just sent back into the draft slot, and the
-            // next reply to the same message would start from the sent text.
-            draftWriteTask?.cancel()
-            draftWriteTask = nil
-            UserDefaults.standard.removeObject(forKey: draftKey)
-            // Subtle "Pop" confirms the send landed — the dismiss animation
-            // is silent, this fills the gap between "send" and "sheet gone".
-            SoundEffects.send()
-            onSent(response.providerMessageId)
-            dismiss()
+            // The server's own answer decides. A 200 with `ok: false` is
+            // a refusal wearing a success's clothes, and announcing "sent"
+            // on it is a promise the user will not check.
+            switch ComposeFlow.outcome(of: response) {
+            case .rejected:
+                sendFailure = .rejected
+                error = l10n.sendRejected
+            case .accepted(let providerMessageId):
+                didSend = true
+                // The pending write must not land after the send: it would put
+                // the body the user just sent back into the draft slot, and the
+                // next reply to the same message would start from the sent text.
+                draftWriteTask?.cancel()
+                draftWriteTask = nil
+                draftSlot.clear()
+                // Subtle "Pop" confirms the send landed — the dismiss animation
+                // is silent, this fills the gap between "send" and "sheet gone".
+                SoundEffects.send()
+                onSent(providerMessageId)
+                dismiss()
+            }
         } catch {
             // The typed body stays put so a retry is one click away.
-            self.error = l10n.sendFailed + error.lagoonUIMessage
+            let failure = ComposeFlow.Failure.classify(error)
+            sendFailure = failure
+            self.error = message(for: failure, error: error)
         }
         isSending = false
     }
