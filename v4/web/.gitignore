@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.local
+.vite/
+
+# seeded synthetic sidecar (scripts/synth-sidecar.sh): throwaway db + ephemeral keys
+.synth/

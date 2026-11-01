@@ -1,0 +1,31 @@
+[package]
+name = "lagoon-api"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Lagoon v4 read-only Rust backend (R1+R2): health, accounts, messages, bodies, folder-counts plus the local-only read endpoints (briefing/advice/stacks/senders/sent/notices/time-saved/usage/actions/drafts/search/export)"
+
+[dependencies]
+aes-gcm.workspace = true
+axum.workspace = true
+base64.workspace = true
+# Local-time calendar windows (time-saved's today/week, usage's yyyy-MM key) and
+# ISO-8601 parsing for ?since=. chrono's clock feature is the local time zone.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rusqlite = { workspace = true, features = ["backup"] }
+# The protocol layer (R3.1). The adapter in src/provider/lagoon_mail.rs is the
+# only place this crate names it; routes and the sync engine see our traits.
+lagoon-mail = { path = "../lagoon-mail" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The contract test replays golden fixtures over real HTTP, so the Host guard,
+# status codes and Content-Type are exercised instead of bypassed.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"

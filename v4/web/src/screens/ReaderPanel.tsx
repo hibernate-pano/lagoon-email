@@ -1,0 +1,370 @@
+/**
+ * The reading pane (MessageDetailView.swift, 1445 lines in v3 — M1 slice).
+ *
+ * Read path, exactly the order v3 uses (MessageDetailView.swift:930-993):
+ *   1. GET /body                                    (always)
+ *   2. GET /inline-images                           (only when the body carries
+ *                                                    inline, image-typed parts)
+ *   3. POST /read                                   (dwell; DISABLED in M1 —
+ *                                                    see core/config.ts)
+ * Steps 1 and 2 are independent: the text is readable while images are still
+ * arriving, and a failed image must never blank the message. When some images
+ * fail the pane says so in a second line (that is the reader's "partial success"
+ * state, v3: MessageDetailView.swift:995-1011).
+ *
+ * Every write verb is rendered disabled with "M2 开放" instead of hidden: a
+ * missing button is indistinguishable from a missing feature, and M1's promise
+ * is "you can read everything, you cannot change anything".
+ */
+import { useEffect, useState, type ReactNode } from "react";
+import type { AiStatus, Attachment, ConnectedAccount, InlineImagesResponse, MessageBody, MessageSummary } from "../core/types";
+import { apiCall } from "../core/api";
+import { COMMON_UNAVAILABLE, describeHttpFailure } from "../core/errors";
+import { useApiOutcome } from "../core/hooks";
+import { AsyncSurface } from "../ui/AsyncSurface";
+import { TriBadge, Banner } from "../ui/atoms";
+import type { WriteBridge } from "../core/uiBridge";
+import { HtmlFrame } from "./HtmlFrame";
+import { t } from "../l10n/zh";
+
+function isInlineImage(attachment: Attachment): boolean {
+  return attachment.disposition === "inline" && attachment.mimeType.startsWith("image/");
+}
+
+function mimeMapOf(attachments: Attachment[]): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const attachment of attachments) {
+    const cid = attachment.contentId?.trim().toLowerCase();
+    if (cid) map[cid] = attachment.mimeType;
+  }
+  return map;
+}
+
+function SummaryPanel(props: { remoteId: string; accountId: string }): ReactNode {
+  const [opened, setOpened] = useState(false);
+  const summary = useApiOutcome<MessageSummary>({
+    deps: [props.remoteId, opened],
+    enabled: opened,
+    load: () =>
+      apiCall<MessageSummary>({
+        method: "GET",
+        path: "/api/messages/" + encodeURIComponent(props.remoteId) + "/summary",
+        query: { accountId: props.accountId },
+      }),
+    translate: {
+      errorTitle: t.reader.summary,
+      unavailableCodes: COMMON_UNAVAILABLE,
+      describeCode: describeHttpFailure,
+    },
+  });
+
+
+  return (
+    <div style={{ marginTop: "var(--sp-md)" }}>
+      <button className="btn" onClick={() => setOpened((v) => !v)} aria-expanded={opened}>
+        {t.reader.summary}
+      </button>
+      {opened ? (
+        <div style={{ marginTop: "var(--sp-sm)" }}>
+          <AsyncSurface
+            outcome={summary.outcome}
+            onRetry={summary.refresh}
+            empty={{ title: t.reader.summaryTitle, detail: "" }}
+            loadingLabel={t.six.loading}
+            compact
+          >
+            {(value) => (
+              <div>
+                <p style={{ margin: "0 0 var(--sp-sm)" }}>{value.summary}</p>
+                {value.actionItems.length > 0 ? (
+                  <>
+                    <div className="surface-detail">{t.reader.summaryActions}</div>
+                    <ul style={{ margin: "var(--sp-xs) 0 0", paddingLeft: "1.2em" }}>
+                      {value.actionItems.map((item, index) => (
+                        <li key={String(index)}>{item}</li>
+                      ))}
+                    </ul>
+                  </>
+                ) : null}
+              </div>
+            )}
+          </AsyncSurface>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export interface ReaderPanelProps {
+  remoteId: string | null;
+  account: ConnectedAccount;
+  aiStatus?: AiStatus;
+  writes: WriteBridge;
+  onPurge: (remoteId: string) => void;
+  onOpenHistory: () => void;
+  onClose: () => void;
+}
+
+export function ReaderPanel(props: ReaderPanelProps): ReactNode {
+  const { remoteId, account } = props;
+  const [images, setImages] = useState<Record<string, string>>({});
+  const [imagesFailed, setImagesFailed] = useState(0);
+  const [imagesLoading, setImagesLoading] = useState(false);
+
+  const body = useApiOutcome<MessageBody>({
+    deps: [remoteId, account.id],
+    enabled: remoteId !== null,
+    load: () =>
+      apiCall<MessageBody>({
+        method: "GET",
+        path: "/api/messages/" + encodeURIComponent(remoteId ?? "") + "/body",
+        query: { accountId: account.id },
+      }),
+    translate: {
+      errorTitle: t.reader.loadFailed,
+      describeCode: describeHttpFailure,
+      unavailableCodes: {
+        ...COMMON_UNAVAILABLE,
+        "provider-auth-failed": {
+          reason: "capability",
+          title: "邮箱授权过期了",
+          detail: "服务端返回 401 provider-auth-failed：需要重新连接这个邮箱。",
+        },
+        "message-gone": {
+          reason: "capability",
+          title: t.reader.gone,
+          detail: "410 是确定的结论：重试不会把它找回来。",
+        },
+      },
+    },
+  });
+
+  const bodyData = body.outcome.phase === "ready" ? body.outcome.data : undefined;
+
+  // Images are a separate, fire-and-forget request: the text must never wait on
+  // them, and a partial failure must not blank the message.
+  useEffect(() => {
+    setImages({});
+    setImagesFailed(0);
+    const data = bodyData;
+    if (!data) return;
+    const wanted = data.attachments.filter(isInlineImage);
+    if (wanted.length === 0) return;
+    let cancelled = false;
+    setImagesLoading(true);
+    void (async () => {
+      const result = await apiCall<InlineImagesResponse>({
+        method: "GET",
+        path: "/api/messages/" + encodeURIComponent(data.remoteId) + "/inline-images",
+        query: { accountId: account.id },
+      });
+      if (cancelled) return;
+      if (result.kind === "ok") {
+        setImages(result.data.images);
+        const missing = wanted.filter((attachment) => {
+          const cid = attachment.contentId?.trim().toLowerCase();
+          return !cid || !(cid in result.data.images);
+        }).length;
+        setImagesFailed(missing);
+      } else {
+        setImagesFailed(wanted.length);
+      }
+      setImagesLoading(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [bodyData, account.id]);
+
+  if (remoteId === null) {
+    return (
+      <div className="pane">
+        <div className="pane-body">
+          <div className="surface" role="status">
+            <div className="surface-title">{t.reader.emptyTitle}</div>
+            <div className="surface-detail">{t.reader.emptyDetail}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const mimeByCid = bodyData ? mimeMapOf(bodyData.attachments) : {};
+
+  return (
+    <div className="pane">
+      <div className="pane-head">
+        <span className="surface-title">{t.reader.title}</span>
+        <span className="badge">{account.email}</span>
+        {props.aiStatus && !props.aiStatus.configured ? <span className="badge">{t.reader.aiNotConfigured}</span> : null}
+        <span className="spacer" />
+        <button className="btn" onClick={props.onClose}>
+          {t.six.dismiss}
+        </button>
+      </div>
+      <div className="pane-body">
+        <div className="reader">
+          {bodyData ? (
+            <div className="reader-head">
+              <h2 className="reader-subject">{bodyData.subject ?? "(无主题)"}</h2>
+              <div className="reader-meta">
+                <span>
+                  {t.reader.from}: {bodyData.fromName ? bodyData.fromName + " <" + bodyData.fromAddress + ">" : bodyData.fromAddress}
+                </span>
+                <span>
+                  {t.reader.to}: {bodyData.to.join(", ") || bodyData.toAddress || "—"}
+                </span>
+                {bodyData.cc.length > 0 ? <span>{t.reader.cc}: {bodyData.cc.join(", ")}</span> : null}
+                {bodyData.attachments.filter((a) => a.disposition !== "inline").length > 0 ? (
+                  <span>{t.reader.attachments(bodyData.attachments.filter((a) => a.disposition !== "inline").length)}</span>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+
+          <ReaderActionBar
+            remoteId={remoteId}
+            account={account}
+            writes={props.writes}
+            onPurge={() => props.onPurge(remoteId)}
+            onOpenHistory={props.onOpenHistory}
+            imagesLoading={imagesLoading}
+            imagesFailed={imagesFailed}
+          />
+
+          <div className="reader-body">
+            <div className="reader-body-inner">
+              <AsyncSurface
+                outcome={body.outcome}
+                onRetry={body.refresh}
+                empty={{ title: t.reader.loadFailed, detail: "" }}
+                loadingLabel={t.reader.loading}
+              >
+                {(data) => (
+                  <>
+                    <p className="surface-detail" style={{ marginTop: 0 }}>
+                      {data.html ? t.reader.htmlNote : t.reader.plainFallback}
+                    </p>
+                    {data.html ? (
+                      <HtmlFrame
+                        html={data.html}
+                        images={images}
+                        mimeByCid={mimeByCid}
+                        title={t.reader.htmlNote}
+                      />
+                    ) : (
+                      <div className="plain-body">{data.text}</div>
+                    )}
+                    {data.hasMore ? <Banner tone="info" title={t.six.partial} detail="hasMore=true：正文被截断（服务端分页）。" /> : null}
+                    {data.attachments.filter((a) => a.disposition !== "inline").length > 0 ? (
+                      <div className="attach-list">
+                        {data.attachments
+                          .filter((a) => a.disposition !== "inline")
+                          .map((a) => (
+                            <span className="chip" key={a.id}>
+                              📎 {a.filename ?? a.id} · {a.mimeType}
+                            </span>
+                          ))}
+                      </div>
+                    ) : null}
+                    <SummaryPanel remoteId={data.remoteId} accountId={account.id} />
+                    <div style={{ marginTop: "var(--sp-md)", display: "flex", gap: "var(--sp-xs)", flexWrap: "wrap" }}>
+                      <span className="surface-detail">{t.reader.capabilities}</span>
+                      <TriBadge label="archive" gate={account.capabilities.archiveFolder} />
+                      <TriBadge label="delete" gate={account.capabilities.trashFolder} />
+                      <TriBadge label="purge" gate={account.capabilities.uidplus} />
+                      <TriBadge label="sent" gate={account.capabilities.sentFolder} />
+                    </div>
+                  </>
+                )}
+              </AsyncSurface>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+/**
+ * The reader's action bar.
+ *
+ * v3 keeps it *inside* the reading pane rather than in the window toolbar, and
+ * says why: toolbar items that appear/disappear when a detail is pushed tripped
+ * an AppKit crash (MessageDetailView.swift:335-344). The Web has no such crash,
+ * but it keeps the placement because it is also the better UX: the verbs sit
+ * next to the message they act on.
+ *
+ * Capability rule: a settled false disables the button *and* explains itself in
+ * the title; nil (not probed) leaves it enabled and lets the server's 409 be the
+ * authority (MailCapabilities.swift:121-156).
+ */
+function ReaderActionBar(props: {
+  remoteId: string;
+  account: ConnectedAccount;
+  writes: WriteBridge;
+  onPurge: () => void;
+  onOpenHistory: () => void;
+  imagesLoading: boolean;
+  imagesFailed: number;
+}): ReactNode {
+  const { account, writes, remoteId } = props;
+  const archived = account.capabilities.archiveFolder;
+  const trash = account.capabilities.trashFolder;
+  void archived;
+  void trash;
+  const busy = writes.busy;
+
+  return (
+    <div className="reader-toolbar">
+      <button
+        className="btn"
+        disabled={busy}
+        title={t.m2.actions.pin}
+        onClick={() => writes.row("pin", remoteId)}
+      >
+        ⌖ {t.m2.actions.pin}
+      </button>
+      <button
+        className="btn"
+        disabled={busy}
+        title={t.m2.actions.markRead}
+        onClick={() => writes.row("markRead", remoteId)}
+      >
+        ◉ {t.m2.actions.markRead}
+      </button>
+      <span className="toolbar-divider" aria-hidden="true" />
+      <button
+        className="btn"
+        disabled={busy || !writes.canArchive}
+        title={writes.canArchive ? t.m2.actions.archive : writes.archiveHint}
+        onClick={() => writes.row("archive", remoteId)}
+      >
+        ⤓ {t.m2.actions.archive}
+      </button>
+      <button
+        className="btn"
+        disabled={busy || !writes.canDelete}
+        title={writes.canDelete ? t.m2.actions.delete : writes.deleteHint}
+        onClick={() => writes.row("delete", remoteId)}
+      >
+        ⌫ {t.m2.actions.delete}
+      </button>
+      <button
+        className="btn danger"
+        disabled={busy || !writes.canPurge}
+        title={writes.canPurge ? t.m2.actions.purge : writes.purgeHint}
+        onClick={props.onPurge}
+      >
+        ⨯ {t.m2.actions.purge}
+      </button>
+      <span className="spacer" />
+      {props.imagesLoading ? <span className="chip">{t.reader.inlineLoading}</span> : null}
+      {props.imagesFailed > 0 ? (
+        <span className="chip warn">{t.reader.inlinePartial(props.imagesFailed)}</span>
+      ) : null}
+      <button className="btn" onClick={props.onOpenHistory} title={t.m2.actions.history}>
+        {t.m2.actions.history}
+      </button>
+    </div>
+  );
+}

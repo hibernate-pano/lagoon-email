@@ -1,0 +1,198 @@
+{
+ "source": "v3.2.0 LagoonServerCLI, fresh store, captured 2026-10-29",
+ "objects": [
+  {
+   "type": "index",
+   "name": "advice_queue_idx",
+   "table": "advice",
+   "sql": "CREATE INDEX advice_queue_idx\n        ON advice (account_id, decision, created_at DESC)"
+  },
+  {
+   "type": "index",
+   "name": "ai_actions_account_created_idx",
+   "table": "ai_actions",
+   "sql": "CREATE INDEX ai_actions_account_created_idx\n        ON ai_actions(account_id, created_at DESC)"
+  },
+  {
+   "type": "index",
+   "name": "ai_actions_send_request_idx",
+   "table": "ai_actions",
+   "sql": "CREATE UNIQUE INDEX ai_actions_send_request_idx\n        ON ai_actions (account_id, json_extract(payload, '$.requestId'))\n        WHERE kind = 'send' AND json_extract(payload, '$.requestId') IS NOT NULL"
+  },
+  {
+   "type": "index",
+   "name": "ai_actions_undo_of_idx",
+   "table": "ai_actions",
+   "sql": "CREATE INDEX ai_actions_undo_of_idx\n        ON ai_actions (account_id, json_extract(payload, '$.undoOf'))\n        WHERE kind = 'undo'"
+  },
+  {
+   "type": "index",
+   "name": "ai_overrides_account_scope_idx",
+   "table": "ai_overrides",
+   "sql": "CREATE INDEX ai_overrides_account_scope_idx\n        ON ai_overrides (account_id, scope, from_address, created_at, to_group)"
+  },
+  {
+   "type": "index",
+   "name": "ai_overrides_remote_id_idx",
+   "table": "ai_overrides",
+   "sql": "CREATE INDEX ai_overrides_remote_id_idx ON ai_overrides(remote_id)"
+  },
+  {
+   "type": "index",
+   "name": "draft_replies_remote_id_idx",
+   "table": "draft_replies",
+   "sql": "CREATE INDEX draft_replies_remote_id_idx\n        ON draft_replies(remote_id, created_at DESC)"
+  },
+  {
+   "type": "index",
+   "name": "message_headers_account_deleted_idx",
+   "table": "message_headers",
+   "sql": "CREATE INDEX message_headers_account_deleted_idx\n        ON message_headers (account_id, received_at DESC) WHERE is_deleted = FALSE"
+  },
+  {
+   "type": "index",
+   "name": "message_headers_account_received_idx",
+   "table": "message_headers",
+   "sql": "CREATE INDEX message_headers_account_received_idx\n        ON message_headers (account_id, received_at DESC)"
+  },
+  {
+   "type": "index",
+   "name": "message_headers_account_sender_idx",
+   "table": "message_headers",
+   "sql": "CREATE INDEX message_headers_account_sender_idx\n        ON message_headers (account_id, from_address, received_at DESC)\n        WHERE is_deleted = FALSE"
+  },
+  {
+   "type": "index",
+   "name": "message_headers_account_sent_idx",
+   "table": "message_headers",
+   "sql": "CREATE INDEX message_headers_account_sent_idx\n        ON message_headers (account_id, received_at DESC) WHERE is_sent = TRUE"
+  },
+  {
+   "type": "index",
+   "name": "message_headers_list_unsubscribe_idx",
+   "table": "message_headers",
+   "sql": "CREATE INDEX message_headers_list_unsubscribe_idx\n        ON message_headers (account_id) WHERE list_unsubscribe = TRUE"
+  },
+  {
+   "type": "index",
+   "name": "message_headers_unread_idx",
+   "table": "message_headers",
+   "sql": "CREATE INDEX message_headers_unread_idx\n        ON message_headers (account_id)\n        WHERE is_deleted = FALSE AND is_archived = FALSE AND is_read = FALSE"
+  },
+  {
+   "type": "index",
+   "name": "reminders_pending_idx",
+   "table": "reminders",
+   "sql": "CREATE INDEX reminders_pending_idx\n        ON reminders (account_id, dismissed_at, due_at)"
+  },
+  {
+   "type": "index",
+   "name": "stack_rules_account_idx",
+   "table": "stack_rules",
+   "sql": "CREATE INDEX stack_rules_account_idx ON stack_rules (account_id)"
+  },
+  {
+   "type": "index",
+   "name": "usage_log_year_month_idx",
+   "table": "usage_log",
+   "sql": "CREATE INDEX usage_log_year_month_idx ON usage_log(year_month)"
+  },
+  {
+   "type": "table",
+   "name": "accounts",
+   "table": "accounts",
+   "sql": "CREATE TABLE accounts (\n        id              BLOB PRIMARY KEY,\n        -- 'gmail' stays in the whitelist on purpose: rewriting a CHECK means\n        -- rebuilding this table (7 foreign keys reference it), which buys\n        -- nothing — the QQ-only app never writes the value, and a future\n        -- provider re-adds it without a migration.\n        provider        TEXT NOT NULL CHECK (provider IN ('gmail','qq')),\n        oauth_user      TEXT NOT NULL,\n        email           TEXT NOT NULL,\n        credentials     BLOB,\n        sync_state      TEXT NOT NULL DEFAULT '{}',\n        capabilities    TEXT NOT NULL DEFAULT '{}',\n        is_active       INTEGER NOT NULL DEFAULT 0,\n        sync_status     TEXT NOT NULL DEFAULT 'ok',\n        last_sync_at    TEXT,\n        last_sync_error TEXT,\n        created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),\n        updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),\n        UNIQUE (provider, oauth_user)\n    )"
+  },
+  {
+   "type": "table",
+   "name": "advice",
+   "table": "advice",
+   "sql": "CREATE TABLE advice (\n        id         INTEGER PRIMARY KEY AUTOINCREMENT,\n        account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,\n        remote_id  TEXT NOT NULL,\n        action     TEXT NOT NULL,\n        category   TEXT,\n        confidence TEXT NOT NULL DEFAULT 'medium',\n        rationale  TEXT,\n        due_text   TEXT,\n        source     TEXT NOT NULL DEFAULT 'heuristic',\n        model      TEXT,\n        decision   TEXT NOT NULL DEFAULT 'pending',\n        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),\n        decided_at TEXT,\n        UNIQUE (account_id, remote_id),\n        FOREIGN KEY (account_id, remote_id)\n            REFERENCES message_headers(account_id, remote_id)\n            ON DELETE CASCADE\n    )"
+  },
+  {
+   "type": "table",
+   "name": "ai_actions",
+   "table": "ai_actions",
+   "sql": "CREATE TABLE ai_actions (\n        id         INTEGER PRIMARY KEY AUTOINCREMENT,\n        account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,\n        kind       TEXT NOT NULL,\n        payload    TEXT NOT NULL DEFAULT '{}',\n        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),\n        expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now','+30 days'))\n    )"
+  },
+  {
+   "type": "table",
+   "name": "ai_overrides",
+   "table": "ai_overrides",
+   "sql": "CREATE TABLE ai_overrides (\n        id         INTEGER PRIMARY KEY AUTOINCREMENT,\n        account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,\n        remote_id  TEXT NOT NULL,\n        from_group TEXT NOT NULL,\n        to_group   TEXT NOT NULL,\n        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))\n    , scope TEXT NOT NULL DEFAULT 'sender', from_address TEXT)"
+  },
+  {
+   "type": "table",
+   "name": "draft_replies",
+   "table": "draft_replies",
+   "sql": "CREATE TABLE draft_replies (\n        id             INTEGER PRIMARY KEY AUTOINCREMENT,\n        account_id     BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,\n        remote_id      TEXT NOT NULL,\n        variants       TEXT NOT NULL,\n        chosen_variant INTEGER,\n        created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))\n    )"
+  },
+  {
+   "type": "table",
+   "name": "grdb_migrations",
+   "table": "grdb_migrations",
+   "sql": "CREATE TABLE grdb_migrations (identifier TEXT NOT NULL PRIMARY KEY)"
+  },
+  {
+   "type": "table",
+   "name": "message_bodies",
+   "table": "message_bodies",
+   "sql": "CREATE TABLE message_bodies (\n        account_id    BLOB NOT NULL,\n        remote_id     TEXT NOT NULL,\n        body_cipher     TEXT NOT NULL DEFAULT '',\n        body_html_cipher     TEXT,\n        has_more      INTEGER NOT NULL DEFAULT FALSE,\n        attachments   TEXT NOT NULL DEFAULT '[]',\n        to_addresses  TEXT NOT NULL DEFAULT '[]',\n        cc_addresses  TEXT NOT NULL DEFAULT '[]',\n        fetched_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),\n        PRIMARY KEY (account_id, remote_id),\n        FOREIGN KEY (account_id, remote_id)\n            REFERENCES message_headers(account_id, remote_id)\n            ON DELETE CASCADE\n    )"
+  },
+  {
+   "type": "table",
+   "name": "message_headers",
+   "table": "message_headers",
+   "sql": "CREATE TABLE message_headers (\n        id                 BLOB PRIMARY KEY,\n        account_id         BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,\n        remote_id          TEXT NOT NULL,\n        thread_id          TEXT NOT NULL,\n        from_address       TEXT NOT NULL,\n        from_name          TEXT,\n        subject            TEXT,\n        snippet_cipher            TEXT,\n        received_at        TEXT NOT NULL,\n        is_read            INTEGER NOT NULL DEFAULT FALSE,\n        is_archived        INTEGER NOT NULL DEFAULT FALSE,\n        fetched_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),\n        list_unsubscribe   INTEGER NOT NULL DEFAULT FALSE,\n        message_id_header  TEXT,\n        in_reply_to        TEXT,\n        references_header  TEXT,\n        unsubscribe_links  TEXT NOT NULL DEFAULT '[]',\n        is_deleted         INTEGER NOT NULL DEFAULT FALSE, is_sent INTEGER NOT NULL DEFAULT FALSE,\n        UNIQUE (account_id, remote_id)\n    )"
+  },
+  {
+   "type": "table",
+   "name": "message_pins",
+   "table": "message_pins",
+   "sql": "CREATE TABLE message_pins (\n        account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,\n        remote_id  TEXT NOT NULL,\n        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),\n        PRIMARY KEY (account_id, remote_id)\n    )"
+  },
+  {
+   "type": "table",
+   "name": "reminders",
+   "table": "reminders",
+   "sql": "CREATE TABLE reminders (\n        id           INTEGER PRIMARY KEY AUTOINCREMENT,\n        account_id   BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,\n        remote_id    TEXT NOT NULL,\n        due_at       TEXT NOT NULL,\n        note         TEXT,\n        created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),\n        dismissed_at TEXT,\n        UNIQUE (account_id, remote_id),\n        FOREIGN KEY (account_id, remote_id)\n            REFERENCES message_headers(account_id, remote_id)\n            ON DELETE CASCADE\n    )"
+  },
+  {
+   "type": "table",
+   "name": "sqlite_sequence",
+   "table": "sqlite_sequence",
+   "sql": "CREATE TABLE sqlite_sequence(name,seq)"
+  },
+  {
+   "type": "table",
+   "name": "stack_rules",
+   "table": "stack_rules",
+   "sql": "CREATE TABLE stack_rules (\n        id         BLOB PRIMARY KEY,\n        account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,\n        name       TEXT NOT NULL,\n        kind       TEXT NOT NULL CHECK (kind IN ('sender', 'keyword')),\n        value      TEXT NOT NULL,\n        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))\n    )"
+  },
+  {
+   "type": "table",
+   "name": "store_notices",
+   "table": "store_notices",
+   "sql": "CREATE TABLE store_notices (\n        id         TEXT PRIMARY KEY,\n        detail     TEXT,\n        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))\n    )"
+  },
+  {
+   "type": "table",
+   "name": "usage_log",
+   "table": "usage_log",
+   "sql": "CREATE TABLE usage_log (\n        id                INTEGER PRIMARY KEY AUTOINCREMENT,\n        year_month        TEXT NOT NULL,\n        account_email     TEXT NOT NULL,\n        capability        TEXT NOT NULL,\n        model             TEXT NOT NULL,\n        prompt_tokens     INTEGER NOT NULL,\n        completion_tokens INTEGER NOT NULL,\n        cost_micro_usd    INTEGER NOT NULL,\n        created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))\n    )"
+  }
+ ],
+ "migrations": [
+  "lagoon-v1",
+  "lagoon-v2",
+  "lagoon-v3",
+  "lagoon-v4",
+  "lagoon-v5",
+  "lagoon-v5b",
+  "lagoon-v6",
+  "lagoon-v7",
+  "lagoon-v8",
+  "lagoon-v9",
+  "lagoon-v10"
+ ]
+}

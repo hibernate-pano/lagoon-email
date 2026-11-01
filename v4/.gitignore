@@ -1,0 +1,15 @@
+# v4 本地构建产物（产品代码入库，产物不入库）
+# dev-only keys (0600, never committed)
+.dev/
+
+# build output
+node_modules/
+target/
+dist/
+release/
+build/
+*.log
+.DS_Store
+spike/**/node_modules/
+spike/**/target/
+spike/**/dist/

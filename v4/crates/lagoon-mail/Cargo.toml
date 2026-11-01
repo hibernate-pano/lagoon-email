@@ -1,0 +1,22 @@
+[package]
+name = "lagoon-mail"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Lagoon v4 mail protocol layer (R3.1): injectable transport, IMAP, SMTP, MIME/charset decoding, capability negotiation and the read-only sync seam"
+
+[dependencies]
+# v3's MIMEParser hand-rolled base64/RFC2047; the Rust port keeps the same
+# tolerant behaviour and uses the standard engine for the primitive.
+base64 = "0.22"
+# The GBK / GB18030 / Shift-JIS branch of MIMEParser.decodeCharset (v3 used
+# CoreFoundation's IANA table; encoding_rs is the Rust equivalent).
+encoding_rs = "0.8"
+# Implicit TLS only (993/465), full certificate verification. ring is the
+# crypto provider: it builds offline on this host and the reference version is
+# pinned below.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Platform trust store (macOS Security.framework; Linux/Windows equivalents).
+# v3 relied on NIOSSL's default trust roots; the Rust port asks the OS, so a
+# self-signed / incomplete chain is rejected unless the OS trusts it.
+rustls-platform-verifier = "0.7"

@@ -1,0 +1,26 @@
+{
+  "name": "lagoon-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Lagoon v4 web frontend (M1 read-only). See v4/docs/ipc-contract.md",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.9.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.0"
+  }
+}

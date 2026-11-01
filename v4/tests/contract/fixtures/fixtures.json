@@ -1,0 +1,1990 @@
+{
+  "fixtures": [
+    {
+      "name": "healthz",
+      "note": "Ungated health probe; plain text, no JSON envelope.",
+      "request": {
+        "auth": "none",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/healthz",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": "ok",
+        "body_kind": "text",
+        "content_type": "text/plain; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "accounts.list",
+      "note": "ConnectedAccount[]; capabilities echo the negotiated store.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/accounts",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": [
+          {
+            "capabilities": {
+              "archiveFolder": false,
+              "idle": false,
+              "move": false,
+              "sentFolder": false,
+              "serverSnippet": false,
+              "trashFolder": false,
+              "uidplus": false
+            },
+            "email": "contract-fixture-b@example.invalid",
+            "id": "33333333-3333-4333-8333-333333333333",
+            "isActive": false,
+            "provider": "qq",
+            "syncHealth": {
+              "status": "ok"
+            },
+            "unreadCount": 1
+          },
+          {
+            "capabilities": {
+              "archiveFolder": false,
+              "idle": false,
+              "move": false,
+              "sentFolder": false,
+              "serverSnippet": false,
+              "trashFolder": false,
+              "uidplus": false
+            },
+            "email": "contract-fixture-c@example.invalid",
+            "id": "66666666-6666-4666-8666-666666666666",
+            "isActive": false,
+            "provider": "qq",
+            "syncHealth": {
+              "status": "ok"
+            },
+            "unreadCount": 0
+          },
+          {
+            "capabilities": {
+              "archiveFolder": false,
+              "idle": false,
+              "move": false,
+              "sentFolder": false,
+              "serverSnippet": false,
+              "trashFolder": false,
+              "uidplus": false
+            },
+            "email": "contract-fixture@example.invalid",
+            "id": "11111111-1111-4111-8111-111111111111",
+            "isActive": true,
+            "provider": "qq",
+            "syncHealth": {
+              "status": "ok"
+            },
+            "unreadCount": 1
+          }
+        ],
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "auth.missing-token",
+      "note": "APIAuthMiddleware is fail-closed: no bearer, no route.",
+      "request": {
+        "auth": "none",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/accounts",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "api-unauthorized"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 401
+      }
+    },
+    {
+      "name": "auth.bad-token",
+      "note": "A wrong bearer is the same 401 as a missing one.",
+      "request": {
+        "auth": "bad-token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/accounts",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "api-unauthorized"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 401
+      }
+    },
+    {
+      "name": "host.forbidden",
+      "note": "Loopback Host guard (DNS-rebinding defence) answers 403.",
+      "request": {
+        "auth": "token",
+        "headers": {
+          "Host": "evil.example"
+        },
+        "json": null,
+        "method": "GET",
+        "path": "/api/accounts",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "forbidden-host"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 403
+      }
+    },
+    {
+      "name": "messages.list",
+      "note": "Default inbox lens: archived=false, deleted=false.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "cursor": {
+            "accountId": "11111111-1111-4111-8111-111111111111",
+            "lastFetchedAt": "<timestamp>",
+            "totalUnread": 1
+          },
+          "messages": [
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222223",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": false,
+              "isSent": false,
+              "messageIdHeader": "<fixture-3@example.invalid>",
+              "receivedAt": "2025-01-03T09:00:00Z",
+              "remoteId": "fixture-msg-3",
+              "subject": "Contract fixture three (unread)",
+              "threadId": "fixture-thread-3"
+            },
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222221",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": true,
+              "isSent": false,
+              "messageIdHeader": "<fixture-1@example.invalid>",
+              "receivedAt": "2025-01-01T09:00:00Z",
+              "remoteId": "fixture-msg-1",
+              "subject": "Contract fixture one",
+              "threadId": "fixture-thread-1"
+            }
+          ],
+          "totalCount": 2
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "messages.list.limit",
+      "note": "limit is a ceiling; totalCount ignores it.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111",
+          "limit": "1"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "cursor": {
+            "accountId": "11111111-1111-4111-8111-111111111111",
+            "lastFetchedAt": "<timestamp>",
+            "totalUnread": 1
+          },
+          "messages": [
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222223",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": false,
+              "isSent": false,
+              "messageIdHeader": "<fixture-3@example.invalid>",
+              "receivedAt": "2025-01-03T09:00:00Z",
+              "remoteId": "fixture-msg-3",
+              "subject": "Contract fixture three (unread)",
+              "threadId": "fixture-thread-3"
+            }
+          ],
+          "totalCount": 2
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "messages.list.archived",
+      "note": "档案柜 lens.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111",
+          "archived": "true"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "cursor": {
+            "accountId": "11111111-1111-4111-8111-111111111111",
+            "lastFetchedAt": "<timestamp>",
+            "totalUnread": 1
+          },
+          "messages": [
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222222",
+              "inReplyTo": "<fixture-1@example.invalid>",
+              "isArchived": true,
+              "isDeleted": false,
+              "isPinned": true,
+              "isRead": true,
+              "isSent": false,
+              "messageIdHeader": "<fixture-2@example.invalid>",
+              "receivedAt": "2025-01-02T09:00:00Z",
+              "references": "<fixture-1@example.invalid>",
+              "remoteId": "fixture-msg-2",
+              "subject": "Contract fixture two (archived, pinned)",
+              "threadId": "fixture-thread-2"
+            }
+          ],
+          "totalCount": 1
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "messages.list.pinned",
+      "note": "置顶 lens (a lens of its own).",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111",
+          "pinned": "true"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "cursor": {
+            "accountId": "11111111-1111-4111-8111-111111111111",
+            "lastFetchedAt": "<timestamp>",
+            "totalUnread": 1
+          },
+          "messages": [
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222222",
+              "inReplyTo": "<fixture-1@example.invalid>",
+              "isArchived": true,
+              "isDeleted": false,
+              "isPinned": true,
+              "isRead": true,
+              "isSent": false,
+              "messageIdHeader": "<fixture-2@example.invalid>",
+              "receivedAt": "2025-01-02T09:00:00Z",
+              "references": "<fixture-1@example.invalid>",
+              "remoteId": "fixture-msg-2",
+              "subject": "Contract fixture two (archived, pinned)",
+              "threadId": "fixture-thread-2"
+            }
+          ],
+          "totalCount": 1
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "messages.list.unread",
+      "note": "未读 lens.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111",
+          "unread": "true"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "cursor": {
+            "accountId": "11111111-1111-4111-8111-111111111111",
+            "lastFetchedAt": "<timestamp>",
+            "totalUnread": 1
+          },
+          "messages": [
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222223",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": false,
+              "isSent": false,
+              "messageIdHeader": "<fixture-3@example.invalid>",
+              "receivedAt": "2025-01-03T09:00:00Z",
+              "remoteId": "fixture-msg-3",
+              "subject": "Contract fixture three (unread)",
+              "threadId": "fixture-thread-3"
+            }
+          ],
+          "totalCount": 1
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "messages.list.sender",
+      "note": "发件人归集 lens (exact from_address).",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111",
+          "sender": "alice.fixture@example.invalid"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "cursor": {
+            "accountId": "11111111-1111-4111-8111-111111111111",
+            "lastFetchedAt": "<timestamp>",
+            "totalUnread": 1
+          },
+          "messages": [
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222223",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": false,
+              "isSent": false,
+              "messageIdHeader": "<fixture-3@example.invalid>",
+              "receivedAt": "2025-01-03T09:00:00Z",
+              "remoteId": "fixture-msg-3",
+              "subject": "Contract fixture three (unread)",
+              "threadId": "fixture-thread-3"
+            },
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222221",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": true,
+              "isSent": false,
+              "messageIdHeader": "<fixture-1@example.invalid>",
+              "receivedAt": "2025-01-01T09:00:00Z",
+              "remoteId": "fixture-msg-1",
+              "subject": "Contract fixture one",
+              "threadId": "fixture-thread-1"
+            }
+          ],
+          "totalCount": 2
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "messages.list.malformed-account",
+      "note": "accountId must parse as a UUID.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages",
+        "query": {
+          "accountId": "not-a-uuid"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "malformed-accountId"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 400
+      }
+    },
+    {
+      "name": "messages.list.missing-account",
+      "note": "accountId is required.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "malformed-accountId"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 400
+      }
+    },
+    {
+      "name": "messages.list.b",
+      "note": "The populated account: two headers, newest first.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "cursor": {
+            "accountId": "33333333-3333-4333-8333-333333333333",
+            "lastFetchedAt": "<timestamp>",
+            "totalUnread": 1
+          },
+          "messages": [
+            {
+              "accountId": "33333333-3333-4333-8333-333333333333",
+              "fromAddress": "bob.fixture@example.invalid",
+              "fromName": "Bob Fixture",
+              "id": "44444444-4444-4444-8444-444444444442",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": false,
+              "isSent": false,
+              "messageIdHeader": "<fixture-b-2@example.invalid>",
+              "receivedAt": "2025-02-02T09:00:00Z",
+              "remoteId": "fixture-b-msg-2",
+              "subject": "Second fixture for advice",
+              "threadId": "fixture-b-thread-2"
+            },
+            {
+              "accountId": "33333333-3333-4333-8333-333333333333",
+              "fromAddress": "bob.fixture@example.invalid",
+              "fromName": "Bob Fixture",
+              "id": "44444444-4444-4444-8444-444444444441",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": true,
+              "isSent": false,
+              "messageIdHeader": "<fixture-b-1@example.invalid>",
+              "receivedAt": "2025-02-01T09:00:00Z",
+              "remoteId": "fixture-b-msg-1",
+              "subject": "Body match fixture (sealed)",
+              "threadId": "fixture-b-thread-1"
+            }
+          ],
+          "totalCount": 2
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "folder-counts",
+      "note": "Sidebar tallies: live/unread/archived/pinned/deleted/sent.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/folder-counts",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "counts": [
+            {
+              "count": 2,
+              "id": "live"
+            },
+            {
+              "count": 1,
+              "id": "unread"
+            },
+            {
+              "count": 1,
+              "id": "archived"
+            },
+            {
+              "count": 1,
+              "id": "pinned"
+            },
+            {
+              "count": 0,
+              "id": "deleted"
+            },
+            {
+              "count": 0,
+              "id": "sent"
+            }
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "senders",
+      "note": "Sender ranking over the local store.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/senders",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "senders": [
+            {
+              "address": "alice.fixture@example.invalid",
+              "displayName": "Alice Fixture",
+              "latestAt": "2025-01-03T09:00:00Z",
+              "totalCount": 3,
+              "unreadCount": 1
+            }
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "senders.data",
+      "note": "One sender, two messages, one unread.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/senders",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "senders": [
+            {
+              "address": "bob.fixture@example.invalid",
+              "displayName": "Bob Fixture",
+              "latestAt": "2025-02-02T09:00:00Z",
+              "totalCount": 2,
+              "unreadCount": 1
+            }
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "export.index",
+      "note": "Export index: every header, oldest first, no limit.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/export/index",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "deletedCount": 0,
+          "messages": [
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222221",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": true,
+              "isSent": false,
+              "messageIdHeader": "<fixture-1@example.invalid>",
+              "receivedAt": "2025-01-01T09:00:00Z",
+              "remoteId": "fixture-msg-1",
+              "subject": "Contract fixture one",
+              "threadId": "fixture-thread-1"
+            },
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222222",
+              "inReplyTo": "<fixture-1@example.invalid>",
+              "isArchived": true,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": true,
+              "isSent": false,
+              "messageIdHeader": "<fixture-2@example.invalid>",
+              "receivedAt": "2025-01-02T09:00:00Z",
+              "references": "<fixture-1@example.invalid>",
+              "remoteId": "fixture-msg-2",
+              "subject": "Contract fixture two (archived, pinned)",
+              "threadId": "fixture-thread-2"
+            },
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222223",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": false,
+              "isSent": false,
+              "messageIdHeader": "<fixture-3@example.invalid>",
+              "receivedAt": "2025-01-03T09:00:00Z",
+              "remoteId": "fixture-msg-3",
+              "subject": "Contract fixture three (unread)",
+              "threadId": "fixture-thread-3"
+            }
+          ],
+          "sentCount": 0,
+          "totalCount": 3
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "advice.list",
+      "note": "Read-only advice queue (account A is deliberately empty).",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/advice",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "advice": []
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "advice.list.data",
+      "note": "The default queue lens: pending suggestions only.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/advice",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "advice": [
+            {
+              "accountId": "33333333-3333-4333-8333-333333333333",
+              "advice": {
+                "action": "archive",
+                "category": "marketing",
+                "confidence": "high",
+                "rationale": "You have not opened this sender in months."
+              },
+              "createdAt": "<timestamp>",
+              "decision": "pending",
+              "id": 1,
+              "model": "contract-fixture-model",
+              "remoteId": "fixture-b-msg-1",
+              "source": "ai"
+            }
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "advice.list.all",
+      "note": "decision=any returns every verdict, newest first.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/advice",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333",
+          "decision": "any"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "advice": [
+            {
+              "accountId": "33333333-3333-4333-8333-333333333333",
+              "advice": {
+                "action": "reply",
+                "category": "work",
+                "confidence": "medium",
+                "dueText": "2025-02-10",
+                "rationale": "A colleague is waiting on you."
+              },
+              "createdAt": "<timestamp>",
+              "decidedAt": "<timestamp>",
+              "decision": "accepted",
+              "id": 2,
+              "remoteId": "fixture-b-msg-2",
+              "source": "heuristic"
+            },
+            {
+              "accountId": "33333333-3333-4333-8333-333333333333",
+              "advice": {
+                "action": "archive",
+                "category": "marketing",
+                "confidence": "high",
+                "rationale": "You have not opened this sender in months."
+              },
+              "createdAt": "<timestamp>",
+              "decision": "pending",
+              "id": 1,
+              "model": "contract-fixture-model",
+              "remoteId": "fixture-b-msg-1",
+              "source": "ai"
+            }
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "advice.accepted-stats",
+      "note": "The read-only learning signal: accepted (category, action) shapes.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/advice/accepted-stats",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "stats": [
+            {
+              "action": "reply",
+              "category": "work",
+              "count": 1
+            }
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "stacks.list",
+      "note": "聚合规则 list (account A is deliberately empty).",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/stacks",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "stacks": []
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "stacks.list.data",
+      "note": "Two rules with their live counts (sender + keyword).",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/stacks",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "stacks": [
+            {
+              "count": 2,
+              "rule": {
+                "accountId": "33333333-3333-4333-8333-333333333333",
+                "createdAt": "<timestamp>",
+                "id": "55555555-5555-4555-8555-555555555551",
+                "kind": "sender",
+                "name": "Sender to archive",
+                "value": "bob.fixture@example.invalid"
+              }
+            },
+            {
+              "count": 2,
+              "rule": {
+                "accountId": "33333333-3333-4333-8333-333333333333",
+                "createdAt": "<timestamp>",
+                "id": "55555555-5555-4555-8555-555555555552",
+                "kind": "keyword",
+                "name": "Subject keyword",
+                "value": "fixture"
+              }
+            }
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "reminders.list",
+      "note": "Reminders (account A is deliberately empty).",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/reminders",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "reminders": []
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "reminders.list.data",
+      "note": "Only the reminder still waiting.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/reminders",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "reminders": [
+            {
+              "accountId": "33333333-3333-4333-8333-333333333333",
+              "createdAt": "<timestamp>",
+              "dueAt": "<timestamp>",
+              "id": 1,
+              "note": "Follow up on the contract",
+              "remoteId": "fixture-b-msg-1",
+              "subject": "Body match fixture (sealed)"
+            }
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "reminders.list.with-dismissed",
+      "note": "includeDismissed=true returns the dismissed row too.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/reminders",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333",
+          "includeDismissed": "true"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "reminders": [
+            {
+              "accountId": "33333333-3333-4333-8333-333333333333",
+              "createdAt": "<timestamp>",
+              "dueAt": "<timestamp>",
+              "id": 1,
+              "note": "Follow up on the contract",
+              "remoteId": "fixture-b-msg-1",
+              "subject": "Body match fixture (sealed)"
+            },
+            {
+              "accountId": "33333333-3333-4333-8333-333333333333",
+              "createdAt": "<timestamp>",
+              "dismissedAt": "2025-02-07T09:00:00Z",
+              "dueAt": "<timestamp>",
+              "id": 2,
+              "remoteId": "fixture-b-msg-2",
+              "subject": "Second fixture for advice"
+            }
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "time-saved",
+      "note": "Derived from ai_actions; zeros for the account with no history.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/time-saved",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "today": {
+            "byDay": [],
+            "draftsSent": 0,
+            "messagesHandled": 0,
+            "minutesSaved": 0,
+            "unsubscribed": 0
+          },
+          "week": {
+            "byDay": [],
+            "draftsSent": 0,
+            "messagesHandled": 0,
+            "minutesSaved": 0,
+            "unsubscribed": 0
+          }
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "time-saved.data",
+      "note": "One sent reply today: minutes/handled/byDay are non-zero.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/time-saved",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "today": {
+            "byDay": [],
+            "draftsSent": 1,
+            "messagesHandled": 1,
+            "minutesSaved": 2,
+            "unsubscribed": 0
+          },
+          "week": {
+            "byDay": [
+              {
+                "date": "<timestamp>",
+                "messagesHandled": 1,
+                "minutesSaved": 2
+              }
+            ],
+            "draftsSent": 1,
+            "messagesHandled": 1,
+            "minutesSaved": 2,
+            "unsubscribed": 0
+          }
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "actions.list.data",
+      "note": "The undo history: a pin and a sent reply, newest first.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/actions",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "actions": [
+            {
+              "accountId": "33333333-3333-4333-8333-333333333333",
+              "createdAt": "<timestamp>",
+              "expiresAt": "<timestamp>",
+              "id": 2,
+              "kind": "pin",
+              "payload": {
+                "remoteId": "fixture-b-msg-1"
+              }
+            },
+            {
+              "accountId": "33333333-3333-4333-8333-333333333333",
+              "createdAt": "<timestamp>",
+              "expiresAt": "<timestamp>",
+              "id": 1,
+              "kind": "send",
+              "payload": {
+                "providerMessageId": "<fixture-b-sent@example.invalid>",
+                "remoteId": "fixture-b-msg-2"
+              }
+            }
+          ],
+          "hasMore": false,
+          "totalCount": 2
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "usage",
+      "note": "Monthly AI spend; zero calls, no cap configured.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/usage",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "accounts": [],
+          "callCount": 0,
+          "capUSD": 0,
+          "costTrackingAvailable": false,
+          "monthUSD": 0
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "ai-status",
+      "note": "Global AI degraded signal: unconfigured in a fresh sidecar.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/ai-status",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "circuitOpen": false,
+          "configured": false,
+          "creditExhausted": false
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "store-notices",
+      "note": "Store notices (empty: the body key was present).",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/store-notices",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "notices": [
+            {
+              "createdAt": "<timestamp>",
+              "detail": "1",
+              "id": "fixture-notice-1"
+            }
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "briefing",
+      "note": "Briefing feed; the seeded mail is older than the 30-day window.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/briefing",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "backlogCount": 1,
+          "items": [
+            {
+              "group": "needsReply",
+              "message": {
+                "accountId": "11111111-1111-4111-8111-111111111111",
+                "fromAddress": "alice.fixture@example.invalid",
+                "fromName": "Alice Fixture",
+                "id": "22222222-2222-4222-8222-222222222223",
+                "isArchived": false,
+                "isDeleted": false,
+                "isPinned": false,
+                "isRead": false,
+                "isSent": false,
+                "messageIdHeader": "<fixture-3@example.invalid>",
+                "receivedAt": "2025-01-03T09:00:00Z",
+                "remoteId": "fixture-msg-3",
+                "subject": "Contract fixture three (unread)",
+                "threadId": "fixture-thread-3"
+              },
+              "reasonCode": "needs-reply"
+            }
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "body.provider-unconfigured",
+      "note": "Body read needs a provider; credentials are unreadable.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages/fixture-msg-1/body",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "provider-not-configured"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 503
+      }
+    },
+    {
+      "name": "body.cached",
+      "note": "A sealed body cache answers 200 without touching the provider.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages/fixture-b-msg-1/body",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "attachments": [],
+          "cc": [],
+          "fromAddress": "bob.fixture@example.invalid",
+          "fromName": "Bob Fixture",
+          "hasMore": false,
+          "html": "<p>Contract fixture body: <b>sealedneedle</b> appears here.</p>",
+          "receivedAt": "2025-02-01T09:00:00Z",
+          "remoteId": "fixture-b-msg-1",
+          "subject": "Body match fixture (sealed)",
+          "text": "Contract fixture body: sealedneedle appears here.",
+          "to": [
+            "contract-fixture-b@example.invalid"
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "summary.provider-unconfigured",
+      "note": "Summary needs a body; the provider is unconfigured.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages/fixture-msg-1/summary",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "provider-not-configured"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 503
+      }
+    },
+    {
+      "name": "draft.generate.provider-unconfigured",
+      "note": "Draft generation needs a body first; the provider is unconfigured.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "POST",
+        "path": "/api/messages/fixture-msg-1/draft",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "provider-not-configured"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 503
+      }
+    },
+    {
+      "name": "drafts.list.data",
+      "note": "One stored draft (variants are sealed at rest).",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages/fixture-b-msg-2/drafts",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "drafts": [
+            {
+              "accountId": "33333333-3333-4333-8333-333333333333",
+              "createdAt": "<timestamp>",
+              "id": 1,
+              "remoteId": "fixture-b-msg-2",
+              "variants": [
+                "Thanks, I will take a look.",
+                "Could you share the thread?",
+                "Let us set up a short call."
+              ]
+            }
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "inline-images.provider-unconfigured",
+      "note": "Inline images parse one message once.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages/fixture-msg-1/inline-images",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "provider-not-configured"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 503
+      }
+    },
+    {
+      "name": "raw-eml.provider-unconfigured",
+      "note": "Original RFC5322 bytes come from the provider.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages/fixture-msg-1/raw.eml",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "provider-not-configured"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 503
+      }
+    },
+    {
+      "name": "sent.stale",
+      "note": "已发送: the local list answers even when the refresh failed.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/sent",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "messages": [],
+          "refreshedFromServer": 0,
+          "staleReason": "not-configured",
+          "totalCount": 0
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "archive.capability-gate",
+      "note": "A settled archiveFolder=false answers 409 before any write.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "POST",
+        "path": "/api/messages/fixture-msg-1/archive",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "archive-unavailable"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 409
+      }
+    },
+    {
+      "name": "unknown-account",
+      "note": "A well-formed but unknown account id is a 404, not a 400.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/folder-counts",
+        "query": {
+          "accountId": "99999999-9999-4999-8999-999999999999"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "unknown-account"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 404
+      }
+    },
+    {
+      "name": "accounts.imap.empty-body",
+      "note": "An empty body cannot be decoded into the request struct: 400 missing-field.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "POST",
+        "path": "/api/accounts/imap",
+        "query": {},
+        "raw_body": ""
+      },
+      "response": {
+        "body": {
+          "error": "missing-field"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 400
+      }
+    },
+    {
+      "name": "accounts.imap.missing-field",
+      "note": "A body without authCode cannot be decoded: 400 missing-field.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": {
+          "email": "contract-fixture-c@example.invalid",
+          "provider": "qq"
+        },
+        "method": "POST",
+        "path": "/api/accounts/imap",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "missing-field"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 400
+      }
+    },
+    {
+      "name": "accounts.imap.unknown-provider",
+      "note": "provider must be a kind this build knows (qq): 400 missing-field.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": {
+          "authCode": "fixture",
+          "email": "contract-fixture-c@example.invalid",
+          "provider": "gmail"
+        },
+        "method": "POST",
+        "path": "/api/accounts/imap",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "missing-field"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 400
+      }
+    },
+    {
+      "name": "accounts.imap.exists",
+      "note": "An email that is already connected and healthy: 409 account-exists, reported BEFORE any probe (no socket).",
+      "pre": "restore-account-c-ok",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": {
+          "authCode": "fixture",
+          "email": "contract-fixture-c@example.invalid",
+          "provider": "qq"
+        },
+        "method": "POST",
+        "path": "/api/accounts/imap",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "account-exists"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 409
+      }
+    },
+    {
+      "name": "unknown-route",
+      "note": "An unrouted path is Hummingbird's bare 404, not the error envelope.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/definitely-not-a-route",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": null,
+        "body_kind": "empty",
+        "content_type": "",
+        "status": 404
+      }
+    },
+    {
+      "name": "unknown-route.v2",
+      "note": "Path spelling that looks like an API route still 404s.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/messages/fixture-msg-1/nope",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": null,
+        "body_kind": "empty",
+        "content_type": "",
+        "status": 404
+      }
+    },
+    {
+      "name": "read.mark-read",
+      "note": "POST /read defaults to isRead=true; answers 204 with no body.",
+      "r2_skip": "write-path: Rust R2 is READ_ONLY; assert with LAGOON_CONTRACT_INCLUDE_WRITE=1",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "POST",
+        "path": "/api/messages/fixture-msg-3/read",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": null,
+        "body_kind": "empty",
+        "content_type": "",
+        "status": 204
+      }
+    },
+    {
+      "name": "read.recorded",
+      "note": "record=true returns the audit row id (actionId).",
+      "r2_skip": "write-path: Rust R2 is READ_ONLY; assert with LAGOON_CONTRACT_INCLUDE_WRITE=1",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "POST",
+        "path": "/api/messages/fixture-msg-3/read",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111",
+          "record": "true"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "actionId": 3,
+          "ok": true,
+          "remoteId": "fixture-msg-3"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "pin.set",
+      "note": "Pin toggles join the undo log; response carries the action id.",
+      "r2_skip": "write-path: Rust R2 is READ_ONLY; assert with LAGOON_CONTRACT_INCLUDE_WRITE=1",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "POST",
+        "path": "/api/messages/fixture-msg-1/pin",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111",
+          "pinned": "true"
+        },
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "actionId": 4,
+          "ok": true,
+          "remoteId": "fixture-msg-1"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "sync.request",
+      "note": "Wake the sync engine: 204, no body, no content-type.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "POST",
+        "path": "/api/sync",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": null,
+        "body_kind": "empty",
+        "content_type": "",
+        "status": 204
+      }
+    },
+    {
+      "contract_expected": true,
+      "defect_evidence": "v3.2.0 answers 500 internal-error for GET /api/search: the pass-B scan queries COALESCE((... a.category ...)) but only JOINs message_bodies, so SQLite raises 'no such column: a.category'. This fixture is NOT captured from v3; it is the contract's 200 SearchResponse shape.",
+      "expected_source": "api-contract.md 4.8 + MessageHeader[] from export.index",
+      "name": "search.contract",
+      "note": "Subject search on the list account: three hits, newest first.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/search",
+        "query": {
+          "accountId": "11111111-1111-4111-8111-111111111111",
+          "q": "fixture"
+        }
+      },
+      "response": {
+        "body": {
+          "bodyScanLimit": 1000,
+          "bodyScanSkipped": 0,
+          "query": "fixture",
+          "results": [
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222223",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": false,
+              "isSent": false,
+              "messageIdHeader": "<fixture-3@example.invalid>",
+              "receivedAt": "2025-01-03T09:00:00Z",
+              "remoteId": "fixture-msg-3",
+              "subject": "Contract fixture three (unread)",
+              "threadId": "fixture-thread-3"
+            },
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222222",
+              "inReplyTo": "<fixture-1@example.invalid>",
+              "isArchived": true,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": true,
+              "isSent": false,
+              "messageIdHeader": "<fixture-2@example.invalid>",
+              "receivedAt": "2025-01-02T09:00:00Z",
+              "references": "<fixture-1@example.invalid>",
+              "remoteId": "fixture-msg-2",
+              "subject": "Contract fixture two (archived, pinned)",
+              "threadId": "fixture-thread-2"
+            },
+            {
+              "accountId": "11111111-1111-4111-8111-111111111111",
+              "fromAddress": "alice.fixture@example.invalid",
+              "fromName": "Alice Fixture",
+              "id": "22222222-2222-4222-8222-222222222221",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": true,
+              "isSent": false,
+              "messageIdHeader": "<fixture-1@example.invalid>",
+              "receivedAt": "2025-01-01T09:00:00Z",
+              "remoteId": "fixture-msg-1",
+              "subject": "Contract fixture one",
+              "threadId": "fixture-thread-1"
+            }
+          ],
+          "totalCount": 3,
+          "truncated": false
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "contract_expected": true,
+      "defect_evidence": "v3.2.0 answers 500 internal-error for GET /api/search: the pass-B scan queries COALESCE((... a.category ...)) but only JOINs message_bodies, so SQLite raises 'no such column: a.category'. This fixture is NOT captured from v3; it is the contract's 200 SearchResponse shape.",
+      "expected_source": "api-contract.md 4.8 + MessageHeader[] from messages.list.b",
+      "name": "search.contract.sealed-body",
+      "note": "A query that matches only inside a sealed body: exactly one hit.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "GET",
+        "path": "/api/search",
+        "query": {
+          "accountId": "33333333-3333-4333-8333-333333333333",
+          "q": "sealedneedle"
+        }
+      },
+      "response": {
+        "body": {
+          "bodyScanLimit": 1000,
+          "bodyScanSkipped": 0,
+          "query": "sealedneedle",
+          "results": [
+            {
+              "accountId": "33333333-3333-4333-8333-333333333333",
+              "fromAddress": "bob.fixture@example.invalid",
+              "fromName": "Bob Fixture",
+              "id": "44444444-4444-4444-8444-444444444441",
+              "isArchived": false,
+              "isDeleted": false,
+              "isPinned": false,
+              "isRead": true,
+              "isSent": false,
+              "messageIdHeader": "<fixture-b-1@example.invalid>",
+              "receivedAt": "2025-02-01T09:00:00Z",
+              "remoteId": "fixture-b-msg-1",
+              "subject": "Body match fixture (sealed)",
+              "threadId": "fixture-b-thread-1"
+            }
+          ],
+          "totalCount": 1,
+          "truncated": false
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    }
+  ],
+  "normalized": [
+    "createdAt",
+    "date",
+    "decidedAt",
+    "dueAt",
+    "expiresAt",
+    "fetchedAt",
+    "lastErrorAt",
+    "lastFetchedAt",
+    "lastSyncAt",
+    "startedAt",
+    "updatedAt"
+  ],
+  "note": "Golden HTTP fixtures for the Lagoon v4 sidecar API. Captured from a real LagoonServerCLI process on a throwaway SQLite store seeded with synthetic rows; /api/search entries are contract_expected (v3 cannot answer them). Regenerate with: bash v4/scripts/capture-contract.sh",
+  "seed": {
+    "accountEmail": "contract-fixture@example.invalid",
+    "accountEmailB": "contract-fixture-b@example.invalid",
+    "accountEmailC": "contract-fixture-c@example.invalid",
+    "accountId": "11111111-1111-4111-8111-111111111111",
+    "accountIdB": "33333333-3333-4333-8333-333333333333",
+    "accountIdC": "66666666-6666-4666-8666-666666666666",
+    "noticeId": "fixture-notice-1",
+    "remoteIds": [
+      "fixture-msg-1",
+      "fixture-msg-2",
+      "fixture-msg-3"
+    ],
+    "remoteIdsB": [
+      "fixture-b-msg-1",
+      "fixture-b-msg-2"
+    ],
+    "stackRuleIds": [
+      "55555555-5555-4555-8555-555555555551",
+      "55555555-5555-4555-8555-555555555552"
+    ]
+  },
+  "version": 2
+}

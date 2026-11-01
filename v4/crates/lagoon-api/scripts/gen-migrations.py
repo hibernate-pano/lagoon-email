@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Generate src/migrations.rs from v3's LagoonDatabase.swift.
+
+The authority for the DDL is Sources/LagoonKit/LagoonDatabase.swift: the eleven
+registerMigration blocks and the static SQL constants they execute. Hand-copying
+220 lines of DDL into Rust would drift the first time someone edits the Swift
+side, so the Rust module is generated. The generator is checked in next to the
+output; run it from the repo root:
+
+    python3 v4/crates/lagoon-api/scripts/gen-migrations.py
+
+It writes v4/crates/lagoon-api/src/migrations.rs. Every statement is emitted
+verbatim (indentation, comments and all) because sqlite_master stores the CREATE
+statement text as given: a single space of difference is a schema difference.
+"""
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[4]
+SWIFT = ROOT / "Sources/LagoonKit/LagoonDatabase.swift"
+OUT = Path(__file__).resolve().parents[1] / "src/migrations.rs"
+
+# (identifier, constant holding the SQL, data step)
+MIGRATIONS = [
+    ("lagoon-v1", "schema", None),
+    ("lagoon-v2", "indexReconciliation", None),
+    ("lagoon-v3", "advisoryOnlyReconciliation", None),
+    ("lagoon-v4", "adviceReconciliation", None),
+    ("lagoon-v5", "sentFolderReconciliation", None),
+    ("lagoon-v5b", None, "RepairAccountIds"),
+    ("lagoon-v6", "encryptedBodiesReconciliation", "SealBodies"),
+    ("lagoon-v7", "reminderReconciliation", None),
+    ("lagoon-v8", "overrideScopeReconciliation", None),
+    ("lagoon-v9", "sealedDraftsReconciliation", "SealDrafts"),
+    ("lagoon-v10", "overrideSenderReconciliation", None),
+]
+
+
+def read_constants(text: str) -> dict:
+    pattern = re.compile(r'(?:public )?static let (\w+) = """\n(.*?)\n([ \t]*)"""', re.S)
+    constants = {}
+    for match in pattern.finditer(text):
+        name, body, closing_indent = match.group(1), match.group(2), match.group(3)
+        lines = []
+        for line in body.split("\n"):
+            lines.append(line[len(closing_indent):] if line.startswith(closing_indent) else line)
+        constants[name] = "\n".join(lines)
+    return constants
+
+
+def split_statements(sql: str) -> list:
+    """Split on semicolons that are real statement terminators.
+
+    A plain str.split(";") is wrong: the DDL comments are prose and one of them
+    contains a semicolon ("is not in the predicate; the archived view ..."), so
+    the splitter tracks line comments, block comments and single-quoted strings
+    and only cuts in normal state. The comment text stays in the statement -
+    sqlite_master keeps it, and the dump comparison would notice if it did not.
+    """
+    statements = []
+    current = []
+    index = 0
+    state = "normal"
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        pair = sql[index:index + 2]
+        if state == "normal":
+            if pair == "--":
+                state = "line"
+                current.append(pair)
+                index += 2
+                continue
+            if pair == "/*":
+                state = "block"
+                current.append(pair)
+                index += 2
+                continue
+            if char == "'":
+                state = "string"
+                current.append(char)
+                index += 1
+                continue
+            if char == ";":
+                statement = "".join(current).strip()
+                if statement:
+                    statements.append(statement)
+                current = []
+                index += 1
+                continue
+            current.append(char)
+            index += 1
+            continue
+        if state == "line":
+            current.append(char)
+            if char == "\n":
+                state = "normal"
+            index += 1
+            continue
+        if state == "block":
+            if pair == "*/":
+                state = "normal"
+                current.append(pair)
+                index += 2
+                continue
+            current.append(char)
+            index += 1
+            continue
+        # string literal: a doubled quote is an escaped quote, not the end
+        if char == "'":
+            if sql[index:index + 2] == "''":
+                current.append("''")
+                index += 2
+                continue
+            state = "normal"
+            current.append(char)
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    tail = "".join(current).strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+def rust_raw(statement: str) -> str:
+    assert '"##' not in statement, "statement would terminate a Rust raw string"
+    return 'r##"' + statement + '"##'
+
+
+def main() -> int:
+    text = SWIFT.read_text(encoding="utf-8")
+    constants = read_constants(text)
+    lines = [
+        "//! The eleven v3 migrations, translated statement for statement.",
+        "//!",
+        "//! GENERATED by scripts/gen-migrations.py from Sources/LagoonKit/LagoonDatabase.swift.",
+        "//! Do not edit by hand: the text has to stay byte-identical to what v3 executes,",
+        "//! because SQLite stores a CREATE statement's text verbatim in sqlite_master.",
+        "//!",
+        "//! The identifier order is registration order, which is the order GRDB runs them.",
+        "",
+        "use crate::crypto::BodyKey;",
+        "use crate::store::migrate::MigrationError;",
+        "",
+        "/// What a migration does after its SQL, when it also rewrites data.",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+        "pub enum DataStep {",
+        "    None,",
+        "    /// lagoon-v5b: move text-encoded account ids onto the 16-byte form.",
+        "    RepairAccountIds,",
+        "    /// lagoon-v6: seal legacy plaintext bodies and snippets.",
+        "    SealBodies,",
+        "    /// lagoon-v9: seal legacy plaintext draft variants.",
+        "    SealDrafts,",
+        "}",
+        "",
+        "pub struct Migration {",
+        "    pub identifier: &'static str,",
+        "    pub statements: &'static [&'static str],",
+        "    pub data: DataStep,",
+        "}",
+        "",
+        "pub const MIGRATIONS: &[Migration] = &[",
+    ]
+    for identifier, constant, data in MIGRATIONS:
+        statements = [] if constant is None else split_statements(constants[constant])
+        lines.append("    Migration {")
+        lines.append('        identifier: "%s",' % identifier)
+        if statements:
+            lines.append("        statements: &[")
+            for statement in statements:
+                lines.append("            " + rust_raw(statement) + ",")
+            lines.append("        ],")
+        else:
+            lines.append("        statements: &[],")
+        lines.append("        data: DataStep::%s," % (data or "None"))
+        lines.append("    },")
+    lines.extend([
+        "];",
+        "",
+        "/// Total number of statements, used by the migration log line.",
+        "pub fn statement_count() -> usize {",
+        "    MIGRATIONS.iter().map(|migration| migration.statements.len()).sum()",
+        "}",
+        "",
+        "/// Executes one migration's SQL and its data step. Kept here so the generated",
+        "/// table stays data-only.",
+        "pub fn apply(",
+        "    connection: &rusqlite::Connection,",
+        "    migration: &Migration,",
+        "    body_key: Option<&BodyKey>,",
+        ") -> Result<(), MigrationError> {",
+        "    for statement in migration.statements {",
+        "        connection.execute_batch(statement)?;",
+        "    }",
+        "    match migration.data {",
+        "        DataStep::None => Ok(()),",
+        "        DataStep::RepairAccountIds => crate::store::migrate::repair_account_ids(connection),",
+        "        DataStep::SealBodies => crate::store::migrate::seal_legacy_bodies(connection, body_key),",
+        "        DataStep::SealDrafts => crate::store::migrate::seal_legacy_drafts(connection, body_key),",
+        "    }",
+        "}",
+        "",
+    ])
+    OUT.write_text("\n".join(lines), encoding="utf-8")
+    print("wrote %s (%d migrations, %d statements)" % (
+        OUT, len(MIGRATIONS), sum(len([] if c is None else split_statements(constants[c])) for _, c, _ in MIGRATIONS)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

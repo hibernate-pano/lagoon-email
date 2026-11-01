@@ -1,0 +1,171 @@
+/*
+ * Design tokens, extracted from the v3 Swift sources (v4/recon/client-surface.md §5).
+ *
+ * Source of truth, per row:
+ *   Sources/Lagoon/Theme/LagoonTheme.swift       colours
+ *   Sources/Lagoon/Theme/LagoonMetrics.swift     spacing / radii / dot sizes
+ *   Sources/Lagoon/Theme/LagoonTypography.swift  row type + timestamp rule
+ *   Sources/Lagoon/Theme/LagoonSheetSize.swift   sheet widths
+ *   Sources/Lagoon/Views/ColumnLayout/LagoonColumn.swift  column envelopes
+ *
+ * Three kinds of value live here, and they are marked differently on purpose:
+ *   1. exact       — copied from Swift, no judgement involved.
+ *   2. TODO(sample)— the Swift side uses a *system* colour or a semantic font
+ *                    size that has no literal in the repo. The value below is a
+ *                    placeholder chosen to look right; it must be replaced by a
+ *                    real sample (NSColor.systemBlue sRGB; NSFont
+ *                    .preferredFont(forTextStyle:).pointSize) on a Mac. Do not
+ *                    treat these as authoritative.
+ *   3. derived     — a Web-only token that has no v3 equivalent (materials,
+ *                    focus ring, hover). Listed at the bottom of this file.
+ */
+
+:root {
+  /* ---- brand ------------------------------------------------------------ */
+  /* LagoonTheme.brand = Color(red: 0.12, green: 0.43, blue: 0.52) = #1F6F84 */
+  --lagoon-accent: #1f6f84;
+
+  /* ---- severity scale (LagoonTheme.Severity) --------------------------- */
+  /* TODO(sample): v3 uses macOS system colours; these are the documented
+     light-appearance values for the closest system colour. The *dark*
+     appearance below is also a placeholder. Sample both before shipping. */
+  --sev-info: #007aff;
+  --sev-success: #34c759;
+  --sev-warning: #ff9500;
+  --sev-error: #ff3b30;
+  --danger: var(--sev-error);
+
+  /* ---- unread marker (LagoonTheme.unreadMarkerColor) -------------------- */
+  /* exact: light 0.05/0.23/0.29 = #0D3B4A; dark 0.45/0.80/0.87 = #73CCDE.
+     The marker follows the appearance because a fixed deep teal is invisible
+     on a dark row (LagoonTheme.swift:89-114). */
+  --unread-dot: #0d3b4a;
+
+  /* ---- sender avatar palette (SenderAvatar.swift:26-35) ----------------- */
+  /* exact, 8 entries; index = sum(utf8 bytes) % 8 (SenderAvatar.swift:41-45) */
+  --avatar-0: #5c8cc7;
+  --avatar-1: #52a875;
+  --avatar-2: #d98c4d;
+  --avatar-3: #bf669e;
+  --avatar-4: #8073b8;
+  --avatar-5: #4d9ea8;
+  --avatar-6: #d9a84d;
+  --avatar-7: #6b809e;
+
+  /* ---- spacing (LagoonMetrics, exact) ---------------------------------- */
+  --sp-xs: 4px;
+  --sp-sm: 8px;
+  --sp-md: 12px;
+  --sp-lg: 16px;
+  --sp-xl: 24px;
+  --sp-xxl: 32px;
+
+  /* ---- radii (LagoonMetrics, exact) ------------------------------------ */
+  --r-s: 4px;
+  --r-m: 6px;
+  --r-l: 8px;
+
+  /* ---- markers (LagoonMetrics, exact) ---------------------------------- */
+  --dot-status: 8px;
+  --dot-unread: 7px;
+  --stripe-unread: 2px;
+  --avatar: 28px;
+  --icon-col: 20px;
+  --reading-max: 900px;
+  --row-min-compact: 52px;
+  --row-min-dense: 30px;
+
+  /* ---- type ------------------------------------------------------------ */
+  /* TODO(sample): LagoonTypography names only SwiftUI semantic styles
+     (.body / .callout / .caption / .caption2); the repo records no point
+     sizes anywhere. These px values are the macOS default menu/text sizes for
+     those styles, used as placeholders. */
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Helvetica Neue", "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Menlo", "Cascadia Mono", monospace;
+  --fs-subject: 13px;       /* TODO(sample) .body     */
+  --fs-subject-dense: 12px; /* TODO(sample) .callout  */
+  --fs-sender: 10px;        /* TODO(sample) .caption  */
+  --fs-snippet: 10px;       /* TODO(sample) .caption2 */
+  --fs-time: 10px;          /* TODO(sample) .caption2 */
+  --fs-body: 13px;
+  --fs-title: 15px;         /* .headline-ish surface title */
+  --fs-caption: 11px;
+  --lh-subject: 1.35;
+  --lh-snippet: 1.3;
+  --lines-subject: 1;       /* LagoonTypography.rowSubjectLines */
+  --lines-snippet: 2;       /* LagoonTypography.rowSnippetLines */
+
+  /* ---- sheets (LagoonSheetSize, exact) --------------------------------- */
+  --sheet-compact-w: 360px;
+  --sheet-compact-h: 360px;
+  --sheet-standard-w: 520px;
+  --sheet-standard-h: 480px;
+  --sheet-wide-w: 640px;
+  --sheet-wide-h: 560px;
+  --sheet-composer-w: 600px;
+  --sheet-composer-h: 520px;
+
+  /* ---- columns (LagoonColumn.swift:131-135, exact) --------------------- */
+  /* The widths are the *envelopes*; M1 uses min values in a CSS grid and does
+     NOT port the rubber-band solver (see README "gap vs v3"). */
+  --col-nav-min: 180px;
+  --col-nav-ideal: 210px;
+  --col-list-min: 280px;
+  --col-list-ideal: 340px;
+  --col-reader-min: 360px;
+  --col-reader-ideal: 520px;
+  --divider-thickness: 1px;
+  --divider-hit: 10px;
+  --window-min-h: 420px;
+
+  /* ---- motion (LagoonColumn.swift:83, BriefingFeedView.swift:701,
+     NoticeBanner.swift:196) ---------------------------------------------- */
+  --dur-rebound: 150ms;
+  --dur-row: 320ms;
+  --dur-banner: 300ms;
+  --ease-spring: cubic-bezier(0.2, 0.9, 0.2, 1);
+
+  /* ====================================================================== */
+  /* derived tokens — no v3 equivalent (client-surface.md §5.4)             */
+  /* v3 reads .regularMaterial / .bar / .secondary / .tertiary / .quaternary */
+  /* from AppKit. The Web has to spell those out.                            */
+  /* ====================================================================== */
+  --bg-window: #ffffff;
+  --bg-nav: #f2f2f4;          /* NavigationColumnView uses .regularMaterial */
+  --bg-bar: #f7f7f8;          /* .bar: bulk bar, sent-stale strip */
+  --bg-row-hover: rgba(0, 0, 0, 0.04);
+  --bg-row-selected: rgba(31, 111, 132, 0.14);
+  --bg-quaternary: rgba(0, 0, 0, 0.08);
+  --fg-primary: #1d1d1f;
+  --fg-secondary: #6e6e73;
+  --fg-tertiary: #98989d;
+  --separator: rgba(0, 0, 0, 0.12);
+  --focus-ring: #1f6f84;
+
+  --radius-card: var(--r-l);
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --unread-dot: #73ccde;    /* exact: LagoonTheme.swift:110-114 */
+    --sev-info: #0a84ff;      /* TODO(sample) */
+    --sev-success: #30d158;   /* TODO(sample) */
+    --sev-warning: #ff9f0a;   /* TODO(sample) */
+    --sev-error: #ff453a;     /* TODO(sample) */
+
+    --bg-window: #1e1e1e;
+    --bg-nav: #252527;
+    --bg-bar: #2a2a2c;
+    --bg-row-hover: rgba(255, 255, 255, 0.06);
+    --bg-row-selected: rgba(115, 204, 222, 0.18);
+    --bg-quaternary: rgba(255, 255, 255, 0.12);
+    --fg-primary: #f2f2f7;
+    --fg-secondary: #a1a1a6;
+    --fg-tertiary: #7c7c82;
+    --separator: rgba(255, 255, 255, 0.14);
+    --focus-ring: #73ccde;
+    --lagoon-accent: #73ccde;
+  }
+}

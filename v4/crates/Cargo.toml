@@ -1,0 +1,30 @@
+# Rust workspace for the v4 backend (R-series).
+#
+# R1 (this milestone) holds exactly one member: lagoon-api - the read-only
+# vertical slice that replaces the Swift sidecar's HTTP role during development.
+# See lagoon-api/README.md (Chinese) for how to run it.
+[workspace]
+resolver = "2"
+members = ["lagoon-api", "lagoon-mail"]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+# Pinned on purpose: the whole point of R1 is byte-level interop with v3, so a
+# transitive bump that changes JSON/error behaviour is a contract change, not a
+# routine update. aes-gcm is pinned to the exact version the cipher spike proved
+# against Swift's CryptoKit (v4/spike/cipher-interop).
+[workspace.dependencies]
+aes-gcm = "=0.10.3"
+axum = "0.8.9"
+base64 = "0.22"
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SHA-256 + constant-time compare for the bearer check: v3 digests both sides
+# so the comparison cannot oracle the token length (APIAuth.swift:66-73).
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "sync", "signal"] }
+tracing = "0.1"

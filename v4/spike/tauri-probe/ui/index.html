@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<title>Lagoon v4 probe</title>
+<style>
+  body { font: 14px -apple-system, system-ui; margin: 0; display: grid; place-items: center; height: 100vh; background: #0b1220; color: #e6edf3; }
+  .card { text-align: center; }
+  code { background: #16243a; padding: 2px 6px; border-radius: 4px; }
+  #out { margin-top: 12px; color: #7ee787; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h2>Tauri 2 static probe</h2>
+    <p>no bundler · static html · <code>generate_context!</code></p>
+    <p id="out">ipc: waiting…</p>
+  </div>
+  <script>
+    // Prove the Rust<->WebView IPC bridge works without any JS framework.
+    var out = document.getElementById('out');
+    try {
+      window.__TAURI_INTERNALS__.invoke('ping', { name: 'web' })
+        .then(function (v) { out.textContent = 'ipc: ' + v; })
+        .catch(function (e) { out.textContent = 'ipc error: ' + e; });
+    } catch (e) { out.textContent = 'ipc unavailable: ' + e; }
+  </script>
+</body>
+</html>

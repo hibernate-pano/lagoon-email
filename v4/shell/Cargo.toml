@@ -1,0 +1,21 @@
+[package]
+name = "lagoon-v4-shell"
+version = "0.1.0"
+edition = "2021"
+description = "Lagoon V4 desktop shell: Tauri 2 window + sidecar supervisor + the only HTTP path to the Swift server"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# HTTP proxy to 127.0.0.1 only: no TLS, so no TLS backend is compiled in.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["time", "sync", "rt"] }
+base64 = "0.22"
+libc = "0.2"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

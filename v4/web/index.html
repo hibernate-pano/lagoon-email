@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- No remote origin is ever allowed to be contacted by the app shell. The mail
+         body lives in its own sandboxed iframe with its own CSP (see HtmlFrame.tsx). -->
+    <meta name="color-scheme" content="light dark" />
+    <title>Lagoon</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
