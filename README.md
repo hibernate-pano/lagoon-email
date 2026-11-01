@@ -1,262 +1,67 @@
-# Lagoon
+# v4 · 外部版本（Rust + Web）
 
-An **AI Inbox Operating System for the Apple ecosystem** — currently a
-Mac-first, keyboard-first triage machine whose whole promise is one sentence:
-*open twice a day, ten minutes to zero; running resident all day = failure*.
+**Lagoon 的下一代形态，与 v3 并行。发布物里没有 Swift。**
+v3（`/Sources`，SwiftUI + 进程内 Hummingbird）保持可构建、可运行、测试全绿。
 
-Current state: **V3 "embedded"**. The app is self-contained — the Swift
-(Hummingbird) server, the sync engine and the storage all run **inside the
-`Lagoon.app` process**, on an embedded SQLite store under Application Support.
-There is no Docker, no Postgres, no LaunchAgent, no `.env` on a user machine.
-Mail lives at the provider; the local store is a cache plus user state
-(rules, pins, undo audit).
+- 想法与方案：[00-理解与方案.md](00-理解与方案.md)（三层拆解、四路线、里程碑、风险）
+- 决策记录：[docs/adr/0001-strangler-tauri-shell.md](docs/adr/0001-strangler-tauri-shell.md)
+- 外壳 ↔ 前端协议：[docs/ipc-contract.md](docs/ipc-contract.md)（v0.1，冻结）
+- M1 验收清单：[docs/m1-checklist.md](docs/m1-checklist.md)
+- 侦察证据：[recon/](recon/)（server 契约 57 端点 / client 表面 24 界面 / Rust 实测）
 
-**Advisory-only AI (non-negotiable).** The AI reads mail, classifies it,
-explains it and drafts reply text. It never writes: no background archiving,
-deleting, unsubscribing, marking read, no rule creation, and above all no
-sending. Every mutation goes through a user-triggered route and is recorded in
-the undo audit. The sync loop is typed against `MailSyncReading`, a read-only
-subset of `MailProvider` that has no write method to call — so "sync cannot
-touch the mailbox" is enforced by the compiler, not by convention. See
-[the constitution](docs/superpowers/specs/2026-10-02-advisory-only-ai-constitution-design.md).
-
-**Advice (`GET /api/advice`).** Alongside each feed group the classifier
-returns a read-only suggestion: action, category (marketing / spam / work / …),
-confidence, and a one-sentence rationale in the reader's language. Grouping and
-advice come from **one** model call — they share the prompt, so asking twice
-would roughly double prompt tokens against the monthly cap for the same input.
-Suggestions land in their own `advice` table, never in `ai_actions`: a suggestion
-is not an action, and the user never acted on it. Recording a verdict
-(`POST /api/advice/{id}/decision`) writes only that table, and a verdict survives
-re-classification — a dismissed suggestion is never pushed back into the queue.
+## 形态
 
 ```
-Lagoon.app（one process）
-  ├─ SwiftUI client
-  ├─ LagoonRuntime (embedded server, loopback HTTP)
-  │     ├─ Sync Engine — one read-only loop per account (IMAP IDLE / polling)
-  │     └─ SQLite (WAL, GRDB) — ~/Library/Application Support/Lagoon/
-  └─ AI Gateway ──> MiniMax (advisory only: summary/draft/classify text)
+Lagoon v4.app（Rust / Tauri 2 外壳，发布物只含它 + Web 资源）
+  ├─ WebView：React 19 + TS + Vite 前端（web）
+  ├─ Rust 外壳（shell）：窗口 / 进程监督 / HTTP 代理 / Keychain（M2）
+  │     └─ 过渡期边车：v3 的 LagoonServerCLI（开发期脚手架，不进发布物）
+  └─ Rust 后端（crates，R1 起）：axum + rusqlite，逐模块取代边车
 ```
 
-Docs: [startup runbook (zh)](docs/启动说明.md) ·
-[user guide (zh)](docs/使用说明.md) ·
-[archived: v2 design spec (superseded)](docs/superpowers/specs/2026-09-23-v2-inbox-os-final-design.md) ·
-[archived: original product spec (superseded)](docs/superpowers/specs/2026-09-09-lagoon-email-design.md)
+## 状态
 
-## Accounts
-
-**QQ Mail is the only supported provider** (authorization code → IMAP sync →
-read → Briefing Feed → AI summary → SMTP reply → archive/⌘Z undo). The Gmail
-OAuth/REST path was removed for the QQ-only MVP; if it is ever needed again it
-returns as a new feature branch, not resurrected code. Multiple mailboxes can
-stay connected and sync **concurrently** — each account owns its loop, cursor
-and backoff over the shared pool; `is_active` only marks which mailbox the
-client shows.
-
-## Provider capability (QQ Mail)
-
-| | QQ Mail (`qq`) |
+| 里程碑 | 状态 |
 |---|---|
-| Connect | in-app form: address + 16-char authorization code, probed against `imap.qq.com:993` before storing |
-| Sync | IMAP (implicit TLS 993); IDLE when advertised, otherwise UID-window polling; `UIDVALIDITY` change → full resync |
-| Read body | `FETCH` + MIME → plain text (GBK/GB18030/Shift-JIS aware, HTML stripped) |
-| Classify / summarize | same in-process pipeline (heuristics + optional LLM) |
-| Reply (send) | SMTP implicit TLS 465, `MIMEBuilder` output |
-| Archive | `UID MOVE` into the server's archive role folder (creates it if absent; falls back to COPY+EXPUNGE); gated on `capabilities.archiveFolder` |
-| Un-archive | `UID MOVE` back to INBOX — a reverse path, not just the undo toast |
-| Trash | `UID MOVE` into the server's Trash (delete is a move, never a hard expunge); `?deleted=true` lists it |
-| Permanent delete | `UID EXPUNGE <uid>` (RFC 4315). **Requires UIDPLUS** — without it the operation is refused rather than degraded to plain `EXPUNGE`, which would remove every `\Deleted`-flagged message in the folder including other clients' pending deletions. Gated on already being in the Trash |
-| Sent | read-only listing over `/api/sent`; no cursor, no reconcile |
-| Undo | remote move back then local flip; permanent delete, sent/unsubscribed/drafted are explicitly not undoable |
+| M0 契约冻结 + fixtures | ✅ `docs/api-contract.md` + `tests/contract/`（**56 条 = 54 抓取 + 2 contract_expected**，54/54 match，两次抓取 byte-identical） |
+| M1 Rust 外壳 | ✅ `shell/`：边车监督 / api 代理 / boot 事件 / 无孤儿；`--selftest` 12/12；已接真实 `web/dist`，Tauri 模式端到端 3 个 200（见 `docs/m1-checklist.md` §1.2） |
+| M1 Web 前端 | ✅ `web/`：六态 / 引导 / 侧边栏 / 简报 / 列表 / 阅读器（sandbox iframe）/ 命令面板 / 搜索（客户端过滤）/ 写路径（M2） |
+| R1+R2 Rust 读面 | ✅ 24 组路由；api **85 测试**；契约 54/54；与 v3 同库 46/48 SAME + 2 EXPLAINED（search 修复） |
+| M2 Web 写路径 | ✅ 归档/废纸篓/撤销/动作历史/键盘；409 回滚与能力闸门实测；远端成功路径待真实邮箱 |
+| R3.1 邮件协议层 | ✅ `crates/lagoon-mail`：IMAP/SMTP/MIME/GBK + 假传输，**196 测试**，零外联 |
+| R3.2 迁移与可写 store | ✅ v3 的 11 条迁移逐字等价（30 对象/11 identifier diff 全同） |
+| R3.3 账号生命周期 | ✅ 凭据裸 AES-GCM 双向互操作；accounts 路由矩阵 |
+| R3.4 同步 + 生产 provider | ✅ UIDVALIDITY/退避/单写者；`LAGOON_MAIL_PROVIDER` 默认 none；成员集合单会话（4→1 连接） |
+| **产品打包（rust-only）** | ✅ `bash scripts/build-product.sh` → `dist/Lagoon.app`（19MB）；构建只需 rust+node，**不含 Swift**；默认后端 `rust`，fresh install 自动迁移（ADR 0003） |
+| R3.5a 写路径 | ✅ 归档/取消归档/废纸篓/恢复/彻底删除/已读/置顶/批量/清空/审计/撤销；api **91 测试**；写 trait 与同步 trait 分离（编译期保证同步不写） |
+| R3.5b 发送 | ⏳ SMTP 回复/转发/新邮件 + requestId 幂等 |
+| M4 分发 / 跨平台 | ⏳ Developer ID 签名、更新器、Windows/Linux |
+| 验收记录 | 📋 `docs/acceptance-2026-10-29.md` · ADR：[0002](docs/adr/0002-rust-backend-first.md) · [0003](docs/adr/0003-rust-default-product.md) |
 
-## Storage (V3: embedded SQLite)
-
-One SQLite file (`GRDB`, WAL mode, foreign keys ON) holds everything: accounts
-(credential blobs AES-GCM sealed), message headers + bodies, pins, drafts,
-`ai_actions` audit log (undo + time-saved), usage/budget log, user-defined
-stack rules, and the read-only `advice` table.
-
-Note on foreign keys: they **are** on (`LagoonDatabase.open` sets
-`foreignKeysEnabled = true`), so `ON DELETE CASCADE` fires for the tables that
-reference `accounts(id)` (`message_headers`, `advice`, `ai_actions`,
-`draft_replies`, …) and for the two whose FK points at `message_headers`
-(`message_bodies`, `advice`).
-
-This was **not** true on one upgraded install, and it was not a caveat — it
-was a corruption. The `accounts` row held its UUID as 36-character *text*
-while every child held the 16-byte *binary* form. SQLite compares BLOB and
-TEXT as different values, so the parent was unreachable by every
-`WHERE id = ?`: the account could not be found, the sync failed, and the app
-told the user their authorization code had expired — a lie. The cascade never
-matched either, so a deleted account left hundreds of orphan rows behind, and
-`PRAGMA foreign_key_check` reported 727 violations. The `lagoon-v5b`
-migration repairs the encoding (`Sources/LagoonKit/AccountIDRepair.swift`),
-and `hardDeleteSync` still deletes children explicitly — belt and braces, not
-a substitute.
-
-The same missing row had a second consequence, one level up. Because the
-account could not be found, no sync round ever negotiated capabilities for
-it, so `accounts.capabilities` kept the all-false default — and
-`capabilities.archiveFolder` was a plain `Bool`, so "nobody ever asked" was
-read as "this server cannot archive". Every archive, including bulk, came
-back `409 archive-unavailable`. The role fields that gate a verb
-(`archiveFolder`, `trashFolder`, `sentFolder`, `uidplus`) are now `Bool?`,
-where `nil` means *not determined* and the gates read it as **allowed**: the
-server is the authority and still answers 409 when the folder really is
-missing. A settled `false` — a probe that could neither find nor create the
-folder — still closes the gate.
-
-Do not check foreign keys with the `sqlite3` CLI: it opens its own
-connection, and the pragma is per-connection and defaults to OFF there, so it
-reports 0 regardless of what the app does. Use `PRAGMA foreign_key_check`,
-which inspects the data and does not depend on the pragma.
-
-- **Schema**: `Sources/LagoonKit/LagoonDatabase.swift` — the final state of
-  the historical 19 Postgres migrations, expressed for SQLite and applied
-  automatically at startup as **five** registered migrations, not one:
-  `lagoon-v1` (the schema itself), `lagoon-v2` (index reconciliation),
-  `lagoon-v3` (drop `auto_archive_rules`, per the advisory-only constitution),
-  `lagoon-v4` (the `advice` table) and `lagoon-v5` (the `is_sent` column).
-  The constants are named after what they *added*, so `currentVersion` means
-  "the baseline" (v1), not "the newest". Nothing migrates from an old Postgres
-  install: remote mail re-syncs from the provider.
-- **Concurrency**: one `DatabasePool` shared by every sync loop, route and
-  store (`LagoonDB` seam in LagoonKit). The Postgres build needed one
-  connection per loop because a wire connection serves one query at a time;
-  WAL SQLite has no such constraint. Callers join a caller-owned transaction
-  with `LagoonDB(transaction:)` inside `pool.write { … }`.
-- **Dates** are TEXT in GRDB's own `yyyy-MM-dd HH:mm:ss.SSS` UTC encoding;
-  SQL-side defaults use `strftime('%Y-%m-%d %H:%M:%f','now')`, so Swift-bound
-  and SQL-generated values agree lexicographically.
-- **JSON columns** (`sync_state`, `payload`, attachments, address arrays) are
-  TEXT; payload queries use `json_extract`. The send-idempotency uniqueness
-  from Postgres migration 009 lives on as a partial unique index over
-  `json_extract(payload, '$.requestId')`.
-
-## Security posture — what is true today
-
-- **All SQL is parameterized** (`?` binds) — enforced by
-  `scripts/ci-guardrails.sh`, proven by `scripts/test-guardrails.sh`.
-- **No secrets on disk in plaintext**: the AES-GCM key (32 bytes) and the
-  per-install API token live in the **Keychain**, generated on first launch.
-  The AI provider keys are migrated once from the legacy repo `.env` into the
-  Keychain (`lagoon.envJSON`) and never written to a file. The server refuses
-  to start without a valid key.
-- **Credentials encrypted at rest** with AES-GCM (`AccessTokenCipher`),
-  sealing QQ authorization codes in `accounts.credentials`. Not end-to-end encryption: the key is in the
-  Keychain of the same machine — that is the trust boundary of a local-first app.
-- **IMAP/SMTP only 993/465 with implicit TLS and full certificate
-  verification.** Hosts come from server-side presets, never user input.
-- **Loopback + Bearer auth**: the embedded server binds `127.0.0.1` and
-  every `/api/*` route requires `Authorization: Bearer <token>` with the
-  Keychain-held per-install token. The Host-header check (DNS rebinding)
-  stays on. A standalone CLI (`LagoonServerCLI`) keeps the env-var contract
-  for development and diagnostics (`--self-test`, `--list-mailboxes`,
-  `--find-subject`, `--restore`).
-- **Message bodies are sealed at rest** with AES-256-GCM (`BodyCipher`): the
-  plain-text body, the HTML body and the list preview are stored as
-  ciphertext (`lgb1:` + base64) and the key lives in the **Keychain**
-  (`lagoon.bodyKey`), never on disk. Headers — sender, subject, timestamps —
-  and per-message metadata (recipients, attachment names) stay in the clear,
-  because they are the index the list and the sidebar read without a key.
-  A store written by an older build is sealed in place by a migration; the
-  spec's own enforcement ("unit test that asserts no plaintext body field
-  exists in any server-side table") is `Tests/LagoonServerTests/BodyEncryptionTests.swift`.
-  Not end-to-end encryption: the key is in the Keychain of the same machine
-  — that is the trust boundary of a local-first app. Turn on **FileVault**:
-  it is what protects the metadata and the headers this app deliberately
-  leaves readable.
-- **Message bodies are cached** in the local SQLite store on first open,
-  write-through, cascade-deleted with their header row when the provider
-  expunges them. Search matches subject/sender with LIKE (escaped) and
-  reaches into the sealed body and preview through a registered SQL function
-  that opens the envelope inside SQLite (`lagoon_cipher_contains`); the
-  Postgres tsvector arm is gone with the provider.
-- **Unsubscribes are SSRF-guarded** (`UnsubscribeScanner`) and archive /
-  unsubscribe / delete are remote-first: a remote failure returns an error
-  and leaves local state unchanged.
-
-## Build & check
+## 怎么跑
 
 ```bash
-bash scripts/run-all-tests.sh   # guardrails + self-tests + swift test + build CLI & app
-bash scripts/build-app.sh       # dist/Lagoon.app (ad-hoc signed, bundles providers.json)
-swift run Lagoon                # app (boots the embedded server first)
-swift run LagoonServerCLI       # dev server over the same store, env-var contract
+# 产品：一条命令构建 Lagoon.app（只需 rust + node，不需要 Xcode/Swift）
+bash scripts/build-product.sh
+open dist/Lagoon.app
+
+# 开发：跑测试
+cargo test --manifest-path crates/Cargo.toml    # 后端（crates/）
+cd web && npm run build                          # 前端
+cd shell && cargo run -- --selftest              # 外壳自检
+
+# 契约一致性（对任意运行中的后端实例）
+bash scripts/contract-check.sh http://127.0.0.1:PORT TOKEN
 ```
 
-Requirements: macOS 14+, Xcode 26 (Swift 6.3 toolchain). Tests are hermetic —
-each test opens its own temp-file SQLite store, so `swift test` needs no
-Docker and is never skipped.
+**联调注意**：外壳会自己拉起后端；浏览器开发模式见 `docs/ipc-contract.md` §5。
 
-## AI configuration
+## 纪律
 
-```bash
-# dev (CLI or `swift run Lagoon`): env contract, unchanged
-LLM_PROVIDER_PRIMARY_API_KEY=<your MiniMax key>
-LLM_PROVIDER_PRIMARY_BASE_URL=https://api.minimax.chat/v1
-LLM_PROVIDER_PRIMARY_MODEL=MiniMax-M3
-LAGOON_BUDGET_USD_PER_MONTH=10
-```
+- **前端不持有 token**：只有 `web/src/core/api.ts` 一个入口；Tauri 模式走 `invoke("api")` 由 Rust 代理。
+- **契约先行**：改协议先改 `docs/api-contract.md`，fixture 用 `tests/contract/` 回放。
+- **密钥**：开发期 0600 文件（`.dev/keys.json`）；发布期接 Keychain（需稳定签名身份）。
 
-Provider routing and rates live in `config/providers.json` (bundled into the
-app by `scripts/build-app.sh`; the embedded runtime points
-`LAGOON_PROVIDER_CONFIG` at the bundled copy). With no key the server stays
-heuristic-only and `/summary` returns 503 — it never crashes.
+## 历史
 
-## Historical milestones (condensed)
-
-- **M0–M0.1**: Gmail OAuth → Hummingbird → Postgres → SwiftUI list (the Gmail path was removed in the QQ-only MVP that followed); token
-  encryption, loopback enforcement, guardrails.
-- **M1**: Briefing Feed as the default surface, full-body reading, real read
-  state, pinning, AI summary + classification, undo with exact actionId.
-- **M1.5**: provider seam (`MailProvider`), QQ Mail, reply send, sync engine,
-  batched AI classification.
-- **M1.7**: time-saved status bar, cross-client reply detection, whitelist
-  auto-archive (removed again by the advisory-only constitution — the app has
-  no background write path today).
-- **M1.8 → V2**: concurrent multi-account sync, Sent-folder reply signals,
-  bodies + FTS server-side, per-install API token, one-click unsubscribe,
-  conversation/sender grouping lenses, user-defined stacks, archive cabinet,
-  trash delete, sweep, rule suggestions (v2.2.0).
-- **V3**: embedded runtime — SQLite replaces Docker Postgres, the
-  server becomes a library inside the app, secrets move to the Keychain.
-- **V3.1**: advisory-only AI — the sync loop is typed read-only
-  (`MailSyncReading`), the whitelist autopilot is gone, and one classifier
-  call now yields both the feed group and a read-only suggestion stored in
-  the `advice` table (30-day window, 500-row cap, overflow reported). The
-  sender sheet gains bulk mark-read / archive / delete, each confirmed,
-  each undoable.
-- **V3.2 (this)**: the management verbs and the list surfaces that were
-  missing after them — archive/unarchive, a listable Trash (its rows were
-  never queryable before: `is_deleted = FALSE` was hardcoded into the shared
-  filter), restore, permanent delete and empty-trash behind three gates
-  (must already be in the Trash, user-initiated only, local delete strictly
-  after remote success), bulk delete, and Gmail-style two-stage select-all
-  where ⌘A deliberately means *loaded rows only*. Sent mail becomes a real
-  listing (`/api/sent`, no cursor by design — reconciling a folder the user
-  can also write to from another client would delete mail they can see).
-  `is_sent` is a third axis, mutually exclusive with archived/deleted.
-  Three-column navigation, AI advice inline on rows, list density, hover
-  preview, bulk bar, sender ranking, and search that recalls the classifier's
-  own verdicts (reusing the `advice` table — no extra model calls).
-  Four defects fixed along the way, one of them data loss: `/api/delete-bulk`
-  dropped the `sent` field, so "select all sent, then delete" resolved to the
-  inbox; `hardDeleteSync` left `draft_replies` / `ai_overrides` orphaned
-  (the cascade *should* have taken them — see the id-encoding note above for
-  why it did not on that install); API auth
-  was fail-open on a path spelling like `//api/ping`; and the IMAP backfill
-  window counted UID *slots* rather than messages, which on a sparse-UID
-  mailbox covered ~43 of 500 intended messages while reporting healthy.
-
-## Known limitations (by design)
-
-- Distribution still needs Developer ID signing + notarization; the current
-  bundle is ad-hoc signed for local use.
-- No SwiftData client mirror; the client refetches from the embedded server.
-- Search is LIKE-based (no FTS5/trigram yet); CJK substring recall is exact,
-  English inflection recall is gone with the tsvector arm.
-- OAuth state is in-process (lost on restart).
-- macOS only. Attachments >25MB, S/MIME/PGP and multi-draft tabs remain
-  non-goals (spec §4: debt, not features).
+Swift 版 v3.2.0 与本版本的演进过程都在 git 历史里（checkpoint 提交 11ae71b 之前的树即 Swift 产品）。

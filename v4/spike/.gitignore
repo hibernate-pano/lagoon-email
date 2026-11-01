@@ -1,4 +1,0 @@
-# Build outputs of the spikes — reproducible with `cargo build`; keep the
-# sources, Cargo.lock files and transcripts, drop the gigabyte of target/.
-*/target/
-*/*.keychain-db

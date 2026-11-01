@@ -1,0 +1,46 @@
+key_b64=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=   (test vector, not the Keychain key)
+
+### case: ascii
+plaintext      : hello lagoon v4
+rust nonce_hex : 473bc0533cc6aedc21988ae6
+rust envelope  : lgb1:RzvAUzzGrtwhmIrmxJe3r87WEYDiguR6sDcEnGd5DAuve5yx6g9FtysvaQ==
+swift decrypt  : PLAINTEXT=hello lagoon v4
+RESULT A (rust->swift): PASS
+swift envelope : lgb1:LcH/xenkpJ44fimid/VyxqwwgOEm4wv8f5/7vMOkie7hqmxlSt88+qX1Xw==
+rust decrypt   : PLAINTEXT=hello lagoon v4
+RESULT B (swift->rust): PASS
+
+### case: cjk+emoji
+plaintext      : 你好，Lagoon —— 中文正文 🚀 with ascii tail
+rust nonce_hex : fb07da1be922fbc9b3e9afa6
+rust envelope  : lgb1:+wfaG+ki+8mz6a+moWT3uxsEnpL9XluRIUy6GLLc5geuV8kVzh74UsJVofWe0GzeEvrC9OXdLi08vTc3xNOvlIkVL8PDw9fOlmatkdNiMfn04IDR
+swift decrypt  : PLAINTEXT=你好，Lagoon —— 中文正文 🚀 with ascii tail
+RESULT A (rust->swift): PASS
+swift envelope : lgb1:dKrEO5zqBGoWq5IG8Iqz7OlIBH5zFRK3CKZoYHucsQsEjaTyk+miq8X/wGv9FM0IP8IwmPWgZLv1w9E0Ro1imbMjIZvhIX/qdM8LN9WRHhJOld8Q
+rust decrypt   : PLAINTEXT=你好，Lagoon —— 中文正文 🚀 with ascii tail
+RESULT B (swift->rust): PASS
+
+### case: empty-string
+plaintext      : 
+rust nonce_hex : 992389df6c3a0fb65178b5aa
+rust envelope  : lgb1:mSOJ32w6D7ZReLWqdYICiZL6KF/M0Gyp2x2ykw==
+swift decrypt  : PLAINTEXT=
+RESULT A (rust->swift): PASS
+swift envelope : lgb1:P53bXkWJA/BgGfhmCCUDL374zUhmY0Ggy6b0Pw==
+rust decrypt   : PLAINTEXT=
+RESULT B (swift->rust): PASS
+
+### case: tamper (bit flip in ciphertext, must be rejected by both)
+tampered env   : lgb1:TEgibeiBm2yfxKUJ8IBYKo6NwwnARQgtTP9xSpxFXoVQZ4XRew==
+rust  : ERROR=decrypt failed: aead::Error
+swift : SWIFT_ERROR=authenticationFailure
+
+### case: envelope-prefix guard
+rust  : ERROR=not an lgb1: envelope
+
+### versions
+name = "aead"	version = "0.5.2"
+name = "aes"	version = "0.8.4"
+name = "aes-gcm"	version = "0.10.3"
+name = "base64"	version = "0.22.1"
+name = "ghash"	version = "0.5.1"

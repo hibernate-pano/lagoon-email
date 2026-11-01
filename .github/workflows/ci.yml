@@ -9,18 +9,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
+  backend:
     runs-on: macos-15
     timeout-minutes: 30
-
     steps:
       - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+      - name: Format check
+        run: |
+          cargo fmt --manifest-path crates/Cargo.toml --check
+          cargo fmt --manifest-path shell/Cargo.toml --check
+      - name: Backend tests (crates workspace)
+        run: cargo test --offline --manifest-path crates/Cargo.toml
+      - name: Shell build + selftest
+        run: |
+          cargo build --manifest-path shell/Cargo.toml
+          cargo run --manifest-path shell/Cargo.toml -- --selftest
 
-      - name: Show Swift version
-        run: swift --version
-
-      # No database service: the test harness opens a hermetic temp-file
-      # SQLite store per test (Tests/LagoonServerTests/TestDatabase.swift),
-      # so `scripts/run-all-tests.sh` is the whole verification story.
-      - name: Run full checks
-        run: bash scripts/run-all-tests.sh
+  frontend:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build web
+        run: |
+          cd web
+          npm install
+          npm run build
