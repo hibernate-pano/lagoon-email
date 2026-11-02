@@ -14,7 +14,7 @@
  * The rule that keeps this honest: a failure never leaves the screen showing the
  * thing it claimed to do. Rollback happens before the banner is rendered.
  */
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import type {
   AdviceRecord,
   AdviceResponse,
@@ -32,6 +32,7 @@ import { useMailboxOverlay } from "./core/mutations";
 import { BYPASS_CAPABILITY_GATE, UNDO_WINDOW_MS } from "./core/config";
 import { LENS_EMPTY } from "./core/empty";
 import { targetIdsOf } from "./core/selection";
+import type { SendMode, SendOriginal } from "./core/send";
 import { roundSettled, syncStateOf } from "./core/syncWait";
 import {
   bulkAction,
@@ -51,6 +52,7 @@ import { ActionHistoryPanel } from "./screens/ActionHistory";
 import { BriefingFeed } from "./screens/BriefingFeed";
 import { BootScreen } from "./screens/BootScreen";
 import { CommandPalette, buildCommands } from "./screens/CommandPalette";
+import { Composer } from "./screens/Composer";
 import { MessageList } from "./screens/MessageList";
 import { Onboarding } from "./screens/Onboarding";
 import { ReaderPanel } from "./screens/ReaderPanel";
@@ -149,6 +151,10 @@ export function App(): ReactNode {
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [syncBusy, setSyncBusy] = useState(false);
+  /** The open composer, if any. */
+  const [composer, setComposer] = useState<{ mode: SendMode; original?: SendOriginal } | null>(null);
+  /** The message the reader would reply to. */
+  const [replyTarget, setReplyTarget] = useState<SendOriginal | undefined>(undefined);
 
   const overlay = useMailboxOverlay();
 
@@ -173,6 +179,33 @@ export function App(): ReactNode {
     navigate(next);
     setRoute(next);
   };
+
+  /* ------------------------------------------------------------ compose --- */
+
+  const reportReplyTarget = useCallback((original: SendOriginal | undefined) => {
+    setReplyTarget(original);
+  }, []);
+
+  function openCompose(): void {
+    if (!accountId) {
+      setToast({ id: Date.now(), text: t.compose.noAccount });
+      return;
+    }
+    setComposer({ mode: "compose" });
+  }
+
+  function openReply(mode: "reply" | "forward", original?: SendOriginal): void {
+    if (!accountId) {
+      setToast({ id: Date.now(), text: t.compose.noAccount });
+      return;
+    }
+    const target = original ?? replyTarget;
+    if (!target) {
+      setToast({ id: Date.now(), text: t.reader.replyNeedsBody });
+      return;
+    }
+    setComposer({ mode, original: target });
+  }
 
   /* ------------------------------------------------------------ sources --- */
 
@@ -611,6 +644,16 @@ export function App(): ReactNode {
         target !== null && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
       const mod = event.metaKey || event.ctrlKey;
 
+      // A composer is open: nothing behind it may act on mail. ⌘K would take
+      // the caret out of the draft; ⌫ would delete the message behind it.
+      if (composer) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          setComposer(null);
+        }
+        return;
+      }
+
       // ⌘K is safe inside a text field: it opens the palette, it does not
       // touch mail.
       if (mod && event.key.toLowerCase() === "k") {
@@ -685,9 +728,14 @@ export function App(): ReactNode {
         }
         return;
       }
-      if (event.key === "r" || event.key === "R" || (mod && event.key.toLowerCase() === "n")) {
+      if (event.key === "r" || event.key === "R") {
         event.preventDefault();
-        setToast({ id: Date.now(), text: t.m2.keyboard.reply + "（M3）" });
+        openReply("reply");
+        return;
+      }
+      if (event.key === "c" || event.key === "C") {
+        event.preventDefault();
+        openCompose();
         return;
       }
       if (event.key === "?") {
@@ -728,6 +776,9 @@ export function App(): ReactNode {
           {"AI: " + (aiStatus.outcome.data.configured ? "已配置" : "未配置")}
         </Chip>
       ) : null}
+      <button className="btn" onClick={openCompose} disabled={!accountId} title="c">
+        ✎ {t.compose.title}
+      </button>
       <button className="btn" onClick={() => setDensity(nextDensity(density))}>
         {density}
       </button>
@@ -841,6 +892,9 @@ export function App(): ReactNode {
             onPurge={requestPurge}
             onOpenHistory={() => setHistoryOpen(true)}
             onClose={() => setOpenedId(null)}
+            onReply={(original) => openReply("reply", original)}
+            onForward={(original) => openReply("forward", original)}
+            onReplyTarget={reportReplyTarget}
           />
         </div>
       </div>
@@ -886,6 +940,19 @@ export function App(): ReactNode {
       ) : null}
       {paletteOpen ? <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} /> : null}
       {shortcutsOpen ? <ShortcutsDialog onClose={() => setShortcutsOpen(false)} /> : null}
+      {composer && accountId ? (
+        <Composer
+          mode={composer.mode}
+          accountId={accountId}
+          original={composer.original}
+          onClose={() => setComposer(null)}
+          onSent={() => {
+            setComposer(null);
+            setToast({ id: Date.now(), text: t.compose.sent });
+            refreshAll();
+          }}
+        />
+      ) : null}
       <span className="visually-hidden" aria-live="polite">
         {hashFor(route)}
       </span>

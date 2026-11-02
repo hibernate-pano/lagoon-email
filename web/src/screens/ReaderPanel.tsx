@@ -16,13 +16,15 @@
  * missing button is indistinguishable from a missing feature, and M1's promise
  * is "you can read everything, you cannot change anything".
  */
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { AiStatus, Attachment, ConnectedAccount, InlineImagesResponse, MessageBody, MessageSummary } from "../core/types";
 import { apiCall } from "../core/api";
 import { COMMON_UNAVAILABLE, describeHttpFailure } from "../core/errors";
 import { useApiOutcome } from "../core/hooks";
+import type { SendOriginal } from "../core/send";
 import { AsyncSurface } from "../ui/AsyncSurface";
 import { TriBadge, Banner } from "../ui/atoms";
+import { formatWhen } from "../ui/format";
 import type { WriteBridge } from "../core/uiBridge";
 import { HtmlFrame } from "./HtmlFrame";
 import { t } from "../l10n/zh";
@@ -103,6 +105,15 @@ export interface ReaderPanelProps {
   onPurge: (remoteId: string) => void;
   onOpenHistory: () => void;
   onClose: () => void;
+  /** Reply to the open message. */
+  onReply: (original: SendOriginal) => void;
+  /** Forward the open message, original included. */
+  onForward: (original: SendOriginal) => void;
+  /**
+   * Reports what "the open message" is, so the window's shortcuts can reply
+   * to it. `undefined` when there is nothing to reply to.
+   */
+  onReplyTarget: (original: SendOriginal | undefined) => void;
 }
 
 export function ReaderPanel(props: ReaderPanelProps): ReactNode {
@@ -140,6 +151,33 @@ export function ReaderPanel(props: ReaderPanelProps): ReactNode {
   });
 
   const bodyData = body.outcome.phase === "ready" ? body.outcome.data : undefined;
+
+  /**
+   * What "reply to this message" means: the fields the composer prefills.
+   *
+   * Memoised on the body, not rebuilt per render - the window's shortcuts ask
+   * for it, and a fresh object every render would report a new "current
+   * message" forever.
+   */
+  const replyTarget = useMemo<SendOriginal | undefined>(
+    () =>
+      bodyData
+        ? {
+            remoteId: bodyData.remoteId,
+            fromAddress: bodyData.fromAddress,
+            fromName: bodyData.fromName,
+            subject: bodyData.subject,
+            receivedAt: bodyData.receivedAt,
+            when: formatWhen(bodyData.receivedAt),
+            text: bodyData.text,
+          }
+        : undefined,
+    [bodyData],
+  );
+
+  useEffect(() => {
+    props.onReplyTarget(replyTarget);
+  }, [replyTarget, props.onReplyTarget]);
 
   // Images are a separate, fire-and-forget request: the text must never wait on
   // them, and a partial failure must not blank the message.
@@ -230,6 +268,9 @@ export function ReaderPanel(props: ReaderPanelProps): ReactNode {
             onOpenHistory={props.onOpenHistory}
             imagesLoading={imagesLoading}
             imagesFailed={imagesFailed}
+            replyTarget={replyTarget}
+            onReply={props.onReply}
+            onForward={props.onForward}
           />
 
           <div className="reader-body">
@@ -306,6 +347,9 @@ function ReaderActionBar(props: {
   onOpenHistory: () => void;
   imagesLoading: boolean;
   imagesFailed: number;
+  replyTarget?: SendOriginal;
+  onReply: (original: SendOriginal) => void;
+  onForward: (original: SendOriginal) => void;
 }): ReactNode {
   const { account, writes, remoteId } = props;
   const archived = account.capabilities.archiveFolder;
@@ -316,6 +360,27 @@ function ReaderActionBar(props: {
 
   return (
     <div className="reader-toolbar">
+      <button
+        className="btn"
+        disabled={busy || !props.replyTarget}
+        title={props.replyTarget ? t.compose.replyTitle : t.reader.replyNeedsBody}
+        onClick={() => {
+          if (props.replyTarget) props.onReply(props.replyTarget);
+        }}
+      >
+        ↩ {t.compose.replyTitle}
+      </button>
+      <button
+        className="btn"
+        disabled={busy || !props.replyTarget}
+        title={props.replyTarget ? t.compose.forwardTitle : t.reader.replyNeedsBody}
+        onClick={() => {
+          if (props.replyTarget) props.onForward(props.replyTarget);
+        }}
+      >
+        ⇉ {t.compose.forwardTitle}
+      </button>
+      <span className="toolbar-divider" aria-hidden="true" />
       <button
         className="btn"
         disabled={busy}

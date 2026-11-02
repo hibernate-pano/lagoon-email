@@ -28,8 +28,20 @@ export function formatRowTimestamp(iso: string, now: Date = new Date()): string 
   return String(date.getMonth() + 1) + "月" + String(date.getDate()) + "日";
 }
 
-/** SenderAvatar.initials (SenderAvatar.swift:48-69): 2 parts → 2 letters. */
-export function initialsOf(email: string, displayName?: string | null): string {
+/**
+ * A date a human can read, for the reply header ("在 2026-11-02 15:04，张三
+ * <a@b> 写道："). Local time, fixed width: the format is never negotiated with
+ * the reader.
+ */
+export function formatWhen(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const stamp =
+    String(date.getFullYear()) + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate());
+  return stamp + " " + pad(date.getHours()) + ":" + pad(date.getMinutes());
+}
+
+/** SenderAvatar.initials (SenderAvatar.swift:48-69): 2 parts → 2 letters. */export function initialsOf(email: string, displayName?: string | null): string {
   const name = (displayName ?? "").trim();
   if (name) {
     const parts = name.split(/[\s・·]+/).filter(Boolean);

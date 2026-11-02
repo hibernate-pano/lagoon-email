@@ -602,3 +602,60 @@ code, kbd, .mono { font-family: var(--font-mono); }
 }
 .history-table td { padding: 4px var(--sp-sm); border-bottom: 1px solid color-mix(in srgb, var(--separator) 55%, transparent); }
 .history-table td .btn { padding: 2px var(--sp-sm); }
+
+/* ------------------------------------------------------------ composer --- */
+
+/*
+ * The compose sheet. It is a sheet and not a fourth column: a draft needs
+ * room for four fields and a body, and a column would squeeze the message
+ * list out of the window.
+ */
+.compose-scrim { align-items: center; padding-top: 0; }
+.compose-sheet {
+  width: var(--sheet-composer-w);
+  max-width: calc(100vw - var(--sp-xl));
+  height: var(--sheet-composer-h);
+  max-height: calc(100vh - var(--sp-xl));
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-sm);
+  background: var(--bg-window);
+  border: 1px solid var(--separator);
+  border-radius: var(--r-l);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+  padding: var(--sp-lg);
+}
+.compose-head { display: flex; align-items: center; gap: var(--sp-sm); }
+.compose-head h2 { font-size: var(--fs-title); margin: 0; }
+.compose-field { display: flex; flex-direction: column; gap: 2px; }
+.compose-field > span { font-size: var(--fs-caption); color: var(--fg-secondary); }
+.compose-field input {
+  font: inherit;
+  font-size: var(--fs-body);
+  padding: 5px var(--sp-sm);
+  border-radius: var(--r-m);
+  border: 1px solid var(--separator);
+  background: var(--bg-window);
+  color: var(--fg-primary);
+}
+.compose-field input:focus { border-color: var(--focus-ring); outline: none; }
+.compose-body {
+  flex: 1 1 auto;
+  min-height: 180px;
+  resize: vertical;
+  font: inherit;
+  font-size: var(--fs-body);
+  line-height: 1.5;
+  padding: var(--sp-sm);
+  border-radius: var(--r-m);
+  border: 1px solid var(--separator);
+  background: var(--bg-window);
+  color: var(--fg-primary);
+}
+.compose-body:focus { border-color: var(--focus-ring); outline: none; }
+.compose-field-error {
+  font-size: var(--fs-caption);
+  color: var(--sev-error);
+}
+.compose-attachments { display: flex; align-items: center; gap: var(--sp-xs); flex-wrap: wrap; }
+.compose-actions { display: flex; align-items: center; gap: var(--sp-sm); }
