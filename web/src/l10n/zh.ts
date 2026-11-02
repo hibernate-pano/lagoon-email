@@ -330,7 +330,9 @@ export const zh = {
   sync: {
     now: "立即同步",
     running: "同步中…",
-    failed: "同步请求失败",
+    failed: "同步失败；账号健康状态里有原因",
+    done: "同步完成",
+    slow: "同步还在进行，稍后会自动刷新",
   },
 
   common: {

@@ -1,0 +1,6 @@
+# Pin the toolchain so fmt/clippy gates do not drift with the runner's
+# "stable": rustfmt's line-breaking choices change between releases, and a
+# formatting check that fails on untouched code is a gate nobody trusts.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

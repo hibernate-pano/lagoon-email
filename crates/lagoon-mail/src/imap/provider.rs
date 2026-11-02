@@ -327,11 +327,49 @@ impl ImapProvider {
     }
 
     /// Original RFC 5322 message bytes (for .eml export).
+    ///
+    /// Archived and trashed messages are no longer in INBOX, but opening one
+    /// must still work. A Message-ID is the only identity that survives a
+    /// move, so after INBOX says gone the same id is re-resolved in the
+    /// Archive and Trash role folders. Numeric/`uid:` ids are mailbox-local
+    /// and are never chased across folders: a UID means something different
+    /// (or nothing) in another mailbox.
     pub fn fetch_raw_message(&mut self, remote_id: &str) -> Result<Vec<u8>, MailError> {
-        self.with_inbox(|client, selected| {
+        let miss = match self.with_inbox(|client, selected| {
             let uid = resolve_uid(remote_id, client, selected)?;
             client.fetch_full_body(uid)
-        })
+        }) {
+            Ok(raw) => return Ok(raw),
+            Err(error) if error.kind() == MailErrorKind::MessageGone => error,
+            Err(error) => return Err(error),
+        };
+        if is_mailbox_local_id(remote_id) {
+            return Err(miss);
+        }
+
+        let roles = self.ensure_roles()?;
+        let mut folders: Vec<String> = Vec::new();
+        for folder in [roles.archive, roles.trash].into_iter().flatten() {
+            if folder != INBOX && !folders.contains(&folder) {
+                folders.push(folder);
+            }
+        }
+        for folder in folders {
+            let result = self.with_client(|client, selected| {
+                *selected = Some(client.select(&folder)?);
+                let uid = resolve_uid(remote_id, client, selected)?;
+                client.fetch_full_body(uid)
+            });
+            match result {
+                Ok(raw) => return Ok(raw),
+                // Not in this folder either; keep looking.
+                Err(error) if error.kind() == MailErrorKind::MessageGone => continue,
+                // A transport/auth failure is not evidence of absence: surface
+                // it rather than finishing the search and reporting "gone".
+                Err(error) => return Err(error),
+            }
+        }
+        Err(miss)
     }
 
     /// Raw header values for one message (e.g. List-Unsubscribe at click time).
@@ -827,6 +865,15 @@ fn select_inbox(
     let state = client.select(INBOX)?;
     *selected = Some(state.clone());
     Ok(state)
+}
+
+/// Numeric and `uid:` ids address a position inside one mailbox. They cannot
+/// be re-resolved in another folder.
+fn is_mailbox_local_id(remote_id: &str) -> bool {
+    remote_id.parse::<i64>().is_ok()
+        || remote_id
+            .strip_prefix("uid:")
+            .is_some_and(|rest| rest.parse::<i64>().is_ok())
 }
 
 /// UID is a mailbox-local position and can change after MOVE. New IMAP rows use

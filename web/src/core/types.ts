@@ -245,6 +245,8 @@ export interface EmptyTrashResponse {
 
 export type ActionKind =
   | "archive"
+  | "unarchive"
+  | "restore"
   | "read"
   | "pin"
   | "unpin"

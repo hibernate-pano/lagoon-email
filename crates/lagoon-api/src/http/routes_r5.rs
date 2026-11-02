@@ -62,7 +62,10 @@ fn write_provider(
         Ok(blob) => blob,
         Err(error) => {
             tracing::error!(err = %error, "actions.credentialReadFailed");
-            return Err(respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error"));
+            return Err(respond::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal-error",
+            ));
         }
     };
     let Some(blob) = blob else {
@@ -101,11 +104,19 @@ async fn action_context(state: &AppState, account_id: Uuid) -> Result<ActionCont
         Ok(connection) => connection,
         Err(error) => {
             tracing::error!(err = %error, "actions.writeOpenFailed");
-            return Err(respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error"));
+            return Err(respond::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal-error",
+            ));
         }
     };
     let write = write_provider(state, &connection, account_id)?;
-    Ok(ActionContext { account_id, connection, capabilities: account.capabilities, write })
+    Ok(ActionContext {
+        account_id,
+        connection,
+        capabilities: account.capabilities,
+        write,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -143,9 +154,14 @@ impl WriteVerb {
     }
 
     fn audit_kind(&self) -> Option<&'static str> {
+        // Direction is part of the kind. Collapsing Archive+Unarchive into
+        // "archive" made undo of an unarchive run Unarchive again: a 200 that
+        // changed nothing (the mirror of the original undo bug).
         match self {
-            WriteVerb::Archive | WriteVerb::Unarchive => Some("archive"),
-            WriteVerb::Trash | WriteVerb::Restore => Some("delete"),
+            WriteVerb::Archive => Some("archive"),
+            WriteVerb::Unarchive => Some("unarchive"),
+            WriteVerb::Trash => Some("delete"),
+            WriteVerb::Restore => Some("restore"),
             WriteVerb::SetRead(_) => Some("markRead"),
             // pin/unpin audit as their own kinds at the call site; the undo
             // row is written by the undo route itself.
@@ -246,6 +262,7 @@ fn provider_error_response(error: ProviderError, remote_id: &str) -> Response {
         ProviderError::NotConfigured(_) => {
             respond::error(StatusCode::SERVICE_UNAVAILABLE, "provider-not-configured")
         }
+        ProviderError::MessageGone => respond::error(StatusCode::GONE, "message-gone"),
         _ => respond::error(StatusCode::BAD_GATEWAY, "provider-unreachable"),
     }
 }
@@ -271,31 +288,36 @@ async fn run_message_action(
             return provider_error_response(error, &remote_id);
         }
     }
-    let action_id: Option<i64> = match verb.local(&context.connection, context.account_id, &remote_id) {
-        Ok(previous) => {
-            let payload = verb.audit_payload(&remote_id, verb.touches_remote(), previous);
-            match verb.audit_kind() {
-                Some(kind) => {
-                    match write::record_action(&context.connection, context.account_id, kind, &payload)
-                    {
-                        Ok(id) => Some(id),
-                        Err(error) => {
-                            tracing::error!(err = %error, "actions.auditFailed");
-                            return respond::error(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "internal-error",
-                            );
+    let action_id: Option<i64> =
+        match verb.local(&context.connection, context.account_id, &remote_id) {
+            Ok(previous) => {
+                let payload = verb.audit_payload(&remote_id, verb.touches_remote(), previous);
+                match verb.audit_kind() {
+                    Some(kind) => {
+                        match write::record_action(
+                            &context.connection,
+                            context.account_id,
+                            kind,
+                            &payload,
+                        ) {
+                            Ok(id) => Some(id),
+                            Err(error) => {
+                                tracing::error!(err = %error, "actions.auditFailed");
+                                return respond::error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "internal-error",
+                                );
+                            }
                         }
                     }
+                    None => None,
                 }
-                None => None,
             }
-        }
-        Err(error) => {
-            tracing::error!(err = %error, "actions.localFailed");
-            return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
-        }
-    };
+            Err(error) => {
+                tracing::error!(err = %error, "actions.localFailed");
+                return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
+            }
+        };
     respond::json(
         StatusCode::OK,
         &json!({ "ok": true, "remoteId": remote_id, "remote": true, "actionId": action_id }),
@@ -374,27 +396,36 @@ pub async fn mark_read(
         Ok(context) => context,
         Err(response) => return response,
     };
-    let action_id: Option<i64> = match WriteVerb::SetRead(is_read).local(&context.connection, account_id, &remote_id) {
-        Ok(previous) => {
-            if record && previous.is_some() {
-                let payload =
-                    WriteVerb::SetRead(is_read).audit_payload(&remote_id, true, previous);
-                match write::record_action(&context.connection, account_id, "markRead", &payload) {
-                    Ok(id) => Some(id),
-                    Err(error) => {
-                        tracing::error!(err = %error, "read.auditFailed");
-                        return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
+    let action_id: Option<i64> =
+        match WriteVerb::SetRead(is_read).local(&context.connection, account_id, &remote_id) {
+            Ok(previous) => {
+                if record && previous.is_some() {
+                    let payload =
+                        WriteVerb::SetRead(is_read).audit_payload(&remote_id, true, previous);
+                    match write::record_action(
+                        &context.connection,
+                        account_id,
+                        "markRead",
+                        &payload,
+                    ) {
+                        Ok(id) => Some(id),
+                        Err(error) => {
+                            tracing::error!(err = %error, "read.auditFailed");
+                            return respond::error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "internal-error",
+                            );
+                        }
                     }
+                } else {
+                    None
                 }
-            } else {
-                None
             }
-        }
-        Err(error) => {
-            tracing::error!(err = %error, "read.localFailed");
-            return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
-        }
-    };
+            Err(error) => {
+                tracing::error!(err = %error, "read.localFailed");
+                return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
+            }
+        };
     if let Some(write) = context.write.as_ref() {
         if let Err(error) = write.set_read(&remote_id, is_read).await {
             // Best-effort by contract: a failed STORE is logged, never surfaced.
@@ -427,25 +458,24 @@ pub async fn pin(
         Ok(context) => context,
         Err(response) => return response,
     };
-    let action_id =
-        match write::set_pinned(&context.connection, account_id, &remote_id, pinned) {
-            Ok(_) => match write::record_action(
-                &context.connection,
-                account_id,
-                if pinned { "pin" } else { "unpin" },
-                &json!({ "remoteId": remote_id }).to_string(),
-            ) {
-                Ok(id) => id,
-                Err(error) => {
-                    tracing::error!(err = %error, "pin.auditFailed");
-                    return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
-                }
-            },
+    let action_id = match write::set_pinned(&context.connection, account_id, &remote_id, pinned) {
+        Ok(_) => match write::record_action(
+            &context.connection,
+            account_id,
+            if pinned { "pin" } else { "unpin" },
+            &json!({ "remoteId": remote_id }).to_string(),
+        ) {
+            Ok(id) => id,
             Err(error) => {
-                tracing::error!(err = %error, "pin.failed");
+                tracing::error!(err = %error, "pin.auditFailed");
                 return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
             }
-        };
+        },
+        Err(error) => {
+            tracing::error!(err = %error, "pin.failed");
+            return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
+        }
+    };
     respond::json(
         StatusCode::OK,
         &json!({ "ok": true, "remoteId": remote_id, "actionId": action_id }),
@@ -542,6 +572,7 @@ async fn run_bulk(
                 "ok": false,
                 "errorCode": match error {
                     ProviderError::AuthFailed => "imap-auth-failed",
+                    ProviderError::MessageGone => "message-gone",
                     _ => "provider-unreachable",
                 }
             }));
@@ -671,8 +702,7 @@ pub async fn list_actions(
                 let outcome = state
                     .db
                     .read(move |connection| {
-                        write::action_cursor(connection, account_id, id)
-                            .map_err(map_write_error)
+                        write::action_cursor(connection, account_id, id).map_err(map_write_error)
                     })
                     .await;
                 match outcome {
@@ -764,7 +794,9 @@ async fn undo_one(state: &AppState, account_id: Uuid, action_id: i64) -> UndoOut
             // answered 200 "undone" - the flag never moved, and the next
             // reconcile re-confirmed the server still had it archived.
             "archive" => WriteVerb::Archive.inverse(),
+            "unarchive" => WriteVerb::Unarchive.inverse(),
             "delete" => WriteVerb::Trash.inverse(),
+            "restore" => WriteVerb::Restore.inverse(),
             // markRead is the exception: the inverse of a boolean flip is not
             // "the other value", it is the value this action *replaced*, which
             // the audit payload carries. Same reason v3 restored previousIsRead.
@@ -822,8 +854,7 @@ async fn undo_one(state: &AppState, account_id: Uuid, action_id: i64) -> UndoOut
             Err(error) => Err(error.to_string()),
         }
     } else {
-        verb
-            .local(&connection, account_id, &remote_id)
+        verb.local(&connection, account_id, &remote_id)
             .map(|_| ())
             .map_err(|error| error.to_string())
     };
@@ -856,9 +887,7 @@ pub async fn undo_action(
         UndoOutcome::Undone => {
             respond::json(StatusCode::OK, &json!({ "ok": true, "undone": action_id }))
         }
-        UndoOutcome::NotUndoable => {
-            respond::error(StatusCode::BAD_REQUEST, "not-undoable")
-        }
+        UndoOutcome::NotUndoable => respond::error(StatusCode::BAD_REQUEST, "not-undoable"),
         UndoOutcome::Rejected(status, code) => respond::error(status, code),
         UndoOutcome::Failed(message) => {
             tracing::error!(label = %message, "undo.failed");
@@ -910,14 +939,18 @@ pub async fn undo_bulk(
                 items.push(json!({ "actionId": action_id, "ok": true }));
             }
             UndoOutcome::NotUndoable => {
-                items.push(json!({ "actionId": action_id, "ok": false, "errorCode": "not-undoable" }));
+                items.push(
+                    json!({ "actionId": action_id, "ok": false, "errorCode": "not-undoable" }),
+                );
             }
             UndoOutcome::Rejected(_, code) => {
                 items.push(json!({ "actionId": action_id, "ok": false, "errorCode": code }));
             }
             UndoOutcome::Failed(message) => {
                 tracing::error!(actionId = action_id, label = %message, "undoBulk.itemFailed");
-                items.push(json!({ "actionId": action_id, "ok": false, "errorCode": "undo-failed" }));
+                items.push(
+                    json!({ "actionId": action_id, "ok": false, "errorCode": "undo-failed" }),
+                );
             }
         }
     }

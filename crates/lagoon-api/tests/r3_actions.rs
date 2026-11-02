@@ -47,11 +47,7 @@ fn prepare_account(server: &TestServer, capabilities: &Value) {
     connection
         .execute(
             "UPDATE accounts SET credentials = ?, capabilities = ? WHERE id = ?",
-            rusqlite::params![
-                sealed,
-                capabilities.to_string(),
-                uuid_bytes(ACCOUNT_A)
-            ],
+            rusqlite::params![sealed, capabilities.to_string(), uuid_bytes(ACCOUNT_A)],
         )
         .expect("prepare account");
 }
@@ -70,9 +66,24 @@ async fn post(
     let headers = server.auth_headers();
     match body {
         Some(body) => {
-            http::request_with_body(client, "POST", &format!("{}{path}", server.base_url), &headers, body.to_string().as_bytes()).await
+            http::request_with_body(
+                client,
+                "POST",
+                &format!("{}{path}", server.base_url),
+                &headers,
+                body.to_string().as_bytes(),
+            )
+            .await
         }
-        None => http::request(client, "POST", &format!("{}{path}", server.base_url), &headers).await,
+        None => {
+            http::request(
+                client,
+                "POST",
+                &format!("{}{path}", server.base_url),
+                &headers,
+            )
+            .await
+        }
     }
 }
 
@@ -81,48 +92,73 @@ fn flag(server: &TestServer, column: &str, remote_id: &str) -> Option<bool> {
     if column == "is_pinned" {
         // Pinned lives in message_pins, not a header flag (v3 setPinnedSync).
         let found = connection
-            .prepare(
-                "SELECT 1 FROM message_pins WHERE account_id = ? AND remote_id = ? LIMIT 1",
-            )
+            .prepare("SELECT 1 FROM message_pins WHERE account_id = ? AND remote_id = ? LIMIT 1")
             .expect("prepare pins")
-            .query_row(rusqlite::params![uuid_bytes(ACCOUNT_A), remote_id], |_| Ok(()))
+            .query_row(rusqlite::params![uuid_bytes(ACCOUNT_A), remote_id], |_| {
+                Ok(())
+            })
             .optional()
             .expect("pins");
         return Some(found.is_some());
     }
-    let sql = format!("SELECT {column} FROM message_headers WHERE account_id = ? AND remote_id = ?");
+    let sql =
+        format!("SELECT {column} FROM message_headers WHERE account_id = ? AND remote_id = ?");
     let mut statement = connection.prepare(&sql).expect("prepare");
     statement
-        .query_row(
-            rusqlite::params![uuid_bytes(ACCOUNT_A), remote_id],
-            |row| row.get::<_, Option<bool>>(0),
-        )
+        .query_row(rusqlite::params![uuid_bytes(ACCOUNT_A), remote_id], |row| {
+            row.get::<_, Option<bool>>(0)
+        })
         .expect("flag")
 }
 
 #[tokio::test]
 async fn the_gate_answers_409_before_any_provider_call() {
     let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
-    let (server, _fixtures) = TestServer::spawn_with_provider("r3-actions-gate", factory.clone()).await;
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-actions-gate", factory.clone()).await;
     prepare_account(&server, &all_caps_false());
     let client = http::client();
 
-    let observed = post(&client, &server, &format!("/api/messages/{REMOTE}/archive?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/archive?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 409, "{:?}", observed.body);
     assert_eq!(observed.body["error"], json!("archive-unavailable"));
     // The gate runs before the provider is even built: no write calls.
     assert!(factory.write_calls().all().is_empty());
 
-    let observed = post(&client, &server, &format!("/api/messages/{REMOTE}/purge?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/purge?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 409, "{:?}", observed.body);
     assert_eq!(observed.body["error"], json!("uidplus-missing"));
 
-    let observed = post(&client, &server, &format!("/api/trash/empty?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/trash/empty?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 409, "{:?}", observed.body);
 
     // Unknown account: 404 before anything else.
     let other = "99999999-9999-4999-8999-999999999999";
-    let observed = post(&client, &server, &format!("/api/messages/{REMOTE}/archive?accountId={other}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/archive?accountId={other}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 404, "{:?}", observed.body);
     assert_eq!(observed.body["error"], json!("unknown-account"));
 }
@@ -131,12 +167,19 @@ async fn the_gate_answers_409_before_any_provider_call() {
 async fn archive_runs_remote_then_flips_the_flag_and_audits() {
     let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
     factory.write_script(vec![FakeWriteOutcome::Ok]);
-    let (server, _fixtures) = TestServer::spawn_with_provider("r3-actions-archive", factory.clone()).await;
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-actions-archive", factory.clone()).await;
     prepare_account(&server, &all_caps_allowed());
     let client = http::client();
 
     assert_eq!(flag(&server, "is_archived", REMOTE), Some(false));
-    let observed = post(&client, &server, &format!("/api/messages/{REMOTE}/archive?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/archive?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 200, "{:?}", observed.body);
     assert_eq!(observed.body["ok"], json!(true));
     assert_eq!(observed.body["remote"], json!(true));
@@ -164,16 +207,29 @@ async fn archive_runs_remote_then_flips_the_flag_and_audits() {
 #[tokio::test]
 async fn undo_of_an_archive_unarchives_locally_and_remotely() {
     let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
-    let (server, _fixtures) = TestServer::spawn_with_provider("r3-actions-undo-archive", factory.clone()).await;
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-actions-undo-archive", factory.clone()).await;
     prepare_account(&server, &all_caps_allowed());
     let client = http::client();
 
-    let observed = post(&client, &server, &format!("/api/messages/{REMOTE}/archive?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/archive?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 200, "{:?}", observed.body);
     let action_id = observed.body["actionId"].as_i64().expect("actionId");
     assert_eq!(flag(&server, "is_archived", REMOTE), Some(true));
 
-    let observed = post(&client, &server, &format!("/api/actions/{action_id}/undo?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/actions/{action_id}/undo?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 200, "{:?}", observed.body);
     assert_eq!(observed.body["undone"], json!(action_id));
 
@@ -193,16 +249,29 @@ async fn undo_of_an_archive_unarchives_locally_and_remotely() {
 #[tokio::test]
 async fn undo_of_a_delete_restores_locally_and_remotely() {
     let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
-    let (server, _fixtures) = TestServer::spawn_with_provider("r3-actions-undo-delete", factory.clone()).await;
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-actions-undo-delete", factory.clone()).await;
     prepare_account(&server, &all_caps_allowed());
     let client = http::client();
 
-    let observed = post(&client, &server, &format!("/api/messages/{REMOTE}/delete?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/delete?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 200, "{:?}", observed.body);
     let action_id = observed.body["actionId"].as_i64().expect("actionId");
     assert_eq!(flag(&server, "is_deleted", REMOTE), Some(true));
 
-    let observed = post(&client, &server, &format!("/api/actions/{action_id}/undo?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/actions/{action_id}/undo?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 200, "{:?}", observed.body);
     assert_eq!(observed.body["undone"], json!(action_id));
 
@@ -218,17 +287,124 @@ async fn undo_of_a_delete_restores_locally_and_remotely() {
 }
 
 #[tokio::test]
+async fn undo_of_an_unarchive_rearchives_locally_and_remotely() {
+    let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-actions-undo-unarchive", factory.clone()).await;
+    prepare_account(&server, &all_caps_allowed());
+    let client = http::client();
+
+    // The real flow: archive, then take it back out of the archive.
+    let archived = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/archive?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
+    assert_eq!(archived.status, 200, "{:?}", archived.body);
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/unarchive?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+    let action_id = observed.body["actionId"].as_i64().expect("actionId");
+    assert_eq!(flag(&server, "is_archived", REMOTE), Some(false));
+
+    // Undoing "unarchive" must archive again. Collapsing both directions into
+    // kind "archive" made this a no-op that still answered 200.
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/actions/{action_id}/undo?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+    assert_eq!(flag(&server, "is_archived", REMOTE), Some(true));
+    let calls = factory.write_calls().all();
+    assert_eq!(
+        calls,
+        vec![
+            ("archive".to_owned(), REMOTE.to_owned()),
+            ("unarchive".to_owned(), REMOTE.to_owned()),
+            ("archive".to_owned(), REMOTE.to_owned()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn undo_of_a_restore_rethrashes_locally_and_remotely() {
+    let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-actions-undo-restore", factory.clone()).await;
+    prepare_account(&server, &all_caps_allowed());
+    let client = http::client();
+
+    let deleted = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/delete?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
+    assert_eq!(deleted.status, 200, "{:?}", deleted.body);
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/restore?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+    let action_id = observed.body["actionId"].as_i64().expect("actionId");
+    assert_eq!(flag(&server, "is_deleted", REMOTE), Some(false));
+
+    // Undoing "restore" must put it back in the trash.
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/actions/{action_id}/undo?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+    assert_eq!(flag(&server, "is_deleted", REMOTE), Some(true));
+    let calls = factory.write_calls().all();
+    assert_eq!(
+        calls,
+        vec![
+            ("trash".to_owned(), REMOTE.to_owned()),
+            ("restore_from_trash".to_owned(), REMOTE.to_owned()),
+            ("trash".to_owned(), REMOTE.to_owned()),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn mark_read_flips_locally_and_treats_the_remote_as_best_effort() {
     let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
     // The remote STORE fails: the route must still answer, and the local flag
     // must stay flipped (v3 markRead.remoteFailed).
-    factory.write_script(vec![FakeWriteOutcome::Unreachable("store failed".to_owned())]);
-    let (server, _fixtures) = TestServer::spawn_with_provider("r3-actions-read", factory.clone()).await;
+    factory.write_script(vec![FakeWriteOutcome::Unreachable(
+        "store failed".to_owned(),
+    )]);
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-actions-read", factory.clone()).await;
     prepare_account(&server, &all_caps_allowed());
     let client = http::client();
 
     // record=false: a 204 with no audit row, despite the remote failure.
-    let observed = post(&client, &server, &format!("/api/messages/{REMOTE}/read?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/read?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 204, "{:?}", observed.body);
     assert_eq!(flag(&server, "is_read", REMOTE), Some(true));
     assert!(factory.write_calls().all().len() == 1);
@@ -264,19 +440,37 @@ async fn pin_undo_flips_back_and_the_second_undo_is_already_undone() {
     prepare_account(&server, &all_caps_allowed());
     let client = http::client();
 
-    let observed = post(&client, &server, &format!("/api/messages/{REMOTE}/pin?accountId={ACCOUNT_A}&pinned=true"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/pin?accountId={ACCOUNT_A}&pinned=true"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 200, "{:?}", observed.body);
     let action_id = observed.body["actionId"].as_i64().expect("actionId");
     assert_eq!(flag(&server, "is_pinned", REMOTE), Some(true));
 
     // Undo: 200, local flag back.
-    let observed = post(&client, &server, &format!("/api/actions/{action_id}/undo?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/actions/{action_id}/undo?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 200, "{:?}", observed.body);
     assert_eq!(observed.body["undone"], json!(action_id));
     assert_eq!(flag(&server, "is_pinned", REMOTE), Some(false));
 
     // Single-use: the second attempt is 409 already-undone.
-    let observed = post(&client, &server, &format!("/api/actions/{action_id}/undo?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/actions/{action_id}/undo?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 409, "{:?}", observed.body);
     assert_eq!(observed.body["error"], json!("already-undone"));
 
@@ -304,14 +498,27 @@ async fn undo_of_a_purge_is_not_undoable_and_an_expired_one_is_410() {
     connection
         .execute(
             "INSERT INTO ai_actions (account_id, kind, payload) VALUES (?, 'purge', ?)",
-            rusqlite::params![uuid_bytes(ACCOUNT_A), json!({"remoteId": REMOTE}).to_string()],
+            rusqlite::params![
+                uuid_bytes(ACCOUNT_A),
+                json!({"remoteId": REMOTE}).to_string()
+            ],
         )
         .expect("insert purge action");
     let purge_id: i64 = connection
-        .query_row("SELECT id FROM ai_actions WHERE kind = 'purge'", [], |row| row.get(0))
+        .query_row(
+            "SELECT id FROM ai_actions WHERE kind = 'purge'",
+            [],
+            |row| row.get(0),
+        )
         .expect("purge id");
 
-    let observed = post(&client, &server, &format!("/api/actions/{purge_id}/undo?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/actions/{purge_id}/undo?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 400, "{:?}", observed.body);
     assert_eq!(observed.body["error"], json!("not-undoable"));
 
@@ -320,7 +527,10 @@ async fn undo_of_a_purge_is_not_undoable_and_an_expired_one_is_410() {
         .execute(
             "INSERT INTO ai_actions (account_id, kind, payload, expires_at)
              VALUES (?, 'archive', ?, '2020-01-01 00:00:00.000')",
-            rusqlite::params![uuid_bytes(ACCOUNT_A), json!({"remoteId": REMOTE}).to_string()],
+            rusqlite::params![
+                uuid_bytes(ACCOUNT_A),
+                json!({"remoteId": REMOTE}).to_string()
+            ],
         )
         .expect("insert expired action");
     let expired_id: i64 = connection
@@ -331,9 +541,48 @@ async fn undo_of_a_purge_is_not_undoable_and_an_expired_one_is_410() {
         )
         .expect("expired id");
 
-    let observed = post(&client, &server, &format!("/api/actions/{expired_id}/undo?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/actions/{expired_id}/undo?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 410, "{:?}", observed.body);
     assert_eq!(observed.body["error"], json!("action-expired"));
+}
+
+/// A message another client deleted is not an outage. The write route must
+/// answer the honest 410 `message-gone`, leave the local row untouched, and
+/// record no undo row that could never be performed.
+#[tokio::test]
+async fn archiving_a_message_gone_on_the_server_answers_410_and_changes_nothing() {
+    let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
+    factory.write_script(vec![FakeWriteOutcome::MessageGone]);
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-actions-gone", factory.clone()).await;
+    prepare_account(&server, &all_caps_allowed());
+    let client = http::client();
+
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/archive?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
+    assert_eq!(observed.status, 410, "{:?}", observed.body);
+    assert_eq!(observed.body["error"], json!("message-gone"));
+    assert_eq!(flag(&server, "is_archived", REMOTE), Some(false));
+    let connection = open_read_write(&server.db_path);
+    let audits: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM ai_actions WHERE kind = 'archive'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("audit count");
+    assert_eq!(audits, 0, "a failed remote must not record an undo");
 }
 
 #[tokio::test]
@@ -343,7 +592,8 @@ async fn bulk_archive_reports_per_item_results() {
         FakeWriteOutcome::Ok,
         FakeWriteOutcome::Unreachable("move failed".to_owned()),
     ]);
-    let (server, _fixtures) = TestServer::spawn_with_provider("r3-actions-bulk", factory.clone()).await;
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-actions-bulk", factory.clone()).await;
     prepare_account(&server, &all_caps_allowed());
     let client = http::client();
 
@@ -364,7 +614,13 @@ async fn bulk_archive_reports_per_item_results() {
     assert_eq!(flag(&server, "is_archived", "fixture-msg-3"), Some(false));
 
     // Contract shapes: empty body and empty list are distinct 400s.
-    let observed = post(&client, &server, &format!("/api/archive-bulk?accountId={ACCOUNT_A}"), None).await;
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/archive-bulk?accountId={ACCOUNT_A}"),
+        None,
+    )
+    .await;
     assert_eq!(observed.status, 400);
     assert_eq!(observed.body["error"], json!("missing-body"));
     let observed = post(

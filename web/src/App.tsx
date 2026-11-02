@@ -32,6 +32,7 @@ import { useMailboxOverlay } from "./core/mutations";
 import { BYPASS_CAPABILITY_GATE, UNDO_WINDOW_MS } from "./core/config";
 import { LENS_EMPTY } from "./core/empty";
 import { targetIdsOf } from "./core/selection";
+import { roundSettled, syncStateOf } from "./core/syncWait";
 import {
   bulkAction,
   emptyTrash,
@@ -64,6 +65,9 @@ import { t } from "./l10n/zh";
 import { sidecarUrl } from "virtual:sidecar-env";
 
 const POLL_MS = 30_000;
+/** Manual sync waits for the round it started, without blocking on a slow server. */
+const SYNC_POLL_MS = 600;
+const SYNC_WAIT_MS = 10_000;
 
 const LENS_TITLE: Record<LensId, string> = {
   inbox: t.sidebar.inbox,
@@ -316,18 +320,46 @@ export function App(): ReactNode {
 
   /**
    * `POST /api/sync` answers 204 at once: it starts a round, it does not wait
-   * for one. The refresh is what makes the result visible, so it runs either
-   * way - a request that was accepted still produced a round.
+   * for one. Flipping the button back at that moment would show stale mail and
+   * no evidence anything happened, so the button stays busy while the account
+   * row is polled until the round writes a new lastSyncAt/health state (or the
+   * wait budget runs out). The refresh then shows whatever the round produced.
    */
   const syncNow = async () => {
     if (!accountId || syncBusy) return;
+    const known =
+      accounts.outcome.phase === "ready" || accounts.outcome.phase === "empty"
+        ? accounts.outcome.data
+        : [];
+    const before = syncStateOf(known, accountId);
     setSyncBusy(true);
     try {
       const result = await apiCall<null>({ method: "POST", path: "/api/sync" });
       if (result.kind !== "ok") {
         setToast({ id: Date.now(), text: t.sync.failed });
+        refreshAll();
+        return;
+      }
+      let settled = before === null;
+      let last = before;
+      const deadline = Date.now() + SYNC_WAIT_MS;
+      while (!settled && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, SYNC_POLL_MS));
+        const next = await apiCall<ConnectedAccount[]>({ method: "GET", path: "/api/accounts" });
+        if (next.kind !== "ok") break;
+        last = syncStateOf(next.data, accountId);
+        settled = before !== null && roundSettled(before, last);
       }
       refreshAll();
+      const unhealthy =
+        last !== null &&
+        (last.status === "error" ||
+          last.status === "degraded" ||
+          last.status === "needsReconnect");
+      setToast({
+        id: Date.now(),
+        text: unhealthy ? t.sync.failed : settled ? t.sync.done : t.sync.slow,
+      });
     } finally {
       setSyncBusy(false);
     }

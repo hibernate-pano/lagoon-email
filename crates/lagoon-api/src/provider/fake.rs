@@ -83,10 +83,7 @@ impl MailProvider for FakeProvider {
     }
 
     fn pull_changes(&self, after: &SyncCursor) -> PullFuture<'_> {
-        self.cursors
-            .lock()
-            .expect("cursor log")
-            .push(after.clone());
+        self.cursors.lock().expect("cursor log").push(after.clone());
         let next = self.script.lock().expect("script lock").pop_front();
         Box::pin(async move {
             match next {
@@ -110,6 +107,7 @@ pub enum FakeWriteOutcome {
     DeleteUnavailable,
     NotInTrash,
     Unreachable(String),
+    MessageGone,
 }
 
 /// What write verbs saw, in order: (verb, remoteId).
@@ -151,6 +149,7 @@ impl FakeWriteProvider {
             Some(FakeWriteOutcome::Unreachable(message)) => {
                 Err(ProviderError::Unreachable(message))
             }
+            Some(FakeWriteOutcome::MessageGone) => Err(ProviderError::MessageGone),
         }
     }
 }
@@ -279,14 +278,8 @@ impl FakeProviderFactory {
 
     /// Queue pull rounds for every provider this factory builds: the sync
     /// loop the connect route starts runs one round per connect.
-    pub fn pull_rounds(
-        &self,
-        rounds: Vec<Result<MailChangeSet, ProviderError>>,
-    ) -> &Self {
-        self.script
-            .lock()
-            .expect("script lock")
-            .extend(rounds);
+    pub fn pull_rounds(&self, rounds: Vec<Result<MailChangeSet, ProviderError>>) -> &Self {
+        self.script.lock().expect("script lock").extend(rounds);
         self
     }
 

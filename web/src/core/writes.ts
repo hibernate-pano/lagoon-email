@@ -66,9 +66,10 @@ const CONFLICT_CODES = new Set([
   "account-exists",
 ]);
 
-// The undo window closing is the only 410 the API actually returns; v3's
-// message-gone lives in lagoon-mail and never reaches the wire.
-const GONE_CODES = new Set(["action-expired"]);
+// 410 means the target is gone, not that the server failed: the undo window
+// closed, or the message no longer exists on the mail server (another client
+// deleted it before this action reached IMAP).
+const GONE_CODES = new Set(["action-expired", "message-gone"]);
 const NOTFOUND_CODES = new Set(["unknown-account", "unknown-action", "unknown-message"]);
 
 export function classifyFailure(code: string | null, status: number): WriteFailureKind {

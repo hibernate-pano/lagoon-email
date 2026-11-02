@@ -16,7 +16,7 @@ use lagoon_mail::imap::capabilities::MailCapabilities as MailCapabilitiesWire;
 use lagoon_mail::imap::provider::{ImapProvider, ProviderCredentials, IDLE_BUDGET};
 use lagoon_mail::preset::ProviderPreset;
 use lagoon_mail::sync::SyncCursor as MailSyncCursor;
-use lagoon_mail::transport::{Transport, TlsTransport};
+use lagoon_mail::transport::{TlsTransport, Transport};
 use lagoon_mail::{ChangeSet, RemoteHeader as MailRemoteHeader};
 
 use crate::provider::{
@@ -66,10 +66,10 @@ impl LagoonMailProvider {
             MailErrorKind::Unreachable => {
                 ProviderError::Unreachable(error.kind().label().to_owned())
             }
+            MailErrorKind::MessageGone => ProviderError::MessageGone,
             other => ProviderError::Protocol(other.label().to_owned()),
         }
     }
-
 }
 
 fn convert_capabilities(capabilities: MailCapabilitiesWire) -> MailCapabilities {
@@ -389,6 +389,10 @@ mod tests {
         assert!(matches!(
             LagoonMailProvider::map_error(&MailError::new(MailErrorKind::Protocol, "x")),
             ProviderError::Protocol(_)
+        ));
+        assert!(matches!(
+            LagoonMailProvider::map_error(&MailError::message_gone()),
+            ProviderError::MessageGone
         ));
     }
 }

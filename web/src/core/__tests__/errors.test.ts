@@ -30,6 +30,7 @@ const BACKEND_CODES = [
   "malformed-decision",
   "malformed-pinned",
   "malformed-remoteId",
+  "message-gone",
   "missing-body",
   "missing-field",
   "not-undoable",
@@ -62,6 +63,7 @@ describe("the backend error-code dictionary", () => {
     expect(classifyFailure("archive-unavailable", 409)).toBe("capability");
     expect(classifyFailure("already-undone", 409)).toBe("conflict");
     expect(classifyFailure("action-expired", 410)).toBe("gone");
+    expect(classifyFailure("message-gone", 410)).toBe("gone");
     expect(classifyFailure("unknown-account", 404)).toBe("notfound");
     expect(classifyFailure("api-unauthorized", 401)).toBe("unauthorized");
   });

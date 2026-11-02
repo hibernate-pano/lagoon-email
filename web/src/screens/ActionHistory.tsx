@@ -16,6 +16,8 @@ import { t } from "../l10n/zh";
 
 const KIND_LABEL: Record<string, string> = {
   archive: t.m2.actions.archive,
+  unarchive: t.m2.actions.unarchive,
+  restore: t.m2.actions.restore,
   read: t.m2.actions.markRead,
   pin: t.m2.actions.pin,
   unpin: t.m2.actions.unpin,

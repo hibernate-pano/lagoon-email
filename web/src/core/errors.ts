@@ -101,6 +101,7 @@ const CODE_SENTENCES: Record<string, string> = {
   "malformed-decision": "决定的取值不合法（前端 bug）。",
   "malformed-pinned": "pinned 参数不是布尔值（前端 bug）。",
   "malformed-remoteId": "邮件 id 格式不对（前端 bug）。",
+  "message-gone": "这封邮件在服务器上已经不在了（可能已被删除或移走）。",
   "missing-body": "请求体缺失（前端 bug）。",
   "missing-field": "缺少必填字段（前端 bug）。",
   "provider-auth-failed": "邮箱授权被服务器拒绝（401）。重新连接这个账号即可。",

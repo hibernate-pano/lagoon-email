@@ -44,6 +44,9 @@ pub enum ProviderError {
     NotConfigured(String),
     /// The server answered, but not with IMAP we can use.
     Protocol(String),
+    /// The message no longer exists (or is no longer visible) on the server.
+    /// Distinct from `Protocol`: the session is healthy, the data is gone.
+    MessageGone,
 }
 
 impl std::fmt::Display for ProviderError {
@@ -55,6 +58,7 @@ impl std::fmt::Display for ProviderError {
                 write!(formatter, "provider not configured: {message}")
             }
             ProviderError::Protocol(message) => write!(formatter, "imap protocol error: {message}"),
+            ProviderError::MessageGone => formatter.write_str("message gone"),
         }
     }
 }

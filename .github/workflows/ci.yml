@@ -14,24 +14,35 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # The repo pins its toolchain in rust-toolchain.toml. rust-cache keys on
+      # that toolchain and on Cargo.lock, so a warm run does not re-download the
+      # registry; a cold run fetches normally (no --offline, which only works
+      # with a pre-populated cache).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates -> target
+            shell -> target
       - name: Show toolchain
         run: |
           rustc --version
           cargo --version
-      - name: Format check
-        run: |
-          cargo fmt --manifest-path crates/Cargo.toml --check
-          cargo fmt --manifest-path shell/Cargo.toml --check
+      # Lint first and format last: a formatting failure must not hide whether
+      # clippy and the tests passed.
       - name: Clippy (warnings are errors)
-        run: cargo clippy --offline --manifest-path crates/Cargo.toml --workspace --all-targets -- -D warnings
+        run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets -- -D warnings
       - name: Clippy shell (warnings are errors)
-        run: cargo clippy --offline --manifest-path shell/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path shell/Cargo.toml --all-targets -- -D warnings
       - name: Backend tests (crates workspace)
-        run: cargo test --offline --manifest-path crates/Cargo.toml
+        run: cargo test --manifest-path crates/Cargo.toml
       - name: Shell build + selftest
         run: |
           cargo build --manifest-path shell/Cargo.toml
           cargo run --manifest-path shell/Cargo.toml -- --selftest
+      - name: Format check
+        run: |
+          cargo fmt --all --manifest-path crates/Cargo.toml --check
+          cargo fmt --manifest-path shell/Cargo.toml --check
 
   frontend:
     runs-on: macos-15

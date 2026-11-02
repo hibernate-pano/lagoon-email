@@ -41,32 +41,35 @@ pub async fn healthz() -> Response {
 pub async fn accounts(State(state): State<AppState>) -> Response {
     let outcome = state
         .db
-        .read(move |connection| -> Result<Vec<wire::ConnectedAccount>, StoreError> {
-            let accounts = store::accounts::all(connection)?;
-            Ok::<_, StoreError>(
-                accounts
-                    .into_iter()
-                    .map(|account| {
-                        // v3: a count failure must not break the whole
-                        // directory, so it degrades to 0.
-                        let unread = store::messages::unread_count(connection, account.id).unwrap_or(0);
-                        wire::ConnectedAccount {
-                            id: account.id,
-                            provider: account.provider,
-                            email: account.email,
-                            is_active: account.is_active,
-                            unread_count: unread,
-                            sync_health: wire::SyncHealth {
-                                status: wire::SyncHealth::status_or_ok(&account.sync_status),
-                                last_sync_at: account.last_sync_at,
-                                last_error: account.last_sync_error,
-                            },
-                            capabilities: account.capabilities,
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
+        .read(
+            move |connection| -> Result<Vec<wire::ConnectedAccount>, StoreError> {
+                let accounts = store::accounts::all(connection)?;
+                Ok::<_, StoreError>(
+                    accounts
+                        .into_iter()
+                        .map(|account| {
+                            // v3: a count failure must not break the whole
+                            // directory, so it degrades to 0.
+                            let unread =
+                                store::messages::unread_count(connection, account.id).unwrap_or(0);
+                            wire::ConnectedAccount {
+                                id: account.id,
+                                provider: account.provider,
+                                email: account.email,
+                                is_active: account.is_active,
+                                unread_count: unread,
+                                sync_health: wire::SyncHealth {
+                                    status: wire::SyncHealth::status_or_ok(&account.sync_status),
+                                    last_sync_at: account.last_sync_at,
+                                    last_error: account.last_sync_error,
+                                },
+                                capabilities: account.capabilities,
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            },
+        )
         .await;
 
     match outcome {
@@ -167,19 +170,23 @@ pub async fn folder_counts(State(state): State<AppState>, uri: Uri) -> Response 
 
     let outcome = state
         .db
-        .read(move |connection| -> Result<FolderCountsOutcome, StoreError> {
-            if !store::accounts::exists(connection, account_id)? {
-                return Ok(FolderCountsOutcome::UnknownAccount);
-            }
-            Ok(FolderCountsOutcome::Counts(store::messages::FolderTallies {
-                live: store::messages::live_count(connection, account_id)?,
-                unread: store::messages::unread_count(connection, account_id)?,
-                archived: store::messages::archived_count(connection, account_id)?,
-                pinned: store::messages::pinned_count(connection, account_id)?,
-                deleted: store::messages::deleted_count(connection, account_id)?,
-                sent: store::messages::sent_count(connection, account_id)?,
-            }))
-        })
+        .read(
+            move |connection| -> Result<FolderCountsOutcome, StoreError> {
+                if !store::accounts::exists(connection, account_id)? {
+                    return Ok(FolderCountsOutcome::UnknownAccount);
+                }
+                Ok(FolderCountsOutcome::Counts(
+                    store::messages::FolderTallies {
+                        live: store::messages::live_count(connection, account_id)?,
+                        unread: store::messages::unread_count(connection, account_id)?,
+                        archived: store::messages::archived_count(connection, account_id)?,
+                        pinned: store::messages::pinned_count(connection, account_id)?,
+                        deleted: store::messages::deleted_count(connection, account_id)?,
+                        sent: store::messages::sent_count(connection, account_id)?,
+                    },
+                ))
+            },
+        )
         .await;
 
     match outcome {
@@ -229,7 +236,8 @@ pub async fn message_body(
                 return Ok(BodyOutcome::UnknownAccount);
             }
             let header = store::messages::find(connection, account_id, &remote_id_for_read)?;
-            let Some(stored) = store::bodies::find(connection, account_id, &remote_id_for_read)? else {
+            let Some(stored) = store::bodies::find(connection, account_id, &remote_id_for_read)?
+            else {
                 return Ok(BodyOutcome::CacheMiss);
             };
             // A value that will not open is a cache miss, not an error: v3's
@@ -271,9 +279,7 @@ pub async fn message_body(
     match outcome {
         Ok(BodyOutcome::Found(body)) => respond::json(StatusCode::OK, &body),
         Ok(BodyOutcome::CacheMiss) => fetch_and_answer(&state, account_id, &remote_id).await,
-        Ok(BodyOutcome::UnknownAccount) => {
-            respond::error(StatusCode::NOT_FOUND, "unknown-account")
-        }
+        Ok(BodyOutcome::UnknownAccount) => respond::error(StatusCode::NOT_FOUND, "unknown-account"),
         Err(error) => {
             tracing::error!(accountId = %account_id, remoteId = %remote_id, err = %error, "body.readFailed");
             respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error")
@@ -302,6 +308,12 @@ async fn fetch_and_answer(state: &AppState, account_id: Uuid, remote_id: &str) -
             tracing::error!(accountId = %account_id, remoteId = %remote_id, reason = %reason, "body.notConfigured");
             return respond::error(StatusCode::SERVICE_UNAVAILABLE, "provider-not-configured");
         }
+        // A deleted message is not an outage: the contract promises 410, and
+        // the reader has copy for exactly this code.
+        Err(ProviderError::MessageGone) => {
+            tracing::info!(accountId = %account_id, remoteId = %remote_id, "body.gone");
+            return respond::error(StatusCode::GONE, "message-gone");
+        }
         Err(error) => {
             tracing::error!(accountId = %account_id, remoteId = %remote_id, err = %error, "body.fetchFailed");
             return respond::error(StatusCode::BAD_GATEWAY, "provider-unreachable");
@@ -315,7 +327,9 @@ async fn fetch_and_answer(state: &AppState, account_id: Uuid, remote_id: &str) -
     let remote_id_for_header = remote_id.to_owned();
     let header = state
         .db
-        .read(move |connection| store::messages::find(connection, account_id, &remote_id_for_header))
+        .read(move |connection| {
+            store::messages::find(connection, account_id, &remote_id_for_header)
+        })
         .await
         .ok()
         .flatten();

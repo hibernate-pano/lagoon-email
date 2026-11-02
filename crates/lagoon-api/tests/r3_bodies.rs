@@ -131,6 +131,30 @@ async fn a_body_fetch_failure_answers_502_and_caches_nothing() {
     assert_eq!(stored_body_count(&server), 0);
 }
 
+/// The contract has always promised 410 `message-gone` for a body that no
+/// longer exists; before this test the route folded every non-auth failure
+/// into 502 `provider-unreachable`, misreporting a deleted message as an
+/// outage.
+#[tokio::test]
+async fn a_gone_message_answers_410_message_gone_and_caches_nothing() {
+    let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
+    factory.body_script(vec![Err(ProviderError::MessageGone)]);
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-bodies-gone", factory.clone()).await;
+    prepare_account(&server);
+    let client = http::client();
+
+    let observed = get(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/body?accountId={ACCOUNT_A}"),
+    )
+    .await;
+    assert_eq!(observed.status, 410, "{:?}", observed.body);
+    assert_eq!(observed.body["error"], json!("message-gone"));
+    assert_eq!(stored_body_count(&server), 0);
+}
+
 #[tokio::test]
 async fn an_account_without_readable_credentials_answers_503() {
     let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));

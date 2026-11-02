@@ -380,6 +380,49 @@ fn fetch_attachment_returns_decoded_bytes() {
     assert_eq!(attachment.data, b"hello");
 }
 
+/// Archiving moves a message out of INBOX, so a body fetch that only looks in
+/// INBOX turns "open an archived message" into a permanent 502. The Message-ID
+/// is the identity that survives the move; the provider must chase it into the
+/// role folders before calling the message gone.
+#[test]
+fn fetch_raw_message_finds_an_archived_message_after_inbox_says_gone() {
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1 UIDPLUS");
+    select_script(&transport, "A0003", 1, 7, 8);
+    // INBOX: the header search is empty and the recent-window scan finds
+    // nothing, so INBOX really has no such message.
+    transport.enqueue_line("* SEARCH");
+    transport.enqueue_line("A0004 OK SEARCH completed");
+    transport.enqueue_line("A0005 OK FETCH completed");
+    // Roles are discovered once, and Archive exists.
+    transport.enqueue_lines(&[
+        "* LIST (\\HasNoChildren) \"/\" \"INBOX\"",
+        "* LIST (\\Archive) \"/\" \"Archive\"",
+        "A0006 OK LIST completed",
+    ]);
+    select_script(&transport, "A0007", 2, 7, 50);
+    transport.enqueue_line("* SEARCH 42");
+    transport.enqueue_line("A0008 OK SEARCH completed");
+    let raw = b"Message-ID: <m1@example.com>\r\nSubject: archived\r\n\r\nold body".to_vec();
+    transport.enqueue_line(format!("* 1 FETCH (UID 42 BODY[] {{{}}}", raw.len()));
+    transport.enqueue_literal(raw.clone());
+    transport.enqueue_line(")");
+    transport.enqueue_line("A0009 OK FETCH completed");
+    let mut provider = provider(&transport);
+
+    let fetched = provider.fetch_raw_message("<m1@example.com>").unwrap();
+    assert_eq!(fetched, raw);
+    let lines = transport.command_lines();
+    assert!(
+        lines.contains(&"A0007 SELECT \"Archive\"".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"A0009 UID FETCH 42 (BODY.PEEK[])".to_owned()),
+        "{lines:?}"
+    );
+}
+
 #[test]
 fn move_message_creates_the_folder_after_a_refused_copy() {
     let transport = ScriptedTransport::new();
