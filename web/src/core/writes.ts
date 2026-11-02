@@ -4,13 +4,13 @@
  *
  * Taxonomy, taken from recon/server-contract.md §2 and the captured fixtures:
  *
- *   capability  — 409 archive-unavailable / delete-unavailable / not-in-trash,
+ *   capability  — 409 archive-unavailable / delete-unavailable / uidplus-missing,
  *                 503 provider-not-configured. The answer is final: do NOT retry,
  *                 do NOT say "something went wrong".
- *   conflict    — already-undone / action-expired / not-undoable / send-in-flight.
- *                 Each has its own sentence; collapsing them into one is exactly
- *                 what a user cannot act on.
- *   gone        — 410 message-gone / action-expired on a message.
+ *   conflict    — already-undone / not-undoable / send-in-flight. Each has its
+ *                 own sentence; collapsing them into one is exactly what a user
+ *                 cannot act on.
+ *   gone        — 410 action-expired (the undo window closed).
  *   notfound    — 404 unknown-account / unknown-action.
  *   unauthorized— 401 (token / provider auth).
  *   transport   — never reached the server (ok:false from api()).
@@ -55,20 +55,20 @@ export type WriteResult = { ok: true; actionId?: number; purged?: number } | Wri
 const CAPABILITY_CODES = new Set([
   "archive-unavailable",
   "delete-unavailable",
-  "not-in-trash",
-  "sent-unavailable",
+  "uidplus-missing",
   "provider-not-configured",
 ]);
 
 const CONFLICT_CODES = new Set([
   "already-undone",
-  "action-expired",
   "not-undoable",
   "send-in-flight",
   "account-exists",
 ]);
 
-const GONE_CODES = new Set(["message-gone"]);
+// The undo window closing is the only 410 the API actually returns; v3's
+// message-gone lives in lagoon-mail and never reaches the wire.
+const GONE_CODES = new Set(["action-expired"]);
 const NOTFOUND_CODES = new Set(["unknown-account", "unknown-action", "unknown-message"]);
 
 export function classifyFailure(code: string | null, status: number): WriteFailureKind {

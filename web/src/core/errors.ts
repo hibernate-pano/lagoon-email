@@ -42,6 +42,7 @@ export const COMMON_UNAVAILABLE: Record<string, CodeCopy> = {
   "provider-not-configured": {
     reason: "not-configured",
     title: "服务端没有配置这个邮箱服务商（503）",
+    detail: "服务端返回 503 provider-not-configured：这个账号的凭据解不开，或者这版构建没有接邮箱。重试不会变。",
   },
   "ai-not-configured": {
     reason: "not-configured",
@@ -54,11 +55,6 @@ export const COMMON_UNAVAILABLE: Record<string, CodeCopy> = {
   "ai-circuit-open": {
     reason: "not-configured",
     title: t.reader.summaryCircuit,
-  },
-  "sent-unavailable": {
-    reason: "capability",
-    title: "这个账号没有「已发送」文件夹",
-    detail: "服务端返回 404 sent-unavailable：这是确定的结论，重试不会变。",
   },
 };
 
@@ -74,7 +70,55 @@ export function describeHttpFailure(code: string | null, status: number): string
     if (status === 404) return "服务端返回 404 且没有 JSON 信封：未知路由（协议错误，不是业务错误）。";
     return "服务端返回了非协议响应（HTTP " + String(status) + "）。";
   }
-  return t.six.serverCode + ": " + code + "（HTTP " + String(status) + "）";
+  return (
+    codeSentenceFor(code) ??
+    t.six.serverCode + ": " + code + "（HTTP " + String(status) + "）"
+  );
+}
+
+/**
+ * Sentences for backend codes that are neither "unavailable" nor a write
+ * failure: malformed requests (front-end bugs), internal failures and the
+ * protocol-level answers.
+ *
+ * Every code `respond::error` can emit must have an entry somewhere in this
+ * file - `errors.test.ts` carries the list from the Rust routes and fails when
+ * one is missing, so a new server code cannot silently reach the user as
+ * "服务端返回值: foo".
+ */
+const CODE_SENTENCES: Record<string, string> = {
+  "account-exists": "这个邮箱已经连接过了；重复连接不会覆盖现有凭据。",
+  "draft-unreadable": "这封草稿在本地解不开（密钥变了或数据损坏），只能重新生成。",
+  "empty-actionIds": "批量请求没有带动作 id（前端 bug）。",
+  "empty-remoteIds": "批量请求没有带邮件 id（前端 bug）。",
+  "encoding-failed": "服务端编码响应失败（协议错误，正常不该出现）。",
+  "imap-auth-failed": t.onboarding.errorAuthFailed,
+  "imap-unreachable": t.onboarding.errorUnreachable,
+  "internal-error": "服务端内部错误（500）。重试可能有用；一直失败就是 bug。",
+  "invalid-body": "请求体不是合法 JSON（前端 bug）。",
+  "malformed-action-id": "动作 id 格式不对（前端 bug）。",
+  "malformed-before": "before 参数格式不对（前端 bug）。",
+  "malformed-decision": "决定的取值不合法（前端 bug）。",
+  "malformed-pinned": "pinned 参数不是布尔值（前端 bug）。",
+  "malformed-remoteId": "邮件 id 格式不对（前端 bug）。",
+  "missing-body": "请求体缺失（前端 bug）。",
+  "missing-field": "缺少必填字段（前端 bug）。",
+  "provider-auth-failed": "邮箱授权被服务器拒绝（401）。重新连接这个账号即可。",
+  "provider-unreachable": "连不上邮箱服务器（502）。这是网络或服务端问题，可以重试。",
+  "uidplus-missing": "这个邮箱服务器不支持 UIDPLUS，不能彻底删除；只能移入垃圾箱。",
+  "unknown-before": "before 指向的动作不存在（可能已被另一个窗口清掉）。",
+  "unknown-stack": "没有这个 stack 参数（前端 bug）。",
+};
+
+/** The human sentence for a backend code, or null when the dictionary lacks one. */
+export function codeSentenceFor(code: string): string | null {
+  const common = COMMON_UNAVAILABLE[code];
+  if (common) return common.detail ?? common.title;
+  const write = WRITE_UNAVAILABLE[code];
+  if (write) return write.detail ?? write.title;
+  const undo = UNDO_COPY[code];
+  if (undo) return undo;
+  return CODE_SENTENCES[code] ?? null;
 }
 
 /** Connect-form failures (POST /api/accounts/imap), by code (checklist §2). */
@@ -116,10 +160,6 @@ export const WRITE_UNAVAILABLE: Record<string, { title: string; detail?: string 
     title: t.m2.write.notSupported,
     detail: "服务端返回 409 delete-unavailable：这个账号没有废纸篓文件夹。重试不会变。",
   },
-  "not-in-trash": {
-    title: t.m2.write.notInTrash,
-    detail: "服务端返回 409 not-in-trash：只有废纸篓里的邮件才能彻底删除。",
-  },
   "provider-not-configured": {
     title: "邮箱授权不可用",
     detail: "服务端返回 503 provider-not-configured：这个账号的凭据解不开（合成账号就是这样），所以远端操作一定失败。",
@@ -137,11 +177,9 @@ export const UNDO_COPY: Record<string, string> = {
 
 /** Human sentence for a write failure, by code and status. */
 export function describeWriteFailure(code: string | null, status: number): string {
-  if (code && WRITE_UNAVAILABLE[code]) {
-    const entry = WRITE_UNAVAILABLE[code];
-    return entry.detail ?? entry.title;
+  if (code) {
+    const sentence = codeSentenceFor(code);
+    if (sentence) return sentence;
   }
-  if (code && UNDO_COPY[code]) return UNDO_COPY[code];
-  if (code) return t.six.serverCode + ": " + code + "（HTTP " + String(status) + "）";
   return describeHttpFailure(null, status);
 }

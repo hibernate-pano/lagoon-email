@@ -195,7 +195,8 @@ export interface MessageSummary {
 export interface SentResponse {
   messages: MessageHeader[];
   totalCount: number;
-  refreshedFromServer?: boolean;
+  /** How many rows this response refreshed from the server (wire_r2.rs). */
+  refreshedFromServer?: number;
   staleReason?: string | null;
 }
 
