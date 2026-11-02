@@ -115,6 +115,33 @@ pub trait MailProvider: Send + Sync {
 
 pub type WriteFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ProviderError>> + Send + 'a>>;
 
+/// One fetched body, in the shape the store and the wire want.
+///
+/// Lagoon-mail's `ParsedMessage` is converted into this at the seam so the
+/// trait carries no protocol types: the store, the fake and the routes all see
+/// one struct.
+#[derive(Debug, Clone, Default)]
+pub struct MailBody {
+    pub text: String,
+    pub html: Option<String>,
+    pub has_more: bool,
+    pub attachments: Vec<crate::wire::Attachment>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+}
+
+pub type BodyFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<MailBody, ProviderError>> + Send + 'a>>;
+
+/// The read-only body surface.
+///
+/// Separate from [`MailProvider`] on purpose: a body fetch is not a sync round,
+/// and the sync engine must not be able to trigger one. The body route is the
+/// only caller, and only after its own cache miss.
+pub trait MailBodyProvider: Send + Sync {
+    fn fetch_body(&self, remote_id: &str) -> BodyFuture<'_>;
+}
+
 /// The mutating verbs, reachable only from the action routes.
 ///
 /// Every verb maps one v3 write: `archive` = UID MOVE to the archive folder,
@@ -141,6 +168,14 @@ pub trait ProviderFactory: Send + Sync {
     /// The write half. Default None: a build without mail support (contract
     /// runs) answers 503 provider-not-configured on every action route.
     fn make_write(&self, credentials: &ImapCredentials) -> Option<Arc<dyn MailWriteProvider>> {
+        let _ = credentials;
+        None
+    }
+
+    /// The body half. Default None: the body route answers 503
+    /// provider-not-configured on a cache miss, which is what the contract
+    /// fixtures pin for a build without mail support.
+    fn make_body(&self, credentials: &ImapCredentials) -> Option<Arc<dyn MailBodyProvider>> {
         let _ = credentials;
         None
     }

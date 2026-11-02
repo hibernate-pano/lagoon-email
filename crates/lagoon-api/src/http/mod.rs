@@ -85,6 +85,25 @@ impl AppState {
     pub fn write_connection(&self) -> Result<rusqlite::Connection, crate::db::DbError> {
         crate::db::open_writable(self.db.path())
     }
+
+    /// Build a body provider from the account's stored credentials.
+    ///
+    /// `None` is every reason the cache-miss path cannot reach a mailbox: no
+    /// token key, no stored blob, a blob that will not open, or a build with no
+    /// body provider. Every one of them answers 503 provider-not-configured,
+    /// which is what v3 does when its provider cannot be constructed.
+    pub fn body_provider(
+        &self,
+        account_id: crate::uuid::Uuid,
+    ) -> Option<Arc<dyn crate::provider::MailBodyProvider>> {
+        let token_key = self.token_key.as_ref()?;
+        let connection = crate::db::open_writable(self.db.path()).ok()?;
+        let blob = crate::store::write::credentials(&connection, account_id)
+            .ok()
+            .flatten()?;
+        let credentials = crate::token::ImapCredentials::open(token_key, &blob).ok()?;
+        self.provider_factory.make_body(&credentials)
+    }
 }
 
 fn build_supervisor(

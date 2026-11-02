@@ -16,6 +16,7 @@ use axum::extract::{Path, State};
 use axum::http::{StatusCode, Uri};
 use axum::response::Response;
 
+use crate::provider::{MailBody, ProviderError};
 use crate::store::{self, messages::MessageFilter, StoreError};
 use crate::timefmt;
 use crate::uuid::Uuid;
@@ -229,19 +230,18 @@ pub async fn message_body(
             }
             let header = store::messages::find(connection, account_id, &remote_id_for_read)?;
             let Some(stored) = store::bodies::find(connection, account_id, &remote_id_for_read)? else {
-                return Ok(BodyOutcome::ProviderUnconfigured);
+                return Ok(BodyOutcome::CacheMiss);
             };
             // A value that will not open is a cache miss, not an error: v3's
             // `try? await BodyStore.get(...)` swallows the throw and falls
-            // through to the provider. R1 has no provider, so it answers 503 -
-            // the same status v3 answers when its provider cannot be built.
+            // through to the provider.
             let Ok(text) = body_key.open(&stored.text_cipher) else {
-                return Ok(BodyOutcome::ProviderUnconfigured);
+                return Ok(BodyOutcome::CacheMiss);
             };
             let html = match stored.html_cipher.as_deref() {
                 Some(cipher) => match body_key.open(cipher) {
                     Ok(html) => Some(html),
-                    Err(_) => return Ok(BodyOutcome::ProviderUnconfigured),
+                    Err(_) => return Ok(BodyOutcome::CacheMiss),
                 },
                 None => None,
             };
@@ -270,16 +270,109 @@ pub async fn message_body(
 
     match outcome {
         Ok(BodyOutcome::Found(body)) => respond::json(StatusCode::OK, &body),
+        Ok(BodyOutcome::CacheMiss) => fetch_and_answer(&state, account_id, &remote_id).await,
         Ok(BodyOutcome::UnknownAccount) => {
             respond::error(StatusCode::NOT_FOUND, "unknown-account")
-        }
-        Ok(BodyOutcome::ProviderUnconfigured) => {
-            respond::error(StatusCode::SERVICE_UNAVAILABLE, "provider-not-configured")
         }
         Err(error) => {
             tracing::error!(accountId = %account_id, remoteId = %remote_id, err = %error, "body.readFailed");
             respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error")
         }
+    }
+}
+
+/// The cold path: fetch the body from the mailbox, cache it, answer.
+///
+/// v3 `MessageRoutes.fetchBody`: a persisted body is never stale, so the cache
+/// is the fast path and this runs at most once per message. Persisting is
+/// best-effort - a store failure must not fail the read the user is looking at
+/// - and the header row is metadata only: a message the sync loop never listed
+/// still yields its body text.
+async fn fetch_and_answer(state: &AppState, account_id: Uuid, remote_id: &str) -> Response {
+    let Some(provider) = state.body_provider(account_id) else {
+        return respond::error(StatusCode::SERVICE_UNAVAILABLE, "provider-not-configured");
+    };
+    let fetched = match provider.fetch_body(remote_id).await {
+        Ok(body) => body,
+        Err(ProviderError::AuthFailed) => {
+            tracing::error!(accountId = %account_id, remoteId = %remote_id, "body.authFailed");
+            return respond::error(StatusCode::UNAUTHORIZED, "provider-auth-failed");
+        }
+        Err(ProviderError::NotConfigured(reason)) => {
+            tracing::error!(accountId = %account_id, remoteId = %remote_id, reason = %reason, "body.notConfigured");
+            return respond::error(StatusCode::SERVICE_UNAVAILABLE, "provider-not-configured");
+        }
+        Err(error) => {
+            tracing::error!(accountId = %account_id, remoteId = %remote_id, err = %error, "body.fetchFailed");
+            return respond::error(StatusCode::BAD_GATEWAY, "provider-unreachable");
+        }
+    };
+
+    persist_body(state, account_id, remote_id, &fetched).await;
+
+    // Metadata comes from the synced row, best effort: v3 answers the body
+    // even when the row has since been reconciled away.
+    let remote_id_for_header = remote_id.to_owned();
+    let header = state
+        .db
+        .read(move |connection| store::messages::find(connection, account_id, &remote_id_for_header))
+        .await
+        .ok()
+        .flatten();
+
+    respond::json(
+        StatusCode::OK,
+        &wire::MessageBody {
+            remote_id: remote_id.to_owned(),
+            subject: header.as_ref().and_then(|row| row.subject.clone()),
+            from_address: header
+                .as_ref()
+                .map(|row| row.from_address.clone())
+                .unwrap_or_default(),
+            from_name: header.as_ref().and_then(|row| row.from_name.clone()),
+            to_address: None,
+            received_at: header
+                .as_ref()
+                .map(|row| row.received_at)
+                .unwrap_or_else(timefmt::now),
+            text: fetched.text,
+            html: fetched.html,
+            attachments: fetched.attachments,
+            has_more: fetched.has_more,
+            to: fetched.to,
+            cc: fetched.cc,
+        },
+    )
+}
+
+/// Write-through, best effort (v3 `body.persistFailed` / `body.persistSkipped`).
+async fn persist_body(state: &AppState, account_id: Uuid, remote_id: &str, body: &MailBody) {
+    let Ok(attachments) = serde_json::to_string(&body.attachments) else {
+        return;
+    };
+    let to = serde_json::to_string(&body.to).unwrap_or_else(|_| "[]".to_owned());
+    let cc = serde_json::to_string(&body.cc).unwrap_or_else(|_| "[]".to_owned());
+    let connection = match state.write_connection() {
+        Ok(connection) => connection,
+        Err(error) => {
+            tracing::warn!(accountId = %account_id, remoteId = %remote_id, err = %error, "body.persistFailed");
+            return;
+        }
+    };
+    let new_body = store::write::NewBody {
+        account_id,
+        remote_id,
+        text: &body.text,
+        html: body.html.as_deref(),
+        has_more: body.has_more,
+        attachments: &attachments,
+        to_addresses: &to,
+        cc_addresses: &cc,
+    };
+    if let Err(error) = store::write::save_body(&connection, &new_body, &state.body_key) {
+        // Most often this is the `message_headers` foreign key: a body for a
+        // message the sync loop never listed is simply not cacheable.
+        tracing::warn!(accountId = %account_id, remoteId = %remote_id, err = %error, "body.persistFailed");
     }
 }
 
@@ -306,8 +399,9 @@ enum FolderCountsOutcome {
 
 enum BodyOutcome {
     Found(wire::MessageBody),
+    /// No stored body, or a stored value that will not open.
+    CacheMiss,
     UnknownAccount,
-    ProviderUnconfigured,
 }
 
 /// Map a stored header to the wire shape, decrypting the preview.

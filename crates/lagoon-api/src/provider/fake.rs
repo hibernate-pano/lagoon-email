@@ -13,8 +13,8 @@ use crate::token::ImapCredentials;
 use crate::wire::MailCapabilities;
 
 use super::{
-    MailChangeSet, MailProvider, MailWriteProvider, ProbeFuture, ProbeOutcome, ProviderError,
-    ProviderFactory, PullFuture, WriteFuture,
+    BodyFuture, MailBody, MailBodyProvider, MailChangeSet, MailProvider, MailWriteProvider,
+    ProbeFuture, ProbeOutcome, ProviderError, ProviderFactory, PullFuture, WriteFuture,
 };
 
 #[derive(Debug, Clone)]
@@ -185,6 +185,29 @@ impl MailWriteProvider for FakeWriteProvider {
     }
 }
 
+/// A scripted body provider: each `fetch_body` pops the next answer.
+pub struct FakeBodyProvider {
+    script: Arc<Mutex<VecDeque<Result<MailBody, ProviderError>>>>,
+    calls: Arc<Mutex<usize>>,
+}
+
+impl MailBodyProvider for FakeBodyProvider {
+    fn fetch_body(&self, _remote_id: &str) -> BodyFuture<'_> {
+        *self.calls.lock().expect("body calls lock") += 1;
+        let next = self.script.lock().expect("body script lock").pop_front();
+        Box::pin(async move {
+            match next {
+                Some(result) => result,
+                // Same rule as pull_changes: an exhausted script is a test
+                // mistake, and surfacing it beats a silent empty body.
+                None => Err(ProviderError::NotConfigured(
+                    "fake body script exhausted".to_owned(),
+                )),
+            }
+        })
+    }
+}
+
 pub struct FakeProviderFactory {
     outcome: FakeOutcome,
     calls: FakeCalls,
@@ -192,6 +215,8 @@ pub struct FakeProviderFactory {
     cursors: Arc<Mutex<Vec<SyncCursor>>>,
     write_script: Arc<Mutex<VecDeque<FakeWriteOutcome>>>,
     write_calls: FakeWriteCalls,
+    body_script: Arc<Mutex<VecDeque<Result<MailBody, ProviderError>>>>,
+    body_calls: Arc<Mutex<usize>>,
 }
 
 impl FakeProviderFactory {
@@ -203,7 +228,23 @@ impl FakeProviderFactory {
             cursors: Arc::new(Mutex::new(Vec::new())),
             write_script: Arc::new(Mutex::new(VecDeque::new())),
             write_calls: FakeWriteCalls::default(),
+            body_script: Arc::new(Mutex::new(VecDeque::new())),
+            body_calls: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// Script the next body-fetch answers, in call order.
+    pub fn body_script(&self, bodies: Vec<Result<MailBody, ProviderError>>) -> &Self {
+        self.body_script
+            .lock()
+            .expect("body script lock")
+            .extend(bodies);
+        self
+    }
+
+    /// How many times a body provider was asked for a body.
+    pub fn body_calls(&self) -> usize {
+        *self.body_calls.lock().expect("body calls lock")
     }
 
     /// Script the next write-verb answers, in call order. An exhausted script
@@ -231,6 +272,8 @@ impl FakeProviderFactory {
             cursors: Arc::new(Mutex::new(Vec::new())),
             write_script: Arc::new(Mutex::new(VecDeque::new())),
             write_calls: FakeWriteCalls::default(),
+            body_script: Arc::new(Mutex::new(VecDeque::new())),
+            body_calls: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -280,6 +323,13 @@ impl ProviderFactory for FakeProviderFactory {
         Some(Arc::new(FakeWriteProvider {
             script: Arc::clone(&self.write_script),
             calls: self.write_calls.clone(),
+        }))
+    }
+
+    fn make_body(&self, _credentials: &ImapCredentials) -> Option<Arc<dyn MailBodyProvider>> {
+        Some(Arc::new(FakeBodyProvider {
+            script: Arc::clone(&self.body_script),
+            calls: Arc::clone(&self.body_calls),
         }))
     }
 }

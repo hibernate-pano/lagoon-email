@@ -21,8 +21,9 @@ use lagoon_mail::transport::{Transport, TlsTransport};
 use lagoon_mail::{ChangeSet, RemoteHeader as MailRemoteHeader};
 
 use crate::provider::{
-    MailChangeSet, MailProvider, MailWriteProvider, ProbeFuture, ProbeOutcome, ProviderError,
-    ProviderFactory, PullFuture, RemoteHeader, WriteFuture,
+    BodyFuture, MailBody, MailBodyProvider, MailChangeSet, MailProvider, MailWriteProvider,
+    ProbeFuture, ProbeOutcome, ProviderError, ProviderFactory, PullFuture, RemoteHeader,
+    WriteFuture,
 };
 use crate::sync::SyncCursor;
 use crate::token::ImapCredentials;
@@ -207,6 +208,71 @@ impl ProviderFactory for LagoonMailFactory {
             credentials: ProviderCredentials::new(&credentials.username, &credentials.auth_code),
             preset: ProviderPreset::qq(),
         }))
+    }
+
+    fn make_body(&self, credentials: &ImapCredentials) -> Option<Arc<dyn MailBodyProvider>> {
+        Some(Arc::new(LagoonMailBody {
+            transport: Arc::clone(&self.transport),
+            credentials: ProviderCredentials::new(&credentials.username, &credentials.auth_code),
+            preset: ProviderPreset::qq(),
+        }))
+    }
+}
+
+/// The body half: one blocking FETCH per call, on a fresh session.
+///
+/// v3 reads the cache first and only reaches the provider on a miss, so this is
+/// the cold path: a body is fetched at most once per message.
+struct LagoonMailBody {
+    transport: TransportFactory,
+    credentials: ProviderCredentials,
+    preset: ProviderPreset,
+}
+
+impl MailBodyProvider for LagoonMailBody {
+    fn fetch_body(&self, remote_id: &str) -> BodyFuture<'_> {
+        let transport = Arc::clone(&self.transport);
+        let credentials = self.credentials.clone();
+        let preset = self.preset;
+        let remote_id = remote_id.to_owned();
+        Box::pin(async move {
+            let fetched = tokio::task::spawn_blocking(move || {
+                let mut provider =
+                    ImapProvider::new(preset, credentials, Box::new(move || (transport)()));
+                provider.fetch_body(&remote_id)
+            })
+            .await
+            .map_err(|_| ProviderError::Protocol("join".to_owned()))?
+            .map_err(|error| LagoonMailProvider::map_error(&error))?;
+            Ok(convert_body(fetched))
+        })
+    }
+}
+
+fn convert_body(parsed: lagoon_mail::ParsedMessage) -> MailBody {
+    MailBody {
+        text: parsed.text,
+        html: parsed.html,
+        has_more: parsed.has_more,
+        attachments: parsed
+            .attachments
+            .into_iter()
+            .map(|attachment| crate::wire::Attachment {
+                id: attachment.id,
+                filename: attachment.filename,
+                mime_type: attachment.mime_type,
+                size: attachment.size as i64,
+                content_id: attachment.content_id,
+                disposition: match attachment.disposition {
+                    lagoon_mail::AttachmentDisposition::Inline => crate::wire::Disposition::Inline,
+                    lagoon_mail::AttachmentDisposition::Attachment => {
+                        crate::wire::Disposition::Attachment
+                    }
+                },
+            })
+            .collect(),
+        to: parsed.to,
+        cc: parsed.cc,
     }
 }
 
