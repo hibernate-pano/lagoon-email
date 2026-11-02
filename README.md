@@ -31,8 +31,8 @@ Lagoon.app
 | 写路径 | ✅ 归档 / 取消归档 / 废纸篓 / 恢复 / 彻底删除 / 已读 / 置顶 / 批量 / 清空 / 审计 |
 | 撤销 | ✅ 归档与删除执行真正的逆操作，本地与远端同时回退 |
 | 安全 | ✅ API token 必需且 fail-closed；Host 守卫；外壳 CSP；端口由后端自绑 |
-| AI | ❌ 未实现：`/api/ai-status` 恒返回 `configured:false`，界面显示「未配置」 |
-| 发送 | ❌ 未实现（R3.5b）：协议层 SMTP 发送已实现并有测试，产品路由尚未接线 |
+| AI | ✅ 只读顾问（摘要 / 起草 / 分诊建议）；在 `keys.json` 里加 `llmApiKey` 即启用，没配 key 时如实返回 `configured:false`，绝不伪造摘要；AI 永不写邮箱、永不发信 |
+| 发送 | ✅ 回复 / 新建 / 转发；`requestId` 是幂等键，同一次请求只发一封 |
 | 打包 | ✅ `bash scripts/build-product.sh` → `dist/Lagoon.app` |
 
 「远端成功路径」目前由脚本化的假邮件服务器验证；连接真实邮箱的端到端验收仍未做。
@@ -44,7 +44,7 @@ Lagoon.app
 bash scripts/build-product.sh
 open dist/Lagoon.app
 
-# 后端测试（105 个 lagoon-api 测试 + 196 个 lagoon-mail 测试）
+# 后端测试（184 个 lagoon-api 测试 + 203 个 lagoon-mail 测试）
 cargo test --manifest-path crates/Cargo.toml
 
 # 前端：类型检查与构建
@@ -73,7 +73,8 @@ cargo run --manifest-path shell/Cargo.toml -- --selftest
 - **前端不持有 token**：token 只存在于外壳进程；前端通过 IPC 发请求。
 - **契约先行**：改协议先改 `docs/api-contract.md`；`cargo test` 里的契约回放会逐字节比对。
 - **密钥**：首次启动在 `~/Library/Application Support/` 的应用数据目录生成 `keys.json`（权限 0600），不打印、不覆盖。Keychain 存储尚未实现。
-- **测试不联网**：`lagoon-mail` 与 `lagoon-api` 的测试都用脚本化传输，真实邮箱只在显式设置 `LAGOON_MAIL_PROVIDER=production` 时才会被连接。
+- **AI 只读**：AI 平面没有写接口，不依赖 `MailProvider`，永不发信；分诊建议只落 `advice`，执行永远是用户的点击。AI 的花费按调用记进 `usage_log`，达到 `LAGOON_BUDGET_USD_PER_MONTH` 后调用被拒（503 `ai-budget-exceeded`），不会悄悄超支。
+- **测试不联网**：`lagoon-mail` 与 `lagoon-api` 的测试都用脚本化传输，真实邮箱只在显式设置 `LAGOON_MAIL_PROVIDER=production` 时才会被连接，AI 测试从不发请求。
 
 ## 文档
 

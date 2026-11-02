@@ -1,9 +1,24 @@
-# v4 API 契约 v0.1 · Lagoon 服务端 HTTP
+# v4 API 契约 v0.2 · Lagoon 服务端 HTTP
 
 > 状态：**M0 冻结**（2026-10-29）。本文是 `v4/web`、`v4/shell` 与将来 `v4/crates` 对服务端行为的唯一权威描述。
 > 上游事实来源：`v4/recon/server-contract.md`（逐行侦察，带 file:line）。本文是**规范性**的那一份：只写"必须是什么"，不写"为什么当年这样"。
-> 可执行证据：`v4/tests/contract/`（golden fixtures，**51 条 = 49 条抓取 + 2 条 contract_expected**）+ 两个脚本。改契约 = 先改本文 + 重抓 fixtures + 再改实现。
+> 可执行证据：`v4/tests/contract/`（golden fixtures，**58 条 = 56 条抓取 + 2 条 contract_expected**）+ 两个脚本。改契约 = 先改本文 + 重抓 fixtures + 再改实现。
 > 前端与外壳之间的进程协议不在这里：见 [ipc-contract.md](ipc-contract.md)。
+
+### v0.2 变更（2026-11-02，Rust 实现落地）
+
+只改 AI 平面的两个端点，其余端点一字未动：
+
+| 端点 | v0.1（v3 边车） | v0.2（Rust 后端） |
+|---|---|---|
+| `POST /api/ai/reload` | body `{environment: {[string]: string}}`（非空）→ 200 `AIStatus` | 无 body 依赖 → 200 `{ok: true, configured: bool, providers: string[]}` |
+| `POST /api/ai/probe` | body `{environment}` → 200 `AIProbeResult`（13 种 outcome） | 无 body 依赖 → 200 `{ok: true, provider: string, model: string, latencyMs: int}`；503 `ai-not-configured` |
+
+**为什么偏离 v3**：v3 的 `environment` 体是把 LLM 的 API key 从前端送到边车。v4 的密钥模型是「外壳在首次启动时生成 `keys.json`，再把环境变量注入后端进程」——密钥从不经过 HTTP 请求体，前端永远不持有它。因此 v4 的 reload/probe 只读后端进程自己的环境（`LAGOON_AI_CONFIG` 指向配置文件，key 走环境变量），不接受调用方传来的 key。
+
+**为什么 probe 的形状也变了**：v3 的 `AIProbeResult` 枚举 13 种 outcome，前提是边车自己发 HTTP、能看到状态码与跳转。Rust 后端把失败归成三类可行动的事实——「没配置（没有 key）」、「额度用尽（402/429 或正文说余额不足）」、「连不上 / 答得不能用」——对应 503 `ai-not-configured` / 503 `ai-credit-exhausted` / 502 `provider-unreachable` / 502 `ai-error`。保留 13 种枚举反而会让前端替后端猜语义。
+
+前端目前只调用 `GET /api/ai-status`；reload/probe 还没有界面入口，所以这两处变更不破坏任何已存在的调用方。
 
 ---
 
@@ -125,7 +140,9 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | `TimeSavedReport` | `today: Window, week: Window`；Window = `{minutesSaved: double, messagesHandled, draftsSent, unsubscribed, byDay: {date, minutesSaved, messagesHandled}[]}` |
 | `UsageReport` | `monthUSD: double, capUSD: double, callCount: int, costTrackingAvailable: bool, accounts: {accountEmail, monthUSD, callCount}[]` |
 | `AIStatus` | `configured: bool, creditExhausted: bool, circuitOpen: bool` |
-| `AIProbeResult` | `outcome: reachable｜unauthorized｜notFound｜outOfCredit｜rateLimited｜rejected｜providerError｜unexpectedResponse｜timedOut｜unreachable｜redirected｜invalidSettings｜serviceError, httpStatus?: int, detail?: string` |
+| `AIReloadResult` | `ok: bool, configured: bool, providers: string[]`（v0.2；reload 之后的真实状态） |
+| `AIProbeResponse` | `ok: bool, provider: string, model: string, latencyMs: int`（v0.2） |
+| `AIProbeResult` | **v3 遗留，本文不再使用**。v0.1 形状：`outcome: reachable｜unauthorized｜notFound｜outOfCredit｜rateLimited｜rejected｜providerError｜unexpectedResponse｜timedOut｜unreachable｜redirected｜invalidSettings｜serviceError, httpStatus?: int, detail?: string` |
 | `SentResponse` | `messages: MessageHeader[], totalCount: int, refreshedFromServer: int, staleReason?: string` |
 | `StoreNotice` | `id: string, createdAt: ISO date, detail?: string` |
 
@@ -235,8 +252,8 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | `GET /api/ai-status` | 无 | 200 `AIStatus` | — | `ai-status` |
 | `GET /api/store-notices` | 无 | 200 `{notices: StoreNotice[]}` | 500 | `store-notices` |
 | `POST /api/store-notices/:id/ack` | 路径 id | 200 `{ok: true, id}` | 400 `malformed-noticeId` | — |
-| `POST /api/ai/reload` | body `{environment: {[string]: string}}`（非空） | 200 `AIStatus` | 400 `malformed-environment`/`invalid-budget-cap` | — |
-| `POST /api/ai/probe` | body `{environment}` | 200 `AIProbeResult` | 400 `malformed-environment` | — |
+| `POST /api/ai/reload` | 无 body（v0.2：不再收 `environment`） | 200 `AIReloadResult` | 500 `internal-error`（配置文件读不出来） | — |
+| `POST /api/ai/probe` | 无 body（v0.2：不再收 `environment`） | 200 `AIProbeResponse` | 503 `ai-not-configured`/`ai-credit-exhausted`/`ai-circuit-open`；502 `provider-unreachable`/`ai-error` | — |
 
 ---
 
@@ -309,12 +326,12 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 
 ---
 
-## 9. fixture 覆盖矩阵（**51 条 = 49 抓取 + 2 contract_expected** / 57 端点）
+## 9. fixture 覆盖矩阵（**58 条 = 56 抓取 + 2 contract_expected** / 57 端点）
 
 | 覆盖程度 | 端点 |
 |---|---|
-| **有 fixture（49 条抓取，成功或错误路径）** | `healthz`、accounts 列表、messages 列表（5 个 lens + 2 个 400 + 账号 B 列表）、folder-counts、senders（空/有数据）、export/index、advice 列表（空/有数据/`decision=any`）、advice accepted-stats、stacks（空/有数据）、reminders（空/有数据/含 dismissed）、time-saved（零/非零）、actions 列表（有数据）、usage、ai-status、store-notices（1 条）、briefing、body（缓存 **200** / 无 provider 503）、inline-images(503)、raw.eml(503)、summary(503)、draft 生成(503)、drafts 列表（有数据）、sent(200+stale)、archive(409)、folder-counts(404)、read(204+200)、pin(200)、auth 401×2、host 403、unknown-route 404×2 |
-| **只有本文定义（实现前必须补 fixture）** | accounts 连接/激活/删除、`POST /api/sync`、attachments 下载、send/compose/forward、draft choose、delete/unarchive/restore/purge/trash-empty、delete-bulk/archive-bulk、unsubscribe、classify、actions undo/undo-bulk、advice decision、stacks 增删改、reminders 写、store-notices ack、ai/reload、ai/probe |
+| **有 fixture（56 条抓取，成功或错误路径）** | `healthz`、accounts 列表、messages 列表（5 个 lens + 2 个 400 + 账号 B 列表）、folder-counts、senders（空/有数据）、export/index、advice 列表（空/有数据/`decision=any`）、advice accepted-stats、stacks（空/有数据）、reminders（空/有数据/含 dismissed）、time-saved（零/非零）、actions 列表（有数据）、usage、ai-status、ai/reload、ai/probe、store-notices（1 条）、briefing、body（缓存 **200** / 无 provider 503）、inline-images(503)、raw.eml(503)、summary(503)、draft 生成(503)、drafts 列表（有数据）、sent(200+stale)、archive(409)、folder-counts(404)、read(204+200)、pin(200)、sync(204)、accounts IMAP（空体/缺字段/未知服务商/已存在）、auth 401×2、host 403、unknown-route 404×2 |
+| **只有本文定义（实现前必须补 fixture）** | accounts 激活/删除、attachments 下载、send/compose/forward、draft choose、delete/unarchive/restore/purge/trash-empty、delete-bulk/archive-bulk、unsubscribe、classify、actions undo/undo-bulk、advice decision、stacks 增删改、reminders 写、store-notices ack |
 | **contract_expected（v3 不通过，对实现断言）** | `GET /api/search` ×2：subject 命中、sealed-body 命中（见 §7.1） |
 | **r2_skip（写路径，R2 不断言）** | `POST /api/messages/:remoteId/read`（默认 + `record=true` 两态）、`POST /api/messages/:remoteId/pin` |
 

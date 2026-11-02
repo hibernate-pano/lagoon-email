@@ -924,8 +924,16 @@ git commit -m "test(web): 前端测试落地，CI 跑"
 
 ---
 
-## 明确不做（等用户拍板）
+## 明确不做（等用户拍板）→ 2026-11-02 用户授权「我授权你开始所有工作」，以下三项已处理
 
-- **AI（R4）**：补齐 LLM 网关 + 建议/摘要/草稿，或改掉 V1.0 里的「AI 只读」承诺。这是方向分叉，计划里只做**诚实记录**（Task 12），不实现。
-- **发送（R3.5b）**：SMTP 客户端已就绪，接线工作量与 Task 3 同量级，但需要真实邮箱才能验；单列一个迭代。
-- **Developer ID 签名与公证**：需要证书，属外部依赖。
+- **AI（R4）**：✅ **已实现**（2026-11-02）。`crates/lagoon-api/src/ai/`（config / gateway / transport / http / classify / fake）、
+  `http/routes_ai.rs`（`/api/ai-status`、`/summary`、`/draft`、`/api/ai/reload`、`/api/ai/probe`）、
+  同步分诊（`sync/mod.rs::triage`，每轮最多 3 封、积压上限 200）、`message_summaries` 缓存（`lagoon-v12`）、
+  `usage_log` 记账、月度预算闸门（503 `ai-budget-exceeded`）。测试：`tests/r4_ai.rs`（14）、`tests/r4_triage.rs`（4）。
+  宪法约束（`docs/superpowers/specs/2026-10-02-advisory-only-ai-constitution-design.md`）逐条有测试：
+  AI 不持有写接口（编译期），`the_ai_never_touches_the_mailbox` 断言写动词零调用。
+- **发送（R3.5b）**：✅ **已实现**（2026-11-02）。`http/routes_send.rs`（回复 / 新建 / 转发），`requestId` 幂等，
+  发信前校验（收件人/附件/请求体），`r3_send`（13 条）。**仍未做**：真实邮箱端到端发信验证（需要用户同意往真实地址发一封）。
+- **Developer ID 签名与公证**：⛔ **仍被外部依赖挡住**。`security find-identity -v -p codesigning` → `0 valid identities found`；
+  没有 Apple Developer 证书，签名/公证无法进行，`dist/Lagoon.app` 仍是 ad-hoc 签名。
+  解冻条件：用户在 Xcode 或 developer.apple.com 登录开发者账号并生成 Developer ID Application 证书。
