@@ -236,6 +236,14 @@ pub async fn connect_imap(State(state): State<AppState>, body: Bytes) -> Respons
         return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
     }
 
+    // The account exists now, but start_all ran before it did: without this,
+    // no sync loop ever pulls for it and the inbox stays empty forever (v3
+    // triggers the first sync from the connect flow as well).
+    // Fire-and-forget: the response reflects connect-time state; the loop's
+    // first pull happens right after and updates health/cursor as it goes.
+    let sync = Arc::clone(&state.sync);
+    tokio::spawn(async move { sync.start_one(account_id).await });
+
     match connected_account(&connection, account_id) {
         Ok(Some(account)) => respond::json(StatusCode::CREATED, &account),
         Ok(None) => respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error"),

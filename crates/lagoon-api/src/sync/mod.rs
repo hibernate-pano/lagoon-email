@@ -394,6 +394,25 @@ pub fn backoff_seconds(consecutive: u32) -> f64 {
 /// How long an idle round waits before pulling again (v3 waitBudget).
 pub const IDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// The loop body, shared by `start_one` and `start_all` so the two cannot
+/// drift: a parked or vanished account ends its loop, a transient failure
+/// backs off, a successful round waits for the next poll.
+fn spawn_loop(engine: Arc<SyncEngine>, account_id: Uuid) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match engine.round(account_id).await {
+                RoundOutcome::Parked(_) | RoundOutcome::NotFound => break,
+                RoundOutcome::Failed {
+                    backoff_seconds, ..
+                } => {
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(backoff_seconds)).await;
+                }
+                _ => tokio::time::sleep(IDLE_WAIT).await,
+            }
+        }
+    })
+}
+
 pub struct SyncSupervisor {
     engine: Arc<SyncEngine>,
     tasks: tokio::sync::Mutex<HashMap<Uuid, tokio::task::JoinHandle<()>>>,
@@ -409,6 +428,34 @@ impl SyncSupervisor {
 
     pub fn engine(&self) -> Arc<SyncEngine> {
         Arc::clone(&self.engine)
+    }
+
+    /// Start the loop for ONE account, if this build can build a provider for
+    /// it and no loop is *still running*.
+    ///
+    /// The connect route needs this: start_all ran at backend startup, when a
+    /// freshly connected account did not exist yet - without this call the
+    /// account would sit in the store with health "ok" and never pull a single
+    /// message (observed 2026-11-01: a real QQ connect produced an empty inbox).
+    ///
+    /// The liveness check is `is_finished`, not "is there a key": a loop that
+    /// parked on an auth failure ended, but its JoinHandle stayed in the map.
+    /// Treating a finished handle as "already running" made re-authentication a
+    /// no-op that still answered 201 with health "ok" - the account stopped
+    /// syncing for good until the backend restarted.
+    pub async fn start_one(&self, account_id: Uuid) {
+        if !self.engine.has_provider(account_id) {
+            return;
+        }
+        let mut tasks = self.tasks.lock().await;
+        if tasks
+            .get(&account_id)
+            .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        let task = spawn_loop(Arc::clone(&self.engine), account_id);
+        tasks.insert(account_id, task);
     }
 
     /// Start one loop per account that this build can build a provider for.
@@ -429,21 +476,7 @@ impl SyncSupervisor {
             if !self.engine.has_provider(account_id) {
                 continue;
             }
-            let engine = Arc::clone(&self.engine);
-            let task = tokio::spawn(async move {
-                loop {
-                    match engine.round(account_id).await {
-                        RoundOutcome::Parked(_) | RoundOutcome::NotFound => break,
-                        RoundOutcome::Failed {
-                            backoff_seconds, ..
-                        } => {
-                            tokio::time::sleep(std::time::Duration::from_secs_f64(backoff_seconds))
-                                .await;
-                        }
-                        _ => tokio::time::sleep(IDLE_WAIT).await,
-                    }
-                }
-            });
+            let task = spawn_loop(Arc::clone(&self.engine), account_id);
             self.tasks.lock().await.insert(account_id, task);
         }
     }

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use lagoon_api::provider::fake::{FakeOutcome, FakeProviderFactory};
-use lagoon_api::provider::{ProviderFactory, NoProviderFactory};
+use lagoon_api::provider::{MailChangeSet, ProviderFactory, NoProviderFactory};
 use lagoon_api::token::ImapCredentials;
 use lagoon_api::uuid::Uuid;
 use lagoon_api::wire::MailCapabilities;
@@ -51,6 +51,10 @@ async fn connect_creates_the_account_and_seals_its_credentials() {
     let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::with_capabilities(
         tri_state_capabilities(),
     )));
+    // The connect route now starts the account's sync loop, and its first
+    // round runs while the response is in flight: script a benign round so
+    // the assertions on stored state are not racing a failing pull.
+    factory.pull_rounds(vec![Ok(MailChangeSet::default())]);
     let (server, _fixtures) = TestServer::spawn_with_provider("r3-connect", factory.clone()).await;
     let client = http::client();
     let auth = server.auth_headers();
@@ -79,11 +83,14 @@ async fn connect_creates_the_account_and_seals_its_credentials() {
     assert!(observed.body["capabilities"].get("trashFolder").is_none());
     assert_eq!(observed.body["capabilities"]["idle"], json!(true));
 
-    // The probe saw the *submitted* credentials, trimmed.
+    // The probe saw the *submitted* credentials, trimmed. The connect route
+    // also starts the sync loop, whose round builds its own provider from the
+    // stored credentials - so at least two makes, all the same identity.
     let calls = factory.calls().all();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].username, "connect@example.invalid");
-    assert_eq!(calls[0].auth_code, "auth-code-123");
+    assert!(calls.len() >= 1);
+    assert!(calls.iter().all(|call| {
+        call.username == "connect@example.invalid" && call.auth_code == "auth-code-123"
+    }));
 
     // Stored blob is bare AES-GCM (no lgb1:), and it opens with the token key.
     let connection = open_read_write(&server.db_path);
@@ -190,6 +197,9 @@ async fn healthy_account_conflicts_and_reauthentication_replaces() {
     let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::with_capabilities(
         tri_state_capabilities(),
     )));
+    // The connect route starts this account's sync loop; keep the background
+    // rounds benign so the health assertions below are deterministic.
+    factory.pull_rounds(vec![Ok(MailChangeSet::default())]);
     let (server, _fixtures) = TestServer::spawn_with_provider("r3-reattach", factory.clone()).await;
     let client = http::client();
     let auth = server.auth_headers();

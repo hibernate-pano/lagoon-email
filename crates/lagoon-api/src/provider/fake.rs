@@ -234,6 +234,19 @@ impl FakeProviderFactory {
         }
     }
 
+    /// Queue pull rounds for every provider this factory builds: the sync
+    /// loop the connect route starts runs one round per connect.
+    pub fn pull_rounds(
+        &self,
+        rounds: Vec<Result<MailChangeSet, ProviderError>>,
+    ) -> &Self {
+        self.script
+            .lock()
+            .expect("script lock")
+            .extend(rounds);
+        self
+    }
+
     pub fn calls(&self) -> FakeCalls {
         self.calls.clone()
     }
