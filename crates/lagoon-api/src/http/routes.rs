@@ -287,7 +287,7 @@ pub async fn message_body(
 /// is the fast path and this runs at most once per message. Persisting is
 /// best-effort - a store failure must not fail the read the user is looking at
 /// - and the header row is metadata only: a message the sync loop never listed
-/// still yields its body text.
+///   still yields its body text.
 async fn fetch_and_answer(state: &AppState, account_id: Uuid, remote_id: &str) -> Response {
     let Some(provider) = state.body_provider(account_id) else {
         return respond::error(StatusCode::SERVICE_UNAVAILABLE, "provider-not-configured");
@@ -397,6 +397,9 @@ enum FolderCountsOutcome {
     UnknownAccount,
 }
 
+// 256 bytes once per body read; boxing would add an allocation to save stack
+// space that is not scarce here.
+#[allow(clippy::large_enum_variant)]
 enum BodyOutcome {
     Found(wire::MessageBody),
     /// No stored body, or a stored value that will not open.

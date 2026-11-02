@@ -14,7 +14,6 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use lagoon_api::provider::fake::{FakeOutcome, FakeProviderFactory, FakeWriteOutcome};
-use lagoon_api::provider::ProviderFactory;
 use lagoon_api::token::ImapCredentials;
 
 use support::http;

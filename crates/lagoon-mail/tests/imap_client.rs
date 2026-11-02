@@ -140,13 +140,13 @@ fn list_parses_attributes_unicode_names_and_nested_paths() {
 
 fn header_fetch_script(transport: &ScriptedTransport, tag: &str) {
     let header = b"From: Alice <alice@example.com>\r\nSubject: =?GBK?B?u+HS6bzN0qo=?=\r\nMessage-ID: <m1@example.com>\r\n\r\n";
-    transport.enqueue_line(&format!(
+    transport.enqueue_line(format!(
         "* 1 FETCH (UID 7 FLAGS (\\Seen) INTERNALDATE \"11-Sep-2026 10:00:00 +0800\" BODY[HEADER.FIELDS (FROM SUBJECT)] {{{}}}",
         header.len()
     ));
     transport.enqueue_literal(header.to_vec());
     transport.enqueue_line(")");
-    transport.enqueue_line(&format!("{tag} OK FETCH completed"));
+    transport.enqueue_line(format!("{tag} OK FETCH completed"));
 }
 
 #[test]

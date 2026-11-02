@@ -1,11 +1,11 @@
 //! Which business backend this run talks to (contract v0.2 §4.1).
 //!
 //! * rust  - v4/crates lagoon-api, the product backend since R3.4: reads,
-//!           accounts, sync. Endpoints it has not implemented answer 404
-//!           with an empty body, which the shell must pass through as
-//!           ok:true (not as a transport failure).
+//!   accounts, sync. Endpoints it has not implemented answer 404
+//!   with an empty body, which the shell must pass through as
+//!   ok:true (not as a transport failure).
 //! * swift - the v3 LagoonServerCLI sidecar, kept as a development-time
-//!           reference implementation; a packaged app never needs it.
+//!   reference implementation; a packaged app never needs it.
 //!
 //! Selection: --backend swift|rust, else LAGOON_V4_BACKEND, else rust.
 //! The front end never chooses; it only reads boot_status.backend.

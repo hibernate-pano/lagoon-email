@@ -482,7 +482,7 @@ impl ImapProvider {
                 })
             })
             .collect();
-        folders.sort_by(|left, right| left.path.to_lowercase().cmp(&right.path.to_lowercase()));
+        folders.sort_by_key(|left| left.path.to_lowercase());
         Ok(folders)
     }
 

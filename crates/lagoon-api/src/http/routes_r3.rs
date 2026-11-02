@@ -201,7 +201,7 @@ pub async fn connect_imap(State(state): State<AppState>, body: Bytes) -> Respons
                 account.id,
                 &merged,
                 &wire::SyncHealth::status_or_ok(&account.sync_status),
-                account.last_sync_at.map(|value| crate::timefmt::to_stored(value)).as_deref(),
+                account.last_sync_at.map(crate::timefmt::to_stored).as_deref(),
                 None,
             )
             .map_err(store_error)?;

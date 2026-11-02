@@ -234,7 +234,7 @@ pub fn run_pre_hook(db_path: &std::path::Path, hook: &str) -> Result<(), String>
         return Err(format!("missing {}", harness.display()));
     }
     let output = std::process::Command::new("python3")
-        .arg(&harness)
+        .arg(harness)
         .arg("pre")
         .arg("--hook")
         .arg(hook)
@@ -277,7 +277,7 @@ fn seed_via_harness_at(
         ));
     }
     let output = std::process::Command::new("python3")
-        .arg(&harness)
+        .arg(harness)
         .arg("seed")
         .arg("--db")
         .arg(db_path)

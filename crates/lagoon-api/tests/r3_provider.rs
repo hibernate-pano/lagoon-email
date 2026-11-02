@@ -83,7 +83,7 @@ async fn pull_changes_maps_cursor_and_upserts() {
     imap_session_script(&transport, "IMAP4rev1");
     select_script(&transport, "A0003", 3, 7, 20);
     let header = header_literal("Hello");
-    transport.enqueue_line(&format!(
+    transport.enqueue_line(format!(
         "* 1 FETCH (UID 10 BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE)] {{{}}}",
         header.len()
     ));
@@ -196,7 +196,7 @@ async fn pull_changes_fills_membership_on_the_same_session() {
     imap_session_script(&transport, "IMAP4rev1");
     select_script(&transport, "A0003", 3, 7, 20);
     let header = header_literal("Hello");
-    transport.enqueue_line(&format!(
+    transport.enqueue_line(format!(
         "* 1 FETCH (UID 10 BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE)] {{{}}}",
         header.len()
     ));
@@ -212,7 +212,7 @@ async fn pull_changes_fills_membership_on_the_same_session() {
     select_script(&transport, "A0006", 1, 7, 20);
     transport.enqueue_line("* SEARCH 10");
     transport.enqueue_line("A0007 OK SEARCH completed");
-    transport.enqueue_line(&format!(
+    transport.enqueue_line(format!(
         "* 1 FETCH (UID 10 BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE)] {{{}}}",
         header.len()
     ));

@@ -481,7 +481,7 @@ async fn post_api_sync_answers_204_without_waiting() {
 #[tokio::test]
 async fn idle_budget_is_passed_to_the_provider() {
     use lagoon_api::provider::lagoon_mail::LagoonMailFactory;
-    use lagoon_api::provider::{MailProvider, ProviderFactory};
+    use lagoon_api::provider::ProviderFactory;
     use lagoon_mail::imap::provider::IDLE_BUDGET;
     use lagoon_mail::transport::Transport;
     use support::scripted_transport::{imap_session_script, select_script, ScriptedTransport};
@@ -531,7 +531,7 @@ async fn idle_budget_is_passed_to_the_provider() {
 #[tokio::test]
 async fn a_server_without_idle_reports_no_wait() {
     use lagoon_api::provider::lagoon_mail::LagoonMailFactory;
-    use lagoon_api::provider::{MailProvider, ProviderFactory};
+    use lagoon_api::provider::ProviderFactory;
     use lagoon_mail::transport::Transport;
     use support::scripted_transport::{imap_session_script, select_script, ScriptedTransport};
 

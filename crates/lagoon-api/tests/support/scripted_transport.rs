@@ -316,7 +316,7 @@ impl Transport for ScriptedTransport {
 pub fn imap_session_script(transport: &ScriptedTransport, capabilities: &str) {
     transport.enqueue_line("* OK [CAPABILITY IMAP4rev1] ready");
     transport.enqueue_line("A0001 OK AUTHENTICATE completed");
-    transport.enqueue_line(&format!("* CAPABILITY {capabilities}"));
+    transport.enqueue_line(format!("* CAPABILITY {capabilities}"));
     transport.enqueue_line("A0002 OK CAPABILITY completed");
 }
 
@@ -328,11 +328,9 @@ pub fn select_script(
     uid_validity: i64,
     uid_next: i64,
 ) {
-    transport.enqueue_line(&format!("* {exists} EXISTS"));
-    transport.enqueue_line(&format!("* OK [UIDVALIDITY {uid_validity}] UIDs valid"));
-    transport.enqueue_line(&format!("* OK [UIDNEXT {uid_next}] predicted next UID"));
-    transport.enqueue_line(&format!(
-        "* OK [PERMANENTFLAGS (\\Seen \\Deleted \\Flagged)] flags"
-    ));
-    transport.enqueue_line(&format!("{tag} OK [READ-WRITE] SELECT completed"));
+    transport.enqueue_line(format!("* {exists} EXISTS"));
+    transport.enqueue_line(format!("* OK [UIDVALIDITY {uid_validity}] UIDs valid"));
+    transport.enqueue_line(format!("* OK [UIDNEXT {uid_next}] predicted next UID"));
+    transport.enqueue_line("* OK [PERMANENTFLAGS (\\Seen \\Deleted \\Flagged)] flags");
+    transport.enqueue_line(format!("{tag} OK [READ-WRITE] SELECT completed"));
 }

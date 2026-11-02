@@ -87,7 +87,7 @@ async fn connect_creates_the_account_and_seals_its_credentials() {
     // also starts the sync loop, whose round builds its own provider from the
     // stored credentials - so at least two makes, all the same identity.
     let calls = factory.calls().all();
-    assert!(calls.len() >= 1);
+    assert!(!calls.is_empty());
     assert!(calls.iter().all(|call| {
         call.username == "connect@example.invalid" && call.auth_code == "auth-code-123"
     }));

@@ -342,7 +342,7 @@ fn fetch_body_decodes_a_gbk_message_and_uses_body_peek() {
         b"Content-Type: text/plain; charset=gb2312\r\nContent-Transfer-Encoding: 8bit\r\n\r\n"
             .to_vec();
     raw.extend_from_slice(&[0xD6, 0xD0, 0xCE, 0xC4]);
-    transport.enqueue_line(&format!("* 1 FETCH (UID 42 BODY[] {{{}}}", raw.len()));
+    transport.enqueue_line(format!("* 1 FETCH (UID 42 BODY[] {{{}}}", raw.len()));
     transport.enqueue_literal(raw);
     transport.enqueue_line(")");
     transport.enqueue_line("A0004 OK FETCH completed");
@@ -368,7 +368,7 @@ fn fetch_attachment_returns_decoded_bytes() {
     imap_session_script(&transport, "IMAP4rev1 UIDPLUS");
     select_script(&transport, "A0003", 1, 7, 8);
     let raw = b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nbody\r\n--b\r\nContent-Type: application/pdf; name=\"r.pdf\"\r\nContent-Disposition: attachment; filename=\"r.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--b--\r\n".to_vec();
-    transport.enqueue_line(&format!("* 1 FETCH (UID 42 BODY[] {{{}}}", raw.len()));
+    transport.enqueue_line(format!("* 1 FETCH (UID 42 BODY[] {{{}}}", raw.len()));
     transport.enqueue_literal(raw);
     transport.enqueue_line(")");
     transport.enqueue_line("A0004 OK FETCH completed");
@@ -455,7 +455,7 @@ fn list_sent_reads_the_sent_role_and_decodes_headers() {
     ]);
     select_script(&transport, "A0004", 1, 7, 8);
     let header = header_literal("=?UTF-8?B?5L2g5aW9?=");
-    transport.enqueue_line(&format!("* 1 FETCH (UID 7 BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE)] {{{}}}", header.len()));
+    transport.enqueue_line(format!("* 1 FETCH (UID 7 BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE)] {{{}}}", header.len()));
     transport.enqueue_literal(header);
     transport.enqueue_line(")");
     transport.enqueue_line("A0005 OK FETCH completed");
@@ -476,7 +476,7 @@ fn pull_changes_fetches_new_headers_and_reports_the_cursor() {
     imap_session_script(&transport, "IMAP4rev1");
     select_script(&transport, "A0003", 3, 7, 20);
     let header = header_literal("Hello");
-    transport.enqueue_line(&format!("* 1 FETCH (UID 10 BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE)] {{{}}}", header.len()));
+    transport.enqueue_line(format!("* 1 FETCH (UID 10 BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE)] {{{}}}", header.len()));
     transport.enqueue_literal(header);
     transport.enqueue_line(")");
     transport.enqueue_line("A0004 OK FETCH completed");

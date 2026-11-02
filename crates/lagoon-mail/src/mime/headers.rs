@@ -355,7 +355,7 @@ pub fn parse_from_header(raw: &str) -> (String, Option<String>) {
             .map(str::to_owned);
         let address = raw
             .split('<')
-            .last()
+            .next_back()
             .unwrap_or(raw)
             .replace('>', "")
             .trim()

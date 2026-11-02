@@ -35,7 +35,7 @@ impl Uuid {
                 _ => {
                     let value = hex_value(*byte)?;
                     let slot = nibbles / 2;
-                    if nibbles % 2 == 0 {
+                    if nibbles.is_multiple_of(2) {
                         out[slot] = value << 4;
                     } else {
                         out[slot] |= value;

@@ -4,6 +4,12 @@
 //! the v3 contract, any path that merely *looks* like one - falls through to
 //! the bare 404, which is what v3 does and what "m1-checklist.md" §1 records.
 
+// Helpers here return `Result<_, Response>` so a failure can be returned
+// verbatim from an axum handler. `Response` is 128 bytes; boxing it would add
+// an allocation to every error path and force `Err(Box::new(..))` at every
+// call site, so the size is accepted deliberately.
+#![allow(clippy::result_large_err)]
+
 pub mod guard;
 pub mod query;
 pub mod respond;

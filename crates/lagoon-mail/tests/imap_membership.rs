@@ -31,7 +31,7 @@ fn header_without_message_id() -> Vec<u8> {
 }
 
 fn enqueue_fetch(transport: &ScriptedTransport, sequence: usize, uid: i64, header: &[u8]) {
-    transport.enqueue_line(&format!(
+    transport.enqueue_line(format!(
         "* {sequence} FETCH (UID {uid} BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}",
         header.len()
     ));

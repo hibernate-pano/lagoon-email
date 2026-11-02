@@ -287,8 +287,8 @@ mod tests {
         assert_eq!(payload.get("remoteId").map(String::as_str), Some("42"));
         assert_eq!(payload.get("count").map(String::as_str), Some("3"));
         assert_eq!(payload.get("flag").map(String::as_str), Some("1"));
-        assert!(payload.get("nested").is_none());
-        assert!(payload.get("nil").is_none());
+        assert!(!payload.contains_key("nested"));
+        assert!(!payload.contains_key("nil"));
     }
 
     #[test]

@@ -113,7 +113,7 @@ const ARCHIVE_NAMES: &[&str] = &["archive", "archived", "归档"];
 /// the role. QQ nests `废纸篓` under the account root in some locales and at
 /// the top level in others, so a full-path match would miss half of them.
 pub fn role_leaf(name: &str) -> Option<String> {
-    let leaf = name.split('/').last()?.trim();
+    let leaf = name.split('/').next_back()?.trim();
     if leaf.is_empty() {
         None
     } else {

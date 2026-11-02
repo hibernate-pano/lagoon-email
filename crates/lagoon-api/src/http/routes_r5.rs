@@ -271,11 +271,10 @@ async fn run_message_action(
             return provider_error_response(error, &remote_id);
         }
     }
-    let action_id: Option<i64>;
-    match verb.local(&context.connection, context.account_id, &remote_id) {
+    let action_id: Option<i64> = match verb.local(&context.connection, context.account_id, &remote_id) {
         Ok(previous) => {
             let payload = verb.audit_payload(&remote_id, verb.touches_remote(), previous);
-            action_id = match verb.audit_kind() {
+            match verb.audit_kind() {
                 Some(kind) => {
                     match write::record_action(&context.connection, context.account_id, kind, &payload)
                     {
@@ -290,13 +289,13 @@ async fn run_message_action(
                     }
                 }
                 None => None,
-            };
+            }
         }
         Err(error) => {
             tracing::error!(err = %error, "actions.localFailed");
             return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
         }
-    }
+    };
     respond::json(
         StatusCode::OK,
         &json!({ "ok": true, "remoteId": remote_id, "remote": true, "actionId": action_id }),
@@ -375,10 +374,9 @@ pub async fn mark_read(
         Ok(context) => context,
         Err(response) => return response,
     };
-    let action_id: Option<i64>;
-    match WriteVerb::SetRead(is_read).local(&context.connection, account_id, &remote_id) {
+    let action_id: Option<i64> = match WriteVerb::SetRead(is_read).local(&context.connection, account_id, &remote_id) {
         Ok(previous) => {
-            action_id = if record && previous.is_some() {
+            if record && previous.is_some() {
                 let payload =
                     WriteVerb::SetRead(is_read).audit_payload(&remote_id, true, previous);
                 match write::record_action(&context.connection, account_id, "markRead", &payload) {
@@ -390,13 +388,13 @@ pub async fn mark_read(
                 }
             } else {
                 None
-            };
+            }
         }
         Err(error) => {
             tracing::error!(err = %error, "read.localFailed");
             return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
         }
-    }
+    };
     if let Some(write) = context.write.as_ref() {
         if let Err(error) = write.set_read(&remote_id, is_read).await {
             // Best-effort by contract: a failed STORE is logged, never surfaced.
@@ -626,7 +624,7 @@ fn action_wire(account_id: Uuid, record: &write::ActionRecord) -> serde_json::Va
             .created_at
             .parse::<i64>()
             .is_err()
-            .then(|| ())
+            .then_some(())
             .and_then(|_| crate::timefmt::parse_stored(&record.created_at))
             .map(crate::timefmt::to_iso8601)
             .unwrap_or_else(|| record.created_at.clone()),
