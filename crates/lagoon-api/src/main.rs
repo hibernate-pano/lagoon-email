@@ -100,27 +100,13 @@ fn run_migrate(config: &Config) -> Result<(), String> {
 
 async fn run(config: Config) -> Result<(), String> {
     let path = std::path::Path::new(&config.db_path);
-    if !path.exists() {
-        // Fresh install: no store yet. Create one and apply the v3 migration
-        // chain, which is what the v3 server did at startup ("applied
-        // automatically").
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
-        }
-    }
-    // Existing store: bring it up to this build's chain before opening it
-    // read-only. v3 applied its migrations at startup, and this build owns one
-    // additive migration on top (`lagoon-v11`, the body-fetch UID column); a
-    // v3-era store must get it or the sync write path loses that column.
-    // A file that is not a known Lagoon store is left untouched — the strict
-    // probe below then refuses it instead of writing into a foreign database.
-    if path.exists() && lagoon_api::db::looks_like_a_lagoon_store(path) {
-        let connection = lagoon_api::db::open_writable(config.db_path.clone())
-            .map_err(|error| error.to_string())?;
-        let report = lagoon_api::store::migrate::migrate(&connection, Some(&config.body_key))
-            .map_err(|error| error.to_string())?;
-        drop(connection);
+    // A fresh install has no store at all; an existing one may predate this
+    // build's chain. `prepare` creates what is missing and migrates what is
+    // ours - and leaves a foreign SQLite file alone, so the strict probe below
+    // refuses it instead of writing into somebody else's database.
+    if let Some(report) = lagoon_api::store::migrate::prepare(path, Some(&config.body_key))
+        .map_err(|error| error.to_string())?
+    {
         if !report.applied.is_empty() {
             tracing::info!(
                 applied = report.applied.len(),

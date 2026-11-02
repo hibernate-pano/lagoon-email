@@ -20,6 +20,8 @@
 //! * [`http`]     - axum router, Host guard, bearer auth, error envelope
 //! * [`telemetry`]- trace events on stderr (no `tracing-subscriber` needed)
 
+/// The read-only AI plane: routing, the gateway, and the HTTP seam.
+pub mod ai;
 pub mod briefing;
 pub mod config;
 pub mod crypto;

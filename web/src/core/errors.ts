@@ -88,6 +88,7 @@ export function describeHttpFailure(code: string | null, status: number): string
  */
 const CODE_SENTENCES: Record<string, string> = {
   "account-exists": "这个邮箱已经连接过了；重复连接不会覆盖现有凭据。",
+  "ai-error": "模型回答了，但答的不是能用的东西（502）。重试可能有用；一直失败就是 bug。",
   "draft-unreadable": "这封草稿在本地解不开（密钥变了或数据损坏），只能重新生成。",
   "empty-actionIds": "批量请求没有带动作 id（前端 bug）。",
   "empty-remoteIds": "批量请求没有带邮件 id（前端 bug）。",
@@ -164,6 +165,56 @@ export const WRITE_UNAVAILABLE: Record<string, { title: string; detail?: string 
   "provider-not-configured": {
     title: "邮箱授权不可用",
     detail: "服务端返回 503 provider-not-configured：这个账号的凭据解不开（合成账号就是这样），所以远端操作一定失败。",
+  },
+  // The send paths (R3.5b). Every one of them is refused BEFORE the message
+  // reaches the SMTP server: a rejected request never sends half a mail.
+  "malformed-recipient": {
+    title: "收件人地址不合法（400）",
+    detail: "服务端在发信前就拒了：收件人不是一个合法地址。改一下再发。",
+  },
+  "malformed-attachment": {
+    title: "附件解不开（400）",
+    detail: "服务端在发信前就拒了：附件数据不是合法的 base64，或者缺了字段。",
+  },
+  "malformed-request-id": {
+    title: "请求 id 不合法（400）",
+    detail: "服务端要求 requestId 是一个 UUID（用来保证一封只发一次）。这是前端 bug。",
+  },
+  "malformed-compose": {
+    title: "写信请求不完整（400）",
+    detail: "新邮件至少要有收件人和正文。",
+  },
+  "malformed-forward": {
+    title: "转发请求不合法（400）",
+    detail: "转发要一份收件人数组，而且不能自己再带附件（原信会被整个带过去）。",
+  },
+  "malformed-body": {
+    title: "请求体不合法（400）",
+    detail: "服务端没有从请求体里读到它要的东西。这是前端 bug。",
+  },
+  "send-in-flight": {
+    title: "这封还在发（409）",
+    detail: "同一个 requestId 已经有一封在发。稍等一下再试，不要重复点发送。",
+  },
+  "smtp-auth-failed": {
+    title: "发信服务器拒绝了授权（401）",
+    detail: "服务端返回 401 smtp-auth-failed：这个账号的邮箱授权码不被发信服务器接受。重新连接这个账号。",
+  },
+  "smtp-send-failed": {
+    title: "信没发出去（502）",
+    detail: "服务端返回 502 smtp-send-failed：网络或发信服务器的问题。重试可能有用。",
+  },
+  "forward-original-unavailable": {
+    title: "拿不到原信（502）",
+    detail: "转发要把原信整个带过去，但服务端没能取到原文；转发一封残缺的信比不转发更糟。",
+  },
+  "attachment-too-large": {
+    title: "附件太大（413）",
+    detail: "单个附件最大 25 MB，一次最多 48 MB。",
+  },
+  "unknown-message": {
+    title: "服务端找不到这封邮件（404）",
+    detail: "邮件已经被删掉，或者这个 id 属于别的账号。",
   },
 };
 

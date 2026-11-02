@@ -412,6 +412,27 @@ pub const MIGRATIONS: &[Migration] = &[
         statements: &[r##"ALTER TABLE message_headers ADD COLUMN remote_uid INTEGER"##],
         data: DataStep::None,
     },
+    // v4-only (not in v3): the AI summary cache.
+    //
+    // One summary per message, sealed with the body key: a summary is derived
+    // from a private mail, so it is as private as the mail. Without this table
+    // every open of a message would be a paid model call, and the user would
+    // pay for the same words twice.
+    Migration {
+        identifier: "lagoon-v12",
+        statements: &[r##"CREATE TABLE IF NOT EXISTS message_summaries (
+            account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            remote_id  TEXT NOT NULL,
+            payload    TEXT NOT NULL,
+            model      TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+            PRIMARY KEY (account_id, remote_id),
+            FOREIGN KEY (account_id, remote_id)
+                REFERENCES message_headers(account_id, remote_id)
+                ON DELETE CASCADE
+        )"##],
+        data: DataStep::None,
+    },
 ];
 
 /// Total number of statements, used by the migration log line.

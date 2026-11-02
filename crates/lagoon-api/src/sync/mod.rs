@@ -17,7 +17,7 @@
 //! no archive/trash/send verbs to call, which is the compile-time version of
 //! v3's "sync never writes to the mailbox".
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -26,9 +26,11 @@ use std::sync::Arc;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::ai::classify::{self, TriageTarget};
+use crate::ai::gateway::AiGateway;
 use crate::crypto::BodyKey;
 use crate::db;
-use crate::provider::{MailChangeSet, ProviderError, ProviderFactory};
+use crate::provider::{MailChangeSet, ProviderError, ProviderFactory, RemoteHeader};
 use crate::store::{self, write};
 use crate::timefmt;
 use crate::token::{ImapCredentials, TokenKey};
@@ -112,7 +114,21 @@ pub struct SyncEngine {
     failures: tokio::sync::Mutex<HashMap<Uuid, u32>>,
     /// The single writer: applies are serialised across every account.
     writer: tokio::sync::Mutex<()>,
+    /// The AI advisor. `None` means this build has no advisor: no
+    /// suggestions are made and no model is called.
+    ai: Option<Arc<AiGateway>>,
+    /// Mails waiting for a suggestion, per account.
+    ///
+    /// A first sync brings hundreds of mails; asking the model about all of
+    /// them in one round would be a long, expensive round. The backlog keeps
+    /// them and the engine works through a few per round.
+    triage_backlog: tokio::sync::Mutex<HashMap<Uuid, VecDeque<TriageTarget>>>,
 }
+
+/// How many mails one round asks the model about.
+const TRIAGE_PER_ROUND: usize = 3;
+/// How many mails wait for a suggestion at most.
+const TRIAGE_BACKLOG_LIMIT: usize = 200;
 
 impl SyncEngine {
     pub fn new(
@@ -128,7 +144,15 @@ impl SyncEngine {
             factory,
             failures: tokio::sync::Mutex::new(HashMap::new()),
             writer: tokio::sync::Mutex::new(()),
+            ai: None,
+            triage_backlog: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Give the engine an advisor. Without one it makes no suggestions.
+    pub fn with_ai(mut self, ai: Arc<AiGateway>) -> Self {
+        self.ai = Some(ai);
+        self
     }
 
     pub fn body_key(&self) -> &BodyKey {
@@ -246,8 +270,12 @@ impl SyncEngine {
         };
 
         // Single writer: from here to the cursor update nothing else applies.
-        let _writer = self.writer.lock().await;
-        let applied = self.apply(&connection, account_id, &changes, &sync_state);
+        // The lock is scoped so the advice step below does not hold it while
+        // the model thinks.
+        let applied = {
+            let _writer = self.writer.lock().await;
+            self.apply(&connection, account_id, &changes, &sync_state)
+        };
         if let Err(error) = applied {
             tracing::error!(err = %error, "sync.applyFailed");
             let consecutive = self.next_failure(account_id).await;
@@ -258,6 +286,11 @@ impl SyncEngine {
                 backoff_seconds: backoff_seconds(consecutive),
             };
         }
+        // The advice step. It never fails the round: a suggestion is a
+        // convenience, and a model that is down must not stop the mail from
+        // being synced.
+        self.triage(account_id, &account.email, &changes.upserts)
+            .await;
         self.failures.lock().await.insert(account_id, 0);
         tracing::info!(
             account = %account.email,
@@ -378,6 +411,110 @@ impl SyncEngine {
         )?;
         write::update_health(connection, account_id, "ok", None, None)?;
         Ok(())
+    }
+
+    /// Suggest what to do with the new mail.
+    ///
+    /// Off unless the AI is configured: no key, no calls, no rows. The
+    /// backlog is bounded, so a first sync of hundreds of mails does not turn
+    /// into hundreds of model calls in one round.
+    ///
+    /// The suggestion is a suggestion (constitution §2): it lands in the
+    /// advice queue, and the only thing that changes a mail is the user's own
+    /// click in the action plane.
+    async fn triage(&self, account_id: Uuid, account_email: &str, upserts: &[RemoteHeader]) {
+        let Some(ai) = &self.ai else {
+            return;
+        };
+        if !ai.status().configured {
+            return;
+        }
+        // Fill the backlog with the new mail. The connection lives inside this
+        // block: no borrow of it may survive into the model call below.
+        {
+            let Ok(connection) = db::open_writable(&self.db_path) else {
+                return;
+            };
+            let mut backlogs = self.triage_backlog.lock().await;
+            let backlog = backlogs.entry(account_id).or_default();
+            for header in upserts {
+                if backlog.len() >= TRIAGE_BACKLOG_LIMIT {
+                    break;
+                }
+                // A mail that already has a suggestion keeps it: asking
+                // again would cost money for the same words.
+                match store::advice::has_advice(&connection, account_id, &header.remote_id) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(err = %error, "triage.readFailed");
+                        return;
+                    }
+                }
+                backlog.push_back(TriageTarget {
+                    remote_id: header.remote_id.clone(),
+                    from_address: header.from_address.clone(),
+                    subject: header.subject.clone(),
+                    snippet: header.snippet.clone(),
+                });
+            }
+        }
+
+        // Take a few and ask the model.
+        let targets = {
+            let mut backlogs = self.triage_backlog.lock().await;
+            let backlog = backlogs.entry(account_id).or_default();
+            let count = TRIAGE_PER_ROUND.min(backlog.len());
+            (0..count)
+                .filter_map(|_| backlog.pop_front())
+                .collect::<Vec<TriageTarget>>()
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let classified = classify::classify(ai, targets).await;
+        if classified.is_empty() {
+            return;
+        }
+
+        // Write the suggestions, and what they cost.
+        let Ok(connection) = db::open_writable(&self.db_path) else {
+            return;
+        };
+        let month = chrono::Local::now().format("%Y-%m").to_string();
+        for item in classified {
+            let suggestion = &item.classification;
+            if let Err(error) = store::advice::upsert_ai(
+                &connection,
+                account_id,
+                &item.remote_id,
+                &store::advice::AiSuggestion {
+                    action: &suggestion.action,
+                    category: suggestion.category.as_deref(),
+                    confidence: &suggestion.confidence,
+                    rationale: suggestion.rationale.as_deref(),
+                    due_text: suggestion.due_text.as_deref(),
+                    model: &item.completion.model,
+                },
+            ) {
+                tracing::warn!(err = %error, "triage.storeFailed");
+                continue;
+            }
+            if let Err(error) = store::usage::record(
+                &connection,
+                &store::usage::UsageRecord {
+                    year_month: &month,
+                    account_email,
+                    capability: "classify",
+                    model: &item.completion.model,
+                    prompt_tokens: item.completion.prompt_tokens,
+                    completion_tokens: item.completion.completion_tokens,
+                    cost_micro_usd: item.completion.cost_micro_usd,
+                },
+            ) {
+                tracing::warn!(err = %error, "triage.usageFailed");
+            }
+        }
     }
 
     fn mark_needs_reconnect(&self, connection: &Connection, account_id: Uuid, label: &str) {

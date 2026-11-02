@@ -493,22 +493,6 @@ pub async fn usage(State(state): State<AppState>) -> Response {
     }
 }
 
-/// GET /api/ai-status - the degraded signal.
-///
-/// R2 has no AI gateway, so all three flags are false. They stay booleans rather
-/// than going absent: v3's AIStatus has no optional field, and the client reads
-/// configured == false as "the AI features are off".
-pub async fn ai_status() -> Response {
-    respond::json(
-        StatusCode::OK,
-        &wire_r2::AIStatus {
-            configured: false,
-            credit_exhausted: false,
-            circuit_open: false,
-        },
-    )
-}
-
 /// GET /api/actions - the audit log, newest first, with keyset paging.
 pub async fn actions(State(state): State<AppState>, uri: Uri) -> Response {
     let params = query::parse(&uri);
@@ -828,30 +812,6 @@ fn parse_remote_id(remote_id: &str) -> Option<Response> {
     }
 }
 
-/// GET /api/messages/{remoteId}/summary - the AI summary.
-///
-/// R2 has no provider and no model. The fixture pins 503 provider-not-configured
-/// here, which is also the gate v3 reaches on this store: its AI gateway object
-/// exists even when nothing is configured, so the provider check runs first and
-/// the sealed credentials fail there.
-pub async fn summary(
-    State(state): State<AppState>,
-    Path(remote_id): Path<String>,
-    uri: Uri,
-) -> Response {
-    let params = query::parse(&uri);
-    let Some(account_id) = account_id_param(&params) else {
-        return respond::error(StatusCode::BAD_REQUEST, "malformed-accountId");
-    };
-    if let Some(response) = parse_remote_id(&remote_id) {
-        return response;
-    }
-    if let Some(response) = provider_gate(&state, account_id, "summary.error").await {
-        return response;
-    }
-    respond::error(StatusCode::SERVICE_UNAVAILABLE, "provider-not-configured")
-}
-
 /// GET /api/messages/{remoteId}/inline-images - cid images as data URLs.
 pub async fn inline_images(
     State(state): State<AppState>,
@@ -1026,28 +986,4 @@ pub async fn briefing(State(state): State<AppState>, uri: Uri) -> Response {
         }
         Err(error) => internal_error("briefing.error", error),
     }
-}
-
-/// POST /api/messages/{remoteId}/draft - generate reply variants.
-///
-/// Needs a model *and* the body (the prompt is the mail), so it sits behind both
-/// gates. R2 has neither; the fixture records 503 provider-not-configured, which
-/// is the gate v3 reaches on this store because its gateway object exists even
-/// when no model is configured, and the sealed credentials fail at the provider.
-pub async fn draft_generate(
-    State(state): State<AppState>,
-    Path(remote_id): Path<String>,
-    uri: Uri,
-) -> Response {
-    let params = query::parse(&uri);
-    let Some(account_id) = account_id_param(&params) else {
-        return respond::error(StatusCode::BAD_REQUEST, "malformed-accountId");
-    };
-    if let Some(response) = parse_remote_id(&remote_id) {
-        return response;
-    }
-    if let Some(response) = provider_gate(&state, account_id, "draft.generate.error").await {
-        return response;
-    }
-    respond::error(StatusCode::SERVICE_UNAVAILABLE, "provider-not-configured")
 }

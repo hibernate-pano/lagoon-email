@@ -20,6 +20,8 @@ pub mod reminders;
 pub mod search;
 pub mod senders;
 pub mod stacks;
+/// The cached AI summaries (`message_summaries`).
+pub mod summaries;
 pub mod usage;
 /// The writable store: accounts, headers, bodies, pins, audit, drafts.
 pub mod write;

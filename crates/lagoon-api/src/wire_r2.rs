@@ -334,6 +334,45 @@ pub struct ExportIndexResponse {
     pub sent_count: i64,
 }
 
+// --------------------------------------------------------------------- ai ----
+
+/// `MessageSummary` (the contract): what the mail says, in the user's words.
+///
+/// `provider` is the model that answered. It is absent when the answer came
+/// from the cache: a summary read twice was paid for once, and the model that
+/// wrote it is still worth naming - but the wire follows v3 and omits it when
+/// there is nothing to say.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageSummary {
+    pub remote_id: String,
+    pub summary: String,
+    pub action_items: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+}
+
+/// The answer to `POST /api/ai/reload`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiReloadResponse {
+    pub ok: bool,
+    /// Whether the AI can work right now (a key is really there).
+    pub configured: bool,
+    /// The providers the configuration knows.
+    pub providers: Vec<String>,
+}
+
+/// The answer to `POST /api/ai/probe`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProbeResponse {
+    pub ok: bool,
+    pub provider: String,
+    pub model: String,
+    pub latency_ms: u128,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

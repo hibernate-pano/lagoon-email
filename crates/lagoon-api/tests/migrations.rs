@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use lagoon_api::crypto::BodyKey;
 use lagoon_api::db;
-use lagoon_api::store::migrate::{migrate, seal_legacy_bodies};
+use lagoon_api::store::migrate::{migrate, prepare, seal_legacy_bodies};
 use lagoon_api::store::write::{self, NewAccount, NewBody, NewHeader};
 use lagoon_api::uuid::Uuid;
 use support::TempDir;
@@ -53,6 +53,12 @@ fn dump_schema(path: &std::path::Path) -> (Vec<SchemaObject>, Vec<String>) {
         if object.kind == "index" && object.name.starts_with("sqlite_autoindex") {
             continue;
         }
+        // v4-only tables are not in the v3 golden: this one caches the AI
+        // summaries. The golden is the v3 oracle and stays untouched; the
+        // divergence is listed here so it is a decision, not a surprise.
+        if object.name == "message_summaries" {
+            continue;
+        }
         objects.push(object);
     }
     let migrations: Vec<String> = connection
@@ -71,8 +77,9 @@ fn rust_schema_matches_the_v3_golden() {
     let path = temp.join("rust.sqlite");
     let connection = db::open_writable(&path).expect("open writable");
     let report = migrate(&connection, Some(&test_key())).expect("migrate");
-    // 11 v3 migrations + lagoon-v11 (the v4-only remote_uid column).
-    assert_eq!(report.applied.len(), 12);
+    // 11 v3 migrations + lagoon-v11 (remote_uid) + lagoon-v12 (the summary
+    // cache).
+    assert_eq!(report.applied.len(), 13);
     drop(connection);
 
     let golden_path =
@@ -130,10 +137,11 @@ fn rust_schema_matches_the_v3_golden() {
         .iter()
         .map(|value| value.as_str().expect("migration name").to_owned())
         .collect();
-    // v4 appends one additive migration after v3's chain. The golden is the
+    // v4 appends its additive migrations after v3's chain. The golden is the
     // v3 oracle and stays untouched; anything else in the list is a real
     // divergence and still fails.
     golden_migrations.push("lagoon-v11".to_owned());
+    golden_migrations.push("lagoon-v12".to_owned());
     assert_eq!(
         migrations, golden_migrations,
         "grdb_migrations rows differ from v3"
@@ -151,7 +159,7 @@ fn migration_is_idempotent_and_keeps_data() {
     write::upsert_account(&connection, &new_account(account)).expect("account");
     let second = migrate(&connection, Some(&key)).expect("second");
     assert!(second.is_noop());
-    assert_eq!(second.already_present, 12);
+    assert_eq!(second.already_present, 13);
     let found = lagoon_api::store::accounts::find(&connection, account)
         .expect("find")
         .expect("account still there");
@@ -373,4 +381,66 @@ fn folder_roles_merge_instead_of_replacing_the_blob() {
     assert_eq!(found.capabilities.archive_folder, Some(false));
     assert_eq!(found.capabilities.sent_folder, Some(true));
     assert!(!found.capabilities.idle);
+}
+
+/// A first launch has no store at all - not even the directory. The server
+/// must create and migrate one, exactly as v3 did at startup; refusing to
+/// start ("the store does not exist") would make a fresh install unusable.
+#[test]
+fn a_fresh_install_creates_the_store_and_applies_the_whole_chain() {
+    let temp = TempDir::new("r3-fresh-install");
+    let path = temp.join("data").join("lagoon.sqlite");
+    let report = prepare(&path, Some(&test_key()))
+        .expect("prepare")
+        .expect("a fresh store is migrated");
+    assert!(!report.applied.is_empty(), "the whole chain must apply");
+    assert_eq!(
+        report.applied.last(),
+        Some(&"lagoon-v12"),
+        "{:?}",
+        report.applied
+    );
+    assert!(path.is_file(), "the store file must exist now");
+
+    // What the server does next: open it read-only with the strict probe.
+    lagoon_api::db::Db::open_read_only(&path).expect("the store the server opens");
+
+    // A second launch is a no-op, not a re-migration.
+    let again = prepare(&path, Some(&test_key()))
+        .expect("prepare")
+        .expect("a lagoon store is looked at");
+    assert!(again.applied.is_empty(), "{:?}", again.applied);
+}
+
+/// A file that is not one of ours is never written to: the caller's strict
+/// probe must be the one to refuse it, with a message about the schema
+/// rather than a half-migrated foreign database.
+#[test]
+fn a_foreign_file_is_never_migrated() {
+    let temp = TempDir::new("r3-foreign-store");
+    let path = temp.join("foreign.sqlite");
+    let connection = rusqlite::Connection::open(&path).expect("open");
+    connection
+        .execute_batch("CREATE TABLE notes (body TEXT)")
+        .expect("ddl");
+    drop(connection);
+
+    assert!(
+        prepare(&path, Some(&test_key()))
+            .expect("prepare")
+            .is_none(),
+        "a foreign database is not a store to migrate"
+    );
+    let connection = rusqlite::Connection::open(&path).expect("reopen");
+    let bookkeeping: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'grdb_migrations'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(
+        bookkeeping, 0,
+        "a foreign database must not grow our tables"
+    );
 }

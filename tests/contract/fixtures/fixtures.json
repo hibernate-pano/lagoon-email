@@ -1260,6 +1260,52 @@
       }
     },
     {
+      "name": "ai.reload",
+      "note": "Re-read the provider configuration; with no key in the environment the AI is still not configured.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "POST",
+        "path": "/api/ai/reload",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "ok": true,
+          "configured": false,
+          "providers": [
+            "minimax"
+          ]
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 200
+      }
+    },
+    {
+      "name": "ai.probe",
+      "note": "One tiny call to find out whether the provider answers; without a key there is nothing to call.",
+      "request": {
+        "auth": "token",
+        "headers": {},
+        "json": null,
+        "method": "POST",
+        "path": "/api/ai/probe",
+        "query": {},
+        "raw_body": null
+      },
+      "response": {
+        "body": {
+          "error": "ai-not-configured"
+        },
+        "body_kind": "json",
+        "content_type": "application/json; charset=utf-8",
+        "status": 503
+      }
+    },
+    {
       "name": "store-notices",
       "note": "Store notices (empty: the body key was present).",
       "request": {

@@ -174,6 +174,19 @@ CREATE TABLE usage_log (
     cost_micro_usd    INTEGER NOT NULL,
     created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
 );
+
+-- v4-only (lagoon-v12): the AI summary cache.
+CREATE TABLE message_summaries (
+    account_id BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    remote_id  TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    model      TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now')),
+    PRIMARY KEY (account_id, remote_id),
+    FOREIGN KEY (account_id, remote_id)
+        REFERENCES message_headers(account_id, remote_id)
+        ON DELETE CASCADE
+);
 ";
 
 /// The migration chain a v3.2.0 store carries, in registration order.

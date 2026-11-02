@@ -26,6 +26,33 @@ pub enum MigrationError {
     MissingBodyKey,
 }
 
+/// Why a store could not be prepared for the server.
+#[derive(Debug)]
+pub enum PrepareError {
+    Io(std::io::Error),
+    /// The writable open failed (permissions, a directory in the way, ...).
+    Open(String),
+    Migration(MigrationError),
+}
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrepareError::Io(error) => write!(formatter, "io: {error}"),
+            PrepareError::Open(message) => write!(formatter, "open: {message}"),
+            PrepareError::Migration(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for PrepareError {}
+
+impl From<MigrationError> for PrepareError {
+    fn from(error: MigrationError) -> Self {
+        PrepareError::Migration(error)
+    }
+}
+
 impl std::fmt::Display for MigrationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -103,6 +130,38 @@ pub fn migrate(
         report.applied.push(migration.identifier);
     }
     Ok(report)
+}
+
+/// Create the store when it is missing, then bring it to this build's chain.
+///
+/// A first launch has no store at all - not even the directory. v3 created and
+/// migrated its store at startup, and refusing to start because "the store
+/// does not exist" would make a fresh install unusable. A file that exists
+/// but is not a Lagoon store is never written to: `Ok(None)` sends the caller
+/// to its strict schema probe, which refuses a foreign database with a clear
+/// message instead of half-migrating it.
+///
+/// `Ok(Some(report))` means this call did look at (and possibly migrated) a
+/// real store.
+pub fn prepare(
+    path: &std::path::Path,
+    body_key: Option<&BodyKey>,
+) -> Result<Option<MigrationReport>, PrepareError> {
+    let fresh = !path.exists();
+    if fresh {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(PrepareError::Io)?;
+            }
+        }
+    } else if !crate::db::looks_like_a_lagoon_store(path) {
+        // Somebody else's SQLite file: not ours to touch.
+        return Ok(None);
+    }
+    let connection =
+        crate::db::open_writable(path).map_err(|error| PrepareError::Open(error.to_string()))?;
+    let report = migrate(&connection, body_key)?;
+    Ok(Some(report))
 }
 
 /// The child tables that carry an account_id, with whether they also carry the
@@ -325,12 +384,12 @@ mod tests {
         let connection = open();
         let key = test_key();
         let report = migrate(&connection, Some(&key)).expect("migrate");
-        // Eleven v3 migrations plus v4's additive lagoon-v11.
-        assert_eq!(report.applied.len(), 12);
+        // Eleven v3 migrations plus v4's additive lagoon-v11 and lagoon-v12.
+        assert_eq!(report.applied.len(), 13);
         let recorded: i64 = connection
             .query_row("SELECT COUNT(*) FROM grdb_migrations", [], |row| row.get(0))
             .expect("count");
-        assert_eq!(recorded, 12);
+        assert_eq!(recorded, 13);
         // Every table v3 creates is there.
         for table in [
             "accounts",
@@ -345,6 +404,7 @@ mod tests {
             "ai_actions",
             "ai_overrides",
             "usage_log",
+            "message_summaries",
         ] {
             let exists: i64 = connection
                 .query_row(
@@ -364,7 +424,7 @@ mod tests {
         migrate(&connection, Some(&key)).expect("first migrate");
         let second = migrate(&connection, Some(&key)).expect("second migrate");
         assert!(second.is_noop());
-        assert_eq!(second.already_present, 12);
+        assert_eq!(second.already_present, 13);
     }
 
     #[test]

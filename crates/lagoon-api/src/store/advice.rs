@@ -33,7 +33,9 @@ pub struct AdviceRow {
 const COLUMNS: &str = "id, account_id, remote_id, action, category, confidence,
                        rationale, due_text, source, model, decision, created_at, decided_at";
 
-const ACTIONS: [&str; 7] = [
+/// The actions the queue knows. A suggestion outside this set cannot be
+/// shown, so the classifier normalises to one of these.
+pub const ACTIONS: [&str; 7] = [
     "reply",
     "wait",
     "archive",
@@ -42,7 +44,8 @@ const ACTIONS: [&str; 7] = [
     "remind",
     "nothing",
 ];
-const CATEGORIES: [&str; 10] = [
+/// The categories the queue knows.
+pub const CATEGORIES: [&str; 10] = [
     "personal",
     "work",
     "marketing",
@@ -54,7 +57,8 @@ const CATEGORIES: [&str; 10] = [
     "newsletter",
     "other",
 ];
-const CONFIDENCES: [&str; 3] = ["high", "medium", "low"];
+/// The confidence levels the queue knows.
+pub const CONFIDENCES: [&str; 3] = ["high", "medium", "low"];
 const SOURCES: [&str; 2] = ["heuristic", "ai"];
 const DECISIONS: [&str; 3] = ["pending", "accepted", "dismissed"];
 
@@ -199,4 +203,89 @@ pub(crate) fn optional_text(
     Ok(row
         .get::<_, Option<String>>(index)?
         .filter(|value| !value.is_empty()))
+}
+
+/// Whether this message already has a suggestion.
+///
+/// The classifier asks this before every call: a mail is classified once, and
+/// a second call would cost money for the same words.
+pub fn has_advice(
+    connection: &Connection,
+    account_id: Uuid,
+    remote_id: &str,
+) -> rusqlite::Result<bool> {
+    let count: i64 = connection.query_row(
+        "SELECT count(*) FROM advice WHERE account_id = ? AND remote_id = ?",
+        rusqlite::params![account_id.as_bytes().as_slice(), remote_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// One suggestion from the model, as stored in `advice`.
+///
+/// The queue only knows seven actions, ten categories and three confidence
+/// levels; [`upsert_ai`] normalises anything else to what it can show.
+#[derive(Debug, Clone, Copy)]
+pub struct AiSuggestion<'a> {
+    pub action: &'a str,
+    pub category: Option<&'a str>,
+    pub confidence: &'a str,
+    pub rationale: Option<&'a str>,
+    pub due_text: Option<&'a str>,
+    pub model: &'a str,
+}
+
+/// Store the AI's suggestion for one message.
+///
+/// The suggestion is not an action: it lives in `advice`, never in
+/// `ai_actions`, so the undo history never lists something the user never
+/// did. A row that already exists is replaced - the model saw the mail again
+/// and changed its mind - unless the user already decided, which is the
+/// user's call and not the model's to overwrite.
+pub fn upsert_ai(
+    connection: &Connection,
+    account_id: Uuid,
+    remote_id: &str,
+    suggestion: &AiSuggestion<'_>,
+) -> rusqlite::Result<()> {
+    let action = if ACTIONS.contains(&suggestion.action) {
+        suggestion.action
+    } else {
+        "nothing"
+    };
+    let confidence = if CONFIDENCES.contains(&suggestion.confidence) {
+        suggestion.confidence
+    } else {
+        "low"
+    };
+    let category = suggestion
+        .category
+        .filter(|value| CATEGORIES.contains(value));
+    connection.execute(
+        "INSERT INTO advice
+            (account_id, remote_id, action, category, confidence, rationale,
+             due_text, source, model, decision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ai', ?8, 'pending')
+         ON CONFLICT (account_id, remote_id) DO UPDATE SET
+            action = excluded.action,
+            category = excluded.category,
+            confidence = excluded.confidence,
+            rationale = excluded.rationale,
+            due_text = excluded.due_text,
+            model = excluded.model,
+            source = 'ai'
+         WHERE advice.decision = 'pending'",
+        rusqlite::params![
+            account_id.as_bytes().as_slice(),
+            remote_id,
+            action,
+            category,
+            confidence,
+            suggestion.rationale,
+            suggestion.due_text,
+            suggestion.model,
+        ],
+    )?;
+    Ok(())
 }

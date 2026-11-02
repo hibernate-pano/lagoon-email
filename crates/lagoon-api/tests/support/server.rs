@@ -43,6 +43,18 @@ pub fn open_read_write(path: &Path) -> Connection {
     connection
 }
 
+/// The AI gateway the tests get when they do not bring their own: the real
+/// configuration, but a key source that never finds a key.
+pub fn no_key_gateway() -> Arc<lagoon_api::ai::gateway::AiGateway> {
+    Arc::new(
+        lagoon_api::ai::gateway::AiGateway::new(
+            lagoon_api::ai::config::AiConfig::embedded().expect("the shipped config parses"),
+            Arc::new(lagoon_api::ai::transport::HttpChatTransport::new()),
+        )
+        .with_keys(Arc::new(|_name| None)),
+    )
+}
+
 pub struct TestServer {
     pub base_url: String,
     pub token: String,
@@ -90,7 +102,31 @@ impl TestServer {
             seed.apply(&connection).expect("seed");
         }
         (
-            Self::start_with(db_path, Some(TEST_API_TOKEN), temp, Some(factory)).await,
+            Self::start_with(db_path, Some(TEST_API_TOKEN), temp, Some(factory), None).await,
+            fixtures,
+        )
+    }
+
+    /// Start with a scripted provider factory and a scripted AI gateway.
+    ///
+    /// R4: the AI routes need a gateway whose transport answers from a
+    /// script, so the tests never reach the internet.
+    pub async fn spawn_with_provider_and_ai(
+        label: &str,
+        factory: Arc<dyn lagoon_api::provider::ProviderFactory>,
+        ai: Arc<lagoon_api::ai::gateway::AiGateway>,
+    ) -> (Self, Fixtures) {
+        let fixtures = Fixtures::load();
+        let seed = Seed::from_fixtures(&fixtures);
+        let temp = TempDir::new(label);
+        let db_path = temp.join("lagoon.sqlite");
+        {
+            let connection = open_read_write(&db_path);
+            schema::create(&connection).expect("schema");
+            seed.apply(&connection).expect("seed");
+        }
+        (
+            Self::start_with(db_path, Some(TEST_API_TOKEN), temp, Some(factory), Some(ai)).await,
             fixtures,
         )
     }
@@ -104,7 +140,7 @@ impl TestServer {
     }
 
     async fn start(db_path: PathBuf, token: Option<&str>, temp: TempDir) -> Self {
-        Self::start_with(db_path, token, temp, None).await
+        Self::start_with(db_path, token, temp, None, None).await
     }
 
     async fn start_with(
@@ -112,6 +148,7 @@ impl TestServer {
         token: Option<&str>,
         temp: TempDir,
         factory: Option<Arc<dyn lagoon_api::provider::ProviderFactory>>,
+        ai: Option<Arc<lagoon_api::ai::gateway::AiGateway>>,
     ) -> Self {
         let db = Db::open_read_only(db_path.clone()).expect("open the store read-only");
         let body_key = body_key();
@@ -127,6 +164,14 @@ impl TestServer {
         let mut state = AppState::new(Arc::new(db), &config);
         if let Some(factory) = factory {
             state = state.with_provider_factory(factory);
+        }
+        match ai {
+            Some(ai) => state = state.with_ai_gateway(ai),
+            // A gateway with no keys, so the suite never depends on the
+            // environment it happens to run in: the contract fixtures pin
+            // `configured:false`, and a developer with a real key exported
+            // would otherwise fail them.
+            None => state = state.with_ai_gateway(no_key_gateway()),
         }
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

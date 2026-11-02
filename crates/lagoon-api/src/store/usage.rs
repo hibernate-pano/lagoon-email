@@ -59,3 +59,40 @@ pub fn account_breakdown(
     }
     Ok(shares)
 }
+
+/// One line in the cost ledger.
+#[derive(Debug, Clone, Copy)]
+pub struct UsageRecord<'a> {
+    pub year_month: &'a str,
+    pub account_email: &'a str,
+    pub capability: &'a str,
+    pub model: &'a str,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub cost_micro_usd: i64,
+}
+
+/// Record one AI call in the cost ledger.
+///
+/// The ledger is the only place the product knows what the AI cost. A call
+/// that is not written here is money the user spent and nobody can see, so
+/// the routes write one row per call, including the calls that failed
+/// halfway (they cost tokens too).
+pub fn record(connection: &Connection, record: &UsageRecord<'_>) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO usage_log
+            (year_month, account_email, capability, model,
+             prompt_tokens, completion_tokens, cost_micro_usd)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            record.year_month,
+            record.account_email,
+            record.capability,
+            record.model,
+            i64::from(record.prompt_tokens),
+            i64::from(record.completion_tokens),
+            record.cost_micro_usd,
+        ],
+    )?;
+    Ok(())
+}

@@ -14,6 +14,8 @@ pub mod guard;
 pub mod query;
 pub mod respond;
 pub mod routes;
+/// The AI routes: status, summary, draft, reload, probe.
+pub mod routes_ai;
 pub mod routes_r2;
 pub mod routes_r3;
 pub mod routes_r5;
@@ -25,9 +27,31 @@ use std::sync::Arc;
 use axum::routing::get;
 use axum::{middleware, Router};
 
+use crate::ai::config::AiConfig;
+use crate::ai::gateway::{AiGateway, Budget, BudgetSource};
+use crate::ai::transport::HttpChatTransport;
 use crate::config::Config;
 use crate::crypto::BodyKey;
 use crate::db::Db;
+
+/// The budget the gateway enforces: this month's spend from the ledger the
+/// usage route shows, and the cap from the environment (0 = no cap).
+fn budget_source(db: Arc<Db>, cap_usd: f64) -> BudgetSource {
+    let cap_micro_usd = (cap_usd * 1_000_000.0).round() as i64;
+    Arc::new(move || {
+        let month = chrono::Local::now().format("%Y-%m").to_string();
+        let spent_micro_usd = db
+            .with_connection(move |connection| {
+                crate::store::usage::month_summary(connection, &month)
+            })
+            .map(|summary| summary.cost_micro_usd)
+            .unwrap_or(0);
+        Budget {
+            spent_micro_usd,
+            cap_micro_usd,
+        }
+    })
+}
 
 /// Everything a handler needs, cloned per request.
 #[derive(Clone)]
@@ -50,6 +74,13 @@ pub struct AppState {
     /// The sync supervisor: one loop per account with a provider, plus the
     /// trigger POST /api/sync uses.
     pub sync: Arc<crate::sync::SyncSupervisor>,
+    /// The AI gateway: the read-only advisor (constitution §2).
+    ///
+    /// It is always present. What varies is whether it is *configured*: a
+    /// build with no provider key answers `configured:false` and every AI
+    /// route answers 503 ai-not-configured, which is the truth rather than a
+    /// crash.
+    pub ai: Arc<AiGateway>,
 }
 
 impl AppState {
@@ -58,7 +89,20 @@ impl AppState {
         let token_key = config.token_key.clone().map(Arc::new);
         let provider_factory: Arc<dyn crate::provider::ProviderFactory> =
             Arc::new(crate::provider::NoProviderFactory);
-        let sync = build_supervisor(&db, &body_key, &token_key, &provider_factory);
+        // One gateway for the routes and the sync supervisor. Two instances
+        // would keep two breaker states, and `POST /api/ai/reload` would
+        // reach only one of them.
+        //
+        // A configuration that does not load is an empty one: the AI is then
+        // simply not configured, and the status route says so.
+        let ai = Arc::new(
+            AiGateway::new(
+                AiConfig::load_current().unwrap_or_default(),
+                Arc::new(HttpChatTransport::new()),
+            )
+            .with_budget(budget_source(Arc::clone(&db), config.budget_cap_usd)),
+        );
+        let sync = build_supervisor(&db, &body_key, &token_key, &provider_factory, &ai);
         Self {
             db,
             body_key,
@@ -68,7 +112,24 @@ impl AppState {
             token_key,
             provider_factory,
             sync,
+            ai,
         }
+    }
+
+    /// Replace the whole AI gateway (tests that need their own keys).
+    ///
+    /// The sync supervisor is rebuilt around the new gateway, so the advice
+    /// step and the routes use the same advisor.
+    pub fn with_ai_gateway(mut self, gateway: Arc<AiGateway>) -> Self {
+        self.ai = Arc::clone(&gateway);
+        self.sync = build_supervisor(
+            &self.db,
+            &self.body_key,
+            &self.token_key,
+            &self.provider_factory,
+            &self.ai,
+        );
+        self
     }
 
     /// Replace the provider factory (tests, and R3.4b's lagoon-mail wiring).
@@ -79,7 +140,13 @@ impl AppState {
         factory: Arc<dyn crate::provider::ProviderFactory>,
     ) -> Self {
         self.provider_factory = Arc::clone(&factory);
-        self.sync = build_supervisor(&self.db, &self.body_key, &self.token_key, &factory);
+        self.sync = build_supervisor(
+            &self.db,
+            &self.body_key,
+            &self.token_key,
+            &factory,
+            &self.ai,
+        );
         self
     }
 
@@ -136,15 +203,16 @@ fn build_supervisor(
     body_key: &Arc<BodyKey>,
     token_key: &Option<Arc<crate::token::TokenKey>>,
     factory: &Arc<dyn crate::provider::ProviderFactory>,
+    ai: &Arc<AiGateway>,
 ) -> Arc<crate::sync::SyncSupervisor> {
-    Arc::new(crate::sync::SyncSupervisor::new(Arc::new(
-        crate::sync::SyncEngine::new(
-            db.path().to_path_buf(),
-            Arc::clone(body_key),
-            token_key.clone(),
-            Arc::clone(factory),
-        ),
-    )))
+    let mut engine = crate::sync::SyncEngine::new(
+        db.path().to_path_buf(),
+        Arc::clone(body_key),
+        token_key.clone(),
+        Arc::clone(factory),
+    );
+    engine = engine.with_ai(Arc::clone(ai));
+    Arc::new(crate::sync::SyncSupervisor::new(Arc::new(engine)))
 }
 
 /// The R1 router.
@@ -165,13 +233,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/store-notices", get(routes_r2::store_notices))
         .route("/api/time-saved", get(routes_r2::time_saved))
         .route("/api/usage", get(routes_r2::usage))
-        .route("/api/ai-status", get(routes_r2::ai_status))
+        .route("/api/ai-status", get(routes_ai::ai_status))
         .route("/api/actions", get(routes_r2::actions))
         .route("/api/reminders", get(routes_r2::reminders))
         .route("/api/export/index", get(routes_r2::export_index))
         .route("/api/search", get(routes_r2::search))
         .route("/api/messages/{remote_id}/drafts", get(routes_r2::drafts))
-        .route("/api/messages/{remote_id}/summary", get(routes_r2::summary))
+        .route("/api/messages/{remote_id}/summary", get(routes_ai::summary))
         .route(
             "/api/messages/{remote_id}/inline-images",
             get(routes_r2::inline_images),
@@ -230,8 +298,13 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/messages/{remote_id}/draft",
-            axum::routing::post(routes_r2::draft_generate),
+            axum::routing::post(routes_ai::draft_generate),
         )
+        // R4: the AI configuration. reload is the user's "try again" after
+        // fixing the key; probe is the cheapest way to find out whether the
+        // provider answers at all.
+        .route("/api/ai/reload", axum::routing::post(routes_ai::ai_reload))
+        .route("/api/ai/probe", axum::routing::post(routes_ai::ai_probe))
         // R3.5b: the three send paths. Attachments make these bodies big,
         // so they get the contract's 64 MB ceiling instead of axum's 2 MB
         // default; the other routes stay at the default.
@@ -273,4 +346,72 @@ pub fn router(state: AppState) -> Router {
             guard::enforce,
         ))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The budget the gateway enforces is the same ledger `/api/usage`
+    /// shows: one number, one source. If this wiring breaks, the cap the
+    /// user set silently stops protecting them.
+    #[test]
+    fn the_budget_is_the_ledger_and_the_cap() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("lagoon-budget-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("lagoon.sqlite");
+        {
+            let connection = crate::db::open_writable(&path).expect("open for writing");
+            crate::store::migrate::migrate(&connection, None).expect("schema");
+            let month = chrono::Local::now().format("%Y-%m").to_string();
+            crate::store::usage::record(
+                &connection,
+                &crate::store::usage::UsageRecord {
+                    year_month: &month,
+                    account_email: "a@example.invalid",
+                    capability: "summary",
+                    model: "MiniMax-M3",
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    cost_micro_usd: 2_500_000,
+                },
+            )
+            .expect("usage row");
+        }
+        let db = Arc::new(Db::open_read_only(&path).expect("read only"));
+        let budget = budget_source(Arc::clone(&db), 5.0)();
+        assert_eq!(budget.spent_micro_usd, 2_500_000, "this month's ledger");
+        assert_eq!(budget.cap_micro_usd, 5_000_000, "$5 in micro-USD");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A dollar cap that cannot be parsed is no cap, not a zero cap: the
+    /// config already normalises it, and the gateway must agree.
+    #[test]
+    fn a_zero_budget_means_no_cap_at_all() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "lagoon-budget-zero-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("lagoon.sqlite");
+        {
+            let connection = crate::db::open_writable(&path).expect("open for writing");
+            crate::store::migrate::migrate(&connection, None).expect("schema");
+        }
+        let db = Arc::new(Db::open_read_only(&path).expect("read only"));
+        let budget = budget_source(db, 0.0)();
+        assert_eq!(budget.cap_micro_usd, 0);
+        assert!(!budget.is_spent(), "zero is 'no cap', never 'all spent'");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 }

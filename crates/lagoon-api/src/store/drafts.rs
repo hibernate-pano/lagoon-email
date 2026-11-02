@@ -82,3 +82,25 @@ pub fn list(
     }
     Ok(drafts)
 }
+
+/// Store a new set of reply variants and answer its row id.
+///
+/// The whole array is sealed as one envelope, the same way
+/// [`list`] opens it: a draft is the model's words about a private mail, and
+/// a half-sealed draft is a draft nobody can read.
+pub fn insert(
+    connection: &Connection,
+    body_key: &BodyKey,
+    account_id: Uuid,
+    remote_id: &str,
+    variants: &[String],
+) -> Result<i64, DraftError> {
+    let json = serde_json::to_string(variants).map_err(|_| DraftError::Malformed)?;
+    let sealed = body_key.seal(&json).map_err(DraftError::Unreadable)?;
+    connection.execute(
+        "INSERT INTO draft_replies (account_id, remote_id, variants)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![account_id.as_bytes().as_slice(), remote_id, sealed],
+    )?;
+    Ok(connection.last_insert_rowid())
+}
