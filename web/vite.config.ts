@@ -35,7 +35,12 @@ import { fileURLToPath } from "node:url";
 // write UI against a seeded synthetic store (README "写路径怎么验").
 // LAGOON_WEB_ENV is interpreted relative to the REPOSITORY ROOT (not to v4/web,
 // and not to the shell's cwd, which npm sets to the package directory).
-const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
+//
+// "../" from web/ is the repository root. It used to be "../../", which was
+// right when this file lived in a v4/ subdirectory and pointed one level ABOVE
+// the repository: LAGOON_WEB_ENV silently found nothing, the dev server ran
+// without its proxy, and every /api/* request answered with index.html.
+const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const DEV_ENV_FILE = process.env.LAGOON_WEB_ENV
   ? repoRoot + process.env.LAGOON_WEB_ENV
   : fileURLToPath(new URL("../.dev/web.env", import.meta.url));

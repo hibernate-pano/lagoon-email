@@ -9,11 +9,15 @@
          CSP response headers on custom schemes (tauri://localhost), so the config
          value alone left the packaged macOS app with no policy at all. The config
          stays for the platforms whose webviews do honour the header; this tag is
-         what is actually enforced here. `ws://localhost:*` keeps Vite HMR working
-         in browser mode (`npm run dev`); the packaged app never opens a socket. -->
+         what is actually enforced here.
+
+         `ws://localhost:*` and `ws://127.0.0.1:*` keep Vite HMR working in
+         browser mode (`npm run dev`); the dev server binds 127.0.0.1, so the
+         socket is ws://127.0.0.1:<port> and a localhost-only rule blocked it.
+         The packaged app never opens a socket. -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; connect-src ipc: http://ipc.localhost http://127.0.0.1:* ws://localhost:*; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'"
+      content="default-src 'self'; connect-src ipc: http://ipc.localhost http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'"
     />
     <meta name="color-scheme" content="light dark" />
     <title>Lagoon</title>
