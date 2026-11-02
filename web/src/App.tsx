@@ -30,6 +30,7 @@ import { COMMON_UNAVAILABLE, describeHttpFailure } from "./core/errors";
 import { useApiOutcome, useBoot, useOnline } from "./core/hooks";
 import { useMailboxOverlay } from "./core/mutations";
 import { BYPASS_CAPABILITY_GATE, UNDO_WINDOW_MS } from "./core/config";
+import { targetIdsOf } from "./core/selection";
 import {
   bulkAction,
   emptyTrash,
@@ -517,8 +518,7 @@ export function App(): ReactNode {
 
   /* ---------------------------------------------------------- selection --- */
 
-  const targetIds = (): string[] =>
-    selection.size > 0 ? [...selection] : openedId ? [openedId] : cursor ? [cursor] : [];
+  const targetIds = (): string[] => targetIdsOf(selection, openedId, cursor);
 
   const handleRowSelect = (remoteId: string, event: { shiftKey: boolean; metaKey: boolean }) => {
     setOpenedId(remoteId);
@@ -556,11 +556,19 @@ export function App(): ReactNode {
         target !== null && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
       const mod = event.metaKey || event.ctrlKey;
 
+      // ⌘K is safe inside a text field: it opens the palette, it does not
+      // touch mail.
       if (mod && event.key.toLowerCase() === "k") {
         event.preventDefault();
         setPaletteOpen((open) => !open);
         return;
       }
+      // Everything below acts on mail. A keystroke meant for a text field must
+      // never reach it: ⌘⌫ in an input deletes text, and acting instead on the
+      // cursor would delete a row the user cannot even see (the cursor is not
+      // cleared when the lens or the filter changes the visible rows).
+      if (typing) return;
+
       if (mod && event.key === "/") {
         event.preventDefault();
         setShortcutsOpen(true);
@@ -581,7 +589,7 @@ export function App(): ReactNode {
         for (const id of targetIds()) void runRowVerb("archive", id);
         return;
       }
-      if (mod && event.key.toLowerCase() === "a" && !typing) {
+      if (mod && event.key.toLowerCase() === "a") {
         event.preventDefault();
         setSelection(new Set(rows.map((row) => row.remoteId)));
         return;
@@ -741,6 +749,7 @@ export function App(): ReactNode {
               onRetry={briefing.refresh}
               onRefresh={briefing.refresh}
               openedId={openedId}
+              cursor={cursor}
               selection={selection}
               onRowSelect={handleRowSelect}
               writes={writes}

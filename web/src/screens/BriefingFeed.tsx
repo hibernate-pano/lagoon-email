@@ -70,6 +70,7 @@ export interface BriefingFeedProps {
   onRetry: () => void;
   onRefresh: () => void;
   openedId: string | null;
+  cursor: string | null;
   selection: Set<string>;
   onRowSelect: (remoteId: string, event: { shiftKey: boolean; metaKey: boolean }) => void;
   writes: WriteBridge;
@@ -164,6 +165,7 @@ export function BriefingFeed(props: BriefingFeedProps): ReactNode {
                                 ) : null
                               }
                               opened={props.openedId === item.message.remoteId}
+                              isCursor={props.cursor === item.message.remoteId}
                               checked={props.selection.has(item.message.remoteId)}
                               onSelect={(event) => props.onRowSelect(item.message.remoteId, event)}
                               actions={

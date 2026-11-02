@@ -200,6 +200,11 @@ code, kbd, .mono { font-family: var(--font-mono); }
 .mail-row:hover { background: var(--bg-row-hover); }
 .mail-row[aria-selected="true"] { background: var(--bg-row-selected); }
 
+/* The keyboard cursor (j/k). Distinct from :focus - the row does not need
+   DOM focus - but it is the row the next verb will act on, so it must be
+   visible without hovering. */
+.mail-row.cursor { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+
 .mail-row.unread::before {
   content: "";
   position: absolute;

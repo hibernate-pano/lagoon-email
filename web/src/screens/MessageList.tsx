@@ -124,6 +124,7 @@ export function MessageList(props: MessageListProps): ReactNode {
                       variant="list"
                       thirdLine={message.snippet}
                       opened={props.openedId === message.remoteId}
+                      isCursor={props.cursor === message.remoteId}
                       checked={props.selection.has(message.remoteId)}
                       onSelect={(event) => props.onRowSelect(message.remoteId, event)}
                       actions={

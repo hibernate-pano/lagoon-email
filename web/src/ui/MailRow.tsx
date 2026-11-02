@@ -26,6 +26,8 @@ export interface MailRowProps {
   opened: boolean;
   /** Part of the multi-selection. */
   checked: boolean;
+  /** The keyboard cursor: the row j/k currently points at. */
+  isCursor?: boolean;
   onSelect: (event: { shiftKey: boolean; metaKey: boolean }) => void;
 }
 
@@ -37,17 +39,21 @@ export function MailRow(props: MailRowProps): ReactNode {
     unread ? "unread" : "",
     props.checked ? "checked" : "",
     props.opened ? "opened" : "",
+    props.isCursor ? "cursor" : "",
     message.isPinned ? "pinned" : "",
   ]
     .filter(Boolean)
     .join(" ");
 
+  // Roving tabindex: Tab lands on the row the keyboard cursor is on, not on
+  // every row (which would make Tab useless in a long list).
   return (
     <div
       className={className}
       role="option"
       aria-selected={props.checked || props.opened}
-      tabIndex={0}
+      aria-current={props.isCursor ? "true" : undefined}
+      tabIndex={props.isCursor ? 0 : -1}
       onClick={(event) => props.onSelect({ shiftKey: event.shiftKey, metaKey: event.metaKey || event.ctrlKey })}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {
