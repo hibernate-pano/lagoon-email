@@ -148,19 +148,41 @@ impl Context {
     }
 }
 
-fn pump<R: Read + Send + 'static>(reader: R, tag: &'static str) {
+fn pump<R: Read + Send + 'static, F: Fn(&str) + Send + 'static>(
+    reader: R,
+    tag: &'static str,
+    on_line: F,
+) {
     std::thread::spawn(move || {
         use std::io::BufRead;
         for line in std::io::BufReader::new(reader).lines() {
             match line {
-                Ok(line) => eprintln!("[{tag}] {line}"),
+                Ok(line) => {
+                    on_line(&line);
+                    eprintln!("[{tag}] {line}");
+                }
                 Err(_) => break,
             }
         }
     });
 }
 
-fn spawn(ctx: &Context, port: u16) -> Result<Child, BootError> {
+/// The one machine-readable line the backend prints after binding.
+///
+/// `<u16>` only, and never 0: `--port 0` is the request, not the answer.
+pub(crate) fn parse_port_line(line: &str) -> Option<u16> {
+    let raw = line.trim().strip_prefix("LAGOON_PORT=")?;
+    match raw.trim().parse::<u16>() {
+        Ok(port) if port != 0 => Some(port),
+        _ => None,
+    }
+}
+
+fn spawn(
+    ctx: &Context,
+    port: u16,
+    on_stdout: impl Fn(&str) + Send + 'static,
+) -> Result<Child, BootError> {
     let db = ctx.data_dir.join("lagoon.sqlite");
     let mut command = Command::new(&ctx.bin);
     match ctx.backend {
@@ -209,10 +231,10 @@ fn spawn(ctx: &Context, port: u16) -> Result<Child, BootError> {
         message: format!("spawn {}: {e}", ctx.bin.display()),
     })?;
     if let Some(stdout) = child.stdout.take() {
-        pump(stdout, "sidecar");
+        pump(stdout, "sidecar", on_stdout);
     }
     if let Some(stderr) = child.stderr.take() {
-        pump(stderr, "sidecar");
+        pump(stderr, "sidecar", |_| {});
     }
     Ok(child)
 }
@@ -230,11 +252,26 @@ async fn healthz_once(shared: &Shared, port: u16, token: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn wait_healthz(shared: &Shared, port: u16, token: &str) -> Result<(), BootError> {
+/// Wait for the port the backend bound, then for /healthz to answer 2xx.
+///
+/// The Rust backend is spawned with `--port 0` and prints `LAGOON_PORT=` once
+/// it is listening; until that line arrives there is no address to handshake
+/// with. The Swift reference backend cannot print it, so it keeps the
+/// shell-chosen port.
+async fn wait_healthz(
+    shared: &Shared,
+    backend: Backend,
+    fixed_port: u16,
+    token: &str,
+) -> Result<u16, BootError> {
     let deadline = Instant::now() + HEALTHZ_BUDGET;
     loop {
-        if healthz_once(shared, port, token).await {
-            return Ok(());
+        let port = match backend {
+            Backend::Rust => shared.reported_port(),
+            Backend::Swift => fixed_port,
+        };
+        if port != 0 && healthz_once(shared, port, token).await {
+            return Ok(port);
         }
         // A child that died during startup is a different failure than a slow
         // one: `exited` vs `health-timeout` (contract §4.1 code set).
@@ -255,10 +292,17 @@ async fn wait_healthz(shared: &Shared, port: u16, token: &str) -> Result<(), Boo
         if Instant::now() >= deadline {
             return Err(BootError {
                 code: "health-timeout",
-                message: format!(
-                    "no 2xx from http://127.0.0.1:{port}/healthz within {}s",
-                    HEALTHZ_BUDGET.as_secs()
-                ),
+                message: if port == 0 {
+                    format!(
+                        "the backend did not print LAGOON_PORT within {}s",
+                        HEALTHZ_BUDGET.as_secs()
+                    )
+                } else {
+                    format!(
+                        "no 2xx from http://127.0.0.1:{port}/healthz within {}s",
+                        HEALTHZ_BUDGET.as_secs()
+                    )
+                },
             });
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -267,20 +311,37 @@ async fn wait_healthz(shared: &Shared, port: u16, token: &str) -> Result<(), Boo
 
 /// One spawn -> healthz -> phase=ready attempt.
 pub async fn start_once(shared: &Shared, ctx: &Context) -> Result<(), BootError> {
-    let port = port::free_port_with_retry(5).map_err(|message| BootError { code: "port", message })?;
-    let child = spawn(ctx, port)?;
+    // Rust: the backend binds :0 and reports the port it got. Choosing the
+    // port here would be a TOCTOU - the listener is closed between the probe
+    // and the child's bind, and whoever takes it receives the healthz request
+    // with the real API token in the Authorization header.
+    let requested = match ctx.backend {
+        Backend::Rust => {
+            shared.clear_reported_port();
+            0
+        }
+        Backend::Swift => {
+            port::free_port_with_retry(5).map_err(|message| BootError { code: "port", message })?
+        }
+    };
+    let slot = shared.port_slot();
+    let child = spawn(ctx, requested, move |line| {
+        if let Some(port) = parse_port_line(line) {
+            let _ = slot.compare_exchange(0, port, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    })?;
     let pid = child.id();
     CHILD_PID.store(pid as i32, Ordering::SeqCst);
     shared.store_child(child);
     shared.set_token(ctx.keys.api_token.clone());
     eprintln!(
-        "[sidecar] spawned pid={pid} port={port} bin={} db={} root={}",
+        "[sidecar] spawned pid={pid} requested_port={requested} bin={} db={} root={}",
         ctx.bin.display(),
         ctx.data_dir.join("lagoon.sqlite").display(),
         ctx.root.display()
     );
-    match wait_healthz(shared, port, &ctx.keys.api_token).await {
-        Ok(()) => {
+    match wait_healthz(shared, ctx.backend, requested, &ctx.keys.api_token).await {
+        Ok(port) => {
             shared.publish(BootStatus::ready(shared.backend().as_str(), port, pid));
             Ok(())
         }
@@ -407,4 +468,19 @@ pub async fn raw_status(
         .await
         .map(|response| response.status().as_u16())
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_port_line;
+
+    #[test]
+    fn the_port_marker_is_parsed_and_nothing_else_is() {
+        assert_eq!(parse_port_line("LAGOON_PORT=51234"), Some(51234));
+        // 0 is what `--port 0` *means*, never what a bound listener reports.
+        assert_eq!(parse_port_line("LAGOON_PORT=0"), None);
+        assert_eq!(parse_port_line("[sidecar] LAGOON_PORT=1"), None);
+        assert_eq!(parse_port_line("LAGOON_PORT=nope"), None);
+        assert_eq!(parse_port_line(""), None);
+    }
 }

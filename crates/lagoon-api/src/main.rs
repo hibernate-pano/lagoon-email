@@ -163,6 +163,14 @@ async fn run(config: Config) -> Result<(), String> {
     // and a supervisor cannot find the server. Printing the real port costs a
     // line and makes ephemeral ports usable.
     tracing::info!(port = bound.port(), "listening");
+    // Machine-readable companion to the log line above. The shell spawns the
+    // backend with --port 0 and must learn the port the kernel assigned; the
+    // alternative - the shell picking a free port and handing it over - is a
+    // TOCTOU: another process can take that port between the probe and the
+    // bind, and the healthz handshake sends the API token to whoever holds it.
+    println!("LAGOON_PORT={}", bound.port());
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
 
     axum::serve(listener, http::router(state))
         .with_graceful_shutdown(shutdown_signal())

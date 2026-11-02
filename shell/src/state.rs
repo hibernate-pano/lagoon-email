@@ -100,6 +100,11 @@ pub struct Shared {
     pub supervising: AtomicBool,
     /// Set on app exit: the supervisor must stop restarting things.
     pub shutdown: AtomicBool,
+    /// The port the backend reported on stdout (`LAGOON_PORT=<u16>`). Zero
+    /// until the line arrives. The handshake waits for it instead of choosing
+    /// a port itself: a port the shell chose can be stolen between the probe
+    /// and the backend's bind, and the healthz request carries the token.
+    reported_port: std::sync::Arc<std::sync::atomic::AtomicU16>,
 }
 
 impl Shared {
@@ -121,7 +126,22 @@ impl Shared {
             http,
             supervising: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            reported_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         }
+    }
+
+    pub fn clear_reported_port(&self) {
+        self.reported_port.store(0, Ordering::SeqCst);
+    }
+
+    pub fn reported_port(&self) -> u16 {
+        self.reported_port.load(Ordering::SeqCst)
+    }
+
+    /// A handle the stdout pump can write the port into without borrowing
+    /// `Shared` (the pump runs on its own thread for the child's lifetime).
+    pub fn port_slot(&self) -> std::sync::Arc<std::sync::atomic::AtomicU16> {
+        std::sync::Arc::clone(&self.reported_port)
     }
 
     pub fn set_app(&self, app: AppHandle) {
