@@ -37,6 +37,7 @@ fn account_key() -> Arc<TokenKey> {
 fn message(remote_id: &str, uid: i64) -> RemoteHeader {
     RemoteHeader {
         remote_id: remote_id.to_owned(),
+        remote_uid: Some(uid),
         thread_id: format!("thread-{remote_id}"),
         from_address: "sender@example.invalid".to_owned(),
         from_name: Some("Sender".to_owned()),
@@ -50,6 +51,51 @@ fn message(remote_id: &str, uid: i64) -> RemoteHeader {
         list_unsubscribe: false,
         unsubscribe_links: "[]".to_owned(),
     }
+}
+
+/// A row synced by a build before `remote_uid` existed keeps NULL until the
+/// membership walk reports its UID. That walk already fetched every Message-ID
+/// on the session, so filling the column costs no extra wire traffic — and
+/// without it those rows keep paying the 2.2s body-open scan forever.
+#[tokio::test]
+async fn inbox_membership_uids_backfill_rows_stored_before_the_column_existed() {
+    let store = Store::new("sync-uid-backfill");
+    let account = store.add_account(ACCOUNT_A, "a@example.invalid", true);
+    let first = round(1, 1, &["legacy-1"], false);
+    let mut legacy = first.clone();
+    for header in &mut legacy.upserts {
+        header.remote_uid = None;
+    }
+    // Second round: no upserts, but membership now reports the UID.
+    let backfill = MailChangeSet {
+        cursor: SyncCursor {
+            uid_validity: Some(1),
+            last_uid: Some(1),
+        },
+        inbox_remote_ids: Some(vec!["legacy-1".to_owned()]),
+        inbox_uids: Some(vec![("legacy-1".to_owned(), 77)]),
+        ..MailChangeSet::default()
+    };
+    let factory = Arc::new(FakeProviderFactory::scripted(vec![
+        Ok(legacy),
+        Ok(backfill),
+    ]));
+    let engine = engine(&store, Arc::clone(&factory));
+
+    engine.round(account).await;
+    let uid = |store: &Store| -> Option<i64> {
+        store
+            .connection()
+            .query_row(
+                "SELECT remote_uid FROM message_headers WHERE remote_id = 'legacy-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("uid")
+    };
+    assert_eq!(uid(&store), None, "the legacy round must not invent a UID");
+    engine.round(account).await;
+    assert_eq!(uid(&store), Some(77));
 }
 
 fn round(
@@ -440,6 +486,16 @@ async fn a_header_only_account_appears_in_the_account_and_message_lists() {
     .expect("messages");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].remote_id, "only-1");
+    // The wire UID survives the upsert: the body route needs it to open the
+    // message with one FETCH instead of re-resolving its Message-ID.
+    let stored_uid: Option<i64> = connection
+        .query_row(
+            "SELECT remote_uid FROM message_headers WHERE remote_id = 'only-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("stored uid");
+    assert_eq!(stored_uid, Some(1));
     let bodies: i64 = connection
         .query_row("SELECT COUNT(*) FROM message_bodies", [], |row| row.get(0))
         .expect("count");

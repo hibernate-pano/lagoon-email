@@ -348,7 +348,7 @@ fn fetch_body_decodes_a_gbk_message_and_uses_body_peek() {
     transport.enqueue_line("A0004 OK FETCH completed");
     let mut provider = provider(&transport);
 
-    let body = provider.fetch_body("42").unwrap();
+    let body = provider.fetch_body("42", None).unwrap();
     assert_eq!(body.text, "中文");
     assert!(body.attachments.is_empty());
     let lines = transport.command_lines();
@@ -419,6 +419,131 @@ fn fetch_raw_message_finds_an_archived_message_after_inbox_says_gone() {
     );
     assert!(
         lines.contains(&"A0009 UID FETCH 42 (BODY.PEEK[])".to_owned()),
+        "{lines:?}"
+    );
+}
+
+/// Sync already reads every message's UID from the server. Persisting it and
+/// passing it back on open turns the cold body fetch into one FETCH; without
+/// the hint it is a SEARCH (empty on QQ) plus a whole-mailbox header scan —
+/// measured at 2.2s on a 419-message mailbox, and slower as the mailbox grows.
+#[test]
+fn fetch_body_with_a_stored_uid_is_one_fetch_and_no_search_or_scan() {
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1 UIDPLUS");
+    select_script(&transport, "A0003", 1, 7, 8);
+    let raw = b"Message-ID: <m1@example.com>\r\nSubject: hello\r\n\r\nbody".to_vec();
+    transport.enqueue_line(format!("* 1 FETCH (UID 42 BODY[] {{{}}}", raw.len()));
+    transport.enqueue_literal(raw);
+    transport.enqueue_line(")");
+    transport.enqueue_line("A0004 OK FETCH completed");
+    let mut provider = provider(&transport);
+
+    let body = provider.fetch_body("<m1@example.com>", Some(42)).unwrap();
+    assert_eq!(body.text, "body");
+    let lines = transport.command_lines();
+    assert!(
+        lines.contains(&"A0004 UID FETCH 42 (BODY.PEEK[])".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("SEARCH")),
+        "a stored UID must not search: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("1:*")),
+        "a stored UID must not scan: {lines:?}"
+    );
+}
+
+/// A stored UID is only meaningful inside the UIDVALIDITY that issued it. If
+/// the server's UID space was rebuilt, the same number can now hold a
+/// different message; answering with it would show the user the wrong mail.
+/// The fetched bytes are checked against the Message-ID the row is keyed by,
+/// and a disagreement falls back to identity resolution.
+#[test]
+fn fetch_body_ignores_a_stored_uid_that_now_holds_another_message() {
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1 UIDPLUS");
+    select_script(&transport, "A0003", 2, 7, 900);
+    let stale = b"Message-ID: <other@example.com>\r\nSubject: not yours\r\n\r\nwrong body".to_vec();
+    transport.enqueue_line(format!("* 1 FETCH (UID 42 BODY[] {{{}}}", stale.len()));
+    transport.enqueue_literal(stale);
+    transport.enqueue_line(")");
+    transport.enqueue_line("A0004 OK FETCH completed");
+    // Fallback: the search is empty (QQ), the scan finds the Message-ID at 12.
+    transport.enqueue_line("* SEARCH");
+    transport.enqueue_line("A0005 OK SEARCH completed");
+    let header = b"Message-ID: <m1@example.com>\r\n\r\n".to_vec();
+    transport.enqueue_line(format!(
+        "* 1 FETCH (UID 12 BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}",
+        header.len()
+    ));
+    transport.enqueue_literal(header);
+    transport.enqueue_line(")");
+    transport.enqueue_line("A0006 OK FETCH completed");
+    let raw = b"Message-ID: <m1@example.com>\r\nSubject: right\r\n\r\nright body".to_vec();
+    transport.enqueue_line(format!("* 1 FETCH (UID 12 BODY[] {{{}}}", raw.len()));
+    transport.enqueue_literal(raw);
+    transport.enqueue_line(")");
+    transport.enqueue_line("A0007 OK FETCH completed");
+    let mut provider = provider(&transport);
+
+    let body = provider.fetch_body("<m1@example.com>", Some(42)).unwrap();
+    assert_eq!(body.text, "right body");
+    let lines = transport.command_lines();
+    assert!(
+        lines.contains(&"A0004 UID FETCH 42 (BODY.PEEK[])".to_owned()),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"A0007 UID FETCH 12 (BODY.PEEK[])".to_owned()),
+        "the fallback must fetch the right message: {lines:?}"
+    );
+}
+
+/// QQ answers `UID SEARCH HEADER Message-ID <id>` with an **empty set** even
+/// when the header is present, so a body fetch by Message-ID cannot rely on
+/// the search. The UID space is sparse (a mailbox with 419 messages can have
+/// UIDNEXT 13963), so a "recent window" scan also misses older messages: the
+/// scan must cover the whole UID range, not the last N UIDs.
+#[test]
+fn fetch_raw_message_finds_an_inbox_message_when_the_header_search_comes_back_empty() {
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1 UIDPLUS");
+    // A mailbox whose UID space is sparse: 2 messages, UIDNEXT 900.
+    select_script(&transport, "A0003", 2, 7, 900);
+    // The header search finds nothing.
+    transport.enqueue_line("* SEARCH");
+    transport.enqueue_line("A0004 OK SEARCH completed");
+    // The full-range scan: `1:*` is every UID the mailbox has, however sparse.
+    let header = b"Message-ID: <m1@example.com>\r\n\r\n".to_vec();
+    transport.enqueue_line(format!(
+        "* 1 FETCH (UID 12 BODY[HEADER.FIELDS (MESSAGE-ID)] {{{}}}",
+        header.len()
+    ));
+    transport.enqueue_literal(header);
+    transport.enqueue_line(")");
+    transport.enqueue_line("A0005 OK FETCH completed");
+    let raw = b"Message-ID: <m1@example.com>\r\nSubject: old\r\n\r\nold body".to_vec();
+    transport.enqueue_line(format!("* 1 FETCH (UID 12 BODY[] {{{}}}", raw.len()));
+    transport.enqueue_literal(raw.clone());
+    transport.enqueue_line(")");
+    transport.enqueue_line("A0006 OK FETCH completed");
+    let mut provider = provider(&transport);
+
+    let fetched = provider.fetch_raw_message("<m1@example.com>").unwrap();
+    assert_eq!(fetched, raw);
+    let lines = transport.command_lines();
+    assert!(
+        lines.contains(
+            &"A0005 UID FETCH 1:* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
+                .to_owned()
+        ),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&"A0006 UID FETCH 12 (BODY.PEEK[])".to_owned()),
         "{lines:?}"
     );
 }

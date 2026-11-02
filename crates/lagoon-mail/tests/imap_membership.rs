@@ -6,7 +6,7 @@
 
 mod support;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use lagoon_mail::imap::provider::{ImapProvider, ProviderCredentials};
 use lagoon_mail::preset::ProviderPreset;
@@ -97,6 +97,16 @@ fn all_three_folders_are_read_on_one_session_with_uid_and_remote_ids() {
     assert_eq!(
         inbox.remote_ids,
         BTreeSet::from(["<inbox-10@example.com>".to_owned(), "uid:11".to_owned()])
+    );
+    // The walk already fetched every Message-ID; keeping the pairing lets the
+    // sync engine backfill remote_uid for rows that were stored before the
+    // column existed, without a second scan.
+    assert_eq!(
+        inbox.uid_by_remote_id,
+        BTreeMap::from([
+            ("<inbox-10@example.com>".to_owned(), 10),
+            ("uid:11".to_owned(), 11),
+        ])
     );
     assert_eq!(
         membership.inbox_remote_ids(),

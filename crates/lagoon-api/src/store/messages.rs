@@ -401,6 +401,28 @@ pub fn export_index(
     Ok(messages)
 }
 
+/// The server UID sync recorded for this row, while the row still lives in
+/// INBOX. A UID addresses a position inside one mailbox: once the message is
+/// archived or trashed locally the stored number belongs to a folder it is no
+/// longer in, so it must not be used to fetch the body.
+pub fn inbox_remote_uid(
+    connection: &Connection,
+    account_id: Uuid,
+    remote_id: &str,
+) -> rusqlite::Result<Option<i64>> {
+    use rusqlite::OptionalExtension as _;
+    connection
+        .query_row(
+            "SELECT remote_uid FROM message_headers
+             WHERE account_id = ? AND remote_id = ?
+               AND is_archived = FALSE AND is_deleted = FALSE
+               AND remote_uid IS NOT NULL",
+            rusqlite::params![account_id.as_bytes().as_slice(), remote_id],
+            |row| row.get(0),
+        )
+        .optional()
+}
+
 /// v3 BackupRoutes.folderCounts: the two counts the export index reports.
 pub fn deleted_and_sent_counts(
     connection: &Connection,

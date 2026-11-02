@@ -1,7 +1,9 @@
 //! The slice of v3's schema the R1 reads depend on.
 //!
 //! Copied column for column from a store the v3 sidecar migrated to
-//! "lagoon-v10" (the dump in the R1 report). Only the five tables R1 selects
+//! "lagoon-v10" (the dump in the R1 report), plus v4's `remote_uid` column
+//! (`lagoon-v11`), which production adds by running the migration chain.
+//! Only the five tables R1 selects
 //! from are created, plus "grdb_migrations" so the startup probe sees the full
 //! migration chain. Creating the whole twelve-table schema here would be a
 //! second copy of v3's DDL that nothing keeps honest - and the point of the dev
@@ -49,6 +51,7 @@ CREATE TABLE message_headers (
     unsubscribe_links  TEXT NOT NULL DEFAULT '[]',
     is_deleted         INTEGER NOT NULL DEFAULT FALSE,
     is_sent            INTEGER NOT NULL DEFAULT FALSE,
+    remote_uid         INTEGER,
     UNIQUE (account_id, remote_id)
 );
 
@@ -179,6 +182,7 @@ pub const MIGRATIONS: &[&str] = &[
     "lagoon-v8",
     "lagoon-v9",
     "lagoon-v10",
+    "lagoon-v11",
 ];
 
 /// Create the schema and record the migration chain.

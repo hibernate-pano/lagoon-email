@@ -325,11 +325,12 @@ mod tests {
         let connection = open();
         let key = test_key();
         let report = migrate(&connection, Some(&key)).expect("migrate");
-        assert_eq!(report.applied.len(), 11);
+        // Eleven v3 migrations plus v4's additive lagoon-v11.
+        assert_eq!(report.applied.len(), 12);
         let recorded: i64 = connection
             .query_row("SELECT COUNT(*) FROM grdb_migrations", [], |row| row.get(0))
             .expect("count");
-        assert_eq!(recorded, 11);
+        assert_eq!(recorded, 12);
         // Every table v3 creates is there.
         for table in [
             "accounts",
@@ -363,7 +364,7 @@ mod tests {
         migrate(&connection, Some(&key)).expect("first migrate");
         let second = migrate(&connection, Some(&key)).expect("second migrate");
         assert!(second.is_noop());
-        assert_eq!(second.already_present, 11);
+        assert_eq!(second.already_present, 12);
     }
 
     #[test]

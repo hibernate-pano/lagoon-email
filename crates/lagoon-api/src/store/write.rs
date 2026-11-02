@@ -214,6 +214,52 @@ pub struct NewHeader<'a> {
     pub in_reply_to: Option<&'a str>,
     pub references: Option<&'a str>,
     pub unsubscribe_links: &'a str,
+    /// The server UID this row was read at (v4 addition). None for rows from
+    /// builds without it; the body route then falls back to resolving by id.
+    pub remote_uid: Option<i64>,
+}
+
+/// Fill `remote_uid` for live INBOX rows from the membership walk.
+///
+/// Rows stored before the column existed have NULL here, and every body open
+/// for them pays a full-mailbox scan. The walk the sync round already ran
+/// fetched every Message-ID, so this is a pure local write. Rows that already
+/// carry a value are only rewritten when the UID actually moved: INBOX
+/// membership is the fresher truth.
+pub fn fill_remote_uids(
+    connection: &Connection,
+    account_id: Uuid,
+    uids: &[(String, i64)],
+) -> Result<(), WriteError> {
+    // A row with a UID only needs rewriting when the UID moved, and a message
+    // that moved back into INBOX arrives as a new UID in the pull anyway and is
+    // upserted there. So: nothing NULL, nothing to do — the steady-state round
+    // pays no writes.
+    let missing: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM message_headers
+         WHERE account_id = ? AND is_archived = FALSE AND is_deleted = FALSE
+           AND remote_uid IS NULL",
+        [account_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if missing == 0 {
+        return Ok(());
+    }
+    let mut statement = connection.prepare(
+        "UPDATE message_headers
+         SET remote_uid = ?1
+         WHERE account_id = ?2 AND remote_id = ?3
+           AND is_archived = FALSE AND is_deleted = FALSE
+           AND (remote_uid IS NULL OR remote_uid != ?1)",
+    )?;
+    for (remote_id, uid) in uids {
+        statement.execute(rusqlite::params![
+            uid,
+            account_id.as_bytes().as_slice(),
+            remote_id
+        ])?;
+    }
+    Ok(())
 }
 
 /// Insert or update one header, keyed by (account_id, remote_id).
@@ -231,8 +277,8 @@ pub fn upsert_header(
         "INSERT INTO message_headers
              (id, account_id, remote_id, thread_id, from_address, from_name, subject,
               snippet_cipher, received_at, list_unsubscribe, message_id_header,
-              in_reply_to, references_header, unsubscribe_links)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+              in_reply_to, references_header, unsubscribe_links, remote_uid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(account_id, remote_id) DO UPDATE SET
              thread_id = excluded.thread_id,
              from_address = excluded.from_address,
@@ -244,7 +290,8 @@ pub fn upsert_header(
              message_id_header = excluded.message_id_header,
              in_reply_to = excluded.in_reply_to,
              references_header = excluded.references_header,
-             unsubscribe_links = excluded.unsubscribe_links",
+             unsubscribe_links = excluded.unsubscribe_links,
+             remote_uid = excluded.remote_uid",
         rusqlite::params![
             header.id.as_bytes().as_slice(),
             header.account_id.as_bytes().as_slice(),
@@ -260,6 +307,7 @@ pub fn upsert_header(
             header.in_reply_to,
             header.references,
             header.unsubscribe_links,
+            header.remote_uid,
         ],
     )?;
     Ok(connection.last_insert_rowid())

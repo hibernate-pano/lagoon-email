@@ -71,7 +71,8 @@ fn rust_schema_matches_the_v3_golden() {
     let path = temp.join("rust.sqlite");
     let connection = db::open_writable(&path).expect("open writable");
     let report = migrate(&connection, Some(&test_key())).expect("migrate");
-    assert_eq!(report.applied.len(), 11);
+    // 11 v3 migrations + lagoon-v11 (the v4-only remote_uid column).
+    assert_eq!(report.applied.len(), 12);
     drop(connection);
 
     let golden_path =
@@ -106,20 +107,33 @@ fn rust_schema_matches_the_v3_golden() {
             golden_object["table"].as_str().unwrap(),
             "table at {index}"
         );
+        // SQLite rewrites a table's stored CREATE text when ALTER TABLE ADD
+        // COLUMN runs, so the v4-only column shows up here. The golden is the
+        // untouched v3 oracle: strip exactly that addition before comparing,
+        // and any other drift still fails.
+        let ours_sql = ours
+            .sql
+            .as_deref()
+            .unwrap_or("")
+            .replace(", remote_uid INTEGER", "");
         assert_eq!(
-            ours.sql.as_deref().unwrap_or(""),
+            ours_sql,
             golden_object["sql"].as_str().unwrap_or(""),
             "SQL differs for {} {}",
             ours.kind,
             ours.name
         );
     }
-    let golden_migrations: Vec<String> = golden["migrations"]
+    let mut golden_migrations: Vec<String> = golden["migrations"]
         .as_array()
         .expect("golden migrations")
         .iter()
         .map(|value| value.as_str().expect("migration name").to_owned())
         .collect();
+    // v4 appends one additive migration after v3's chain. The golden is the
+    // v3 oracle and stays untouched; anything else in the list is a real
+    // divergence and still fails.
+    golden_migrations.push("lagoon-v11".to_owned());
     assert_eq!(
         migrations, golden_migrations,
         "grdb_migrations rows differ from v3"
@@ -137,7 +151,7 @@ fn migration_is_idempotent_and_keeps_data() {
     write::upsert_account(&connection, &new_account(account)).expect("account");
     let second = migrate(&connection, Some(&key)).expect("second");
     assert!(second.is_noop());
-    assert_eq!(second.already_present, 11);
+    assert_eq!(second.already_present, 12);
     let found = lagoon_api::store::accounts::find(&connection, account)
         .expect("find")
         .expect("account still there");
@@ -176,6 +190,7 @@ fn new_header() -> NewHeader<'static> {
         in_reply_to: None,
         references: None,
         unsubscribe_links: "[]",
+        remote_uid: None,
     }
 }
 

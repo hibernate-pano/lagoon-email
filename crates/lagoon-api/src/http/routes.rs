@@ -298,7 +298,21 @@ async fn fetch_and_answer(state: &AppState, account_id: Uuid, remote_id: &str) -
     let Some(provider) = state.body_provider(account_id) else {
         return respond::error(StatusCode::SERVICE_UNAVAILABLE, "provider-not-configured");
     };
-    let fetched = match provider.fetch_body(remote_id).await {
+    // The UID sync recorded for this row lets the provider fetch the body
+    // directly; without it the 419-message QQ mailbox measured 2.2s per open
+    // because the Message-ID search comes back empty and the provider falls
+    // back to scanning every UID. Best effort: a miss just means the provider
+    // resolves by identity, which is what it did before the column existed.
+    let remote_id_for_uid = remote_id.to_owned();
+    let uid_hint = state
+        .db
+        .read(move |connection| {
+            store::messages::inbox_remote_uid(connection, account_id, &remote_id_for_uid)
+        })
+        .await
+        .ok()
+        .flatten();
+    let fetched = match provider.fetch_body(remote_id, uid_hint).await {
         Ok(body) => body,
         Err(ProviderError::AuthFailed) => {
             tracing::error!(accountId = %account_id, remoteId = %remote_id, "body.authFailed");

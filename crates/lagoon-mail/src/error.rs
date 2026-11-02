@@ -284,10 +284,49 @@ impl std::error::Error for TransportError {}
 
 impl From<std::io::Error> for TransportError {
     fn from(error: std::io::Error) -> Self {
-        if error.kind() == std::io::ErrorKind::UnexpectedEof {
-            Self::Closed
-        } else {
-            Self::Io(error.kind())
+        match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => Self::Closed,
+            // A socket read timeout is `WouldBlock` on Unix (SO_RCVTIMEO sets
+            // EAGAIN) and `TimedOut` on Windows. Both mean the wait expired;
+            // keeping them as opaque IO errors hid the one signal IDLE uses to
+            // end its wait normally.
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Self::TimedOut,
+            other => Self::Io(other),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A socket read timeout is not one error kind on every platform: Unix
+    /// `SO_RCVTIMEO` reports `WouldBlock` (EAGAIN), Windows reports
+    /// `TimedOut`. IDLE ends its wait by recognizing the timeout, so a
+    /// `WouldBlock` classified as a generic IO failure makes every IDLE round
+    /// die at the budget's end — observed on the real mailbox as
+    /// `sync.failed label=unreachable` after exactly 290s, with no mail ever
+    /// applied.
+    #[test]
+    fn a_unix_socket_read_timeout_is_a_timeout() {
+        let error = TransportError::from(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        assert!(error.is_timed_out());
+        assert_eq!(error.to_mail("imap").code(), "imap-timeout");
+    }
+
+    #[test]
+    fn a_windows_socket_read_timeout_is_also_a_timeout() {
+        let error = TransportError::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert!(error.is_timed_out());
+        assert_eq!(error.to_mail("imap").code(), "imap-timeout");
+    }
+
+    /// The conversion must not swallow real failures: a reset socket is still
+    /// unreachable, not a timeout.
+    #[test]
+    fn a_reset_socket_is_not_a_timeout() {
+        let error = TransportError::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(!error.is_timed_out());
+        assert_eq!(error.to_mail("imap").code(), "imap-transport");
     }
 }

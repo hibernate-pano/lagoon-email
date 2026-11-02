@@ -29,7 +29,9 @@ use crate::imap::capabilities::{
 };
 use crate::imap::client::{ImapClient, ImapFetchedHeader, ImapSelected, DEFAULT_HEADER_FIELDS};
 use crate::imap::membership::{self, FolderMembership, RemoteMembership};
-use crate::mime::headers::{decode_rfc2047, parse_from_header};
+use crate::mime::headers::{
+    decode_rfc2047, parse_from_header, parse_header_block, split_head_and_body,
+};
 use crate::mime::parser::{self, ParsedMessage};
 use crate::preset::ProviderPreset;
 use crate::sync::{self, ChangeSet, MailSyncReading, RemoteHeader, SyncCursor};
@@ -285,8 +287,15 @@ impl ImapProvider {
 
     /// Body on demand: plain text, optional HTML, attachment metadata +
     /// decoded bytes, and a truncation flag.
-    pub fn fetch_body(&mut self, remote_id: &str) -> Result<ParsedMessage, MailError> {
-        let raw = self.fetch_raw_message(remote_id)?;
+    /// Body on demand. `uid_hint` is the server UID sync already stored for
+    /// this row: when it still points at the same message, the fetch is one
+    /// `UID FETCH` instead of the search-then-full-scan resolution path.
+    pub fn fetch_body(
+        &mut self,
+        remote_id: &str,
+        uid_hint: Option<i64>,
+    ) -> Result<ParsedMessage, MailError> {
+        let raw = self.fetch_raw_message_with_hint(remote_id, uid_hint)?;
         Ok(parser::parse(&raw))
     }
 
@@ -335,8 +344,25 @@ impl ImapProvider {
     /// and are never chased across folders: a UID means something different
     /// (or nothing) in another mailbox.
     pub fn fetch_raw_message(&mut self, remote_id: &str) -> Result<Vec<u8>, MailError> {
-        let miss = match self.with_inbox(|client, selected| {
-            let uid = resolve_uid(remote_id, client, selected)?;
+        self.fetch_raw_message_with_hint(remote_id, None)
+    }
+
+    fn fetch_raw_message_with_hint(
+        &mut self,
+        remote_id: &str,
+        uid_hint: Option<i64>,
+    ) -> Result<Vec<u8>, MailError> {
+        if let Some(uid) = uid_hint {
+            match self.fetch_at_stored_uid(remote_id, uid) {
+                Ok(Some(raw)) => return Ok(raw),
+                // Stale hint (the UID is gone or now holds another message):
+                // resolve by identity instead.
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let miss = match self.with_inbox(|client, _selected| {
+            let uid = resolve_uid(remote_id, client)?;
             client.fetch_full_body(uid)
         }) {
             Ok(raw) => return Ok(raw),
@@ -357,7 +383,7 @@ impl ImapProvider {
         for folder in folders {
             let result = self.with_client(|client, selected| {
                 *selected = Some(client.select(&folder)?);
-                let uid = resolve_uid(remote_id, client, selected)?;
+                let uid = resolve_uid(remote_id, client)?;
                 client.fetch_full_body(uid)
             });
             match result {
@@ -372,13 +398,45 @@ impl ImapProvider {
         Err(miss)
     }
 
+    /// The stored-UID fast path. Sync already read this message's UID off the
+    /// wire, so opening its body is one `UID FETCH` instead of a server-side
+    /// Message-ID search (which QQ answers empty) followed by a whole-mailbox
+    /// header scan.
+    ///
+    /// A UID is scoped to one mailbox and one UIDVALIDITY. The local store
+    /// wipes rows when UIDVALIDITY changes, but a stale row can still race a
+    /// resync, and a UID that now holds a *different* message must never be
+    /// served: the fetched bytes are checked against the Message-ID the row is
+    /// keyed by. `Ok(None)` means "hint unusable, resolve by identity".
+    fn fetch_at_stored_uid(
+        &mut self,
+        remote_id: &str,
+        uid: i64,
+    ) -> Result<Option<Vec<u8>>, MailError> {
+        // A numeric/`uid:` id already *is* a UID; the hint adds nothing and
+        // cannot be verified against a Message-ID.
+        if is_mailbox_local_id(remote_id) {
+            return Ok(None);
+        }
+        let raw = match self.with_inbox(|client, _selected| client.fetch_full_body(uid)) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == MailErrorKind::MessageGone => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if message_id_of(&raw).as_deref() == Some(remote_id) {
+            Ok(Some(raw))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Raw header values for one message (e.g. List-Unsubscribe at click time).
     pub fn fetch_raw_header_values(
         &mut self,
         remote_id: &str,
     ) -> Result<std::collections::BTreeMap<String, String>, MailError> {
-        self.with_inbox(|client, selected| {
-            let uid = resolve_uid(remote_id, client, selected)?;
+        self.with_inbox(|client, _selected| {
+            let uid = resolve_uid(remote_id, client)?;
             client
                 .fetch_header(uid, &DEFAULT_HEADER_FIELDS)?
                 .into_iter()
@@ -389,8 +447,8 @@ impl ImapProvider {
     }
 
     pub fn set_read(&mut self, remote_id: &str, is_read: bool) -> Result<(), MailError> {
-        self.with_inbox(|client, selected| {
-            let uid = resolve_uid(remote_id, client, selected)?;
+        self.with_inbox(|client, _selected| {
+            let uid = resolve_uid(remote_id, client)?;
             if is_read {
                 client.store(uid, &["\\Seen"], &[])
             } else {
@@ -403,8 +461,8 @@ impl ImapProvider {
         let folder = self
             .resolve_archive()?
             .ok_or_else(MailError::archive_unavailable)?;
-        self.with_inbox(|client, selected| {
-            let uid = resolve_uid(remote_id, client, selected)?;
+        self.with_inbox(|client, _selected| {
+            let uid = resolve_uid(remote_id, client)?;
             move_safely(client, uid, &folder)
         })
     }
@@ -415,7 +473,7 @@ impl ImapProvider {
             .ok_or_else(MailError::archive_unavailable)?;
         self.with_client(|client, selected| {
             *selected = Some(client.select(&folder)?);
-            let uid = resolve_uid(remote_id, client, selected)?;
+            let uid = resolve_uid(remote_id, client)?;
             move_safely(client, uid, INBOX)?;
             *selected = None;
             Ok(())
@@ -425,8 +483,8 @@ impl ImapProvider {
     /// Delete = move to the server's Trash folder, never a hard expunge.
     pub fn trash(&mut self, remote_id: &str) -> Result<(), MailError> {
         let folder = self.resolve_trash()?;
-        self.with_inbox(|client, selected| {
-            let uid = resolve_uid(remote_id, client, selected)?;
+        self.with_inbox(|client, _selected| {
+            let uid = resolve_uid(remote_id, client)?;
             move_safely(client, uid, &folder)
         })
     }
@@ -436,7 +494,7 @@ impl ImapProvider {
         let folder = self.resolve_trash()?;
         self.with_client(|client, selected| {
             *selected = Some(client.select(&folder)?);
-            let uid = resolve_uid(remote_id, client, selected)?;
+            let uid = resolve_uid(remote_id, client)?;
             move_safely(client, uid, INBOX)?;
             *selected = None;
             Ok(())
@@ -455,7 +513,7 @@ impl ImapProvider {
         let folder = self.resolve_trash()?;
         self.with_client(|client, selected| {
             *selected = Some(client.select(&folder)?);
-            let uid = resolve_uid(remote_id, client, selected)?;
+            let uid = resolve_uid(remote_id, client)?;
             if !client.capability()?.contains("UIDPLUS") {
                 *selected = None;
                 return Err(MailError::missing_capability("uidplus-missing"));
@@ -537,13 +595,12 @@ impl ImapProvider {
         if target.is_empty() {
             return Ok(false);
         }
-        self.with_inbox(|client, selected| {
+        self.with_inbox(|client, _selected| {
             // Not in the INBOX — it may be in Archive or Trash, where the UID
             // space belongs to a *different* folder. A UID is mailbox-local, so
             // reusing one here would move whatever message happens to hold that
             // UID in the INBOX. That is the worst outcome a move can have.
-            let uid =
-                resolve_uid(remote_id, client, selected).map_err(|_| MailError::message_gone())?;
+            let uid = resolve_uid(remote_id, client).map_err(|_| MailError::message_gone())?;
 
             if client.capability()?.contains("MOVE") {
                 match client.move_to(uid, target) {
@@ -879,11 +936,7 @@ fn is_mailbox_local_id(remote_id: &str) -> bool {
 /// UID is a mailbox-local position and can change after MOVE. New IMAP rows use
 /// Message-ID as the stable identity; numeric values remain supported for rows
 /// created before that migration (v3 `resolveUID`).
-fn resolve_uid(
-    remote_id: &str,
-    client: &mut ImapClient,
-    selected: &Option<ImapSelected>,
-) -> Result<i64, MailError> {
+fn resolve_uid(remote_id: &str, client: &mut ImapClient) -> Result<i64, MailError> {
     if let Ok(uid) = remote_id.parse::<i64>() {
         return Ok(uid);
     }
@@ -896,23 +949,31 @@ fn resolve_uid(
         return Ok(uid);
     }
     // QQ accepts HEADER SEARCH but can return an empty set even when the header
-    // is present (and for older messages it always does). Scan the recent
-    // window once.
-    if let Some(state) = selected {
-        let from_uid = (state.uid_next - 501).max(1);
-        let headers = client.fetch_headers_from_uid(from_uid, &DEFAULT_HEADER_FIELDS)?;
-        for header in headers {
-            if header
-                .raw_headers
-                .get("message-id")
-                .map(|value| value == remote_id)
-                .unwrap_or(false)
-            {
-                return Ok(header.uid);
-            }
+    // is present. The UID space is also sparse — a mailbox with 419 messages
+    // can have UIDNEXT 13963 — so "the last N UIDs" is not a window on the
+    // recent mail, it is a window on whatever happens to be near the newest
+    // UID. The scan must cover the whole range the server reports.
+    let headers = client.fetch_headers_from_uid(1, &["MESSAGE-ID"])?;
+    for header in headers {
+        if header
+            .raw_headers
+            .get("message-id")
+            .map(|value| value.trim() == remote_id)
+            .unwrap_or(false)
+        {
+            return Ok(header.uid);
         }
     }
     Err(MailError::message_gone())
+}
+
+/// The Message-ID a fetched raw message carries, if any. Used to check that a
+/// stored UID still addresses the message the row is keyed by.
+fn message_id_of(raw: &[u8]) -> Option<String> {
+    let (header_block, _) = split_head_and_body(raw);
+    parse_header_block(header_block)
+        .get("message-id")
+        .map(|value| value.trim().to_owned())
 }
 
 /// `UID MOVE` when the server has it, else COPY + UID STORE \\Deleted + UID
@@ -950,6 +1011,7 @@ fn remote_header(fetched: &ImapFetchedHeader) -> RemoteHeader {
         remote_id: message_id
             .clone()
             .unwrap_or_else(|| format!("uid:{}", fetched.uid)),
+        uid: fetched.uid,
         thread_id: sync::thread_id(references.as_deref(), message_id.as_deref(), fetched.uid),
         from_address,
         from_name,
@@ -999,6 +1061,7 @@ mod tests {
         };
         let header = remote_header(&fetched);
         assert_eq!(header.remote_id, "<m1@example.com>");
+        assert_eq!(header.uid, 42, "the wire UID must survive for body fetches");
         assert_eq!(header.thread_id, "<root@example.com>");
         assert_eq!(header.from_address, "chen@example.com");
         assert_eq!(header.from_name.as_deref(), Some("Chen, Qi"));
@@ -1014,6 +1077,7 @@ mod tests {
         };
         let header = remote_header(&bare);
         assert_eq!(header.remote_id, "uid:7");
+        assert_eq!(header.uid, 7);
         assert!(!header.is_read);
     }
 }

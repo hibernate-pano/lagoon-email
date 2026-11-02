@@ -42,6 +42,10 @@ pub struct SyncCursor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteHeader {
     pub remote_id: String,
+    /// The server UID this header was read at. Persisting it lets a later body
+    /// fetch address the message directly instead of re-resolving its
+    /// Message-ID with a search or a whole-mailbox scan.
+    pub uid: i64,
     pub thread_id: String,
     pub from_address: String,
     pub from_name: Option<String>,

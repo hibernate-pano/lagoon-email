@@ -73,8 +73,12 @@ fn run_migrate(config: &Config) -> Result<(), String> {
     let report = lagoon_api::store::migrate::migrate(&connection, Some(&config.body_key))
         .map_err(|error| error.to_string())?;
     if report.applied.is_empty() {
+        let latest = lagoon_api::migrations::MIGRATIONS
+            .last()
+            .map(|migration| migration.identifier)
+            .unwrap_or("unknown");
         println!(
-            "{}: already at lagoon-v10 ({} migrations recorded)",
+            "{}: already at {latest} ({} migrations recorded)",
             config.db_path.display(),
             report.already_present
         );
@@ -95,20 +99,35 @@ fn run_migrate(config: &Config) -> Result<(), String> {
 }
 
 async fn run(config: Config) -> Result<(), String> {
-    // Fresh install: no store yet. Create one and apply the v3 migration chain,
-    // which is what the v3 server did at startup ("applied automatically").
-    // An existing store is still opened read-only and validated strictly below,
-    // so a foreign or newer schema keeps failing closed.
-    if !std::path::Path::new(&config.db_path).exists() {
-        if let Some(parent) = std::path::Path::new(&config.db_path).parent() {
+    let path = std::path::Path::new(&config.db_path);
+    if !path.exists() {
+        // Fresh install: no store yet. Create one and apply the v3 migration
+        // chain, which is what the v3 server did at startup ("applied
+        // automatically").
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
         }
+    }
+    // Existing store: bring it up to this build's chain before opening it
+    // read-only. v3 applied its migrations at startup, and this build owns one
+    // additive migration on top (`lagoon-v11`, the body-fetch UID column); a
+    // v3-era store must get it or the sync write path loses that column.
+    // A file that is not a known Lagoon store is left untouched — the strict
+    // probe below then refuses it instead of writing into a foreign database.
+    if path.exists() && lagoon_api::db::looks_like_a_lagoon_store(path) {
         let connection = lagoon_api::db::open_writable(config.db_path.clone())
             .map_err(|error| error.to_string())?;
         let report = lagoon_api::store::migrate::migrate(&connection, Some(&config.body_key))
             .map_err(|error| error.to_string())?;
-        tracing::info!(applied = report.applied.len(), "fresh store: migrated");
+        drop(connection);
+        if !report.applied.is_empty() {
+            tracing::info!(
+                applied = report.applied.len(),
+                migrations = ?report.applied,
+                "store upgraded"
+            );
+        }
     }
     let db = Db::open_read_only(config.db_path.clone()).map_err(|error| error.to_string())?;
 
@@ -204,7 +223,7 @@ async fn shutdown_signal() {
 fn print_usage() {
     println!("usage: lagoon-api [--migrate] [--db PATH] [--host ADDR] [--port PORT]");
     println!();
-    println!("  --migrate create/upgrade the store to lagoon-v10 and exit");
+    println!("  --migrate create/upgrade the store to the latest migration and exit");
     println!("  --db    SQLite store to read (default: v4/.dev/data/lagoon.sqlite;");
     println!("          LAGOON_DB_PATH and LAGOON_V4_DATA_DIR are also honoured)");
     println!("  --host  bind address (default 127.0.0.1, or LAGOON_SERVER_HOST)");

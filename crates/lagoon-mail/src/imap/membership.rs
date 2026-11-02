@@ -17,7 +17,7 @@
 //! `Some(empty)` means "the server says this folder exists and is empty"; those
 //! are very different permissions.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::MailError;
 use crate::imap::client::{ImapClient, ImapSelected};
@@ -33,6 +33,10 @@ pub struct FolderMembership {
     /// The store-facing identities: the RFC 5322 `Message-ID` when present,
     /// else `uid:<n>` — exactly the rule used for `RemoteHeader.remote_id`.
     pub remote_ids: BTreeSet<String>,
+    /// The pairing the walk already holds: store-facing id → UID in *this*
+    /// folder. The sync engine uses the INBOX map to fill `remote_uid` on rows
+    /// stored before that column existed, so opening a body is one FETCH.
+    pub uid_by_remote_id: BTreeMap<String, i64>,
 }
 
 impl FolderMembership {
@@ -60,6 +64,19 @@ impl RemoteMembership {
     /// Store-facing inbox ids, or `None` when this folder is unknown.
     pub fn inbox_remote_ids(&self) -> Option<Vec<String>> {
         self.inbox.as_ref().map(FolderMembership::remote_ids_vec)
+    }
+
+    /// Inbox `(remote_id, uid)` pairs, or `None` when the inbox is unknown.
+    /// The sync engine uses this to fill `remote_uid` on rows that were stored
+    /// before that column existed — the walk already paid for the header read.
+    pub fn inbox_uid_by_remote_id(&self) -> Option<Vec<(String, i64)>> {
+        self.inbox.as_ref().map(|inbox| {
+            inbox
+                .uid_by_remote_id
+                .iter()
+                .map(|(remote_id, uid)| (remote_id.clone(), *uid))
+                .collect()
+        })
     }
 
     pub fn archived_remote_ids(&self) -> Option<Vec<String>> {
@@ -105,6 +122,7 @@ pub(crate) fn collect_folder(
     let headers = client.fetch_headers_for_uids(&uid_list, &["MESSAGE-ID"])?;
     let mut seen = BTreeSet::new();
     let mut remote_ids = BTreeSet::new();
+    let mut uid_by_remote_id = BTreeMap::new();
     for header in &headers {
         if !uids.contains(&header.uid) {
             continue;
@@ -117,12 +135,17 @@ pub(crate) fn collect_folder(
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| format!("uid:{}", header.uid));
+        uid_by_remote_id.insert(remote_id.clone(), header.uid);
         remote_ids.insert(remote_id);
     }
     if seen != uids {
         return Ok(None);
     }
-    Ok(Some(FolderMembership { uids, remote_ids }))
+    Ok(Some(FolderMembership {
+        uids,
+        remote_ids,
+        uid_by_remote_id,
+    }))
 }
 
 #[cfg(test)]

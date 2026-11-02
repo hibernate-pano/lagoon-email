@@ -100,6 +100,7 @@ fn seed(path: &str, body_key: &BodyKey, token_key: &TokenKey) -> Result<String, 
             in_reply_to: None,
             references: None,
             unsubscribe_links: "[]",
+            remote_uid: None,
         },
         Some(body_key),
     )

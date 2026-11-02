@@ -111,6 +111,70 @@ async fn a_body_the_store_does_not_have_is_fetched_cached_and_answered() {
     assert_eq!(factory.body_calls(), 1, "a cached body must not re-fetch");
 }
 
+/// Sync reads every message's server UID; the route must pass it back on a
+/// cold body open. Without it the provider searches by Message-ID (QQ answers
+/// empty) and then scans the whole mailbox — 2.2s per open on a 419-message
+/// mailbox in the real read-only probe.
+#[tokio::test]
+async fn a_body_fetch_passes_the_uid_sync_stored_for_an_inbox_row() {
+    let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
+    factory.body_script(vec![Ok(fetched_body())]);
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-bodies-uid-hint", factory.clone()).await;
+    prepare_account(&server);
+    let client = http::client();
+    {
+        let connection = open_read_write(&server.db_path);
+        connection
+            .execute(
+                "UPDATE message_headers SET remote_uid = 42 WHERE account_id = ? AND remote_id = ?",
+                rusqlite::params![uuid_bytes(ACCOUNT_A), REMOTE],
+            )
+            .expect("seed uid");
+    }
+
+    let observed = get(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/body?accountId={ACCOUNT_A}"),
+    )
+    .await;
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+    assert_eq!(factory.body_uids(), vec![Some(42)]);
+}
+
+/// The stored UID addresses a position inside INBOX. After an archive or trash
+/// the same number belongs to a folder the message has left, so the route must
+/// not hand it to the provider.
+#[tokio::test]
+async fn a_body_fetch_does_not_reuse_the_inbox_uid_for_an_archived_row() {
+    let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
+    factory.body_script(vec![Ok(fetched_body())]);
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-bodies-uid-archived", factory.clone()).await;
+    prepare_account(&server);
+    let client = http::client();
+    {
+        let connection = open_read_write(&server.db_path);
+        connection
+            .execute(
+                "UPDATE message_headers SET remote_uid = 42, is_archived = TRUE
+                 WHERE account_id = ? AND remote_id = ?",
+                rusqlite::params![uuid_bytes(ACCOUNT_A), REMOTE],
+            )
+            .expect("seed uid");
+    }
+
+    let observed = get(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/body?accountId={ACCOUNT_A}"),
+    )
+    .await;
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+    assert_eq!(factory.body_uids(), vec![None]);
+}
+
 #[tokio::test]
 async fn a_body_fetch_failure_answers_502_and_caches_nothing() {
     let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));

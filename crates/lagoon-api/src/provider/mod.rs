@@ -72,6 +72,9 @@ pub type ProbeFuture<'a> =
 #[derive(Debug, Clone, Default)]
 pub struct RemoteHeader {
     pub remote_id: String,
+    /// Server UID at sync time; the body route passes it back so opening a
+    /// message is one FETCH instead of an identity search plus a scan.
+    pub remote_uid: Option<i64>,
     pub thread_id: String,
     pub from_address: String,
     pub from_name: Option<String>,
@@ -98,6 +101,10 @@ pub struct MailChangeSet {
     pub replied_message_ids: Vec<String>,
     /// None means the provider did not report inbox membership this round.
     pub inbox_remote_ids: Option<Vec<String>>,
+    /// Inbox `(remoteId, uid)` pairs from the same membership walk. Used to
+    /// fill `remote_uid` on rows stored before that column existed; None means
+    /// the walk did not report them.
+    pub inbox_uids: Option<Vec<(String, i64)>>,
     pub archived_remote_ids: Option<Vec<String>>,
     pub trashed_remote_ids: Option<Vec<String>>,
     pub removed_remote_ids: Vec<String>,
@@ -146,7 +153,10 @@ pub type BodyFuture<'a> =
 /// and the sync engine must not be able to trigger one. The body route is the
 /// only caller, and only after its own cache miss.
 pub trait MailBodyProvider: Send + Sync {
-    fn fetch_body(&self, remote_id: &str) -> BodyFuture<'_>;
+    /// `uid_hint` is the UID the store recorded at sync time. It is a hint,
+    /// not an identity: an implementation that cannot verify it must fall
+    /// back to resolving `remote_id`.
+    fn fetch_body(&self, remote_id: &str, uid_hint: Option<i64>) -> BodyFuture<'_>;
 }
 
 /// The mutating verbs, reachable only from the action routes.

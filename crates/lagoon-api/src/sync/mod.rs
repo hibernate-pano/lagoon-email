@@ -304,9 +304,16 @@ impl SyncEngine {
                     in_reply_to: header.in_reply_to.as_deref(),
                     references: header.references.as_deref(),
                     unsubscribe_links: &header.unsubscribe_links,
+                    remote_uid: header.remote_uid,
                 },
                 Some(&self.body_key),
             )?;
+        }
+        // Rows stored by a build before `remote_uid` existed have no UID, so
+        // every body open pays a full-mailbox scan. The membership walk this
+        // round already fetched each Message-ID, so fill the column from it.
+        if let Some(uids) = &changes.inbox_uids {
+            write::fill_remote_uids(connection, account_id, uids)?;
         }
         if let Some(inbox) = &changes.inbox_remote_ids {
             // v3 rule: a local row may be deleted only for a message the

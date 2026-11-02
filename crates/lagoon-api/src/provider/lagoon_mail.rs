@@ -88,6 +88,7 @@ fn convert_capabilities(capabilities: MailCapabilitiesWire) -> MailCapabilities 
 fn convert_header(header: MailRemoteHeader) -> RemoteHeader {
     RemoteHeader {
         remote_id: header.remote_id,
+        remote_uid: Some(header.uid),
         thread_id: header.thread_id,
         from_address: header.from_address,
         from_name: header.from_name,
@@ -161,15 +162,18 @@ impl MailProvider for LagoonMailProvider {
             .map_err(|_| ProviderError::Protocol("join".to_owned()))?
             .map_err(|error| LagoonMailProvider::map_error(&error))?;
             let (changes, membership) = pulled;
-            let (inbox, archived, trashed) = match membership {
+            let (inbox, inbox_uids, archived, trashed) = match membership {
                 Some(membership) if !changes.reset_required => (
                     membership.inbox_remote_ids(),
+                    membership.inbox_uid_by_remote_id(),
                     membership.archived_remote_ids(),
                     membership.trashed_remote_ids(),
                 ),
-                _ => (None, None, None),
+                _ => (None, None, None, None),
             };
-            Ok(convert_change_set(changes, inbox, archived, trashed))
+            Ok(convert_change_set(
+                changes, inbox, inbox_uids, archived, trashed,
+            ))
         })
     }
 }
@@ -177,6 +181,7 @@ impl MailProvider for LagoonMailProvider {
 fn convert_change_set(
     changes: ChangeSet,
     inbox: Option<Vec<String>>,
+    inbox_uids: Option<Vec<(String, i64)>>,
     archived: Option<Vec<String>>,
     trashed: Option<Vec<String>>,
 ) -> MailChangeSet {
@@ -189,6 +194,7 @@ fn convert_change_set(
         upserts: changes.upserts.into_iter().map(convert_header).collect(),
         replied_message_ids: changes.replied_message_ids.into_iter().collect(),
         inbox_remote_ids: inbox,
+        inbox_uids,
         archived_remote_ids: archived,
         trashed_remote_ids: trashed,
         removed_remote_ids: Vec::new(),
@@ -233,7 +239,7 @@ struct LagoonMailBody {
 }
 
 impl MailBodyProvider for LagoonMailBody {
-    fn fetch_body(&self, remote_id: &str) -> BodyFuture<'_> {
+    fn fetch_body(&self, remote_id: &str, uid_hint: Option<i64>) -> BodyFuture<'_> {
         let transport = Arc::clone(&self.transport);
         let credentials = self.credentials.clone();
         let preset = self.preset;
@@ -242,7 +248,7 @@ impl MailBodyProvider for LagoonMailBody {
             let fetched = tokio::task::spawn_blocking(move || {
                 let mut provider =
                     ImapProvider::new(preset, credentials, Box::new(move || (transport)()));
-                provider.fetch_body(&remote_id)
+                provider.fetch_body(&remote_id, uid_hint)
             })
             .await
             .map_err(|_| ProviderError::Protocol("join".to_owned()))?

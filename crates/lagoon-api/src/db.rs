@@ -45,6 +45,32 @@ pub const KNOWN_MIGRATIONS: &[&str] = &[
     "lagoon-v10",
 ];
 
+/// v4's own migration, appended after v3's chain. It is additive (one nullable
+/// column) and the read path works without it, so it is not *required* the way
+/// the v3 list is — but a store carrying it is not "newer than this build
+/// knows", and must not be reported as such.
+pub const V4_MIGRATIONS: &[&str] = &["lagoon-v11"];
+
+/// Whether `path` is a store this build may migrate: a SQLite file whose
+/// `grdb_migrations` records the end of the v3 chain. Checked before opening
+/// writable, so a foreign or truncated file is never written to.
+pub fn looks_like_a_lagoon_store(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(connection) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return false;
+    };
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM grdb_migrations WHERE identifier = 'lagoon-v10')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|found| found == 1)
+        .unwrap_or(false)
+}
+
 /// Tables and columns R1 reads. The probe is column-level on purpose: a v3
 /// migration that only *adds* columns must not stop the server, while one that
 /// renames a column this crate selects has to.
@@ -328,6 +354,7 @@ fn validate_schema(connection: &Connection) -> Result<SchemaReport, DbError> {
     let unknown_migrations = migrations
         .iter()
         .filter(|applied| !KNOWN_MIGRATIONS.contains(&applied.as_str()))
+        .filter(|applied| !V4_MIGRATIONS.contains(&applied.as_str()))
         .cloned()
         .collect();
 

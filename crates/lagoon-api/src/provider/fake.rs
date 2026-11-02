@@ -188,11 +188,13 @@ impl MailWriteProvider for FakeWriteProvider {
 pub struct FakeBodyProvider {
     script: Arc<Mutex<VecDeque<Result<MailBody, ProviderError>>>>,
     calls: Arc<Mutex<usize>>,
+    uids: Arc<Mutex<Vec<Option<i64>>>>,
 }
 
 impl MailBodyProvider for FakeBodyProvider {
-    fn fetch_body(&self, _remote_id: &str) -> BodyFuture<'_> {
+    fn fetch_body(&self, _remote_id: &str, uid_hint: Option<i64>) -> BodyFuture<'_> {
         *self.calls.lock().expect("body calls lock") += 1;
+        self.uids.lock().expect("body uid lock").push(uid_hint);
         let next = self.script.lock().expect("body script lock").pop_front();
         Box::pin(async move {
             match next {
@@ -216,6 +218,7 @@ pub struct FakeProviderFactory {
     write_calls: FakeWriteCalls,
     body_script: Arc<Mutex<VecDeque<Result<MailBody, ProviderError>>>>,
     body_calls: Arc<Mutex<usize>>,
+    body_uids: Arc<Mutex<Vec<Option<i64>>>>,
 }
 
 impl FakeProviderFactory {
@@ -229,6 +232,7 @@ impl FakeProviderFactory {
             write_calls: FakeWriteCalls::default(),
             body_script: Arc::new(Mutex::new(VecDeque::new())),
             body_calls: Arc::new(Mutex::new(0)),
+            body_uids: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -244,6 +248,11 @@ impl FakeProviderFactory {
     /// How many times a body provider was asked for a body.
     pub fn body_calls(&self) -> usize {
         *self.body_calls.lock().expect("body calls lock")
+    }
+
+    /// The UID hint each body fetch received, in call order.
+    pub fn body_uids(&self) -> Vec<Option<i64>> {
+        self.body_uids.lock().expect("body uid lock").clone()
     }
 
     /// Script the next write-verb answers, in call order. An exhausted script
@@ -273,6 +282,7 @@ impl FakeProviderFactory {
             write_calls: FakeWriteCalls::default(),
             body_script: Arc::new(Mutex::new(VecDeque::new())),
             body_calls: Arc::new(Mutex::new(0)),
+            body_uids: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -323,6 +333,7 @@ impl ProviderFactory for FakeProviderFactory {
         Some(Arc::new(FakeBodyProvider {
             script: Arc::clone(&self.body_script),
             calls: Arc::clone(&self.body_calls),
+            uids: Arc::clone(&self.body_uids),
         }))
     }
 }
