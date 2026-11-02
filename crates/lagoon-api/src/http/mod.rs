@@ -17,6 +17,7 @@ pub mod routes;
 pub mod routes_r2;
 pub mod routes_r3;
 pub mod routes_r5;
+pub mod routes_send;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -98,6 +99,24 @@ impl AppState {
     /// token key, no stored blob, a blob that will not open, or a build with no
     /// body provider. Every one of them answers 503 provider-not-configured,
     /// which is what v3 does when its provider cannot be constructed.
+    /// Build a send provider from the account's stored credentials.
+    ///
+    /// `None` is every reason a send cannot reach the mailbox: no token key,
+    /// no stored blob, a blob that will not open, or a build with no send
+    /// provider. All of them answer 503 provider-not-configured.
+    pub fn send_provider(
+        &self,
+        account_id: crate::uuid::Uuid,
+    ) -> Option<Arc<dyn crate::provider::MailSendProvider>> {
+        let token_key = self.token_key.as_ref()?;
+        let connection = crate::db::open_writable(self.db.path()).ok()?;
+        let blob = crate::store::write::credentials(&connection, account_id)
+            .ok()
+            .flatten()?;
+        let credentials = crate::token::ImapCredentials::open(token_key, &blob).ok()?;
+        self.provider_factory.make_send(&credentials)
+    }
+
     pub fn body_provider(
         &self,
         account_id: crate::uuid::Uuid,
@@ -212,6 +231,24 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/messages/{remote_id}/draft",
             axum::routing::post(routes_r2::draft_generate),
+        )
+        // R3.5b: the three send paths. Attachments make these bodies big,
+        // so they get the contract's 64 MB ceiling instead of axum's 2 MB
+        // default; the other routes stay at the default.
+        .route(
+            "/api/messages/{remote_id}/send",
+            axum::routing::post(routes_send::reply)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/api/compose/send",
+            axum::routing::post(routes_send::compose)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/api/messages/{remote_id}/forward",
+            axum::routing::post(routes_send::forward)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         // R3.3: account lifecycle over the provider seam.
         .route(

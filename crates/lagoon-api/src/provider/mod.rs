@@ -147,6 +147,8 @@ pub struct MailBody {
 pub type BodyFuture<'a> =
     Pin<Box<dyn Future<Output = Result<MailBody, ProviderError>> + Send + 'a>>;
 
+pub type RawFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, ProviderError>> + Send + 'a>>;
+
 /// The read-only body surface.
 ///
 /// Separate from [`MailProvider`] on purpose: a body fetch is not a sync round,
@@ -157,6 +159,61 @@ pub trait MailBodyProvider: Send + Sync {
     /// not an identity: an implementation that cannot verify it must fall
     /// back to resolving `remote_id`.
     fn fetch_body(&self, remote_id: &str, uid_hint: Option<i64>) -> BodyFuture<'_>;
+
+    /// The original RFC 5322 bytes. Forwarding needs the whole message as a
+    /// `message/rfc822` part, not the parsed text; a provider that cannot
+    /// produce it answers `NotConfigured` and the route says the original is
+    /// unavailable rather than forwarding a damaged copy.
+    fn fetch_raw(&self, remote_id: &str, uid_hint: Option<i64>) -> RawFuture<'_> {
+        let _ = (remote_id, uid_hint);
+        Box::pin(async { Err(ProviderError::NotConfigured("raw".to_owned())) })
+    }
+}
+
+/// One attachment the user attached to an outgoing message.
+#[derive(Debug, Clone)]
+pub struct OutgoingAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub data: Vec<u8>,
+    /// A forwarded original is inline: the recipient's client renders it as a
+    /// message rather than offering it as a file.
+    pub inline: bool,
+}
+
+/// One message to deliver. The seam's shape, not lagoon-mail's: the fake never
+/// builds MIME, and the adapter owns the protocol.
+#[derive(Debug, Clone, Default)]
+pub struct OutgoingMail {
+    pub from_email: String,
+    pub from_name: Option<String>,
+    /// Primary recipients, one entry each. The adapter joins them for `To:`.
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub body: String,
+    pub in_reply_to: Option<String>,
+    pub references: Option<String>,
+    pub is_reply: bool,
+    pub attachments: Vec<OutgoingAttachment>,
+}
+
+/// What the transport reported. `provider_message_id` is the Message-ID the
+/// sender generated; the store uses it as the sent row's identity.
+#[derive(Debug, Clone, Default)]
+pub struct SentMail {
+    pub provider_message_id: Option<String>,
+}
+
+pub type SendFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<SentMail, ProviderError>> + Send + 'a>>;
+
+/// The send surface. Deliberately not on [`MailWriteProvider`]: delivery is a
+/// different operation from mutating an existing mailbox, and the sync engine
+/// must never be able to reach either.
+pub trait MailSendProvider: Send + Sync {
+    fn send(&self, mail: OutgoingMail) -> SendFuture<'_>;
 }
 
 /// The mutating verbs, reachable only from the action routes.
@@ -193,6 +250,13 @@ pub trait ProviderFactory: Send + Sync {
     /// provider-not-configured on a cache miss, which is what the contract
     /// fixtures pin for a build without mail support.
     fn make_body(&self, credentials: &ImapCredentials) -> Option<Arc<dyn MailBodyProvider>> {
+        let _ = credentials;
+        None
+    }
+
+    /// The send half. Default None: every send route answers 503
+    /// provider-not-configured, which is the contract's fixture.
+    fn make_send(&self, credentials: &ImapCredentials) -> Option<Arc<dyn MailSendProvider>> {
         let _ = credentials;
         None
     }

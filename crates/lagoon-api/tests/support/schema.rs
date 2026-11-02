@@ -116,6 +116,13 @@ CREATE TABLE ai_actions (
     expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now','+30 days'))
 );
 
+-- Send idempotency (v3's migration 009): one send per client requestId.
+-- The R3.5b send routes rely on this index being the lock, so it belongs in
+-- the test schema too - without it two sends could both win the claim.
+CREATE UNIQUE INDEX ai_actions_send_request_idx
+    ON ai_actions (account_id, json_extract(payload, '$.requestId'))
+    WHERE kind = 'send' AND json_extract(payload, '$.requestId') IS NOT NULL;
+
 CREATE TABLE draft_replies (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id     BLOB NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,

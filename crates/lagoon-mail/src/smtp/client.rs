@@ -74,6 +74,19 @@ impl SmtpClient {
         }
     }
 
+    /// Builds the exact bytes and the locally generated `Message-ID`
+    /// (`<hex@lagoon>`) without sending. `send_raw` takes the same pair, so a
+    /// message the server accepts can be appended to Sent verbatim.
+    pub fn prepare(outbound: &OutboundMessage) -> (String, Vec<u8>) {
+        let message_id = generate_message_id();
+        let message = if outbound.is_reply {
+            build_reply(outbound, &message_id)
+        } else {
+            build_new_message(outbound, &message_id)
+        };
+        (message_id, message)
+    }
+
     /// Sends one message and returns the locally generated `Message-ID`
     /// (`<hex@lagoon>`) so the caller can record it.
     pub fn send(
@@ -84,12 +97,7 @@ impl SmtpClient {
         username: &str,
         auth_code: &str,
     ) -> Result<String, MailError> {
-        let message_id = generate_message_id();
-        let message = if outbound.is_reply {
-            build_reply(outbound, &message_id)
-        } else {
-            build_new_message(outbound, &message_id)
-        };
+        let (message_id, message) = Self::prepare(outbound);
         self.send_raw(&message, outbound, host, port, username, auth_code)?;
         Ok(message_id)
     }

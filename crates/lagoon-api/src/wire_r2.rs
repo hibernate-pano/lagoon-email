@@ -229,6 +229,20 @@ pub struct DraftListResponse {
     pub drafts: Vec<DraftReply>,
 }
 
+// ------------------------------------------------------------------ send ----
+
+/// `SendResponse` (the contract): ok plus the Message-ID the sender minted.
+///
+/// The id is what a replay of the same requestId answers with, so it has to
+/// be the real one and not a per-request placeholder.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_message_id: Option<String>,
+}
+
 // ---------------------------------------------------------------- search ----
 
 #[derive(Debug, Clone, Serialize)]

@@ -13,9 +13,17 @@ use crate::token::ImapCredentials;
 use crate::wire::MailCapabilities;
 
 use super::{
-    BodyFuture, MailBody, MailBodyProvider, MailChangeSet, MailProvider, MailWriteProvider,
-    ProbeFuture, ProbeOutcome, ProviderError, ProviderFactory, PullFuture, WriteFuture,
+    BodyFuture, MailBody, MailBodyProvider, MailChangeSet, MailProvider, MailSendProvider,
+    MailWriteProvider, OutgoingMail, ProbeFuture, ProbeOutcome, ProviderError, ProviderFactory,
+    PullFuture, RawFuture, SendFuture, SentMail, WriteFuture,
 };
+
+/// The scripted answers of the body provider, in call order.
+type BodyScript = Arc<Mutex<VecDeque<Result<MailBody, ProviderError>>>>;
+/// The scripted answers of the raw-message surface, in call order.
+type RawScript = Arc<Mutex<VecDeque<Result<Vec<u8>, ProviderError>>>>;
+/// The scripted answers of the send provider, in call order.
+type SendScript = Arc<Mutex<VecDeque<Result<SentMail, ProviderError>>>>;
 
 #[derive(Debug, Clone)]
 pub enum FakeOutcome {
@@ -186,8 +194,10 @@ impl MailWriteProvider for FakeWriteProvider {
 
 /// A scripted body provider: each `fetch_body` pops the next answer.
 pub struct FakeBodyProvider {
-    script: Arc<Mutex<VecDeque<Result<MailBody, ProviderError>>>>,
+    script: BodyScript,
+    raw_script: RawScript,
     calls: Arc<Mutex<usize>>,
+    raw_calls: Arc<Mutex<usize>>,
     uids: Arc<Mutex<Vec<Option<i64>>>>,
 }
 
@@ -207,6 +217,45 @@ impl MailBodyProvider for FakeBodyProvider {
             }
         })
     }
+
+    fn fetch_raw(&self, _remote_id: &str, uid_hint: Option<i64>) -> RawFuture<'_> {
+        *self.raw_calls.lock().expect("raw calls lock") += 1;
+        self.uids.lock().expect("body uid lock").push(uid_hint);
+        let next = self.raw_script.lock().expect("raw script lock").pop_front();
+        Box::pin(async move {
+            match next {
+                Some(result) => result,
+                None => Err(ProviderError::NotConfigured(
+                    "fake raw script exhausted".to_owned(),
+                )),
+            }
+        })
+    }
+}
+
+/// A scripted send provider: each `send` pops the next answer and records the
+/// outgoing message, so a test can assert exactly what would have been sent
+/// without a socket.
+pub struct FakeSendProvider {
+    script: Arc<Mutex<VecDeque<Result<SentMail, ProviderError>>>>,
+    calls: Arc<Mutex<Vec<OutgoingMail>>>,
+}
+
+impl MailSendProvider for FakeSendProvider {
+    fn send(&self, mail: OutgoingMail) -> SendFuture<'_> {
+        self.calls.lock().expect("send calls lock").push(mail);
+        let next = self.script.lock().expect("send script lock").pop_front();
+        Box::pin(async move {
+            match next {
+                Some(result) => result,
+                // An exhausted script still succeeds with a predictable id:
+                // send tests that do not care about the id stay short.
+                None => Ok(SentMail {
+                    provider_message_id: Some("<fake-sent@lagoon>".to_owned()),
+                }),
+            }
+        })
+    }
 }
 
 pub struct FakeProviderFactory {
@@ -216,9 +265,13 @@ pub struct FakeProviderFactory {
     cursors: Arc<Mutex<Vec<SyncCursor>>>,
     write_script: Arc<Mutex<VecDeque<FakeWriteOutcome>>>,
     write_calls: FakeWriteCalls,
-    body_script: Arc<Mutex<VecDeque<Result<MailBody, ProviderError>>>>,
+    body_script: BodyScript,
     body_calls: Arc<Mutex<usize>>,
+    raw_script: RawScript,
+    raw_calls: Arc<Mutex<usize>>,
     body_uids: Arc<Mutex<Vec<Option<i64>>>>,
+    send_script: SendScript,
+    send_calls: Arc<Mutex<Vec<OutgoingMail>>>,
 }
 
 impl FakeProviderFactory {
@@ -232,8 +285,40 @@ impl FakeProviderFactory {
             write_calls: FakeWriteCalls::default(),
             body_script: Arc::new(Mutex::new(VecDeque::new())),
             body_calls: Arc::new(Mutex::new(0)),
+            raw_script: Arc::new(Mutex::new(VecDeque::new())),
+            raw_calls: Arc::new(Mutex::new(0)),
             body_uids: Arc::new(Mutex::new(Vec::new())),
+            send_script: Arc::new(Mutex::new(VecDeque::new())),
+            send_calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Script the next raw-message answers, in call order.
+    pub fn raw_script(&self, raws: Vec<Result<Vec<u8>, ProviderError>>) -> &Self {
+        self.raw_script
+            .lock()
+            .expect("raw script lock")
+            .extend(raws);
+        self
+    }
+
+    /// How many times a body provider was asked for raw bytes.
+    pub fn raw_calls(&self) -> usize {
+        *self.raw_calls.lock().expect("raw calls lock")
+    }
+
+    /// Script the next send answers, in call order.
+    pub fn send_script(&self, sends: Vec<Result<SentMail, ProviderError>>) -> &Self {
+        self.send_script
+            .lock()
+            .expect("send script lock")
+            .extend(sends);
+        self
+    }
+
+    /// Every outgoing message this factory was asked to deliver, in order.
+    pub fn send_calls(&self) -> Vec<OutgoingMail> {
+        self.send_calls.lock().expect("send calls lock").clone()
     }
 
     /// Script the next body-fetch answers, in call order.
@@ -282,7 +367,11 @@ impl FakeProviderFactory {
             write_calls: FakeWriteCalls::default(),
             body_script: Arc::new(Mutex::new(VecDeque::new())),
             body_calls: Arc::new(Mutex::new(0)),
+            raw_script: Arc::new(Mutex::new(VecDeque::new())),
+            raw_calls: Arc::new(Mutex::new(0)),
             body_uids: Arc::new(Mutex::new(Vec::new())),
+            send_script: Arc::new(Mutex::new(VecDeque::new())),
+            send_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -332,8 +421,17 @@ impl ProviderFactory for FakeProviderFactory {
     fn make_body(&self, _credentials: &ImapCredentials) -> Option<Arc<dyn MailBodyProvider>> {
         Some(Arc::new(FakeBodyProvider {
             script: Arc::clone(&self.body_script),
+            raw_script: Arc::clone(&self.raw_script),
             calls: Arc::clone(&self.body_calls),
+            raw_calls: Arc::clone(&self.raw_calls),
             uids: Arc::clone(&self.body_uids),
+        }))
+    }
+
+    fn make_send(&self, _credentials: &ImapCredentials) -> Option<Arc<dyn MailSendProvider>> {
+        Some(Arc::new(FakeSendProvider {
+            script: Arc::clone(&self.send_script),
+            calls: Arc::clone(&self.send_calls),
         }))
     }
 }

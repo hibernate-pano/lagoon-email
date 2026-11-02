@@ -14,15 +14,17 @@ use std::sync::Arc;
 use lagoon_mail::error::{MailError, MailErrorKind};
 use lagoon_mail::imap::capabilities::MailCapabilities as MailCapabilitiesWire;
 use lagoon_mail::imap::provider::{ImapProvider, ProviderCredentials, IDLE_BUDGET};
+use lagoon_mail::mime::builder::{OutboundAttachment, OutboundMessage};
 use lagoon_mail::preset::ProviderPreset;
+use lagoon_mail::smtp::SmtpClient;
 use lagoon_mail::sync::SyncCursor as MailSyncCursor;
 use lagoon_mail::transport::{TlsTransport, Transport};
 use lagoon_mail::{ChangeSet, RemoteHeader as MailRemoteHeader};
 
 use crate::provider::{
-    BodyFuture, MailBody, MailBodyProvider, MailChangeSet, MailProvider, MailWriteProvider,
-    ProbeFuture, ProbeOutcome, ProviderError, ProviderFactory, PullFuture, RemoteHeader,
-    WriteFuture,
+    BodyFuture, MailBody, MailBodyProvider, MailChangeSet, MailProvider, MailSendProvider,
+    MailWriteProvider, OutgoingMail, ProbeFuture, ProbeOutcome, ProviderError, ProviderFactory,
+    PullFuture, RawFuture, RemoteHeader, SendFuture, SentMail, WriteFuture,
 };
 use crate::sync::SyncCursor;
 use crate::token::ImapCredentials;
@@ -226,6 +228,14 @@ impl ProviderFactory for LagoonMailFactory {
             preset: ProviderPreset::qq(),
         }))
     }
+
+    fn make_send(&self, credentials: &ImapCredentials) -> Option<Arc<dyn MailSendProvider>> {
+        Some(Arc::new(LagoonMailSend {
+            transport: Arc::clone(&self.transport),
+            credentials: ProviderCredentials::new(&credentials.username, &credentials.auth_code),
+            preset: ProviderPreset::qq(),
+        }))
+    }
 }
 
 /// The body half: one blocking FETCH per call, on a fresh session.
@@ -254,6 +264,104 @@ impl MailBodyProvider for LagoonMailBody {
             .map_err(|_| ProviderError::Protocol("join".to_owned()))?
             .map_err(|error| LagoonMailProvider::map_error(&error))?;
             Ok(convert_body(fetched))
+        })
+    }
+
+    fn fetch_raw(&self, remote_id: &str, uid_hint: Option<i64>) -> RawFuture<'_> {
+        let transport = Arc::clone(&self.transport);
+        let credentials = self.credentials.clone();
+        let preset = self.preset;
+        let remote_id = remote_id.to_owned();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut provider =
+                    ImapProvider::new(preset, credentials, Box::new(move || (transport)()));
+                provider.fetch_raw_message_with_hint(&remote_id, uid_hint)
+            })
+            .await
+            .map_err(|_| ProviderError::Protocol("join".to_owned()))?
+            .map_err(|error| LagoonMailProvider::map_error(&error))
+        })
+    }
+}
+
+/// The send half: one SMTP delivery, then a best-effort copy to Sent.
+///
+/// The Sent append runs after SMTP has accepted the message, and its failure
+/// never fails the send: the mail is already gone, and answering 502 would
+/// invite the user to send it twice. A missing Sent folder is the server's
+/// shape, not a delivery problem.
+struct LagoonMailSend {
+    transport: TransportFactory,
+    credentials: ProviderCredentials,
+    preset: ProviderPreset,
+}
+
+impl MailSendProvider for LagoonMailSend {
+    fn send(&self, mail: OutgoingMail) -> SendFuture<'_> {
+        let transport = Arc::clone(&self.transport);
+        let credentials = self.credentials.clone();
+        let preset = self.preset;
+        Box::pin(async move {
+            let outbound = OutboundMessage {
+                from_email: mail.from_email,
+                from_name: mail.from_name,
+                to: mail.to.join(", "),
+                cc: mail.cc,
+                bcc: mail.bcc,
+                subject: mail.subject,
+                body: mail.body,
+                in_reply_to: mail.in_reply_to,
+                references: mail.references,
+                is_reply: mail.is_reply,
+                attachments: mail
+                    .attachments
+                    .into_iter()
+                    .map(|attachment| {
+                        if attachment.inline {
+                            OutboundAttachment::inline(
+                                attachment.filename,
+                                attachment.mime_type,
+                                attachment.data,
+                            )
+                        } else {
+                            OutboundAttachment::new(
+                                attachment.filename,
+                                attachment.mime_type,
+                                attachment.data,
+                            )
+                        }
+                    })
+                    .collect(),
+            };
+            tokio::task::spawn_blocking(move || {
+                let (message_id, raw) = SmtpClient::prepare(&outbound);
+                let (smtp_host, smtp_port) = preset.smtp_endpoint();
+                let mut smtp = SmtpClient::new((transport)());
+                smtp.send_raw(
+                    &raw,
+                    &outbound,
+                    smtp_host,
+                    smtp_port,
+                    credentials.username(),
+                    credentials.secret(),
+                )
+                .map_err(|error| LagoonMailProvider::map_error(&error))?;
+                let append_transport = Arc::clone(&transport);
+                let mut imap =
+                    ImapProvider::new(preset, credentials, Box::new(move || (append_transport)()));
+                if let Err(error) = imap.append_to_sent(&raw) {
+                    tracing::warn!(
+                        label = error.kind().label(),
+                        "send.sentAppendFailed: the message was delivered"
+                    );
+                }
+                Ok(SentMail {
+                    provider_message_id: Some(message_id),
+                })
+            })
+            .await
+            .map_err(|_| ProviderError::Protocol("join".to_owned()))?
         })
     }
 }

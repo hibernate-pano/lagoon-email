@@ -347,7 +347,7 @@ impl ImapProvider {
         self.fetch_raw_message_with_hint(remote_id, None)
     }
 
-    fn fetch_raw_message_with_hint(
+    pub fn fetch_raw_message_with_hint(
         &mut self,
         remote_id: &str,
         uid_hint: Option<i64>,
@@ -639,6 +639,17 @@ impl ImapProvider {
             client.uid_expunge(uid)?;
             Ok(true)
         })
+    }
+
+    /// Append already-sent RFC 5322 bytes to the account's Sent folder.
+    ///
+    /// The exact bytes SMTP delivered go in, so other clients see the message
+    /// they would have seen had it been sent from them. A missing Sent folder
+    /// is `sent-unavailable`; the caller has already delivered the mail and
+    /// must not treat this as a failed send.
+    pub fn append_to_sent(&mut self, raw: &[u8]) -> Result<(), MailError> {
+        let folder = self.resolve_sent()?;
+        self.with_client(|client, _selected| client.append(&folder, raw))
     }
 
     /// The newest headers in the account's Sent folder.

@@ -399,6 +399,150 @@ pub fn record_action(
     Ok(connection.last_insert_rowid())
 }
 
+/// What `claim_send` found when it tried to take a requestId.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendClaim {
+    /// This request owns the send; `i64` is the audit row to complete.
+    Claimed(i64),
+    /// Another request with the same id is still on the wire.
+    InFlight,
+    /// The send already happened; replay its provider id.
+    Completed(Option<String>),
+    /// The first attempt failed with this error code; replay it instead of
+    /// sending again.
+    Failed(String),
+}
+
+/// Atomically claim a send requestId.
+///
+/// The unique index `ai_actions_send_request_idx` is the lock: the INSERT that
+/// wins is the only request allowed to talk to SMTP, so two concurrent retries
+/// can never both deliver. A send that fails is marked failed rather than left
+/// pending, so the same key replays the first result instead of hanging in
+/// flight forever; a new requestId starts a fresh attempt.
+pub fn claim_send(
+    connection: &Connection,
+    account_id: Uuid,
+    request_id: &str,
+) -> Result<SendClaim, WriteError> {
+    let payload = serde_json::json!({
+        "requestId": request_id,
+        "status": "pending",
+    })
+    .to_string();
+    match connection.execute(
+        "INSERT INTO ai_actions (account_id, kind, payload) VALUES (?1, 'send', ?2)",
+        rusqlite::params![account_id.as_bytes().as_slice(), payload],
+    ) {
+        Ok(_) => Ok(SendClaim::Claimed(connection.last_insert_rowid())),
+        Err(error) if is_unique_violation(&error) => {
+            let existing: Option<String> = connection
+                .query_row(
+                    "SELECT payload FROM ai_actions
+                     WHERE account_id = ?1 AND kind = 'send'
+                       AND json_extract(payload, '$.requestId') = ?2
+                     LIMIT 1",
+                    rusqlite::params![account_id.as_bytes().as_slice(), request_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(existing) = existing else {
+                // The row vanished between the INSERT and this read. Treating
+                // it as in-flight is the safe answer: the other request may
+                // still deliver.
+                return Ok(SendClaim::InFlight);
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&existing).unwrap_or(serde_json::json!({}));
+            match value.get("status").and_then(|status| status.as_str()) {
+                Some("completed") => Ok(SendClaim::Completed(
+                    value
+                        .get("providerMessageId")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_owned),
+                )),
+                Some("failed") => Ok(SendClaim::Failed(
+                    value
+                        .get("error")
+                        .and_then(|error| error.as_str())
+                        .unwrap_or("smtp-send-failed")
+                        .to_owned(),
+                )),
+                // No status: v3-era rows only carried requestId + the result.
+                None if value.get("providerMessageId").is_some() => Ok(SendClaim::Completed(
+                    value
+                        .get("providerMessageId")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_owned),
+                )),
+                _ => Ok(SendClaim::InFlight),
+            }
+        }
+        Err(error) => Err(WriteError::Sqlite(error)),
+    }
+}
+
+/// Mark a claimed send as delivered, recording what the client can retry with.
+pub fn complete_send(
+    connection: &Connection,
+    action_id: i64,
+    provider_message_id: Option<&str>,
+    remote_id: &str,
+) -> Result<(), WriteError> {
+    connection.execute(
+        "UPDATE ai_actions
+         SET payload = json_set(payload,
+                                '$.status', 'completed',
+                                '$.providerMessageId', ?1,
+                                '$.remoteId', ?2)
+         WHERE id = ?3",
+        rusqlite::params![provider_message_id, remote_id, action_id],
+    )?;
+    Ok(())
+}
+
+/// Mark a claimed send as failed with the error code the client saw.
+pub fn fail_send(connection: &Connection, action_id: i64, code: &str) -> Result<(), WriteError> {
+    connection.execute(
+        "UPDATE ai_actions
+         SET payload = json_set(payload, '$.status', 'failed', '$.error', ?1)
+         WHERE id = ?2",
+        rusqlite::params![code, action_id],
+    )?;
+    Ok(())
+}
+
+fn is_unique_violation(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
+/// Record a message this client sent: the header the sent list shows, plus the
+/// body it already has (no IMAP round trip when the user opens it).
+///
+/// The row is identified by the provider Message-ID so replay and dedupe are
+/// keyed on what actually left the machine.
+#[allow(clippy::too_many_arguments)]
+pub fn save_sent_message(
+    connection: &Connection,
+    header: &NewHeader<'_>,
+    body: &NewBody<'_>,
+    body_key: &BodyKey,
+) -> Result<(), WriteError> {
+    upsert_header(connection, header, Some(body_key))?;
+    connection.execute(
+        "UPDATE message_headers
+         SET is_sent = TRUE, is_read = TRUE, is_archived = FALSE, is_deleted = FALSE
+         WHERE account_id = ?1 AND remote_id = ?2",
+        rusqlite::params![header.account_id.as_bytes().as_slice(), header.remote_id],
+    )?;
+    save_body(connection, body, body_key)?;
+    Ok(())
+}
+
 /// Record the undo of an earlier action: one row, no mutation of the original.
 pub fn record_undo(
     connection: &Connection,
