@@ -19,6 +19,7 @@ import {
   bytesToBase64,
   draftFor,
   fingerprintOf,
+  hasDraftChanges,
   MAX_ATTACHMENT_BYTES,
   MAX_TOTAL_ATTACHMENT_BYTES,
   newRequestId,
@@ -33,6 +34,7 @@ import {
   type SendOriginal,
 } from "../core/send";
 import { Banner } from "../ui/atoms";
+import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { t } from "../l10n/zh";
 
 export interface ComposerProps {
@@ -60,6 +62,10 @@ function titleOf(mode: SendMode): string {
 export function Composer(props: ComposerProps): ReactNode {
   const { mode, original } = props;
   const [form, setForm] = useState<SendForm>(() => draftFor(mode, original));
+  /** What the composer opened with, so "did you write anything" has an answer. */
+  const initial = useMemo(() => draftFor(mode, original), [mode, original]);
+  /** The close confirmation is local: it is about this sheet, not the window. */
+  const [confirmClose, setConfirmClose] = useState(false);
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const [attempt, setAttempt] = useState<SendAttempt | null>(null);
   const [fieldError, setFieldError] = useState<{ field: string; reason: string } | null>(null);
@@ -162,13 +168,29 @@ export function Composer(props: ComposerProps): ReactNode {
     setPhase({ kind: "unknown", detail: result.message });
   }
 
+  /**
+   * Closing a draft that has typed text in it asks first.
+   *
+   * There is no server-side draft yet, so "close" means "gone": asking is the
+   * only thing between a stray Escape and a lost message. An untouched reply
+   * is not a draft (its quote is prefilled, not written), so it closes quietly.
+   */
+  function requestClose(): void {
+    if (sending) return;
+    if (hasDraftChanges(initial, form)) {
+      setConfirmClose(true);
+      return;
+    }
+    props.onClose();
+  }
+
   function onKeyDown(event: React.KeyboardEvent<HTMLDivElement>): void {
     // The window-level shortcuts (palette, archive, delete) must not fire
     // while a draft is open: ⌘K would steal the caret mid-sentence.
     event.stopPropagation();
     if (event.key === "Escape") {
       event.preventDefault();
-      if (!sending) props.onClose();
+      requestClose();
       return;
     }
     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
@@ -182,7 +204,7 @@ export function Composer(props: ComposerProps): ReactNode {
 
   return (
     <div className="scrim compose-scrim" onMouseDown={(event) => {
-      if (event.target === event.currentTarget && !sending) props.onClose();
+      if (event.target === event.currentTarget) requestClose();
     }}>
       <div
         className="compose-sheet"
@@ -194,7 +216,7 @@ export function Composer(props: ComposerProps): ReactNode {
         <div className="compose-head">
           <h2>{titleOf(mode)}</h2>
           <span className="spacer" />
-          <button className="btn link" onClick={props.onClose} disabled={sending} aria-label={t.compose.close}>
+          <button className="btn link" onClick={requestClose} disabled={sending} aria-label={t.compose.close}>
             ✕
           </button>
         </div>
@@ -314,7 +336,7 @@ export function Composer(props: ComposerProps): ReactNode {
         </div>
 
         <div className="compose-actions">
-          <button className="btn" onClick={props.onClose} disabled={sending}>
+          <button className="btn" onClick={requestClose} disabled={sending}>
             {t.compose.cancel}
           </button>
           <span className="spacer" />
@@ -323,6 +345,21 @@ export function Composer(props: ComposerProps): ReactNode {
           </button>
         </div>
       </div>
+      <ConfirmDialog
+        request={
+          confirmClose
+            ? {
+                title: t.compose.discardTitle,
+                message: t.compose.discardMessage,
+                confirmLabel: t.compose.discardConfirm,
+                destructive: true,
+                onConfirm: props.onClose,
+              }
+            : null
+        }
+        busy={false}
+        onCancel={() => setConfirmClose(false)}
+      />
     </div>
   );
 }

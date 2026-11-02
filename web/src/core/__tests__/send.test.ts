@@ -5,6 +5,7 @@ import {
   bytesToBase64,
   draftFor,
   fingerprintOf,
+  hasDraftChanges,
   newRequestId,
   requestIdFor,
   sendFailureTitle,
@@ -160,6 +161,37 @@ describe("the reply draft", () => {
     const draft = draftFor("reply", { ...original, text: "" });
     expect(draft.body.trim().length).toBeGreaterThan(0);
     expect(draft.body.split("\n").some((line) => line.startsWith("> "))).toBe(false);
+  });
+});
+
+describe("what closing the composer would throw away", () => {
+  it("is nothing for an untouched draft", () => {
+    const initial = draftFor("reply", original);
+    expect(hasDraftChanges(initial, { ...initial })).toBe(false);
+  });
+
+  it("is the quoted original the reply came with? no - that is not typed text", () => {
+    const initial = draftFor("reply", original);
+    const edited = { ...initial, body: initial.body + "\n补充一句" };
+    expect(hasDraftChanges(initial, edited)).toBe(true);
+    expect(hasDraftChanges(initial, { ...initial, body: initial.body + "   " })).toBe(false);
+  });
+
+  it("is true once anything the user types or attaches changes", () => {
+    const initial = form();
+    expect(hasDraftChanges(initial, form({ to: "a@b.example" }))).toBe(true);
+    expect(hasDraftChanges(initial, form({ cc: "c@d.example" }))).toBe(true);
+    expect(hasDraftChanges(initial, form({ bcc: "e@f.example" }))).toBe(true);
+    expect(hasDraftChanges(initial, form({ subject: "主题" }))).toBe(true);
+    expect(hasDraftChanges(initial, form({ body: "正文" }))).toBe(true);
+    expect(
+      hasDraftChanges(
+        initial,
+        form({
+          attachments: [{ filename: "a.pdf", mimeType: "application/pdf", dataBase64: "AA==" }],
+        }),
+      ),
+    ).toBe(true);
   });
 });
 

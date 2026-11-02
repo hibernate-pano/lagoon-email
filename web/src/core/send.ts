@@ -81,8 +81,25 @@ export function draftFor(mode: SendMode, original?: SendOriginal): SendForm {
   return form;
 }
 
-/** "Re: 报价", but not "Re: Re: 报价". */
-function replySubject(subject: string | null | undefined): string {
+/**
+ * Whether closing the composer would throw away something the user wrote.
+ *
+ * Compared against the form the composer opened with, not against "empty": a
+ * reply already carries the quoted original and a subject, and none of that is
+ * text the user would miss.
+ */
+export function hasDraftChanges(initial: SendForm, current: SendForm): boolean {
+  return (
+    current.to.trim() !== initial.to.trim() ||
+    current.cc.trim() !== initial.cc.trim() ||
+    current.bcc.trim() !== initial.bcc.trim() ||
+    current.subject.trim() !== initial.subject.trim() ||
+    current.body.trim() !== initial.body.trim() ||
+    current.attachments.length !== initial.attachments.length
+  );
+}
+
+/** "Re: 报价", but not "Re: Re: 报价". */function replySubject(subject: string | null | undefined): string {
   const value = (subject ?? "").trim();
   if (value === "") return "";
   if (/^(re|回复|答复)\s*[:：]/i.test(value)) return value;
