@@ -577,15 +577,19 @@ impl ImapProvider {
             let state = client.select(INBOX)?;
             *selected = Some(state.clone());
             let mut state = state;
-            if wait_up_to > Duration::ZERO
+            let supports_idle = wait_up_to > Duration::ZERO
                 && client
                     .capability()
                     .map(|capabilities| capabilities.contains("IDLE"))
-                    .unwrap_or(false)
-            {
+                    .unwrap_or(false);
+            // `waited` is only true when the IDLE really ran: a refused IDLE
+            // returns at once, and reporting a wait that did not happen would
+            // make the caller skip its own pause and spin.
+            let mut waited = false;
+            if supports_idle {
                 // One bounded stretch; the event itself is not needed because
                 // the FETCH below is the source of truth.
-                let _ = client.idle(wait_up_to);
+                waited = client.idle(wait_up_to).is_ok();
                 state = client.select(INBOX)?;
                 *selected = Some(state.clone());
             }
@@ -599,6 +603,7 @@ impl ImapProvider {
                 return Ok(ChangeSet {
                     reset_required: true,
                     cursor,
+                    waited,
                     ..ChangeSet::default()
                 });
             }
@@ -615,6 +620,7 @@ impl ImapProvider {
                 upserts: headers.iter().map(remote_header).collect(),
                 reset_required: false,
                 cursor,
+                waited,
                 ..ChangeSet::default()
             })
         })

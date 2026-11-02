@@ -10,11 +10,10 @@
 //! at a time per account; spawn_blocking keeps that off the async reactor.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use lagoon_mail::error::{MailError, MailErrorKind};
 use lagoon_mail::imap::capabilities::MailCapabilities as MailCapabilitiesWire;
-use lagoon_mail::imap::provider::{ImapProvider, ProviderCredentials};
+use lagoon_mail::imap::provider::{ImapProvider, ProviderCredentials, IDLE_BUDGET};
 use lagoon_mail::preset::ProviderPreset;
 use lagoon_mail::sync::SyncCursor as MailSyncCursor;
 use lagoon_mail::transport::{Transport, TlsTransport};
@@ -143,7 +142,10 @@ impl MailProvider for LagoonMailProvider {
             let pulled = tokio::task::spawn_blocking(move || {
                 let mut provider =
                     ImapProvider::new(preset, credentials, Box::new(move || (factory)()));
-                let changes = provider.pull_changes(cursor, Duration::ZERO)?;
+                // A server with IDLE blocks here (bounded by IDLE_BUDGET)
+                // until something happens; a server without it returns
+                // immediately and the loop falls back to polling.
+                let changes = provider.pull_changes(cursor, IDLE_BUDGET)?;
                 // Membership runs on the SAME session the pull just used:
                 // one login per round, not four. A reset round means the UID
                 // space changed, so membership of the old generation would be
@@ -190,6 +192,7 @@ fn convert_change_set(
         archived_remote_ids: archived,
         trashed_remote_ids: trashed,
         removed_remote_ids: Vec::new(),
+        waited: changes.waited,
     }
 }
 

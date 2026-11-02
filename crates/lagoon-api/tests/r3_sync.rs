@@ -173,7 +173,8 @@ async fn first_batch_then_incremental_resumes_from_the_cursor() {
         outcome,
         RoundOutcome::Applied {
             upserts: 10,
-            reset: false
+            reset: false,
+            waited: false
         }
     );
     assert_eq!(store.headers(account), 10);
@@ -187,7 +188,8 @@ async fn first_batch_then_incremental_resumes_from_the_cursor() {
         outcome,
         RoundOutcome::Applied {
             upserts: 2,
-            reset: false
+            reset: false,
+            waited: false
         }
     );
     assert_eq!(store.headers(account), 12);
@@ -251,7 +253,8 @@ async fn uidvalidity_change_resets_live_rows_without_duplicates() {
         engine.round(account).await,
         RoundOutcome::Applied {
             upserts: 5,
-            reset: false
+            reset: false,
+            waited: false
         }
     );
     assert_eq!(store.headers(account), 6, "five live plus one archived");
@@ -259,7 +262,8 @@ async fn uidvalidity_change_resets_live_rows_without_duplicates() {
         engine.round(account).await,
         RoundOutcome::Applied {
             upserts: 5,
-            reset: true
+            reset: true,
+            waited: false
         }
     );
     assert_eq!(
@@ -380,14 +384,16 @@ async fn accounts_are_isolated_and_concurrent_rounds_apply_cleanly() {
         left,
         RoundOutcome::Applied {
             upserts: 2,
-            reset: false
+            reset: false,
+            waited: false
         }
     );
     assert_eq!(
         right,
         RoundOutcome::Applied {
             upserts: 1,
-            reset: false
+            reset: false,
+            waited: false
         }
     );
     assert_eq!(store.headers(first), 2);
@@ -412,7 +418,8 @@ async fn a_header_only_account_appears_in_the_account_and_message_lists() {
         engine.round(account).await,
         RoundOutcome::Applied {
             upserts: 1,
-            reset: false
+            reset: false,
+            waited: false
         }
     );
     let connection = store.connection();
@@ -461,5 +468,100 @@ async fn post_api_sync_answers_204_without_waiting() {
     assert!(
         elapsed.as_millis() < 500,
         "POST /api/sync must not wait for the round: {elapsed:?}"
+    );
+}
+
+/// A server that advertises IDLE must be asked to wait.
+///
+/// The adapter used to pass `Duration::ZERO`, which disables the IDLE branch in
+/// `ImapProvider::pull_changes` entirely: every account polled on a fixed
+/// 300-second timer, so new mail was up to five minutes late even on servers
+/// that support instant notification. This pins both halves: the budget is
+/// exported and non-zero, and the wire really carries `IDLE`.
+#[tokio::test]
+async fn idle_budget_is_passed_to_the_provider() {
+    use lagoon_api::provider::lagoon_mail::LagoonMailFactory;
+    use lagoon_api::provider::{MailProvider, ProviderFactory};
+    use lagoon_mail::imap::provider::IDLE_BUDGET;
+    use lagoon_mail::transport::Transport;
+    use support::scripted_transport::{imap_session_script, select_script, ScriptedTransport};
+
+    assert!(IDLE_BUDGET > std::time::Duration::ZERO);
+
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1 IDLE");
+    select_script(&transport, "A0003", 0, 7, 1);
+    transport.enqueue_line("+ idling");
+    transport.enqueue_line("* 1 EXISTS");
+    transport.enqueue_line("A0004 OK IDLE completed");
+    select_script(&transport, "A0005", 1, 7, 2);
+    transport.enqueue_line("A0006 OK FETCH completed");
+
+    let handle = transport.handle();
+    let make: Arc<dyn Fn() -> Box<dyn Transport> + Send + Sync> =
+        Arc::new(move || Box::new(handle.clone()));
+    let provider = LagoonMailFactory::with_transport(make)
+        .make(&ImapCredentials::new("user@example.invalid", "auth-code"))
+        .expect("provider");
+
+    let changes = provider
+        .pull_changes(&SyncCursor {
+            uid_validity: Some(7),
+            last_uid: Some(1),
+        })
+        .await
+        .expect("pull");
+    assert!(
+        changes.waited,
+        "an IDLE round must report that it already waited"
+    );
+
+    let commands = transport.command_lines();
+    assert!(
+        commands.iter().any(|line| line.ends_with(" IDLE")),
+        "the adapter must ask the server to wait, got: {commands:?}"
+    );
+}
+
+/// The other half of the IDLE contract: without the capability there is no
+/// wait, and the loop must fall back to polling.
+///
+/// A `waited` that was true unconditionally would turn the sync loop into a
+/// tight loop with no pause at all, hammering every non-IDLE server.
+#[tokio::test]
+async fn a_server_without_idle_reports_no_wait() {
+    use lagoon_api::provider::lagoon_mail::LagoonMailFactory;
+    use lagoon_api::provider::{MailProvider, ProviderFactory};
+    use lagoon_mail::transport::Transport;
+    use support::scripted_transport::{imap_session_script, select_script, ScriptedTransport};
+
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1");
+    select_script(&transport, "A0003", 0, 7, 1);
+    transport.enqueue_line("A0004 OK FETCH completed");
+
+    let handle = transport.handle();
+    let make: Arc<dyn Fn() -> Box<dyn Transport> + Send + Sync> =
+        Arc::new(move || Box::new(handle.clone()));
+    let provider = LagoonMailFactory::with_transport(make)
+        .make(&ImapCredentials::new("user@example.invalid", "auth-code"))
+        .expect("provider");
+
+    let changes = provider
+        .pull_changes(&SyncCursor {
+            uid_validity: Some(7),
+            last_uid: Some(1),
+        })
+        .await
+        .expect("pull");
+
+    assert!(
+        !changes.waited,
+        "a server without IDLE must leave the polling cadence alone"
+    );
+    let commands = transport.command_lines();
+    assert!(
+        !commands.iter().any(|line| line.ends_with(" IDLE")),
+        "no IDLE on a server that did not advertise it: {commands:?}"
     );
 }

@@ -97,6 +97,9 @@ pub struct MailChangeSet {
     pub archived_remote_ids: Option<Vec<String>>,
     pub trashed_remote_ids: Option<Vec<String>>,
     pub removed_remote_ids: Vec<String>,
+    /// This pull blocked waiting for the server (IMAP IDLE). The sync loop
+    /// must not sleep on top: the wait already happened inside the pull.
+    pub waited: bool,
 }
 
 pub type PullFuture<'a> =

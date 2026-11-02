@@ -87,7 +87,12 @@ pub enum ParkReason {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RoundOutcome {
-    Applied { upserts: usize, reset: bool },
+    Applied {
+        upserts: usize,
+        reset: bool,
+        /// The pull blocked on IDLE; the loop must not sleep again.
+        waited: bool,
+    },
     Parked(ParkReason),
     NoProvider,
     NotFound,
@@ -264,6 +269,7 @@ impl SyncEngine {
         RoundOutcome::Applied {
             upserts: changes.upserts.len(),
             reset: changes.reset_required,
+            waited: changes.waited,
         }
     }
 
@@ -394,20 +400,40 @@ pub fn backoff_seconds(consecutive: u32) -> f64 {
 /// How long an idle round waits before pulling again (v3 waitBudget).
 pub const IDLE_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// What the loop does once a round returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterRound {
+    Stop,
+    In(std::time::Duration),
+}
+
+/// A parked or vanished account ends its loop, a transient failure backs off,
+/// a round that already waited on IDLE goes again at once, and anything else
+/// waits for the next poll.
+fn after_round(outcome: &RoundOutcome) -> AfterRound {
+    match outcome {
+        RoundOutcome::Parked(_) | RoundOutcome::NotFound => AfterRound::Stop,
+        RoundOutcome::Failed {
+            backoff_seconds, ..
+        } => AfterRound::In(std::time::Duration::from_secs_f64(*backoff_seconds)),
+        // The pull blocked on IDLE for up to IDLE_BUDGET; sleeping on top
+        // would add back exactly the latency IDLE exists to remove.
+        RoundOutcome::Applied { waited: true, .. } => {
+            AfterRound::In(std::time::Duration::ZERO)
+        }
+        _ => AfterRound::In(IDLE_WAIT),
+    }
+}
+
 /// The loop body, shared by `start_one` and `start_all` so the two cannot
-/// drift: a parked or vanished account ends its loop, a transient failure
-/// backs off, a successful round waits for the next poll.
+/// drift.
 fn spawn_loop(engine: Arc<SyncEngine>, account_id: Uuid) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match engine.round(account_id).await {
-                RoundOutcome::Parked(_) | RoundOutcome::NotFound => break,
-                RoundOutcome::Failed {
-                    backoff_seconds, ..
-                } => {
-                    tokio::time::sleep(std::time::Duration::from_secs_f64(backoff_seconds)).await;
-                }
-                _ => tokio::time::sleep(IDLE_WAIT).await,
+            let outcome = engine.round(account_id).await;
+            match after_round(&outcome) {
+                AfterRound::Stop => break,
+                AfterRound::In(pause) => tokio::time::sleep(pause).await,
             }
         }
     })
@@ -529,3 +555,59 @@ impl SyncSupervisor {
 
 /// Type alias so callers can name the engine's future without importing pin.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_waited_round_does_not_sleep_again() {
+        assert_eq!(
+            after_round(&RoundOutcome::Applied {
+                upserts: 0,
+                reset: false,
+                waited: true,
+            }),
+            AfterRound::In(std::time::Duration::ZERO),
+            "IDLE already blocked inside the round"
+        );
+    }
+
+    #[test]
+    fn a_polled_round_keeps_the_polling_cadence() {
+        assert_eq!(
+            after_round(&RoundOutcome::Applied {
+                upserts: 3,
+                reset: false,
+                waited: false,
+            }),
+            AfterRound::In(IDLE_WAIT)
+        );
+    }
+
+    #[test]
+    fn a_parked_or_missing_account_ends_the_loop() {
+        assert_eq!(
+            after_round(&RoundOutcome::Parked(ParkReason::NeedsReconnect)),
+            AfterRound::Stop
+        );
+        assert_eq!(
+            after_round(&RoundOutcome::Parked(ParkReason::AccountMissing)),
+            AfterRound::Stop
+        );
+        assert_eq!(after_round(&RoundOutcome::NotFound), AfterRound::Stop);
+    }
+
+    #[test]
+    fn a_failed_round_uses_its_backoff() {
+        let outcome = RoundOutcome::Failed {
+            label: "unreachable".to_owned(),
+            consecutive: 2,
+            backoff_seconds: 4.0,
+        };
+        assert_eq!(
+            after_round(&outcome),
+            AfterRound::In(std::time::Duration::from_secs(4))
+        );
+    }
+}

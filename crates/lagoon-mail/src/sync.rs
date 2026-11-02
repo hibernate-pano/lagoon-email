@@ -72,6 +72,10 @@ pub struct ChangeSet {
     /// Message-IDs seen referenced from sent mail (In-Reply-To/References of
     /// Sent-folder messages).
     pub replied_message_ids: BTreeSet<String>,
+    /// The pull actually used IDLE and spent up to the caller's budget waiting.
+    /// A loop that would otherwise sleep between rounds must not sleep again:
+    /// the wait already happened inside this call.
+    pub waited: bool,
 }
 
 /// Everything the sync engine may do to a mailbox. Read-only by construction.
