@@ -327,6 +327,12 @@ export const zh = {
     },
   },
 
+  sync: {
+    now: "立即同步",
+    running: "同步中…",
+    failed: "同步请求失败",
+  },
+
   common: {
     yes: "是",
     no: "否",

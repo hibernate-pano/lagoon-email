@@ -30,6 +30,7 @@ import { COMMON_UNAVAILABLE, describeHttpFailure } from "./core/errors";
 import { useApiOutcome, useBoot, useOnline } from "./core/hooks";
 import { useMailboxOverlay } from "./core/mutations";
 import { BYPASS_CAPABILITY_GATE, UNDO_WINDOW_MS } from "./core/config";
+import { LENS_EMPTY } from "./core/empty";
 import { targetIdsOf } from "./core/selection";
 import {
   bulkAction,
@@ -71,15 +72,6 @@ const LENS_TITLE: Record<LensId, string> = {
   archived: t.sidebar.archived,
   sent: t.sidebar.sent,
   trash: t.sidebar.trash,
-};
-
-const LENS_EMPTY: Record<LensId, { title: string; detail?: string }> = {
-  inbox: { title: t.list.empty.inbox[0], detail: t.list.empty.inbox[1] },
-  unread: { title: t.list.empty.unread[0], detail: t.list.empty.unread[1] },
-  pinned: { title: t.list.empty.pinned[0], detail: t.list.empty.pinned[1] },
-  archived: { title: t.list.empty.archived[0], detail: t.list.empty.archived[1] },
-  sent: { title: t.list.empty.sent[0], detail: t.list.empty.sent[1] },
-  trash: { title: t.list.empty.trash[0], detail: t.list.empty.trash[1] },
 };
 
 const EMPTY_ACCOUNTS: ConnectedAccount[] = [];
@@ -152,6 +144,7 @@ export function App(): ReactNode {
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
 
   const overlay = useMailboxOverlay();
 
@@ -190,7 +183,12 @@ export function App(): ReactNode {
     load: () => apiCall<ConnectedAccount[]>({ method: "GET", path: "/api/accounts" }),
     deps: [bootReady],
     pollMs: POLL_MS,
-    translate: { errorTitle: "账号列表读取失败", unavailableCodes: COMMON_UNAVAILABLE, describeCode: describeHttpFailure },
+    translate: {
+      errorTitle: "账号列表读取失败",
+      unavailableCodes: COMMON_UNAVAILABLE,
+      describeCode: describeHttpFailure,
+      isEmpty: (data) => data.length === 0,
+    },
   });
 
   const aiStatus = useApiOutcome<AiStatus>({
@@ -232,7 +230,12 @@ export function App(): ReactNode {
     deps: [accountId, route.view],
     pollMs: POLL_MS,
     load: () => apiCall({ method: "GET", path: "/api/briefing", query: { accountId: accountId ?? "" } }),
-    translate: { errorTitle: t.briefing.loadFailed, unavailableCodes: COMMON_UNAVAILABLE, describeCode: describeHttpFailure },
+    translate: {
+      errorTitle: t.briefing.loadFailed,
+      unavailableCodes: COMMON_UNAVAILABLE,
+      describeCode: describeHttpFailure,
+      isEmpty: (data) => data.items.length === 0,
+    },
   });
 
   const advice = useApiOutcome<AdviceResponse>({
@@ -268,6 +271,7 @@ export function App(): ReactNode {
       errorTitle: t.list.loadFailed,
       unavailableCodes: COMMON_UNAVAILABLE,
       describeCode: describeHttpFailure,
+      isEmpty: (data) => data.messages.length === 0,
     },
   });
 
@@ -308,6 +312,25 @@ export function App(): ReactNode {
     void briefing.refresh();
     void counts.refresh();
     void accounts.refresh();
+  };
+
+  /**
+   * `POST /api/sync` answers 204 at once: it starts a round, it does not wait
+   * for one. The refresh is what makes the result visible, so it runs either
+   * way - a request that was accepted still produced a round.
+   */
+  const syncNow = async () => {
+    if (!accountId || syncBusy) return;
+    setSyncBusy(true);
+    try {
+      const result = await apiCall<null>({ method: "POST", path: "/api/sync" });
+      if (result.kind !== "ok") {
+        setToast({ id: Date.now(), text: t.sync.failed });
+      }
+      refreshAll();
+    } finally {
+      setSyncBusy(false);
+    }
   };
 
   /* ------------------------------------------------------------- writes --- */
@@ -675,6 +698,9 @@ export function App(): ReactNode {
       ) : null}
       <button className="btn" onClick={() => setDensity(nextDensity(density))}>
         {density}
+      </button>
+      <button className="btn" onClick={() => void syncNow()} disabled={!accountId || syncBusy}>
+        {syncBusy ? t.sync.running : t.sync.now}
       </button>
       <button className="btn" onClick={() => setHistoryOpen(true)} disabled={!accountId}>
         {t.m2.actions.history}

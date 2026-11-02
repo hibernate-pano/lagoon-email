@@ -21,6 +21,7 @@ import type { MessageHeader, SyncResponse } from "../core/types";
 import type { LensId } from "../core/router";
 import type { Outcome } from "../core/async";
 import type { WriteBridge } from "../core/uiBridge";
+import { emptyStateFor } from "../core/empty";
 import { AsyncSurface } from "../ui/AsyncSurface";
 import { BulkBar } from "../ui/BulkBar";
 import { MailRow } from "../ui/MailRow";
@@ -74,6 +75,10 @@ export function MessageList(props: MessageListProps): ReactNode {
       ? props.outcome.data.totalCount ?? null
       : null;
 
+  // A known zero earns the lens copy; anything else keeps the copy the caller
+  // passed (AsyncSurface uses it for the "empty" phase).
+  const emptyCopy = emptyStateFor(props.lens, props.rows.length) ?? props.empty;
+
   return (
     <div className="pane">
       <div className="pane-head">
@@ -111,10 +116,20 @@ export function MessageList(props: MessageListProps): ReactNode {
           {() => (
             <>
               {filtered.length === 0 ? (
-                <div className="surface compact" role="status">
-                  <div className="surface-title">{t.list.searchEmpty}</div>
-                  <div className="surface-detail">{query}</div>
-                </div>
+                // A filtered-to-zero list is not the same as an empty mailbox:
+                // the search copy belongs to a query, the lens copy to a known
+                // zero with no query.
+                query.trim() === "" ? (
+                  <div className="surface compact" role="status">
+                    <div className="surface-title">{emptyCopy.title}</div>
+                    {emptyCopy.detail ? <div className="surface-detail">{emptyCopy.detail}</div> : null}
+                  </div>
+                ) : (
+                  <div className="surface compact" role="status">
+                    <div className="surface-title">{t.list.searchEmpty}</div>
+                    <div className="surface-detail">{query}</div>
+                  </div>
+                )
               ) : (
                 <div className="rows" role="listbox" aria-multiselectable="true" aria-label={props.title}>
                   {filtered.map((message) => (
