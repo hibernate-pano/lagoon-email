@@ -163,6 +163,62 @@ async fn archive_runs_remote_then_flips_the_flag_and_audits() {
 }
 
 #[tokio::test]
+async fn undo_of_an_archive_unarchives_locally_and_remotely() {
+    let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
+    let (server, _fixtures) = TestServer::spawn_with_provider("r3-actions-undo-archive", factory.clone()).await;
+    prepare_account(&server, &all_caps_allowed());
+    let client = http::client();
+
+    let observed = post(&client, &server, &format!("/api/messages/{REMOTE}/archive?accountId={ACCOUNT_A}"), None).await;
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+    let action_id = observed.body["actionId"].as_i64().expect("actionId");
+    assert_eq!(flag(&server, "is_archived", REMOTE), Some(true));
+
+    let observed = post(&client, &server, &format!("/api/actions/{action_id}/undo?accountId={ACCOUNT_A}"), None).await;
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+    assert_eq!(observed.body["undone"], json!(action_id));
+
+    // The message comes back - locally AND on the server. The undo is the
+    // INVERSE of the action, not a second copy of it.
+    assert_eq!(flag(&server, "is_archived", REMOTE), Some(false));
+    let calls = factory.write_calls().all();
+    assert_eq!(
+        calls,
+        vec![
+            ("archive".to_owned(), REMOTE.to_owned()),
+            ("unarchive".to_owned(), REMOTE.to_owned()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn undo_of_a_delete_restores_locally_and_remotely() {
+    let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
+    let (server, _fixtures) = TestServer::spawn_with_provider("r3-actions-undo-delete", factory.clone()).await;
+    prepare_account(&server, &all_caps_allowed());
+    let client = http::client();
+
+    let observed = post(&client, &server, &format!("/api/messages/{REMOTE}/delete?accountId={ACCOUNT_A}"), None).await;
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+    let action_id = observed.body["actionId"].as_i64().expect("actionId");
+    assert_eq!(flag(&server, "is_deleted", REMOTE), Some(true));
+
+    let observed = post(&client, &server, &format!("/api/actions/{action_id}/undo?accountId={ACCOUNT_A}"), None).await;
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+    assert_eq!(observed.body["undone"], json!(action_id));
+
+    assert_eq!(flag(&server, "is_deleted", REMOTE), Some(false));
+    let calls = factory.write_calls().all();
+    assert_eq!(
+        calls,
+        vec![
+            ("trash".to_owned(), REMOTE.to_owned()),
+            ("restore_from_trash".to_owned(), REMOTE.to_owned()),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn mark_read_flips_locally_and_treats_the_remote_as_best_effort() {
     let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
     // The remote STORE fails: the route must still answer, and the local flag

@@ -495,12 +495,6 @@ pub async fn empty_trash(
 
 /* ------------------------------------------------------------------ bulk --- */
 
-#[derive(Debug, Deserialize)]
-pub struct BulkBody {
-    #[serde(rename = "remoteIds")]
-    remote_ids: Option<Vec<String>>,
-}
-
 fn parse_bulk(body: &[u8]) -> Result<Vec<String>, Response> {
     if body.is_empty() {
         return Err(respond::error(StatusCode::BAD_REQUEST, "missing-body"));
@@ -767,8 +761,15 @@ async fn undo_one(state: &AppState, account_id: Uuid, action_id: i64) -> UndoOut
         let payload: serde_json::Value =
             serde_json::from_str(&action.payload).unwrap_or_else(|_| json!({}));
         let verb = match action.kind.as_str() {
-            "archive" => WriteVerb::Archive,
-            "delete" => WriteVerb::Trash,
+            // The undo runs the INVERSE verb, both remotely and locally.
+            // Mapping "archive" back to Archive re-archived the message and
+            // answered 200 "undone" - the flag never moved, and the next
+            // reconcile re-confirmed the server still had it archived.
+            "archive" => WriteVerb::Archive.inverse(),
+            "delete" => WriteVerb::Trash.inverse(),
+            // markRead is the exception: the inverse of a boolean flip is not
+            // "the other value", it is the value this action *replaced*, which
+            // the audit payload carries. Same reason v3 restored previousIsRead.
             "markRead" => WriteVerb::SetRead(
                 payload
                     .get("previousIsRead")
