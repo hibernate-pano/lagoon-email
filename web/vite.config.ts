@@ -60,7 +60,7 @@ function readDevEnv(): { url: string; token: string } {
   return { url: env.VITE_SIDECAR_URL ?? "", token: env.VITE_SIDECAR_TOKEN ?? "" };
 }
 
-function sidecarEnvPlugin(url: string, hasToken: boolean): Plugin {
+export function sidecarEnvPlugin(url: string, hasToken: boolean): Plugin {
   return {
     name: "lagoon-sidecar-env",
     resolveId(id) {

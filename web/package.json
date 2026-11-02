@@ -3,11 +3,12 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Lagoon v4 web frontend (M1 read-only). See v4/docs/ipc-contract.md",
+  "description": "Lagoon web frontend. See docs/ipc-contract.md",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
+    "test": "vitest run",
     "typecheck": "tsc -b --noEmit"
   },
   "dependencies": {
