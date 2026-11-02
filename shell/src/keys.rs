@@ -1,6 +1,7 @@
-//! The dev-time key file from contract §2 (under v4/.dev, mode 0600).
+//! The key file from contract §2 (under v4/.dev in dev; the app data directory
+//! in the product, mode 0600).
 //!
-//! Shape: `{ "tokenKey": "<base64 32B>", "bodyKey": "<base64 32B>", "apiToken": "<hex>" }`
+//! Shape: `{ "tokenKey": "<base64 32B>", "bodyKey": "<base64 32B>", "apiToken": "<hex>", "llmApiKey"?: "<provider key>" }`
 //! Generated once, mode 0600, never overwritten, never printed.
 //!
 //! The two base64 keys are passed straight to the sidecar as `LAGOON_TOKEN_KEY`
@@ -8,6 +9,11 @@
 //! exactly 32 bytes (Sources/LagoonServerCLI/main.swift:21-48), so this module
 //! validates the same thing *before* spawning — a malformed key is a `keys`
 //! failure, not a mysterious sidecar crash.
+//!
+//! `llmApiKey` is optional and is passed as `LLM_PROVIDER_PRIMARY_API_KEY` —
+//! the name `config/providers.json` declares in `apiKeyEnv`. A packaged app
+//! launched from Finder gets launchd's environment, not the shell's, so this
+//! file is how a real user gives the AI its key without a terminal.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -20,12 +26,16 @@ pub struct Keys {
     pub token_key: String,
     pub body_key: String,
     pub api_token: String,
+    /// The LLM provider key, when the user put one in `keys.json`.
+    pub llm_api_key: Option<String>,
 }
 
 /// Deliberately opaque: a `{:?}` on this struct must not leak key material.
 impl std::fmt::Debug for Keys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Keys { token_key: <redacted>, body_key: <redacted>, api_token: <redacted> }")
+        f.write_str(
+            "Keys { token_key: <redacted>, body_key: <redacted>, api_token: <redacted>, llm_api_key: <redacted> }",
+        )
     }
 }
 
@@ -37,6 +47,9 @@ struct KeysFile {
     body_key: String,
     #[serde(rename = "apiToken")]
     api_token: String,
+    /// Optional: an install that never uses the AI has no such field.
+    #[serde(rename = "llmApiKey", default)]
+    llm_api_key: Option<String>,
 }
 
 fn random_bytes(n: usize) -> Result<Vec<u8>, String> {
@@ -65,6 +78,12 @@ fn validate(keys: KeysFile) -> Result<Keys, String> {
         token_key: keys.token_key,
         body_key: keys.body_key,
         api_token: keys.api_token,
+        // An empty string is the same as no field: "not configured" must not
+        // turn into "configured with nothing".
+        llm_api_key: keys
+            .llm_api_key
+            .map(|key| key.trim().to_owned())
+            .filter(|key| !key.is_empty()),
     })
 }
 
@@ -89,6 +108,9 @@ pub fn load_or_generate(path: &Path) -> Result<Keys, String> {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect(),
+        // The generator never invents an AI key; the user adds `llmApiKey`
+        // by hand when they want the advisor.
+        llm_api_key: None,
     };
     let json = format!(
         "{{\"tokenKey\":\"{}\",\"bodyKey\":\"{}\",\"apiToken\":\"{}\"}}\n",
@@ -107,4 +129,88 @@ pub fn load_or_generate(path: &Path) -> Result<Keys, String> {
     file.sync_all().ok();
     eprintln!("[keys] generated {} (mode 0600)", path.display());
     validate(keys)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "lagoon-keys-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temp dir");
+        directory
+    }
+
+    /// A key file as every install written before the AI existed has it:
+    /// three fields, no `llmApiKey`. It must keep loading.
+    #[test]
+    fn a_key_file_without_an_ai_key_still_loads() {
+        let directory = scratch("no-ai");
+        let path = directory.join("keys.json");
+        let json = format!(
+            "{{\"tokenKey\":\"{}\",\"bodyKey\":\"{}\",\"apiToken\":\"abcd\"}}",
+            B64.encode([7u8; 32]),
+            B64.encode([9u8; 32]),
+        );
+        fs::write(&path, json).expect("write");
+        let keys = load_or_generate(&path).expect("loads");
+        assert_eq!(keys.api_token, "abcd");
+        assert!(keys.llm_api_key.is_none(), "no field is no key");
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The AI key is read from the same 0600 file the other secrets live in,
+    /// and surrounding whitespace (a pasted newline) is not part of the key.
+    #[test]
+    fn an_ai_key_is_read_and_trimmed() {
+        let directory = scratch("ai");
+        let path = directory.join("keys.json");
+        let json = format!(
+            "{{\"tokenKey\":\"{}\",\"bodyKey\":\"{}\",\"apiToken\":\"abcd\",\"llmApiKey\":\"  sk-test  \"}}",
+            B64.encode([7u8; 32]),
+            B64.encode([9u8; 32]),
+        );
+        fs::write(&path, json).expect("write");
+        let keys = load_or_generate(&path).expect("loads");
+        assert_eq!(keys.llm_api_key.as_deref(), Some("sk-test"));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// An empty value is "not set", never "configured with nothing": the
+    /// backend must keep answering `configured:false` in that case.
+    #[test]
+    fn an_empty_ai_key_is_no_key() {
+        let directory = scratch("empty-ai");
+        let path = directory.join("keys.json");
+        let json = format!(
+            "{{\"tokenKey\":\"{}\",\"bodyKey\":\"{}\",\"apiToken\":\"abcd\",\"llmApiKey\":\"   \"}}",
+            B64.encode([7u8; 32]),
+            B64.encode([9u8; 32]),
+        );
+        fs::write(&path, json).expect("write");
+        let keys = load_or_generate(&path).expect("loads");
+        assert!(keys.llm_api_key.is_none());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The Debug output must never carry key material, including the LLM key.
+    #[test]
+    fn debug_never_prints_a_key() {
+        let keys = Keys {
+            token_key: "token-secret".into(),
+            body_key: "body-secret".into(),
+            api_token: "api-secret".into(),
+            llm_api_key: Some("llm-secret".into()),
+        };
+        let printed = format!("{keys:?}");
+        assert!(!printed.contains("secret"));
+        assert!(printed.contains("<redacted>"));
+    }
 }

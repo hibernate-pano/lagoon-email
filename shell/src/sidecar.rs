@@ -227,6 +227,12 @@ fn spawn(
                         "none"
                     },
                 );
+            // The AI key, when keys.json carries one. Finder-launched apps
+            // do not see the shell's environment, so this file is the only
+            // way a user can configure the advisor without a terminal.
+            if let Some(key) = &ctx.keys.llm_api_key {
+                command.env("LLM_PROVIDER_PRIMARY_API_KEY", key);
+            }
         }
     }
     command
