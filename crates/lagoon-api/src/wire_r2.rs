@@ -373,6 +373,19 @@ pub struct AiProbeResponse {
     pub latency_ms: u128,
 }
 
+/// The answer to `GET /api/messages/{remoteId}/inline-images`.
+///
+/// The keys are the content ids - lowercased, without the angle brackets -
+/// and the values are the bytes, base64 encoded. The reader substitutes them
+/// into the HTML as `data:` URLs before the document reaches the sandbox.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineImagesResponse {
+    /// content id → base64 bytes. A BTreeMap so the order is stable: a
+    /// replayed response is byte-identical.
+    pub images: std::collections::BTreeMap<String, String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

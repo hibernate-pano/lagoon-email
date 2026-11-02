@@ -99,6 +99,32 @@ invoke("restart_sidecar") => { ok: boolean; phase: "starting" | "ready" | "faile
 
 payload 同 `boot_status` 的返回值。前端订阅它驱动启动页，不要轮询 `boot_status`。
 
+### 4.5 `download` —— 二进制通道（附件）
+
+`api` 只承载 JSON：代理会把非 JSON 的 body 转成一个有损 `String`，一个 PDF 走那条路必然损坏。
+附件因此走第二条、也是**唯一**的第二条通道：
+
+```ts
+invoke("download", { request: { path, query?, filename? } }) => {
+  ok: boolean;
+  status: number;
+  path?: string;                                  // 仅 2xx：保存到哪
+  code?: string;                                  // 服务端 {"error": …} 的码
+  error?: { code: "not-ready" | "transport" | "timeout" | "bad-path" | "save"; message: string };
+}
+```
+
+规则与 `api` 一致，另外三条：
+
+- `ok` 的含义不变：**服务端答复了才是 `ok: true`**。404 也是答复
+  （`{ ok: true, status: 404, code: "attachment-not-found" }`），连不上才是 `ok: false, status: 0`。
+- 只接受 `path` 以 `/api/` 开头且不含 `..`；token 只在外壳进程里加，绝不回传。
+- 2xx 的字节写到 `<数据目录>/downloads/` 下：文件名只保留最后一段、去掉控制字符与前导点、
+  截到 120 字符；**同名文件不覆盖**（`report.pdf` 第二次成为 `report 2.pdf`），然后在访达里
+  `open -R` **显示**它。**不打开**文件——`invoice.command` 不能因为被点了一下就执行。
+
+`query` 的值照 `api` 的规则统一转字符串（这里用 `accountId`）。
+
 ---
 
 ## 5. 浏览器开发模式（没有 Tauri 时）
@@ -111,6 +137,8 @@ payload 同 `boot_status` 的返回值。前端订阅它驱动启动页，不要
 - 生产路径不变：Tauri `invoke("api")`；构建时 `virtual:sidecar-env` 返回空串，**dist 内不含 token 与端口**（已扫）。
 
 前端的 API 客户端必须只有一个入口（`api(request)`），两种模式在内部切换；界面代码不感知模式。
+唯一的例外是附件下载：`downloadFile(request)` 在 Tauri 里走 §4.5 的 `download` 命令，在浏览器里
+`fetch` 成 Blob 交给浏览器下载——两条路都拿不到 token。
 
 ---
 

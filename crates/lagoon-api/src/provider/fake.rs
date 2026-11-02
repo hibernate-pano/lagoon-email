@@ -13,9 +13,10 @@ use crate::token::ImapCredentials;
 use crate::wire::MailCapabilities;
 
 use super::{
-    BodyFuture, MailBody, MailBodyProvider, MailChangeSet, MailProvider, MailSendProvider,
-    MailWriteProvider, OutgoingMail, ProbeFuture, ProbeOutcome, ProviderError, ProviderFactory,
-    PullFuture, RawFuture, SendFuture, SentMail, WriteFuture,
+    AttachmentFuture, BodyFuture, InlineImagesFuture, MailAttachment, MailBody, MailBodyProvider,
+    MailChangeSet, MailInlineImage, MailProvider, MailSendProvider, MailWriteProvider,
+    OutgoingMail, ProbeFuture, ProbeOutcome, ProviderError, ProviderFactory, PullFuture, RawFuture,
+    SendFuture, SentMail, WriteFuture,
 };
 
 /// The scripted answers of the body provider, in call order.
@@ -24,6 +25,17 @@ type BodyScript = Arc<Mutex<VecDeque<Result<MailBody, ProviderError>>>>;
 type RawScript = Arc<Mutex<VecDeque<Result<Vec<u8>, ProviderError>>>>;
 /// The scripted answers of the send provider, in call order.
 type SendScript = Arc<Mutex<VecDeque<Result<SentMail, ProviderError>>>>;
+/// The scripted answers of the attachment download surface, in call order.
+///
+/// `Ok(None)` is a scripted "this message has no such part" — a fact, not a
+/// failure, and the route answers 404 for it.
+type AttachmentScript = Arc<Mutex<VecDeque<Result<Option<MailAttachment>, ProviderError>>>>;
+/// The scripted answers of the inline-image surface, in call order.
+type InlineImagesScript = Arc<Mutex<VecDeque<Result<Vec<MailInlineImage>, ProviderError>>>>;
+/// What an attachment download was asked for: `(attachment id, uid hint)`.
+type AttachmentCall = (String, Option<i64>);
+/// Every attachment download this provider was asked for, in call order.
+type AttachmentCalls = Arc<Mutex<Vec<AttachmentCall>>>;
 
 #[derive(Debug, Clone)]
 pub enum FakeOutcome {
@@ -199,6 +211,10 @@ pub struct FakeBodyProvider {
     calls: Arc<Mutex<usize>>,
     raw_calls: Arc<Mutex<usize>>,
     uids: Arc<Mutex<Vec<Option<i64>>>>,
+    attachment_script: AttachmentScript,
+    inline_images_script: InlineImagesScript,
+    attachment_calls: AttachmentCalls,
+    inline_images_calls: Arc<Mutex<usize>>,
 }
 
 impl MailBodyProvider for FakeBodyProvider {
@@ -227,6 +243,53 @@ impl MailBodyProvider for FakeBodyProvider {
                 Some(result) => result,
                 None => Err(ProviderError::NotConfigured(
                     "fake raw script exhausted".to_owned(),
+                )),
+            }
+        })
+    }
+
+    fn fetch_attachment(
+        &self,
+        remote_id: &str,
+        uid_hint: Option<i64>,
+        attachment_id: &str,
+    ) -> AttachmentFuture<'_> {
+        self.attachment_calls
+            .lock()
+            .expect("attachment calls lock")
+            .push((remote_id.to_owned(), uid_hint));
+        let _ = attachment_id;
+        let next = self
+            .attachment_script
+            .lock()
+            .expect("attachment script lock")
+            .pop_front();
+        Box::pin(async move {
+            match next {
+                Some(result) => result,
+                None => Err(ProviderError::NotConfigured(
+                    "fake attachment script exhausted".to_owned(),
+                )),
+            }
+        })
+    }
+
+    fn fetch_inline_images(
+        &self,
+        _remote_id: &str,
+        _uid_hint: Option<i64>,
+    ) -> InlineImagesFuture<'_> {
+        *self.inline_images_calls.lock().expect("inline calls lock") += 1;
+        let next = self
+            .inline_images_script
+            .lock()
+            .expect("inline images script lock")
+            .pop_front();
+        Box::pin(async move {
+            match next {
+                Some(result) => result,
+                None => Err(ProviderError::NotConfigured(
+                    "fake inline images script exhausted".to_owned(),
                 )),
             }
         })
@@ -272,6 +335,10 @@ pub struct FakeProviderFactory {
     body_uids: Arc<Mutex<Vec<Option<i64>>>>,
     send_script: SendScript,
     send_calls: Arc<Mutex<Vec<OutgoingMail>>>,
+    attachment_script: AttachmentScript,
+    inline_images_script: InlineImagesScript,
+    attachment_calls: AttachmentCalls,
+    inline_images_calls: Arc<Mutex<usize>>,
 }
 
 impl FakeProviderFactory {
@@ -290,7 +357,51 @@ impl FakeProviderFactory {
             body_uids: Arc::new(Mutex::new(Vec::new())),
             send_script: Arc::new(Mutex::new(VecDeque::new())),
             send_calls: Arc::new(Mutex::new(Vec::new())),
+            attachment_script: Arc::new(Mutex::new(VecDeque::new())),
+            inline_images_script: Arc::new(Mutex::new(VecDeque::new())),
+            attachment_calls: Arc::new(Mutex::new(Vec::new())),
+            inline_images_calls: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// Script the next attachment answers, in call order.
+    ///
+    /// `Ok(None)` scripts "this message has no such part": the route answers
+    /// 404 for it, which is different from a message that is gone.
+    pub fn attachment_script(
+        &self,
+        answers: Vec<Result<Option<MailAttachment>, ProviderError>>,
+    ) -> &Self {
+        self.attachment_script
+            .lock()
+            .expect("attachment script lock")
+            .extend(answers);
+        self
+    }
+
+    /// Every attachment download this factory was asked for: (remoteId, uid).
+    pub fn attachment_calls(&self) -> Vec<(String, Option<i64>)> {
+        self.attachment_calls
+            .lock()
+            .expect("attachment calls lock")
+            .clone()
+    }
+
+    /// Script the next inline-image answers, in call order.
+    pub fn inline_images_script(
+        &self,
+        answers: Vec<Result<Vec<MailInlineImage>, ProviderError>>,
+    ) -> &Self {
+        self.inline_images_script
+            .lock()
+            .expect("inline images script lock")
+            .extend(answers);
+        self
+    }
+
+    /// How many times the inline-image surface was asked.
+    pub fn inline_images_calls(&self) -> usize {
+        *self.inline_images_calls.lock().expect("inline calls lock")
     }
 
     /// Script the next raw-message answers, in call order.
@@ -372,6 +483,10 @@ impl FakeProviderFactory {
             body_uids: Arc::new(Mutex::new(Vec::new())),
             send_script: Arc::new(Mutex::new(VecDeque::new())),
             send_calls: Arc::new(Mutex::new(Vec::new())),
+            attachment_script: Arc::new(Mutex::new(VecDeque::new())),
+            inline_images_script: Arc::new(Mutex::new(VecDeque::new())),
+            attachment_calls: Arc::new(Mutex::new(Vec::new())),
+            inline_images_calls: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -425,6 +540,10 @@ impl ProviderFactory for FakeProviderFactory {
             calls: Arc::clone(&self.body_calls),
             raw_calls: Arc::clone(&self.raw_calls),
             uids: Arc::clone(&self.body_uids),
+            attachment_script: Arc::clone(&self.attachment_script),
+            inline_images_script: Arc::clone(&self.inline_images_script),
+            attachment_calls: Arc::clone(&self.attachment_calls),
+            inline_images_calls: Arc::clone(&self.inline_images_calls),
         }))
     }
 

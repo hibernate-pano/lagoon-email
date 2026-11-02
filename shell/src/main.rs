@@ -10,6 +10,7 @@
 
 mod api;
 mod backend;
+mod download;
 mod keys;
 mod port;
 mod selftest;
@@ -62,6 +63,20 @@ async fn restart_sidecar(state: State<'_, AppState>) -> Result<Value, String> {
     Ok(serde_json::json!({ "ok": true, "phase": "starting" }))
 }
 
+/// Contract §4.5: the binary channel (attachment bytes).
+#[tauri::command]
+async fn download(
+    state: State<'_, AppState>,
+    request: Value,
+) -> Result<download::DownloadResponse, String> {
+    let parsed: download::DownloadRequest = match request.get("request") {
+        Some(inner) => serde_json::from_value(inner.clone()),
+        None => serde_json::from_value(request),
+    }
+    .map_err(|error| format!("invalid DownloadRequest: {error}"))?;
+    Ok(download::run(&state.shared, parsed).await)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -94,7 +109,12 @@ fn main() {
         .manage(AppState {
             shared: shared.clone(),
         })
-        .invoke_handler(tauri::generate_handler![boot_status, api, restart_sidecar])
+        .invoke_handler(tauri::generate_handler![
+            boot_status,
+            api,
+            restart_sidecar,
+            download
+        ])
         .setup(move |app| {
             setup_shared.set_app(app.handle().clone());
             // Publish `starting` now that an emitter exists, so a front end

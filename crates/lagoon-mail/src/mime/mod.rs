@@ -22,5 +22,6 @@ pub use builder::{
     build_new_message, build_reply, OutboundAttachment, OutboundMessage, MAX_ATTACHMENT_BYTES,
 };
 pub use parser::{
-    parse, parse_with_options, AttachmentDisposition, ParsedAttachment, ParsedMessage,
+    parse, parse_with_options, parse_with_policy, AttachmentDisposition, DecodePolicy,
+    ParsedAttachment, ParsedMessage,
 };

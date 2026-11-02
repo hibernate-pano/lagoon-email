@@ -812,25 +812,6 @@ fn parse_remote_id(remote_id: &str) -> Option<Response> {
     }
 }
 
-/// GET /api/messages/{remoteId}/inline-images - cid images as data URLs.
-pub async fn inline_images(
-    State(state): State<AppState>,
-    Path(remote_id): Path<String>,
-    uri: Uri,
-) -> Response {
-    let params = query::parse(&uri);
-    let Some(account_id) = account_id_param(&params) else {
-        return respond::error(StatusCode::BAD_REQUEST, "malformed-accountId");
-    };
-    if let Some(response) = parse_remote_id(&remote_id) {
-        return response;
-    }
-    if let Some(response) = provider_gate(&state, account_id, "inline-images.error").await {
-        return response;
-    }
-    respond::error(StatusCode::SERVICE_UNAVAILABLE, "provider-not-configured")
-}
-
 /// GET /api/messages/{remoteId}/raw.eml - the original message bytes.
 pub async fn raw_eml(
     State(state): State<AppState>,

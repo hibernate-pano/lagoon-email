@@ -23,7 +23,8 @@ Lagoon.app
 
 | 能力 | 状态 |
 |---|---|
-| 读路径 | ✅ 列表 / 计数 / 简报 / 阅读器 / 搜索 / 导出 / 草稿 / 内联图 |
+| 读路径 | ✅ 列表 / 计数 / 简报 / 阅读器 / 搜索 / 导出 / 草稿 / 内联图（正文里的图片真的会显示） |
+| 附件 | ✅ 点一下就存到 `<数据目录>/downloads/` 并在访达里显示；同名不覆盖，**不自动打开**（附件是别人的文件，点一下不等于同意执行它） |
 | 正文 | ✅ 缓存优先；未缓存的邮件在首次打开时抓取并落库 |
 | 账号 | ✅ IMAP 连接、激活、删除；重新认证后同步循环自动恢复 |
 | 同步 | ✅ 每账号一个循环；UIDVALIDITY、指数退避、单写者 |
@@ -46,7 +47,7 @@ Lagoon.app
 bash scripts/build-product.sh
 open dist/Lagoon.app
 
-# 后端测试（184 个 lagoon-api 测试 + 203 个 lagoon-mail 测试）
+# 后端测试（198 个 lagoon-api 测试 + 209 个 lagoon-mail 测试）
 cargo test --manifest-path crates/Cargo.toml
 
 # 前端：类型检查与构建

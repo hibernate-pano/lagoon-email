@@ -193,6 +193,16 @@ export const zh = {
     readOnlyBadge: "M1 只读",
     readOnlyHint: "归档 / 删除 / 回复 / 置顶留到 M2；这一版只读。",
     replyNeedsBody: "先等正文加载出来——回复要用原信的内容。",
+    downloadHint: (name: string) => `保存 ${name}`,
+    downloadBusy: "另存一次，等这个存完再点下一个。",
+    downloadNoId: "这个附件没有可下载的分段 id，取不到字节。",
+    downloaded: (name: string) => `已保存 ${name}（已在访达里显示）`,
+    downloadStarted: (name: string) => `浏览器已开始下载 ${name}`,
+    downloadFailed: (why: string) => `附件没存下来：${why}`,
+    downloadNotReady: "后端还没就绪，等启动完成再试。",
+    downloadTimeout: "等后端超时了，重试可能有用。",
+    downloadTransport: "连不上本机后端（它可能刚退出）。",
+    downloadSaveFailed: (why: string) => `文件没能写进下载目录：${why}`,
   },
 
   compose: {

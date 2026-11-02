@@ -745,3 +745,109 @@ fn the_sync_seam_is_read_only_by_type() {
     let capabilities = use_seam(&mut provider);
     assert!(capabilities.is_some());
 }
+
+/// A message with one inline picture and one file attachment.
+fn multipart_message() -> Vec<u8> {
+    b"Message-ID: <m1@example.com>\r\nContent-Type: multipart/mixed; boundary=m\r\n\r\n\
+--m\r\nContent-Type: text/plain\r\n\r\nbody\r\n\
+--m\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\n\
+Content-Disposition: inline; filename=pic.png\r\nContent-ID: <pic1@example.com>\r\n\r\niVBORw0KGgo=\r\n\
+--m\r\nContent-Type: application/pdf; name=\"r.pdf\"\r\n\
+Content-Disposition: attachment; filename=\"r.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERg==\r\n\
+--m--\r\n"
+        .to_vec()
+}
+
+/// The download route asks for one part by its IMAP path. The bytes come back
+/// decoded, and the metadata needed for Content-Type / Content-Disposition
+/// comes with them.
+#[test]
+fn fetch_attachment_returns_the_bytes_of_the_requested_part() {
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1 UIDPLUS");
+    select_script(&transport, "A0003", 1, 7, 8);
+    let raw = multipart_message();
+    transport.enqueue_line(format!("* 1 FETCH (UID 42 BODY[] {{{}}}", raw.len()));
+    transport.enqueue_literal(raw);
+    transport.enqueue_line(")");
+    transport.enqueue_line("A0004 OK FETCH completed");
+    let mut provider = provider(&transport);
+
+    let fetched = provider
+        .fetch_attachment_with_hint("<m1@example.com>", Some(42), "1.3")
+        .unwrap();
+    assert_eq!(fetched.mime_type, "application/pdf");
+    assert_eq!(fetched.filename.as_deref(), Some("r.pdf"));
+    assert_eq!(fetched.data, b"%PDF".to_vec());
+}
+
+/// A part that is not in the message is not a transport failure and not a
+/// missing message: it is a fact about this message.
+#[test]
+fn fetch_attachment_of_a_part_that_is_not_there_says_not_found() {
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1 UIDPLUS");
+    select_script(&transport, "A0003", 1, 7, 8);
+    let raw = multipart_message();
+    transport.enqueue_line(format!("* 1 FETCH (UID 42 BODY[] {{{}}}", raw.len()));
+    transport.enqueue_literal(raw);
+    transport.enqueue_line(")");
+    transport.enqueue_line("A0004 OK FETCH completed");
+    let mut provider = provider(&transport);
+
+    let error = provider
+        .fetch_attachment_with_hint("<m1@example.com>", Some(42), "9.9")
+        .unwrap_err();
+    assert_eq!(error.kind(), MailErrorKind::AttachmentNotFound);
+    assert_eq!(error.code(), "attachment-not-found");
+}
+
+/// The reader resolves `cid:` references, so the inline images have to come
+/// back with their content ids and their bytes.
+#[test]
+fn fetch_inline_images_returns_the_pictures_with_their_content_ids() {
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1 UIDPLUS");
+    select_script(&transport, "A0003", 1, 7, 8);
+    let raw = multipart_message();
+    transport.enqueue_line(format!("* 1 FETCH (UID 42 BODY[] {{{}}}", raw.len()));
+    transport.enqueue_literal(raw);
+    transport.enqueue_line(")");
+    transport.enqueue_line("A0004 OK FETCH completed");
+    let mut provider = provider(&transport);
+
+    let images = provider
+        .fetch_inline_images_with_hint("<m1@example.com>", Some(42))
+        .unwrap();
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].content_id, "pic1@example.com");
+    assert_eq!(images[0].mime_type, "image/png");
+    assert_eq!(images[0].data, b"\x89PNG\r\n\x1a\n".to_vec());
+}
+
+/// A picture sent as a file can still carry a Content-ID. The body does not
+/// render it, and the inline policy does not decode it - so handing it back as
+/// an inline image would give the HTML an empty `data:` URL and the user a
+/// broken picture instead of the file they were sent.
+#[test]
+fn a_picture_attached_as_a_file_is_not_an_inline_image() {
+    let raw = b"Message-ID: <m2@example.com>\r\nContent-Type: multipart/mixed; boundary=m\r\n\r\n\
+--m\r\nContent-Type: text/plain\r\n\r\nbody\r\n\
+--m\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=photo.png\r\nContent-ID: <photo@example.com>\r\n\r\niVBORw0KGgo=\r\n\
+--m--\r\n"
+        .to_vec();
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1 UIDPLUS");
+    select_script(&transport, "A0003", 1, 7, 8);
+    transport.enqueue_line(format!("* 1 FETCH (UID 42 BODY[] {{{}}}", raw.len()));
+    transport.enqueue_literal(raw);
+    transport.enqueue_line(")");
+    transport.enqueue_line("A0004 OK FETCH completed");
+    let mut provider = provider(&transport);
+
+    let images = provider
+        .fetch_inline_images_with_hint("<m2@example.com>", Some(42))
+        .unwrap();
+    assert!(images.is_empty(), "not an inline image: {images:?}");
+}

@@ -812,6 +812,10 @@ fn send_error(error: &ProviderError) -> (StatusCode, &'static str) {
         ProviderError::NotConfigured(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, "provider-not-configured")
         }
+        // A part that is not in the message and a body that is too big are
+        // facts about the mail, not delivery failures. SMTP never sees them.
+        ProviderError::NotFound(_) => (StatusCode::NOT_FOUND, "attachment-not-found"),
+        ProviderError::TooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "attachment-too-large"),
         ProviderError::Unreachable(_) | ProviderError::Protocol(_) => {
             (StatusCode::BAD_GATEWAY, "smtp-send-failed")
         }

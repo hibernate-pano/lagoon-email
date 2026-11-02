@@ -121,6 +121,11 @@ pub struct Shared {
     pub supervising: AtomicBool,
     /// Set on app exit: the supervisor must stop restarting things.
     pub shutdown: AtomicBool,
+    /// Where downloads land. None until the supervisor has resolved the data
+    /// directory, which happens before `phase=ready` — so a download that
+    /// arrives while it is None is a 0-status "not ready", never a stray file
+    /// in the working directory.
+    downloads: Mutex<Option<std::path::PathBuf>>,
     /// The port the backend reported on stdout (`LAGOON_PORT=<u16>`). Zero
     /// until the line arrives. The handshake waits for it instead of choosing
     /// a port itself: a port the shell chose can be stolen between the probe
@@ -147,8 +152,18 @@ impl Shared {
             http,
             supervising: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            downloads: Mutex::new(None),
             reported_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
         }
+    }
+
+    /// The data directory resolved when the supervisor started.
+    pub fn set_downloads_dir(&self, dir: std::path::PathBuf) {
+        *self.downloads.lock().unwrap() = Some(dir);
+    }
+
+    pub fn downloads_dir(&self) -> Option<std::path::PathBuf> {
+        self.downloads.lock().unwrap().clone()
     }
 
     pub fn clear_reported_port(&self) {

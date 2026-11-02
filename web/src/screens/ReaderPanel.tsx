@@ -18,7 +18,8 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { AiStatus, Attachment, ConnectedAccount, InlineImagesResponse, MessageBody, MessageSummary } from "../core/types";
-import { apiCall } from "../core/api";
+import { apiCall, downloadFile, type ApiFailureCode } from "../core/api";
+import { attachmentPath, downloadName, formatSize, isDownloadable, isInlineImage } from "../core/attachments";
 import { COMMON_UNAVAILABLE, describeHttpFailure } from "../core/errors";
 import { useApiOutcome } from "../core/hooks";
 import type { SendOriginal } from "../core/send";
@@ -29,12 +30,7 @@ import type { WriteBridge } from "../core/uiBridge";
 import { HtmlFrame } from "./HtmlFrame";
 import { t } from "../l10n/zh";
 
-function isInlineImage(attachment: Attachment): boolean {
-  return attachment.disposition === "inline" && attachment.mimeType.startsWith("image/");
-}
-
-function mimeMapOf(attachments: Attachment[]): Record<string, string> {
-  const map: Record<string, string> = {};
+function mimeMapOf(attachments: Attachment[]): Record<string, string> {  const map: Record<string, string> = {};
   for (const attachment of attachments) {
     const cid = attachment.contentId?.trim().toLowerCase();
     if (cid) map[cid] = attachment.mimeType;
@@ -42,8 +38,28 @@ function mimeMapOf(attachments: Attachment[]): Record<string, string> {
   return map;
 }
 
-function SummaryPanel(props: { remoteId: string; accountId: string }): ReactNode {
-  const [opened, setOpened] = useState(false);
+/**
+ * What to say when the download never reached the server (or its bytes never
+ * reached the disk). The shell's messages are English diagnostics; these are
+ * the user's copy. `bad-path` / `bad-request` are front-end bugs, and there
+ * the diagnostic itself is the truth worth showing.
+ */
+function downloadFailureText(code: ApiFailureCode | "save", message: string): string {
+  switch (code) {
+    case "not-ready":
+      return t.reader.downloadNotReady;
+    case "timeout":
+      return t.reader.downloadTimeout;
+    case "transport":
+      return t.reader.downloadTransport;
+    case "save":
+      return t.reader.downloadSaveFailed(message);
+    default:
+      return message;
+  }
+}
+
+function SummaryPanel(props: { remoteId: string; accountId: string }): ReactNode {  const [opened, setOpened] = useState(false);
   const summary = useApiOutcome<MessageSummary>({
     deps: [props.remoteId, opened],
     enabled: opened,
@@ -114,6 +130,8 @@ export interface ReaderPanelProps {
    * to it. `undefined` when there is nothing to reply to.
    */
   onReplyTarget: (original: SendOriginal | undefined) => void;
+  /** One line of feedback for the toast (a download has a visible result). */
+  onToast: (text: string) => void;
 }
 
 export function ReaderPanel(props: ReaderPanelProps): ReactNode {
@@ -121,6 +139,8 @@ export function ReaderPanel(props: ReaderPanelProps): ReactNode {
   const [images, setImages] = useState<Record<string, string>>({});
   const [imagesFailed, setImagesFailed] = useState(0);
   const [imagesLoading, setImagesLoading] = useState(false);
+  /** The attachment id being saved; one at a time (each save fetches the message). */
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
 
   const body = useApiOutcome<MessageBody>({
     deps: [remoteId, account.id],
@@ -214,6 +234,37 @@ export function ReaderPanel(props: ReaderPanelProps): ReactNode {
     };
   }, [bodyData, account.id]);
 
+  /**
+   * Save one attachment.
+   *
+   * Bytes cannot ride the JSON proxy, so this goes through `downloadFile`: the
+   * shell writes the file beside the store and reveals it in Finder, the
+   * browser build hands the Blob to the browser. It never *opens* the file —
+   * an attachment is someone else's file, and clicking a chip is not consent
+   * to run it.
+   */
+  async function download(attachment: Attachment): Promise<void> {
+    if (remoteId === null || downloadingId !== null) return;
+    setDownloadingId(attachment.id);
+    try {
+      const name = downloadName(attachment);
+      const result = await downloadFile({
+        path: attachmentPath(remoteId, attachment.id),
+        query: { accountId: account.id },
+        filename: name,
+      });
+      if (result.kind === "saved") {
+        props.onToast(result.path ? t.reader.downloaded(name) : t.reader.downloadStarted(name));
+      } else if (result.kind === "http") {
+        props.onToast(t.reader.downloadFailed(describeHttpFailure(result.code, result.status)));
+      } else {
+        props.onToast(t.reader.downloadFailed(downloadFailureText(result.code, result.message)));
+      }
+    } finally {
+      setDownloadingId(null);
+    }
+  }
+
   if (remoteId === null) {
     return (
       <div className="pane">
@@ -253,8 +304,8 @@ export function ReaderPanel(props: ReaderPanelProps): ReactNode {
                   {t.reader.to}: {bodyData.to.join(", ") || bodyData.toAddress || "—"}
                 </span>
                 {bodyData.cc.length > 0 ? <span>{t.reader.cc}: {bodyData.cc.join(", ")}</span> : null}
-                {bodyData.attachments.filter((a) => a.disposition !== "inline").length > 0 ? (
-                  <span>{t.reader.attachments(bodyData.attachments.filter((a) => a.disposition !== "inline").length)}</span>
+                {bodyData.attachments.filter(isDownloadable).length > 0 ? (
+                  <span>{t.reader.attachments(bodyData.attachments.filter(isDownloadable).length)}</span>
                 ) : null}
               </div>
             </div>
@@ -297,15 +348,34 @@ export function ReaderPanel(props: ReaderPanelProps): ReactNode {
                       <div className="plain-body">{data.text}</div>
                     )}
                     {data.hasMore ? <Banner tone="info" title={t.six.partial} detail="hasMore=true：正文被截断（服务端分页）。" /> : null}
-                    {data.attachments.filter((a) => a.disposition !== "inline").length > 0 ? (
+                    {data.attachments.filter(isDownloadable).length > 0 ? (
                       <div className="attach-list">
                         {data.attachments
-                          .filter((a) => a.disposition !== "inline")
-                          .map((a) => (
-                            <span className="chip" key={a.id}>
-                              📎 {a.filename ?? a.id} · {a.mimeType}
-                            </span>
-                          ))}
+                          .filter(isDownloadable)
+                          .map((a) => {
+                            const size = formatSize(a.size);
+                            const busy = downloadingId === a.id;
+                            // A part with no id has no route to fetch it from;
+                            // it is listed, but not offered.
+                            const offered = isDownloadable(a);
+                            const title = !offered
+                              ? t.reader.downloadNoId
+                              : downloadingId !== null && !busy
+                                ? t.reader.downloadBusy
+                                : t.reader.downloadHint(downloadName(a));
+                            return (
+                              <button
+                                key={a.id}
+                                className="chip"
+                                disabled={!offered || downloadingId !== null}
+                                title={title}
+                                onClick={() => void download(a)}
+                              >
+                                {busy ? "⏳" : "📎"} {a.filename ?? a.id}
+                                {size ? " · " + size : ""} · {a.mimeType}
+                              </button>
+                            );
+                          })}
                       </div>
                     ) : null}
                     <SummaryPanel remoteId={data.remoteId} accountId={account.id} />

@@ -176,6 +176,116 @@ export async function apiHealth(): Promise<CallResult<string>> {
   return { kind: "ok", status: 200, data: typeof res.body === "string" ? res.body : "" };
 }
 
+// ------------------------------------------------------------- downloads ----
+
+/**
+ * What a download produced.
+ *
+ * Same three-way split as `CallResult`, plus the path the shell saved to. The
+ * browser build has no path: the browser picked the location itself.
+ */
+export type DownloadResult =
+  | { kind: "saved"; status: number; path: string | null }
+  | { kind: "http"; status: number; code: string | null }
+  | { kind: "fail"; code: ApiFailureCode | "save"; message: string };
+
+/** The shell's answer (contract §4.5). */
+interface ShellDownload {
+  ok: boolean;
+  status: number;
+  path?: string;
+  code?: string;
+  error?: { code: string; message: string };
+}
+
+/**
+ * Fetch a binary resource and hand it to the OS.
+ *
+ * This exists because `api` carries JSON only: a PDF cannot ride the proxy
+ * without being destroyed. The token rule is unchanged — in the app the shell
+ * adds it, in the browser the dev proxy does — so this function never sees a
+ * credential either.
+ */
+export async function downloadFile(request: {
+  path: string;
+  query?: ApiRequest["query"];
+  /** The name to save under. */
+  filename: string;
+}): Promise<DownloadResult> {
+  if (!isAllowedPath(request.path)) {
+    return { kind: "fail", code: "bad-path", message: `非法路径：${request.path}` };
+  }
+
+  try {
+    if (isTauriMode()) {
+      const core = await import("@tauri-apps/api/core");
+      const answer = (await core.invoke("download", {
+        request: { path: request.path, query: request.query, filename: request.filename },
+      })) as ShellDownload;
+      if (!answer.ok) {
+        return {
+          kind: "fail",
+          code: (answer.error?.code as ApiFailureCode | "save") ?? "transport",
+          message: answer.error?.message ?? "下载没有开始。",
+        };
+      }
+      if (answer.status < 200 || answer.status >= 300) {
+        return { kind: "http", status: answer.status, code: answer.code ?? null };
+      }
+      return { kind: "saved", status: answer.status, path: answer.path ?? null };
+    }
+
+    if (!hasSidecar) {
+      return {
+        kind: "fail",
+        code: "not-ready",
+        message: "浏览器模式没有配到边车：v4/.dev/web.env 缺失或不完整。",
+      };
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), READ_TIMEOUT_MS);
+    const res = await fetch(request.path + buildQuery(request.query), {
+      headers: { Accept: "*/*" },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) {
+      let code: string | null = null;
+      try {
+        const text = await res.text();
+        const parsed = JSON.parse(text) as unknown;
+        code = errorCodeOf(parsed);
+      } catch {
+        code = null;
+      }
+      return { kind: "http", status: res.status, code };
+    }
+    const blob = await res.blob();
+    // The browser owns the file from here; there is no path to report.
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = request.filename;
+    anchor.rel = "noopener";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    // Revoke on the next tick: revoking synchronously can cancel the download
+    // in some WebKit builds.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    return { kind: "saved", status: res.status, path: null };
+  } catch (error) {
+    const aborted = error instanceof DOMException && error.name === "AbortError";
+    return {
+      kind: "fail",
+      code: aborted ? "timeout" : "transport",
+      message: aborted
+        ? "边车没有在超时时间内答复。"
+        : `连不上边车：${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
 /** Browser-mode diagnostics for the boot screen. Never includes the token. */
 export function transportDescription(): string {
   if (isTauriMode()) return "Tauri IPC（token 只在外壳进程里）";

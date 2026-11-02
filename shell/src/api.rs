@@ -78,7 +78,12 @@ impl ApiResponse {
 }
 
 /// Deserialize `query` from a map of JSON values into a map of strings.
-fn stringify_query<'de, D>(deserializer: D) -> Result<Option<HashMap<String, String>>, D::Error>
+///
+/// Shared with `download`: one query encoding for both channels, so a retry
+/// sends the same URL from either.
+pub(crate) fn stringify_query<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -191,7 +196,7 @@ fn percent_encode(input: &str) -> String {
 
 /// Path plus the encoded query. Pairs are sorted so a retry sends the same
 /// URL, which makes server-side logs comparable.
-fn with_query(path: &str, query: &Option<HashMap<String, String>>) -> String {
+pub(crate) fn with_query(path: &str, query: &Option<HashMap<String, String>>) -> String {
     let Some(query) = query else {
         return path.to_string();
     };

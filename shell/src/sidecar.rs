@@ -408,6 +408,10 @@ pub async fn supervise(shared: Arc<Shared>) {
             return;
         }
     };
+    // Downloads land beside the store, not in the working directory: a dev run
+    // and a packaged run then behave the same way, and nothing is written to
+    // a directory the user did not choose.
+    shared.set_downloads_dir(ctx.data_dir.join("downloads"));
 
     let mut restarts_left = 1u8;
     loop {

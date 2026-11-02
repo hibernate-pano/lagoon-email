@@ -47,6 +47,13 @@ pub enum ProviderError {
     /// The message no longer exists (or is no longer visible) on the server.
     /// Distinct from `Protocol`: the session is healthy, the data is gone.
     MessageGone,
+    /// The message exists, but the part asked for is not in it.
+    ///
+    /// Distinct from `MessageGone`: the mail is readable, this attachment is
+    /// not. The download route answers 404 for it and 410 for a gone message.
+    NotFound(String),
+    /// The bytes are larger than this route is willing to hand out.
+    TooLarge(String),
 }
 
 impl std::fmt::Display for ProviderError {
@@ -59,6 +66,8 @@ impl std::fmt::Display for ProviderError {
             }
             ProviderError::Protocol(message) => write!(formatter, "imap protocol error: {message}"),
             ProviderError::MessageGone => formatter.write_str("message gone"),
+            ProviderError::NotFound(message) => write!(formatter, "not found: {message}"),
+            ProviderError::TooLarge(message) => write!(formatter, "too large: {message}"),
         }
     }
 }
@@ -149,6 +158,29 @@ pub type BodyFuture<'a> =
 
 pub type RawFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, ProviderError>> + Send + 'a>>;
 
+/// One attachment's bytes, as the download route hands them out.
+#[derive(Debug, Clone, Default)]
+pub struct MailAttachment {
+    pub filename: Option<String>,
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
+/// One inline picture: the bytes and the content id the HTML refers to.
+#[derive(Debug, Clone, Default)]
+pub struct MailInlineImage {
+    /// The content id without the angle brackets, as `cid:` uses it.
+    pub content_id: String,
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
+pub type AttachmentFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<MailAttachment>, ProviderError>> + Send + 'a>>;
+
+pub type InlineImagesFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<MailInlineImage>, ProviderError>> + Send + 'a>>;
+
 /// The read-only body surface.
 ///
 /// Separate from [`MailProvider`] on purpose: a body fetch is not a sync round,
@@ -167,6 +199,37 @@ pub trait MailBodyProvider: Send + Sync {
     fn fetch_raw(&self, remote_id: &str, uid_hint: Option<i64>) -> RawFuture<'_> {
         let _ = (remote_id, uid_hint);
         Box::pin(async { Err(ProviderError::NotConfigured("raw".to_owned())) })
+    }
+
+    /// One attachment's bytes, by its part id.
+    ///
+    /// `Ok(None)` is a fact, not a failure: the message is there and the part
+    /// is not. The route answers 404 `attachment-not-found` for it and 410
+    /// `message-gone` for a message that is gone.
+    ///
+    /// The default is "no such capability": a build without mail support
+    /// answers 503 on this route, exactly as the contract's fixtures say.
+    fn fetch_attachment(
+        &self,
+        remote_id: &str,
+        uid_hint: Option<i64>,
+        attachment_id: &str,
+    ) -> AttachmentFuture<'_> {
+        let _ = (remote_id, uid_hint, attachment_id);
+        Box::pin(async { Err(ProviderError::NotConfigured("attachment".to_owned())) })
+    }
+
+    /// The message's inline pictures, with the content ids the HTML refers to.
+    ///
+    /// One fetch for all of them: asking per picture would re-download the
+    /// whole message for every `cid:` in the body.
+    fn fetch_inline_images(
+        &self,
+        remote_id: &str,
+        uid_hint: Option<i64>,
+    ) -> InlineImagesFuture<'_> {
+        let _ = (remote_id, uid_hint);
+        Box::pin(async { Err(ProviderError::NotConfigured("inline-images".to_owned())) })
     }
 }
 

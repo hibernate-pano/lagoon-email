@@ -79,7 +79,7 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | 400 | 参数/请求体形状错误 | `malformed-*`、`invalid-*`、`missing-body`、`empty-remoteIds` |
 | 401 | 凭据缺失/错误（API token 或 IMAP/SMTP 凭据） | `api-unauthorized`、`imap-auth-failed`、`smtp-auth-failed`、`provider-auth-failed` |
 | 403 | Host 非法，或跨账号访问唯一一处（草稿选择） | `forbidden-host`、`draft-different-account` |
-| 404 | 目标不存在；也用于"能力确定的否定"（`sent-unavailable`） | `unknown-account`、`unknown-message`、`unknown-stack`、`unknown-draft`、`unknown-reminder`、`unknown-advice`、`unknown-action`、`sent-unavailable` |
+| 404 | 目标不存在；也用于"能力确定的否定"（`sent-unavailable`） | `unknown-account`、`unknown-message`、`attachment-not-found`、`unknown-stack`、`unknown-draft`、`unknown-reminder`、`unknown-advice`、`unknown-action`、`sent-unavailable` |
 | 409 | 冲突或能力闸门 | `archive-unavailable`、`delete-unavailable`、`not-in-trash`、`send-in-flight`、`already-undone`、`account-exists` |
 | 410 | 邮件已在服务端消失；撤销过期 | `message-gone`、`action-expired` |
 | 413 | 附件超限（单附件 25 MB） | `attachment-too-large` |
@@ -176,9 +176,9 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | Method Path | 入参 | 成功 | 错误 | 远端 | fixture |
 |---|---|---|---|---|---|
 | `GET /api/messages/:remoteId/body` | query `accountId` | 200 `MessageBody`（命中本地缓存即返回） | 400 `malformed-accountId`/`malformed-remoteId`；404 `unknown-account`；410 `message-gone`；401 `provider-auth-failed`；413 `attachment-too-large`；502 `provider-unreachable`；503 `provider-not-configured` | ✉读（未缓存时） | `body.provider-unconfigured`（503 路径） |
-| `GET /api/messages/:remoteId/attachments/:attachmentId` | query `accountId` | 200 二进制；`Content-Type`=原 MIME；`Content-Disposition: attachment; filename="…"; filename*=UTF-8''…` | 400；404 `attachment-not-found`/`unknown-account`；413 `attachment-too-large`；401；502；503 | ✉读（每次重解析整封） | — |
+| `GET /api/messages/:remoteId/attachments/:attachmentId` | query `accountId`；`:attachmentId` 是 IMAP 分段路径（`1`、`1.2`，只允许数字与点） | 200 二进制；`Content-Type`=原 MIME；`Content-Disposition: attachment; filename="…"; filename*=UTF-8''…` | 400 `malformed-accountId`/`malformed-remoteId`/`malformed-attachmentId`；404 `attachment-not-found`/`unknown-account`；413 `attachment-too-large`；410 `message-gone`；401；502；503 | ✉读（每次重解析整封） | `r5_attachments.rs`（fake provider，锁 200/404/410/413/503 与文件名） |
 | `GET /api/messages/:remoteId/raw.eml` | query `accountId` | 200 `message/rfc822`，文件名 = subject（≤80）`.eml` | 同 attachments（无 413） | ✉读 | `raw-eml.provider-unconfigured`（503 路径） |
-| `GET /api/messages/:remoteId/inline-images` | query `accountId` | 200 `InlineImagesResponse`（≤40 张且 ≤8 MB；键为小写、去尖括号的 content-id） | 400；404 `unknown-account`；410；401；502；503 | ✉读（一次读整封） | `inline-images.provider-unconfigured`（503 路径） |
+| `GET /api/messages/:remoteId/inline-images` | query `accountId` | 200 `InlineImagesResponse`（`images: {contentId: base64}`，≤40 张且 ≤8 MB；键为小写、去尖括号的 content-id，值不带 `data:` 前缀） | 400；404 `unknown-account`；410 `message-gone`；401；502；503 | ✉读（一次读整封） | `r5_attachments.rs`（含 40 张上限） |
 | `GET /api/messages/:remoteId/summary` | query `accountId`；header `Accept-Language` | 200 `MessageSummary` | 503 `ai-not-configured`/`ai-credit-exhausted`/`ai-budget-exceeded`/`ai-circuit-open`；502 `ai-error`/`provider-unreachable`；400；404；410；401 | ⊕ LLM | — |
 
 ### 4.4 本地状态写（不改远端）
@@ -331,10 +331,11 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | 覆盖程度 | 端点 |
 |---|---|
 | **有 fixture（56 条抓取，成功或错误路径）** | `healthz`、accounts 列表、messages 列表（5 个 lens + 2 个 400 + 账号 B 列表）、folder-counts、senders（空/有数据）、export/index、advice 列表（空/有数据/`decision=any`）、advice accepted-stats、stacks（空/有数据）、reminders（空/有数据/含 dismissed）、time-saved（零/非零）、actions 列表（有数据）、usage、ai-status、ai/reload、ai/probe、store-notices（1 条）、briefing、body（缓存 **200** / 无 provider 503）、inline-images(503)、raw.eml(503)、summary(503)、draft 生成(503)、drafts 列表（有数据）、sent(200+stale)、archive(409)、folder-counts(404)、read(204+200)、pin(200)、sync(204)、accounts IMAP（空体/缺字段/未知服务商/已存在）、auth 401×2、host 403、unknown-route 404×2 |
-| **只有本文定义（实现前必须补 fixture）** | accounts 激活/删除、attachments 下载、send/compose/forward、draft choose、delete/unarchive/restore/purge/trash-empty、delete-bulk/archive-bulk、unsubscribe、classify、actions undo/undo-bulk、advice decision、stacks 增删改、reminders 写、store-notices ack |
+| **只有本文定义（实现前必须补 fixture）** | accounts 激活/删除、send/compose/forward、draft choose、delete/unarchive/restore/purge/trash-empty、delete-bulk/archive-bulk、unsubscribe、classify、actions undo/undo-bulk、advice decision、stacks 增删改、reminders 写、store-notices ack |
+| **集成测试锁住（fake provider，非抓取 fixture）** | `GET …/attachments/:id`（200 字节 + 文件名、404、410、413、503）、`GET …/inline-images`（200 base64、410、40 张上限）——见 `crates/lagoon-api/tests/r5_attachments.rs` |
 | **contract_expected（v3 不通过，对实现断言）** | `GET /api/search` ×2：subject 命中、sealed-body 命中（见 §7.1） |
 | **r2_skip（写路径，R2 不断言）** | `POST /api/messages/:remoteId/read`（默认 + `record=true` 两态）、`POST /api/messages/:remoteId/pin` |
 
 > 判定口径：fixtures 覆盖的是"**形状**"（路径、状态码、content-type、错误 code、字段集合），不是"业务正确性"。业务正确性由 v3 的 53k 行测试与 M2 的逐屏对照负责；Rust/Web 只要通过 fixtures + 本文，就算契约一致。
 >
-> 仍存的空白：`attachments` 字节下载与 `raw.eml` 的 **200** 响应需要真实 IMAP（本仓库禁止联网抓取），fixtures 只锁它们的 503 形状；200 形状以 §3 类型表为准。`body` 的 200 已由「封存正文缓存」覆盖（`body.cached`）。
+> 仍存的空白：`raw.eml` 的 **200** 响应需要真实 IMAP（本仓库禁止联网抓取），fixtures 只锁它的 503 形状；200 形状以 §3 类型表为准。`attachments` 与 `inline-images` 的 200 已由 fake provider 的集成测试锁住（形状与错误码，不是真实服务器的边界行为）。`body` 的 200 已由「封存正文缓存」覆盖（`body.cached`）。

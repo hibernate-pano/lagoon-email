@@ -16,6 +16,8 @@ pub mod respond;
 pub mod routes;
 /// The AI routes: status, summary, draft, reload, probe.
 pub mod routes_ai;
+/// The mailbox reads that need a provider: inline images and attachments.
+pub mod routes_attachments;
 pub mod routes_r2;
 pub mod routes_r3;
 pub mod routes_r5;
@@ -196,6 +198,18 @@ impl AppState {
         let credentials = crate::token::ImapCredentials::open(token_key, &blob).ok()?;
         self.provider_factory.make_body(&credentials)
     }
+
+    /// Whether the store knows this account.
+    ///
+    /// `None` means the store could not answer - which is not the same as
+    /// "no such account". A route that treats it as "no" would answer 404
+    /// unknown-account for a database hiccup.
+    pub async fn account_exists(&self, account_id: crate::uuid::Uuid) -> Option<bool> {
+        self.db
+            .read(move |connection| crate::store::accounts::exists(connection, account_id))
+            .await
+            .ok()
+    }
 }
 
 fn build_supervisor(
@@ -242,7 +256,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/messages/{remote_id}/summary", get(routes_ai::summary))
         .route(
             "/api/messages/{remote_id}/inline-images",
-            get(routes_r2::inline_images),
+            get(routes_attachments::inline_images),
+        )
+        .route(
+            "/api/messages/{remote_id}/attachments/{attachment_id}",
+            get(routes_attachments::attachment),
         )
         .route("/api/messages/{remote_id}/raw.eml", get(routes_r2::raw_eml))
         // R3.5a: the write paths. archive replaces the R2 503 stub; the rest

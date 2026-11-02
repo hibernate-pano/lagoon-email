@@ -45,6 +45,11 @@ pub enum MailErrorKind {
     UnsafeOperation,
     /// A protocol frame exceeded a hard bound.
     TooLarge,
+    /// The message is there, but the part asked for is not in it.
+    ///
+    /// Distinct from `MessageGone`: the mail still exists, this part does not.
+    /// The download route answers 404 for it and 410 for a gone message.
+    AttachmentNotFound,
 }
 
 impl MailErrorKind {
@@ -63,6 +68,7 @@ impl MailErrorKind {
             Self::MissingCapability => "capability-missing",
             Self::UnsafeOperation => "unsafe-operation",
             Self::TooLarge => "too-large",
+            Self::AttachmentNotFound => "attachment-not-found",
         }
     }
 }
@@ -152,6 +158,10 @@ impl MailError {
         Self::new(MailErrorKind::TooLarge, code)
     }
 
+    pub fn attachment_not_found() -> Self {
+        Self::new(MailErrorKind::AttachmentNotFound, "attachment-not-found")
+    }
+
     pub fn kind(&self) -> MailErrorKind {
         self.kind
     }
@@ -183,7 +193,8 @@ impl MailError {
             | MailErrorKind::SentUnavailable
             | MailErrorKind::MissingCapability
             | MailErrorKind::UnsafeOperation
-            | MailErrorKind::TooLarge => true,
+            | MailErrorKind::TooLarge
+            | MailErrorKind::AttachmentNotFound => true,
             MailErrorKind::AuthFailed
             | MailErrorKind::Unreachable
             | MailErrorKind::NotConfigured

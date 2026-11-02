@@ -89,6 +89,7 @@ export function describeHttpFailure(code: string | null, status: number): string
 const CODE_SENTENCES: Record<string, string> = {
   "account-exists": "这个邮箱已经连接过了；重复连接不会覆盖现有凭据。",
   "ai-error": "模型回答了，但答的不是能用的东西（502）。重试可能有用；一直失败就是 bug。",
+  "attachment-not-found": "这封邮件里没有这个附件（可能在服务器上已被替换或删除）。",
   "draft-unreadable": "这封草稿在本地解不开（密钥变了或数据损坏），只能重新生成。",
   "empty-actionIds": "批量请求没有带动作 id（前端 bug）。",
   "empty-remoteIds": "批量请求没有带邮件 id（前端 bug）。",
@@ -98,6 +99,7 @@ const CODE_SENTENCES: Record<string, string> = {
   "internal-error": "服务端内部错误（500）。重试可能有用；一直失败就是 bug。",
   "invalid-body": "请求体不是合法 JSON（前端 bug）。",
   "malformed-action-id": "动作 id 格式不对（前端 bug）。",
+  "malformed-attachmentId": "附件 id 格式不对（前端 bug）。",
   "malformed-before": "before 参数格式不对（前端 bug）。",
   "malformed-decision": "决定的取值不合法（前端 bug）。",
   "malformed-pinned": "pinned 参数不是布尔值（前端 bug）。",

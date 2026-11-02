@@ -22,9 +22,10 @@ use lagoon_mail::transport::{TlsTransport, Transport};
 use lagoon_mail::{ChangeSet, RemoteHeader as MailRemoteHeader};
 
 use crate::provider::{
-    BodyFuture, MailBody, MailBodyProvider, MailChangeSet, MailProvider, MailSendProvider,
-    MailWriteProvider, OutgoingMail, ProbeFuture, ProbeOutcome, ProviderError, ProviderFactory,
-    PullFuture, RawFuture, RemoteHeader, SendFuture, SentMail, WriteFuture,
+    AttachmentFuture, BodyFuture, InlineImagesFuture, MailAttachment, MailBody, MailBodyProvider,
+    MailChangeSet, MailInlineImage, MailProvider, MailSendProvider, MailWriteProvider,
+    OutgoingMail, ProbeFuture, ProbeOutcome, ProviderError, ProviderFactory, PullFuture, RawFuture,
+    RemoteHeader, SendFuture, SentMail, WriteFuture,
 };
 use crate::sync::SyncCursor;
 use crate::token::ImapCredentials;
@@ -69,6 +70,8 @@ impl LagoonMailProvider {
                 ProviderError::Unreachable(error.kind().label().to_owned())
             }
             MailErrorKind::MessageGone => ProviderError::MessageGone,
+            MailErrorKind::AttachmentNotFound => ProviderError::NotFound(error.code().to_owned()),
+            MailErrorKind::TooLarge => ProviderError::TooLarge(error.code().to_owned()),
             other => ProviderError::Protocol(other.label().to_owned()),
         }
     }
@@ -281,6 +284,69 @@ impl MailBodyProvider for LagoonMailBody {
             .await
             .map_err(|_| ProviderError::Protocol("join".to_owned()))?
             .map_err(|error| LagoonMailProvider::map_error(&error))
+        })
+    }
+
+    /// One attachment's bytes. A part that is not in the message is `Ok(None)`:
+    /// the mail is readable, this part is not — the route says 404, not 410.
+    fn fetch_attachment(
+        &self,
+        remote_id: &str,
+        uid_hint: Option<i64>,
+        attachment_id: &str,
+    ) -> AttachmentFuture<'_> {
+        let transport = Arc::clone(&self.transport);
+        let credentials = self.credentials.clone();
+        let preset = self.preset;
+        let remote_id = remote_id.to_owned();
+        let attachment_id = attachment_id.to_owned();
+        Box::pin(async move {
+            let fetched = tokio::task::spawn_blocking(move || {
+                let mut provider =
+                    ImapProvider::new(preset, credentials, Box::new(move || (transport)()));
+                provider.fetch_attachment_with_hint(&remote_id, uid_hint, &attachment_id)
+            })
+            .await
+            .map_err(|_| ProviderError::Protocol("join".to_owned()))?;
+            match fetched {
+                Ok(fetched) => Ok(Some(MailAttachment {
+                    filename: fetched.filename,
+                    mime_type: fetched.mime_type,
+                    data: fetched.data,
+                })),
+                Err(error) if error.kind() == MailErrorKind::AttachmentNotFound => Ok(None),
+                Err(error) => Err(LagoonMailProvider::map_error(&error)),
+            }
+        })
+    }
+
+    /// The message's inline pictures, in one fetch.
+    fn fetch_inline_images(
+        &self,
+        remote_id: &str,
+        uid_hint: Option<i64>,
+    ) -> InlineImagesFuture<'_> {
+        let transport = Arc::clone(&self.transport);
+        let credentials = self.credentials.clone();
+        let preset = self.preset;
+        let remote_id = remote_id.to_owned();
+        Box::pin(async move {
+            let images = tokio::task::spawn_blocking(move || {
+                let mut provider =
+                    ImapProvider::new(preset, credentials, Box::new(move || (transport)()));
+                provider.fetch_inline_images_with_hint(&remote_id, uid_hint)
+            })
+            .await
+            .map_err(|_| ProviderError::Protocol("join".to_owned()))?
+            .map_err(|error| LagoonMailProvider::map_error(&error))?;
+            Ok(images
+                .into_iter()
+                .map(|image| MailInlineImage {
+                    content_id: image.content_id,
+                    mime_type: image.mime_type,
+                    data: image.data,
+                })
+                .collect())
         })
     }
 }

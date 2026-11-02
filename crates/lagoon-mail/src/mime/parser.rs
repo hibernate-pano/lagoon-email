@@ -46,6 +46,40 @@ impl AttachmentDisposition {
     }
 }
 
+/// Which attachment bytes a parse decodes.
+///
+/// Decoding is the expensive half of a parse: a 25 MB attachment is 33 MB of
+/// base64 on the wire, and decoding it to throw it away is pure waste. Three
+/// callers want three different things — the body route wants metadata only,
+/// the inline-image route wants the pictures, the download route wants one
+/// part — so the choice is explicit rather than "decode everything".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodePolicy {
+    /// No attachment bytes: metadata only.
+    None,
+    /// Every attachment's bytes.
+    All,
+    /// Only the inline images (`Content-Disposition: inline` and an image
+    /// type — the parts a `cid:` reference can point at).
+    InlineImages,
+    /// Only the part with this id (the IMAP part path, `1.2`).
+    Part(String),
+}
+
+impl DecodePolicy {
+    /// Whether the part described by these attributes carries bytes.
+    fn decodes(&self, id: &str, mime_type: &str, disposition: AttachmentDisposition) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::InlineImages => {
+                disposition == AttachmentDisposition::Inline && mime_type.starts_with("image/")
+            }
+            Self::Part(wanted) => id == wanted,
+        }
+    }
+}
+
 /// One attachment. `id` is the IMAP part path (`1`, `1.2`) so the attachment
 /// route can re-fetch a single part with `BODY[1.2]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,16 +113,26 @@ pub struct ParsedMessage {
 
 /// Full parse without attachment bytes (the body route's shape).
 pub fn parse(message: &[u8]) -> ParsedMessage {
-    parse_with_options(message, false)
+    parse_with_policy(message, &DecodePolicy::None)
 }
 
 /// Full parse. `decode_attachment_bytes` defaults to `false` because the body
 /// route strips attachment bytes before the wire response; decoding them there
 /// was pure waste. The attachment download route passes `true`.
 pub fn parse_with_options(message: &[u8], decode_attachment_bytes: bool) -> ParsedMessage {
+    let policy = if decode_attachment_bytes {
+        DecodePolicy::All
+    } else {
+        DecodePolicy::None
+    };
+    parse_with_policy(message, &policy)
+}
+
+/// Full parse under an explicit decode policy.
+pub fn parse_with_policy(message: &[u8], policy: &DecodePolicy) -> ParsedMessage {
     let (header, body) = split_head_and_body(message);
     let headers = parse_header_block(header);
-    let result = parse_part(&headers, body, 0, "1", decode_attachment_bytes);
+    let result = parse_part(&headers, body, 0, "1", policy);
     let text = match &result.text {
         Some(text) => text.clone(),
         None => result.html.as_deref().map(html::strip).unwrap_or_default(),
@@ -121,7 +165,7 @@ fn parse_part(
     body: &[u8],
     depth: usize,
     part_path: &str,
-    decode_attachment_bytes: bool,
+    policy: &DecodePolicy,
 ) -> ParseResult {
     if depth >= MAX_DEPTH {
         return ParseResult::default();
@@ -148,14 +192,15 @@ fn parse_part(
         // other shape — read the inner part, but keep the forward itself
         // downloadable.
         if disposition_raw.starts_with("attachment") {
+            let decode = policy.decodes(part_path, &mime_type, AttachmentDisposition::Attachment);
             return attachment_result(
                 part_path,
                 filename,
                 &mime_type,
-                body.to_vec(),
+                if decode { body.to_vec() } else { Vec::new() },
                 body,
                 &encoding,
-                decode_attachment_bytes,
+                decode,
                 content_id,
                 AttachmentDisposition::Attachment,
             );
@@ -169,7 +214,7 @@ fn parse_part(
             // this part, so BODY[1.1.2] is the second part *inside* the forward
             // while BODY[1.1] is the forward itself.
             part_path,
-            decode_attachment_bytes,
+            policy,
         );
         // The forwarded text belongs to the body; its HTML does not — the
         // detail view renders html in preference to text, so promoting it would
@@ -179,12 +224,7 @@ fn parse_part(
             ..Default::default()
         };
         result.attachments.push(forwarded_attachment(
-            part_path,
-            filename,
-            body,
-            &encoding,
-            decode_attachment_bytes,
-            content_id,
+            part_path, filename, body, &encoding, policy, content_id,
         ));
         result.attachments.extend(inner.attachments);
         result.has_more = inner.has_more;
@@ -198,13 +238,7 @@ fn parse_part(
         let mut result = ParseResult::default();
         for (index, part) in split_parts(body, boundary).iter().enumerate() {
             let child_path = format!("{part_path}.{}", index + 1);
-            let child = parse_part(
-                &part.headers,
-                &part.body,
-                depth + 1,
-                &child_path,
-                decode_attachment_bytes,
-            );
+            let child = parse_part(&part.headers, &part.body, depth + 1, &child_path, policy);
             if result.text.is_none() {
                 result.text = child.text;
             }
@@ -228,12 +262,6 @@ fn parse_part(
         return result;
     }
 
-    let decoded = match encoding.as_str() {
-        "base64" => base64_decode(&String::from_utf8_lossy(body)).unwrap_or_else(|| body.to_vec()),
-        "quoted-printable" => decode_quoted_printable(body),
-        _ => body.to_vec(),
-    };
-
     if mime_type.starts_with("text/") {
         // An explicit `Content-Disposition: attachment` on a text part is still
         // an attachment (rare but legal).
@@ -242,10 +270,10 @@ fn parse_part(
                 part_path,
                 filename,
                 &mime_type,
-                decoded,
+                decode_body(&encoding, body),
                 body,
                 &encoding,
-                decode_attachment_bytes,
+                policy.decodes(part_path, &mime_type, AttachmentDisposition::Attachment),
                 content_id,
                 AttachmentDisposition::Attachment,
             );
@@ -253,7 +281,7 @@ fn parse_part(
         return text_result(
             &mime_type,
             parameters.get("charset").map(String::as_str),
-            &decoded,
+            &decode_body(&encoding, body),
             content_id,
         );
     }
@@ -270,17 +298,34 @@ fn parse_part(
     } else {
         AttachmentDisposition::Attachment
     };
+    // The bytes are decoded only when the policy asks for them: a body route
+    // that decodes a 25 MB attachment and drops the result is 33 MB of wasted
+    // base64 on every open.
+    let decode = policy.decodes(part_path, &mime_type, disposition);
     attachment_result(
         part_path,
         filename,
         &mime_type,
-        decoded,
+        if decode {
+            decode_body(&encoding, body)
+        } else {
+            Vec::new()
+        },
         body,
         &encoding,
-        decode_attachment_bytes,
+        decode,
         content_id,
         disposition,
     )
+}
+
+/// The part's bytes, decoded from its transfer encoding.
+fn decode_body(encoding: &str, body: &[u8]) -> Vec<u8> {
+    match encoding {
+        "base64" => base64_decode(&String::from_utf8_lossy(body)).unwrap_or_else(|| body.to_vec()),
+        "quoted-printable" => decode_quoted_printable(body),
+        _ => body.to_vec(),
+    }
 }
 
 fn text_result(
@@ -350,25 +395,22 @@ fn forwarded_attachment(
     filename: Option<String>,
     body: &[u8],
     encoding: &str,
-    decode_bytes: bool,
+    policy: &DecodePolicy,
     content_id: Option<String>,
 ) -> ParsedAttachment {
+    let decode = policy.decodes(part_path, "message/rfc822", AttachmentDisposition::Inline);
     ParsedAttachment {
         id: part_path.to_owned(),
         filename,
         mime_type: "message/rfc822".to_owned(),
-        size: if decode_bytes {
+        size: if decode {
             body.len()
         } else {
             estimated_size(encoding, body)
         },
         content_id,
         disposition: AttachmentDisposition::Inline,
-        data: if decode_bytes {
-            body.to_vec()
-        } else {
-            Vec::new()
-        },
+        data: if decode { body.to_vec() } else { Vec::new() },
     }
 }
 
@@ -788,5 +830,67 @@ mod tests {
         let (mime_type, parameters) = parse_content_type(None);
         assert_eq!(mime_type, "text/plain");
         assert!(parameters.is_empty());
+    }
+
+    /// A mail with one inline picture and one file attachment.
+    fn mixed_message() -> Vec<u8> {
+        b"Content-Type: multipart/mixed; boundary=m\r\n\r\n\
+--m\r\nContent-Type: text/plain\r\n\r\nbody\r\n\
+--m\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\n\
+Content-Disposition: inline; filename=pic.png\r\nContent-ID: <pic1@example.com>\r\n\r\niVBORw0KGgo=\r\n\
+--m\r\nContent-Type: application/pdf; name=\"r.pdf\"\r\n\
+Content-Disposition: attachment; filename=\"r.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERg==\r\n\
+--m--\r\n"
+            .to_vec()
+    }
+
+    #[test]
+    fn the_inline_image_policy_decodes_the_pictures_and_leaves_the_files_alone() {
+        let parsed = parse_with_policy(&mixed_message(), &DecodePolicy::InlineImages);
+        assert_eq!(parsed.attachments.len(), 2);
+        let picture = parsed
+            .attachments
+            .iter()
+            .find(|attachment| attachment.id == "1.2")
+            .expect("the inline picture");
+        assert_eq!(picture.data, b"\x89PNG\r\n\x1a\n".to_vec());
+        let file = parsed
+            .attachments
+            .iter()
+            .find(|attachment| attachment.id == "1.3")
+            .expect("the file");
+        assert!(
+            file.data.is_empty(),
+            "a file must not be decoded for the inline-image route"
+        );
+        // The size is still reported: it is estimated, not decoded.
+        assert_eq!(file.size, 4);
+    }
+
+    #[test]
+    fn the_part_policy_decodes_one_part_and_leaves_the_others_alone() {
+        let parsed = parse_with_policy(&mixed_message(), &DecodePolicy::Part("1.3".to_owned()));
+        let picture = parsed
+            .attachments
+            .iter()
+            .find(|attachment| attachment.id == "1.2")
+            .expect("the inline picture");
+        assert!(picture.data.is_empty());
+        let file = parsed
+            .attachments
+            .iter()
+            .find(|attachment| attachment.id == "1.3")
+            .expect("the file");
+        assert_eq!(file.data, b"%PDF".to_vec());
+    }
+
+    #[test]
+    fn the_none_policy_decodes_nothing_but_keeps_the_metadata() {
+        let parsed = parse_with_policy(&mixed_message(), &DecodePolicy::None);
+        assert_eq!(parsed.attachments.len(), 2);
+        for attachment in &parsed.attachments {
+            assert!(attachment.data.is_empty());
+            assert!(attachment.size > 0, "the size is estimated, not decoded");
+        }
     }
 }

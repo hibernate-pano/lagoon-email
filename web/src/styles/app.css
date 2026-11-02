@@ -360,6 +360,11 @@ code, kbd, .mono { font-family: var(--font-mono); }
 .chip.ok { color: var(--sev-success); border-color: color-mix(in srgb, var(--sev-success) 45%, transparent); }
 .chip.err { color: var(--sev-error); border-color: color-mix(in srgb, var(--sev-error) 45%, transparent); }
 .chip.unknown { color: var(--fg-tertiary); border-style: dashed; }
+/* A chip that is a button: an attachment the reader can save. */
+button.chip { font: inherit; background: none; cursor: pointer; }
+button.chip:hover:not(:disabled) { border-color: var(--lagoon-accent); color: var(--lagoon-accent); }
+button.chip:disabled { cursor: not-allowed; opacity: 0.55; }
+button.chip:focus-visible { outline: 2px solid var(--lagoon-accent); outline-offset: 2px; }
 
 /* ------------------------------------------------------------- buttons ---- */
 

@@ -110,6 +110,15 @@ pub struct FetchedAttachmentBytes {
     pub data: Vec<u8>,
 }
 
+/// One inline picture: the bytes plus the `Content-ID` the HTML refers to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedInlineImage {
+    /// The content id without the angle brackets, as the HTML's `cid:` uses it.
+    pub content_id: String,
+    pub mime_type: String,
+    pub data: Vec<u8>,
+}
+
 pub struct ImapProvider {
     preset: ProviderPreset,
     credentials: ProviderCredentials,
@@ -316,15 +325,33 @@ impl ImapProvider {
         remote_id: &str,
         attachment_id: &str,
     ) -> Result<FetchedAttachmentBytes, MailError> {
-        let raw = self.fetch_raw_message(remote_id)?;
+        self.fetch_attachment_with_hint(remote_id, None, attachment_id)
+    }
+
+    /// One attachment's bytes, with the UID the sync loop stored for this row.
+    ///
+    /// The hint turns the fetch into one `UID FETCH`; without it the provider
+    /// resolves the message by identity, which on QQ means a search that comes
+    /// back empty followed by a whole-mailbox scan.
+    ///
+    /// Only the requested part is decoded. A mail that carries a 25 MB file
+    /// must not pay for decoding it to answer a question about a small picture.
+    pub fn fetch_attachment_with_hint(
+        &mut self,
+        remote_id: &str,
+        uid_hint: Option<i64>,
+        attachment_id: &str,
+    ) -> Result<FetchedAttachmentBytes, MailError> {
+        let raw = self.fetch_raw_message_with_hint(remote_id, uid_hint)?;
         // The download route DOES need the bytes, so decode them here (the body
         // route skips this via the default false).
-        let parsed = parser::parse_with_options(&raw, true);
+        let parsed =
+            parser::parse_with_policy(&raw, &parser::DecodePolicy::Part(attachment_id.to_owned()));
         let attachment = parsed
             .attachments
             .into_iter()
             .find(|attachment| attachment.id == attachment_id)
-            .ok_or_else(|| MailError::new(MailErrorKind::MessageGone, "attachment-not-found"))?;
+            .ok_or_else(MailError::attachment_not_found)?;
         if attachment.data.len() > MAX_ATTACHMENT_BYTES {
             return Err(MailError::too_large("attachment-too-large"));
         }
@@ -333,6 +360,39 @@ impl ImapProvider {
             filename: attachment.filename,
             data: attachment.data,
         })
+    }
+
+    /// The message's inline pictures, with the content ids the HTML refers to.
+    ///
+    /// One fetch, one parse: the reader resolves every `cid:` in the body, so
+    /// asking for the pictures one at a time would re-download the whole
+    /// message for each of them.
+    pub fn fetch_inline_images_with_hint(
+        &mut self,
+        remote_id: &str,
+        uid_hint: Option<i64>,
+    ) -> Result<Vec<FetchedInlineImage>, MailError> {
+        let raw = self.fetch_raw_message_with_hint(remote_id, uid_hint)?;
+        let parsed = parser::parse_with_policy(&raw, &parser::DecodePolicy::InlineImages);
+        Ok(parsed
+            .attachments
+            .into_iter()
+            // Inline *and* an image: the policy decoded exactly those, and a
+            // file attachment that happens to carry a Content-ID is not a
+            // `cid:` target (its bytes were not decoded either).
+            .filter(|attachment| {
+                attachment.disposition == parser::AttachmentDisposition::Inline
+                    && attachment.mime_type.starts_with("image/")
+            })
+            .filter_map(|attachment| {
+                let content_id = attachment.content_id?;
+                Some(FetchedInlineImage {
+                    content_id,
+                    mime_type: attachment.mime_type,
+                    data: attachment.data,
+                })
+            })
+            .collect())
     }
 
     /// Original RFC 5322 message bytes (for .eml export).

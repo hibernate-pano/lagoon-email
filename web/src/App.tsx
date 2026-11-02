@@ -895,6 +895,16 @@ export function App(): ReactNode {
             onReply={(original) => openReply("reply", original)}
             onForward={(original) => openReply("forward", original)}
             onReplyTarget={reportReplyTarget}
+            // One toast slot: a pending undo outranks a download notice. Saving
+            // an attachment already has a visible result (the file, in Finder);
+            // losing the ⌘Z for an archive has none.
+            onToast={(text) =>
+              setToast((current) =>
+                current && (current.actionId !== undefined || (current.actionIds?.length ?? 0) > 0)
+                  ? current
+                  : { id: Date.now(), text },
+              )
+            }
           />
         </div>
       </div>
