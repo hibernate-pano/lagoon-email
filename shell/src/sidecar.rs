@@ -45,8 +45,14 @@ extern "C" fn exit_with_sidecar(signal: libc::c_int) {
 /// Installs SIGTERM/SIGINT handling once at startup (contract §3: no orphans).
 pub fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGTERM, exit_with_sidecar as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, exit_with_sidecar as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            exit_with_sidecar as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            exit_with_sidecar as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -70,18 +76,14 @@ pub struct Context {
 /// the backend binary under Contents/Resources.
 pub fn is_packaged() -> bool {
     std::env::current_exe()
-        .map(|exe| {
-            exe.to_string_lossy()
-                .contains(".app/Contents/MacOS")
-        })
+        .map(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS"))
         .unwrap_or(false)
 }
 
 /// The per-user home for a packaged install (keys + SQLite store).
 fn app_home() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
-    Path::new(&home)
-        .join("Library/Application Support/Lagoon-v4")
+    Path::new(&home).join("Library/Application Support/Lagoon-v4")
 }
 
 /// The repo root, resolvable because this crate is checked in at <repo>/shell
@@ -120,7 +122,12 @@ impl Context {
         let packaged = is_packaged();
         let (root, working_dir, data_dir, keys_path) = if packaged {
             let home = app_home();
-            (home.clone(), home.clone(), home.clone(), home.join("keys.json"))
+            (
+                home.clone(),
+                home.clone(),
+                home.clone(),
+                home.join("keys.json"),
+            )
         } else {
             let root = repo_root();
             let data = data_dir(&root);
@@ -214,7 +221,11 @@ fn spawn(
                 // touch the network.
                 .env(
                     "LAGOON_MAIL_PROVIDER",
-                    if ctx.production_provider { "production" } else { "none" },
+                    if ctx.production_provider {
+                        "production"
+                    } else {
+                        "none"
+                    },
                 );
         }
     }
@@ -280,12 +291,15 @@ async fn wait_healthz(
                 return Err(BootError {
                     code: "exited",
                     message: format!(
-                        "sidecar exited during startup ({status:?}); see the [sidecar] log lines above"
-                    ),
+                    "sidecar exited during startup ({status:?}); see the [sidecar] log lines above"
+                ),
                 })
             }
             Some(Err(e)) => {
-                return Err(BootError { code: "exited", message: format!("try_wait failed: {e}") })
+                return Err(BootError {
+                    code: "exited",
+                    message: format!("try_wait failed: {e}"),
+                })
             }
             _ => {}
         }
@@ -320,9 +334,10 @@ pub async fn start_once(shared: &Shared, ctx: &Context) -> Result<(), BootError>
             shared.clear_reported_port();
             0
         }
-        Backend::Swift => {
-            port::free_port_with_retry(5).map_err(|message| BootError { code: "port", message })?
-        }
+        Backend::Swift => port::free_port_with_retry(5).map_err(|message| BootError {
+            code: "port",
+            message,
+        })?,
     };
     let slot = shared.port_slot();
     let child = spawn(ctx, requested, move |line| {

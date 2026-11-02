@@ -29,7 +29,9 @@ fn main() -> ExitCode {
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: LAGOON_BODY_KEY=<base64> LAGOON_TOKEN_KEY=<base64> fake_account --db PATH");
+        eprintln!(
+            "usage: LAGOON_BODY_KEY=<base64> LAGOON_TOKEN_KEY=<base64> fake_account --db PATH"
+        );
         return ExitCode::FAILURE;
     };
     let Ok(body_key) = BodyKey::from_base64(&std::env::var("LAGOON_BODY_KEY").unwrap_or_default())

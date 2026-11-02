@@ -194,7 +194,11 @@ mod tests {
     #[test]
     fn opens_a_blob_produced_by_cryptokit() {
         let blob = BASE64.decode(CRYPTOKIT_BLOB).expect("fixture base64");
-        assert_eq!(blob.len(), 12 + 87 + 16, "combined layout: nonce || ct || tag");
+        assert_eq!(
+            blob.len(),
+            12 + 87 + 16,
+            "combined layout: nonce || ct || tag"
+        );
         let plaintext = key().open(&blob).expect("open CryptoKit blob");
         assert_eq!(
             plaintext,
@@ -211,7 +215,10 @@ mod tests {
         let credentials = ImapCredentials::new("a@b", "code");
         let blob = credentials.seal(&key).expect("seal");
         assert_eq!(blob.len(), 12 + credentials.to_json().len() + 16);
-        assert_eq!(ImapCredentials::open(&key, &blob).expect("open"), credentials);
+        assert_eq!(
+            ImapCredentials::open(&key, &blob).expect("open"),
+            credentials
+        );
         let mut tampered = blob.clone();
         tampered[12] ^= 0xFF;
         assert_eq!(key.open(&tampered), Err(TokenCipherError::Decrypt));
@@ -223,8 +230,10 @@ mod tests {
         // Same base64 seed, different type: the two keys must not be
         // interchangeable, because one seals text envelopes and the other
         // seals binary credential blobs.
-        let body = crate::crypto::BodyKey::from_base64(&BASE64.encode(b"fedcba9876543210fedcba9876543210"))
-            .expect("body key");
+        let body = crate::crypto::BodyKey::from_base64(
+            &BASE64.encode(b"fedcba9876543210fedcba9876543210"),
+        )
+        .expect("body key");
         let envelope = body.seal("{\"kind\":\"imap\"}").expect("seal body");
         assert!(envelope.starts_with("lgb1:"));
         // A credential blob is not an lgb1: envelope and has no text prefix.

@@ -67,13 +67,11 @@ pub fn snapshot(
     let (backlog_axes, backlog_arguments) = backlog_filter.where_clause();
     let backlog_clause = format!("{backlog_axes}\nAND h.received_at < ?");
 
-    let window_rows_sql = format!(
-        "{MESSAGE_ROWS} {window_clause} ORDER BY h.received_at DESC LIMIT ?"
-    );
+    let window_rows_sql =
+        format!("{MESSAGE_ROWS} {window_clause} ORDER BY h.received_at DESC LIMIT ?");
     let window_count_sql = format!("SELECT COUNT(*) FROM message_headers h {window_clause}");
-    let backlog_rows_sql = format!(
-        "{MESSAGE_ROWS} {backlog_clause} ORDER BY h.received_at ASC LIMIT ?"
-    );
+    let backlog_rows_sql =
+        format!("{MESSAGE_ROWS} {backlog_clause} ORDER BY h.received_at ASC LIMIT ?");
     let backlog_count_sql = format!("SELECT COUNT(*) FROM message_headers h {backlog_clause}");
 
     // Two different statements share one WHERE clause, so the LIMIT value is
@@ -82,8 +80,9 @@ pub fn snapshot(
     window_rows_arguments.push(rusqlite::types::Value::Integer(limit.max(1)));
 
     let mut backlog_count_arguments = backlog_arguments.clone();
-    backlog_count_arguments
-        .push(rusqlite::types::Value::Text(crate::timefmt::to_stored(window_start)));
+    backlog_count_arguments.push(rusqlite::types::Value::Text(crate::timefmt::to_stored(
+        window_start,
+    )));
 
     let mut backlog_rows_arguments = backlog_count_arguments.clone();
     backlog_rows_arguments.push(rusqlite::types::Value::Integer(MAX_BACKLOG_ITEMS));

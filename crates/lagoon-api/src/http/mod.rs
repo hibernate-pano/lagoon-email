@@ -153,33 +153,87 @@ pub fn router(state: AppState) -> Router {
         .route("/api/search", get(routes_r2::search))
         .route("/api/messages/{remote_id}/drafts", get(routes_r2::drafts))
         .route("/api/messages/{remote_id}/summary", get(routes_r2::summary))
-        .route("/api/messages/{remote_id}/inline-images", get(routes_r2::inline_images))
+        .route(
+            "/api/messages/{remote_id}/inline-images",
+            get(routes_r2::inline_images),
+        )
         .route("/api/messages/{remote_id}/raw.eml", get(routes_r2::raw_eml))
         // R3.5a: the write paths. archive replaces the R2 503 stub; the rest
         // are new registrations (axum panics on duplicates, so each stub that
         // an R3.5 route replaces must be removed here).
-        .route("/api/messages/{remote_id}/archive", axum::routing::post(routes_r5::archive))
-        .route("/api/messages/{remote_id}/unarchive", axum::routing::post(routes_r5::unarchive))
-        .route("/api/messages/{remote_id}/delete", axum::routing::post(routes_r5::delete))
-        .route("/api/messages/{remote_id}/restore", axum::routing::post(routes_r5::restore))
-        .route("/api/messages/{remote_id}/purge", axum::routing::post(routes_r5::purge))
-        .route("/api/messages/{remote_id}/read", axum::routing::post(routes_r5::mark_read))
-        .route("/api/messages/{remote_id}/pin", axum::routing::post(routes_r5::pin))
-        .route("/api/trash/empty", axum::routing::post(routes_r5::empty_trash))
-        .route("/api/archive-bulk", axum::routing::post(routes_r5::archive_bulk))
-        .route("/api/delete-bulk", axum::routing::post(routes_r5::delete_bulk))
-        .route("/api/actions/{id}/undo", axum::routing::post(routes_r5::undo_action))
-        .route("/api/actions/undo-bulk", axum::routing::post(routes_r5::undo_bulk))
-        .route("/api/messages/{remote_id}/draft", axum::routing::post(routes_r2::draft_generate))
+        .route(
+            "/api/messages/{remote_id}/archive",
+            axum::routing::post(routes_r5::archive),
+        )
+        .route(
+            "/api/messages/{remote_id}/unarchive",
+            axum::routing::post(routes_r5::unarchive),
+        )
+        .route(
+            "/api/messages/{remote_id}/delete",
+            axum::routing::post(routes_r5::delete),
+        )
+        .route(
+            "/api/messages/{remote_id}/restore",
+            axum::routing::post(routes_r5::restore),
+        )
+        .route(
+            "/api/messages/{remote_id}/purge",
+            axum::routing::post(routes_r5::purge),
+        )
+        .route(
+            "/api/messages/{remote_id}/read",
+            axum::routing::post(routes_r5::mark_read),
+        )
+        .route(
+            "/api/messages/{remote_id}/pin",
+            axum::routing::post(routes_r5::pin),
+        )
+        .route(
+            "/api/trash/empty",
+            axum::routing::post(routes_r5::empty_trash),
+        )
+        .route(
+            "/api/archive-bulk",
+            axum::routing::post(routes_r5::archive_bulk),
+        )
+        .route(
+            "/api/delete-bulk",
+            axum::routing::post(routes_r5::delete_bulk),
+        )
+        .route(
+            "/api/actions/{id}/undo",
+            axum::routing::post(routes_r5::undo_action),
+        )
+        .route(
+            "/api/actions/undo-bulk",
+            axum::routing::post(routes_r5::undo_bulk),
+        )
+        .route(
+            "/api/messages/{remote_id}/draft",
+            axum::routing::post(routes_r2::draft_generate),
+        )
         // R3.3: account lifecycle over the provider seam.
-        .route("/api/accounts/imap", axum::routing::post(routes_r3::connect_imap))
-        .route("/api/accounts/{id}/activate", axum::routing::post(routes_r3::activate))
-        .route("/api/accounts/{id}", axum::routing::delete(routes_r3::delete_account))
+        .route(
+            "/api/accounts/imap",
+            axum::routing::post(routes_r3::connect_imap),
+        )
+        .route(
+            "/api/accounts/{id}/activate",
+            axum::routing::post(routes_r3::activate),
+        )
+        .route(
+            "/api/accounts/{id}",
+            axum::routing::delete(routes_r3::delete_account),
+        )
         // R3.4a: trigger a sync round and answer immediately (v3 204).
         .route("/api/sync", axum::routing::post(routes_r3::sync_now))
         .fallback(routes::not_found)
         // One middleware, with the Host check before the token check inside it:
         // v3's stack order is Host -> auth -> routes (Runtime.swift:187-191).
-        .layer(middleware::from_fn_with_state(state.clone(), guard::enforce))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            guard::enforce,
+        ))
         .with_state(state)
 }

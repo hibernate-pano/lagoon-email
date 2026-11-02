@@ -65,9 +65,7 @@ pub struct BodyKey([u8; KEY_LEN]);
 impl BodyKey {
     /// Decode the base64 form the environment carries (`LAGOON_BODY_KEY`).
     pub fn from_base64(raw: &str) -> Result<Self, CipherError> {
-        let bytes = BASE64
-            .decode(raw.trim())
-            .map_err(|_| CipherError::Base64)?;
+        let bytes = BASE64.decode(raw.trim()).map_err(|_| CipherError::Base64)?;
         if bytes.len() != KEY_LEN {
             return Err(CipherError::BadKey(bytes.len()));
         }

@@ -39,7 +39,9 @@ pub fn ranking(
     let mut arguments: Vec<rusqlite::types::Value> =
         vec![rusqlite::types::Value::Blob(account_id.as_bytes().to_vec())];
     if let Some(query) = query {
-        sql.push_str(" AND (from_address LIKE ? ESCAPE '\\' OR IFNULL(from_name, '') LIKE ? ESCAPE '\\')");
+        sql.push_str(
+            " AND (from_address LIKE ? ESCAPE '\\' OR IFNULL(from_name, '') LIKE ? ESCAPE '\\')",
+        );
         let pattern = like_pattern(query);
         arguments.push(rusqlite::types::Value::Text(pattern.clone()));
         arguments.push(rusqlite::types::Value::Text(pattern));
@@ -55,7 +57,9 @@ pub fn ranking(
         senders.push(SenderRow {
             address: row.get(0)?,
             // v3 optionalText: NULL and the empty string are both "no name".
-            display_name: row.get::<_, Option<String>>(1)?.filter(|name| !name.is_empty()),
+            display_name: row
+                .get::<_, Option<String>>(1)?
+                .filter(|name| !name.is_empty()),
             total_count: row.get(2)?,
             unread_count: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
             // v3 falls back to the epoch so one unparseable row ranks last

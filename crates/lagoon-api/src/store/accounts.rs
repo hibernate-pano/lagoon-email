@@ -80,7 +80,8 @@ pub fn find_by_oauth_user(
 
 /// The raw sync_state JSON, for the routes that merge one field into it.
 pub fn sync_state_json(connection: &Connection, id: Uuid) -> Result<Option<String>, StoreError> {
-    let mut statement = connection.prepare("SELECT sync_state FROM accounts WHERE id = ? LIMIT 1")?;
+    let mut statement =
+        connection.prepare("SELECT sync_state FROM accounts WHERE id = ? LIMIT 1")?;
     let mut rows = statement.query([id.as_bytes().as_slice()])?;
     match rows.next()? {
         Some(row) => Ok(row.get(0)?),
@@ -90,8 +91,7 @@ pub fn sync_state_json(connection: &Connection, id: Uuid) -> Result<Option<Strin
 
 /// Whether the row exists. Same answer as `find(..).is_some()` without decoding.
 pub fn exists(connection: &Connection, id: Uuid) -> Result<bool, StoreError> {
-    let mut statement =
-        connection.prepare("SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?)")?;
+    let mut statement = connection.prepare("SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?)")?;
     let present: i64 = statement.query_row([id.as_bytes().as_slice()], |row| row.get(0))?;
     Ok(present != 0)
 }

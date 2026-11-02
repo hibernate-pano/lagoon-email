@@ -61,11 +61,23 @@ pub struct BootStatus {
 
 impl BootStatus {
     pub fn starting(backend: &'static str) -> Self {
-        Self { phase: Phase::Starting, backend, port: None, pid: None, error: None }
+        Self {
+            phase: Phase::Starting,
+            backend,
+            port: None,
+            pid: None,
+            error: None,
+        }
     }
 
     pub fn ready(backend: &'static str, port: u16, pid: u32) -> Self {
-        Self { phase: Phase::Ready, backend, port: Some(port), pid: Some(pid), error: None }
+        Self {
+            phase: Phase::Ready,
+            backend,
+            port: Some(port),
+            pid: Some(pid),
+            error: None,
+        }
     }
 
     pub fn failed(backend: &'static str, code: &'static str, message: impl Into<String>) -> Self {
@@ -74,12 +86,21 @@ impl BootStatus {
             backend,
             port: None,
             pid: None,
-            error: Some(BootError { code, message: message.into() }),
+            error: Some(BootError {
+                code,
+                message: message.into(),
+            }),
         }
     }
 
     pub fn failed_from(backend: &'static str, err: BootError) -> Self {
-        Self { phase: Phase::Failed, backend, port: None, pid: None, error: Some(err) }
+        Self {
+            phase: Phase::Failed,
+            backend,
+            port: None,
+            pid: None,
+            error: Some(err),
+        }
     }
 }
 
@@ -210,7 +231,9 @@ impl Shared {
 
     /// SIGTERM, wait `grace`, then SIGKILL (contract §3: no orphans).
     pub fn terminate_child(&self, grace: Duration) {
-        let Some(mut child) = self.take_child() else { return };
+        let Some(mut child) = self.take_child() else {
+            return;
+        };
         let pid = child.id() as i32;
         crate::sidecar::CHILD_PID.store(0, Ordering::SeqCst);
         eprintln!("[sidecar] SIGTERM pid={pid}");
@@ -233,7 +256,10 @@ impl Shared {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        eprintln!("[sidecar] SIGKILL pid={pid} (did not exit within {:?})", grace);
+        eprintln!(
+            "[sidecar] SIGKILL pid={pid} (did not exit within {:?})",
+            grace
+        );
         unsafe { libc::kill(pid, libc::SIGKILL) };
         let _ = child.wait();
     }

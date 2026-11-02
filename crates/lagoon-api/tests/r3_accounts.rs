@@ -12,7 +12,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use lagoon_api::provider::fake::{FakeOutcome, FakeProviderFactory};
-use lagoon_api::provider::{MailChangeSet, ProviderFactory, NoProviderFactory};
+use lagoon_api::provider::{MailChangeSet, NoProviderFactory, ProviderFactory};
 use lagoon_api::token::ImapCredentials;
 use lagoon_api::uuid::Uuid;
 use lagoon_api::wire::MailCapabilities;
@@ -226,7 +226,10 @@ async fn healthy_account_conflicts_and_reauthentication_replaces() {
     .await;
     assert_eq!(conflict.status, 409);
     assert_eq!(conflict.body, json!({"error": "account-exists"}));
-    assert!(factory.calls().all().is_empty(), "no probe for a healthy account");
+    assert!(
+        factory.calls().all().is_empty(),
+        "no probe for a healthy account"
+    );
 
     // A parked row is re-authenticated in place: same id, new code, health ok.
     {
@@ -259,7 +262,9 @@ async fn healthy_account_conflicts_and_reauthentication_replaces() {
         .expect("row");
     assert_eq!(status, "ok");
     assert_eq!(
-        ImapCredentials::open(&token_key(), &blob).expect("open").auth_code,
+        ImapCredentials::open(&token_key(), &blob)
+            .expect("open")
+            .auth_code,
         "fresh-code"
     );
 }
@@ -301,7 +306,10 @@ async fn a_failed_reauthentication_leaves_the_row_untouched() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("row");
-    assert_eq!(blob, original_blob, "credentials must not move on a failed probe");
+    assert_eq!(
+        blob, original_blob,
+        "credentials must not move on a failed probe"
+    );
     assert_eq!(status, "needsReconnect");
 }
 
@@ -314,7 +322,10 @@ async fn activate_switches_and_delete_cascades() {
     let second = "bbbbbbbb-2222-4222-8222-222222222222";
     {
         let connection = open_read_write(&server.db_path);
-        for (id, email, active) in [(first, "one@example.invalid", 1), (second, "two@example.invalid", 0)] {
+        for (id, email, active) in [
+            (first, "one@example.invalid", 1),
+            (second, "two@example.invalid", 0),
+        ] {
             connection
                 .execute(
                     "INSERT INTO accounts (id, provider, oauth_user, email, is_active)
@@ -360,7 +371,10 @@ async fn activate_switches_and_delete_cascades() {
     let unknown = http::request(
         &client,
         "POST",
-        &format!("{}/api/accounts/99999999-9999-4999-8999-999999999999/activate", server.base_url),
+        &format!(
+            "{}/api/accounts/99999999-9999-4999-8999-999999999999/activate",
+            server.base_url
+        ),
         &auth,
     )
     .await;
@@ -374,7 +388,10 @@ async fn activate_switches_and_delete_cascades() {
         &auth,
     )
     .await;
-    assert_eq!(malformed.status, 404, "v3 says unknown-account for a bad uuid");
+    assert_eq!(
+        malformed.status, 404,
+        "v3 says unknown-account for a bad uuid"
+    );
     assert_eq!(malformed.body, json!({"error": "unknown-account"}));
 
     // Delete the active account: cascade removes its header and body, and

@@ -119,9 +119,7 @@ pub fn accepted_stats(
     account_id: Uuid,
     limit: i64,
 ) -> rusqlite::Result<Vec<AcceptedStat>> {
-    let sql = format!(
-        "SELECT {COLUMNS} FROM advice WHERE account_id = ? AND decision = ?"
-    );
+    let sql = format!("SELECT {COLUMNS} FROM advice WHERE account_id = ? AND decision = ?");
     let mut statement = connection.prepare(&sql)?;
     let mut rows = statement.query(rusqlite::params![
         account_id.as_bytes().as_slice(),
@@ -194,7 +192,10 @@ fn decode(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<AdviceRow>> {
 }
 
 /// v3 optionalText: NULL and the empty string are both "no value".
-pub(crate) fn optional_text(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
+pub(crate) fn optional_text(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<String>> {
     Ok(row
         .get::<_, Option<String>>(index)?
         .filter(|value| !value.is_empty()))

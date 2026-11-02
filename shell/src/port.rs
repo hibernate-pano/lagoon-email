@@ -29,5 +29,7 @@ pub fn free_port_with_retry(attempts: u8) -> Result<u16, String> {
             }
         }
     }
-    Err(format!("could not bind a free port after {attempts} attempts: {last}"))
+    Err(format!(
+        "could not bind a free port after {attempts} attempts: {last}"
+    ))
 }

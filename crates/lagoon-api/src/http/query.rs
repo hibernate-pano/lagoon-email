@@ -93,7 +93,9 @@ mod tests {
 
     #[test]
     fn decodes_form_encoding() {
-        let pairs = parse(&uri("/api/messages?accountId=abc&sender=a%40b.example&q=x+y"));
+        let pairs = parse(&uri(
+            "/api/messages?accountId=abc&sender=a%40b.example&q=x+y",
+        ));
         assert_eq!(get(&pairs, "accountId"), Some("abc"));
         assert_eq!(get(&pairs, "sender"), Some("a@b.example"));
         assert_eq!(get(&pairs, "q"), Some("x y"));

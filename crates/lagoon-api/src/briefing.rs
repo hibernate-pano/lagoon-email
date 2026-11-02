@@ -95,7 +95,10 @@ pub fn classify(
     if signals.pinned_remote_ids.contains(&message.remote_id) {
         return (Group::Pinned, Reason::Pinned);
     }
-    if signals.list_unsubscribe_remote_ids.contains(&message.remote_id) {
+    if signals
+        .list_unsubscribe_remote_ids
+        .contains(&message.remote_id)
+    {
         return (Group::SubscriptionNoise, Reason::ListUnsubscribe);
     }
     if matches_subscription_sender(&message.from_address) {
@@ -158,7 +161,9 @@ impl Resolver {
             .collect();
         let sender_overrides = sender_pairs
             .iter()
-            .filter_map(|(address, group)| Group::parse(group).map(|group| (address.clone(), group)))
+            .filter_map(|(address, group)| {
+                Group::parse(group).map(|group| (address.clone(), group))
+            })
             .collect();
         Self {
             message_overrides,
@@ -241,9 +246,13 @@ mod tests {
     #[test]
     fn subscription_senders_and_self_are_recognised() {
         assert!(matches_subscription_sender("no-reply@shop.example"));
-        assert!(matches_subscription_sender("Newsletter <news@example.invalid>"));
+        assert!(matches_subscription_sender(
+            "Newsletter <news@example.invalid>"
+        ));
         assert!(matches_subscription_sender("notifications@github.example"));
-        assert!(!matches_subscription_sender("alice.fixture@example.invalid"));
+        assert!(!matches_subscription_sender(
+            "alice.fixture@example.invalid"
+        ));
 
         let now = Timestamp::from_millis(1_700_000_000_000);
         let verdict = classify(
@@ -261,7 +270,10 @@ mod tests {
         let mail = message("alice@example.invalid", false, now);
         let resolver = Resolver::from_store(
             &[("fixture-msg-3".to_owned(), "safeToArchive".to_owned())],
-            &[("alice@example.invalid".to_owned(), "subscriptionNoise".to_owned())],
+            &[(
+                "alice@example.invalid".to_owned(),
+                "subscriptionNoise".to_owned(),
+            )],
             HashSet::from(["fixture-msg-3".to_owned()]),
         );
         assert_eq!(
@@ -276,7 +288,10 @@ mod tests {
         let mail = message("alice@example.invalid", false, now);
         let resolver = Resolver::from_store(
             &[("fixture-msg-3".to_owned(), "safeToArchive".to_owned())],
-            &[("alice@example.invalid".to_owned(), "subscriptionNoise".to_owned())],
+            &[(
+                "alice@example.invalid".to_owned(),
+                "subscriptionNoise".to_owned(),
+            )],
             HashSet::new(),
         );
         assert_eq!(

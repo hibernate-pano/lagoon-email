@@ -60,12 +60,20 @@ impl ApiResponse {
             ok: false,
             status: 0,
             body: None,
-            error: Some(ApiError { code, message: message.into() }),
+            error: Some(ApiError {
+                code,
+                message: message.into(),
+            }),
         }
     }
 
     pub fn answered(status: u16, body: Value) -> Self {
-        Self { ok: true, status, body: Some(body), error: None }
+        Self {
+            ok: true,
+            status,
+            body: Some(body),
+            error: None,
+        }
     }
 }
 
@@ -96,7 +104,10 @@ where
 /// would break the web side on day one. Everything else is `bad-request`.
 pub fn parse_request(raw: Value) -> Result<ApiRequest, ApiResponse> {
     let Value::Object(map) = raw else {
-        return Err(ApiResponse::fail("bad-request", "request must be a JSON object"));
+        return Err(ApiResponse::fail(
+            "bad-request",
+            "request must be a JSON object",
+        ));
     };
     let candidate = match map.get("request") {
         Some(Value::Object(inner)) if !map.contains_key("method") => Value::Object(inner.clone()),
@@ -122,7 +133,10 @@ pub fn validate(req: &ApiRequest) -> Result<reqwest::Method, ApiResponse> {
     let Some(method) = method_of(&req.method) else {
         return Err(ApiResponse::fail(
             "bad-request",
-            format!("unsupported method {:?}; use GET, POST, PATCH or DELETE", req.method),
+            format!(
+                "unsupported method {:?}; use GET, POST, PATCH or DELETE",
+                req.method
+            ),
         ));
     };
     let path = req.path.as_str();
@@ -135,9 +149,14 @@ pub fn validate(req: &ApiRequest) -> Result<reqwest::Method, ApiResponse> {
     }
     if path.starts_with("//")
         || path.contains("://")
-        || path.chars().any(|c| c.is_control() || c == ' ' || c == '\t')
+        || path
+            .chars()
+            .any(|c| c.is_control() || c == ' ' || c == '\t')
     {
-        return Err(ApiResponse::fail("bad-path", format!("path {path:?} is not a plain path")));
+        return Err(ApiResponse::fail(
+            "bad-path",
+            format!("path {path:?} is not a plain path"),
+        ));
     }
     Ok(method)
 }
@@ -173,7 +192,9 @@ fn percent_encode(input: &str) -> String {
 /// Path plus the encoded query. Pairs are sorted so a retry sends the same
 /// URL, which makes server-side logs comparable.
 fn with_query(path: &str, query: &Option<HashMap<String, String>>) -> String {
-    let Some(query) = query else { return path.to_string() };
+    let Some(query) = query else {
+        return path.to_string();
+    };
     if query.is_empty() {
         return path.to_string();
     }
@@ -214,10 +235,14 @@ async fn forward_inner(shared: &Shared, req: ApiRequest) -> ApiResponse {
         let status = shared.status();
         return ApiResponse::fail(
             "not-ready",
-            format!("sidecar is {:?}{}", status.phase.as_str(), match &status.error {
-                Some(error) => format!(" ({})", error.code),
-                None => String::new(),
-            }),
+            format!(
+                "sidecar is {:?}{}",
+                status.phase.as_str(),
+                match &status.error {
+                    Some(error) => format!(" ({})", error.code),
+                    None => String::new(),
+                }
+            ),
         );
     };
 
@@ -249,7 +274,11 @@ async fn forward_inner(shared: &Shared, req: ApiRequest) -> ApiResponse {
             }
             Err(e) => {
                 let response = classify(&e);
-                let retryable = response.error.as_ref().map(|e| e.code == "transport").unwrap_or(false);
+                let retryable = response
+                    .error
+                    .as_ref()
+                    .map(|e| e.code == "transport")
+                    .unwrap_or(false);
                 if retryable && attempt + 1 < attempts {
                     last = Some(response);
                     tokio::time::sleep(Duration::from_millis(120)).await;
@@ -268,7 +297,12 @@ mod tests {
     use super::*;
 
     fn request(method: &str, path: &str) -> ApiRequest {
-        ApiRequest { method: method.into(), path: path.into(), query: None, body: None }
+        ApiRequest {
+            method: method.into(),
+            path: path.into(),
+            query: None,
+            body: None,
+        }
     }
 
     #[test]
@@ -299,7 +333,10 @@ mod tests {
         let wrapped = serde_json::json!({"request":{"method":"GET","path":"/healthz"}});
         assert_eq!(parse_request(wrapped).unwrap().path, "/healthz");
         let broken = serde_json::json!({"method":"GET"});
-        assert_eq!(parse_request(broken).unwrap_err().error.unwrap().code, "bad-request");
+        assert_eq!(
+            parse_request(broken).unwrap_err().error.unwrap().code,
+            "bad-request"
+        );
     }
 
     #[test]

@@ -43,8 +43,14 @@ pub struct Seed {
 impl Seed {
     pub fn from_fixtures(fixtures: &Fixtures) -> Self {
         let identity = fixtures.seed_block();
-        let account_id = identity["accountId"].as_str().expect("seed.accountId").to_owned();
-        let account_email = identity["accountEmail"].as_str().expect("seed.accountEmail").to_owned();
+        let account_id = identity["accountId"]
+            .as_str()
+            .expect("seed.accountId")
+            .to_owned();
+        let account_email = identity["accountEmail"]
+            .as_str()
+            .expect("seed.accountEmail")
+            .to_owned();
 
         let account_body = &fixtures.by_name("accounts.list")["response"]["body"];
         let capabilities = account_body[0]["capabilities"].clone();
@@ -72,7 +78,8 @@ impl Seed {
             }
         }
 
-        let pinned_remote_ids = fixtures.by_name("messages.list.pinned")["response"]["body"]["messages"]
+        let pinned_remote_ids = fixtures.by_name("messages.list.pinned")["response"]["body"]
+            ["messages"]
             .as_array()
             .map(|items| {
                 items
@@ -171,7 +178,10 @@ fn message_from_fixture(message: &Value) -> SeedMessage {
         id: message["id"].as_str().expect("id").to_owned(),
         remote_id: message["remoteId"].as_str().expect("remoteId").to_owned(),
         thread_id: message["threadId"].as_str().expect("threadId").to_owned(),
-        from_address: message["fromAddress"].as_str().expect("fromAddress").to_owned(),
+        from_address: message["fromAddress"]
+            .as_str()
+            .expect("fromAddress")
+            .to_owned(),
         from_name: message["fromName"].as_str().map(str::to_owned),
         subject: message["subject"].as_str().map(str::to_owned),
         received_at: iso_to_stored(message["receivedAt"].as_str().expect("receivedAt")),
@@ -312,10 +322,7 @@ fn seed_via_harness_at(
             .collect();
         let sql = format!("DELETE FROM accounts WHERE id NOT IN ({placeholders})");
         connection
-            .execute(
-                &sql,
-                rusqlite::params_from_iter(bytes.iter()),
-            )
+            .execute(&sql, rusqlite::params_from_iter(bytes.iter()))
             .map_err(|error| format!("cannot prune extra seeded accounts: {error}"))?;
     }
     Ok(())

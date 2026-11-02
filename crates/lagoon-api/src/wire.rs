@@ -83,7 +83,13 @@ impl SyncHealth {
     /// (`AccountStore.decode`); the same fallback keeps the payload decodable
     /// for a client that only knows the five statuses.
     pub fn status_or_ok(raw: &str) -> String {
-        const STATUSES: [&str; 5] = ["ok", "degraded", "needsReconnect", "error", "accountMissing"];
+        const STATUSES: [&str; 5] = [
+            "ok",
+            "degraded",
+            "needsReconnect",
+            "error",
+            "accountMissing",
+        ];
         if STATUSES.contains(&raw) {
             raw.to_owned()
         } else {
@@ -156,15 +162,40 @@ pub struct FolderCountsResponse {
 }
 
 impl FolderCountsResponse {
-    pub fn new(live: i64, unread: i64, archived: i64, pinned: i64, deleted: i64, sent: i64) -> Self {
+    pub fn new(
+        live: i64,
+        unread: i64,
+        archived: i64,
+        pinned: i64,
+        deleted: i64,
+        sent: i64,
+    ) -> Self {
         Self {
             counts: vec![
-                FolderCount { id: "live".to_owned(), count: live },
-                FolderCount { id: "unread".to_owned(), count: unread },
-                FolderCount { id: "archived".to_owned(), count: archived },
-                FolderCount { id: "pinned".to_owned(), count: pinned },
-                FolderCount { id: "deleted".to_owned(), count: deleted },
-                FolderCount { id: "sent".to_owned(), count: sent },
+                FolderCount {
+                    id: "live".to_owned(),
+                    count: live,
+                },
+                FolderCount {
+                    id: "unread".to_owned(),
+                    count: unread,
+                },
+                FolderCount {
+                    id: "archived".to_owned(),
+                    count: archived,
+                },
+                FolderCount {
+                    id: "pinned".to_owned(),
+                    count: pinned,
+                },
+                FolderCount {
+                    id: "deleted".to_owned(),
+                    count: deleted,
+                },
+                FolderCount {
+                    id: "sent".to_owned(),
+                    count: sent,
+                },
             ],
         }
     }

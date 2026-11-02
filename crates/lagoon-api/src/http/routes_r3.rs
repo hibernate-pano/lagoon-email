@@ -15,8 +15,8 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 
-use crate::provider::{ProviderError};
-use crate::store::{self, write, StoreError, write::NewAccount};
+use crate::provider::ProviderError;
+use crate::store::{self, write, write::NewAccount, StoreError};
 use crate::token::ImapCredentials;
 use crate::uuid::Uuid;
 use crate::wire;
@@ -134,13 +134,14 @@ pub async fn connect_imap(State(state): State<AppState>, body: Bytes) -> Respons
         }
     };
 
-    let existing = match store::accounts::find_by_oauth_user(&connection, &connect.provider, &connect.email) {
-        Ok(existing) => existing,
-        Err(error) => {
-            tracing::error!(err = %error, "accounts.lookupFailed");
-            return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
-        }
-    };
+    let existing =
+        match store::accounts::find_by_oauth_user(&connection, &connect.provider, &connect.email) {
+            Ok(existing) => existing,
+            Err(error) => {
+                tracing::error!(err = %error, "accounts.lookupFailed");
+                return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
+            }
+        };
     // Rule 1: a healthy account is reported before any network work.
     if let Some(account) = &existing {
         if wire::SyncHealth::status_or_ok(&account.sync_status) == "ok" {
@@ -187,11 +188,14 @@ pub async fn connect_imap(State(state): State<AppState>, body: Bytes) -> Respons
         if let Some(account) = &existing {
             // Re-authentication in place: only the code, capabilities, archive
             // folder and health move; id, cursor and read state stay put.
-            write::update_credentials(&connection, account.id, &sealed)
-                .map_err(store_error)?;
+            write::update_credentials(&connection, account.id, &sealed).map_err(store_error)?;
             if let Some(capabilities) = &outcome.capabilities {
-                write::update_capabilities(&connection, account.id, &capabilities_json(capabilities))
-                    .map_err(store_error)?;
+                write::update_capabilities(
+                    &connection,
+                    account.id,
+                    &capabilities_json(capabilities),
+                )
+                .map_err(store_error)?;
             }
             let current = store::accounts::sync_state_json(&connection, account.id)?
                 .unwrap_or_else(|| "{}".to_owned());
@@ -201,7 +205,10 @@ pub async fn connect_imap(State(state): State<AppState>, body: Bytes) -> Respons
                 account.id,
                 &merged,
                 &wire::SyncHealth::status_or_ok(&account.sync_status),
-                account.last_sync_at.map(crate::timefmt::to_stored).as_deref(),
+                account
+                    .last_sync_at
+                    .map(crate::timefmt::to_stored)
+                    .as_deref(),
                 None,
             )
             .map_err(store_error)?;

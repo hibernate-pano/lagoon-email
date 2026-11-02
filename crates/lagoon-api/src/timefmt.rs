@@ -74,9 +74,8 @@ pub fn parse_stored(raw: &str) -> Option<Timestamp> {
     if millis_text.len() != 3 {
         return None;
     }
-    make_timestamp(year, month, day, hour, minute, second).map(|ts| {
-        Timestamp::from_millis(ts.millis() + millis as i64)
-    })
+    make_timestamp(year, month, day, hour, minute, second)
+        .map(|ts| Timestamp::from_millis(ts.millis() + millis as i64))
 }
 
 /// Parse the store's form, falling back to ISO-8601.
@@ -181,7 +180,14 @@ pub fn to_iso8601(ts: Timestamp) -> String {
     )
 }
 
-fn make_timestamp(year: i64, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> Option<Timestamp> {
+fn make_timestamp(
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<Timestamp> {
     if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
         return None;
     }
@@ -273,7 +279,15 @@ mod tests {
 
     #[test]
     fn rejects_values_dateformatter_would_reject() {
-        for bad in ["", "2025-01-03", "2025-01-03 09:00:00", "2025-13-03 09:00:00.000", "2025-02-30 09:00:00.000", "2025-01-03 24:00:00.000", "not a date at all"] {
+        for bad in [
+            "",
+            "2025-01-03",
+            "2025-01-03 09:00:00",
+            "2025-13-03 09:00:00.000",
+            "2025-02-30 09:00:00.000",
+            "2025-01-03 24:00:00.000",
+            "not a date at all",
+        ] {
             assert!(parse_stored(bad).is_none(), "accepted {bad:?}");
         }
     }

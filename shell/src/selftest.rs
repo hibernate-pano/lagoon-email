@@ -21,7 +21,11 @@ fn check(scope: &str, name: &str, passed: bool, detail: impl AsRef<str>) -> usiz
     let mark = if passed { "PASS" } else { "FAIL" };
     eprintln!("[selftest {scope}] {mark} {name}");
     eprintln!("                 {}", detail.as_ref());
-    if passed { 0 } else { 1 }
+    if passed {
+        0
+    } else {
+        1
+    }
 }
 
 fn render(response: &api::ApiResponse) -> String {
@@ -29,7 +33,12 @@ fn render(response: &api::ApiResponse) -> String {
 }
 
 fn request(method: &str, path: &str) -> api::ApiRequest {
-    api::ApiRequest { method: method.to_string(), path: path.to_string(), query: None, body: None }
+    api::ApiRequest {
+        method: method.to_string(),
+        path: path.to_string(),
+        query: None,
+        body: None,
+    }
 }
 
 fn write_request(method: &str, path: &str) -> api::ApiRequest {
@@ -45,7 +54,11 @@ fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
-async fn wait_ready(shared: &Shared, budget: Duration, different_from: Option<u32>) -> Option<(u16, u32)> {
+async fn wait_ready(
+    shared: &Shared,
+    budget: Duration,
+    different_from: Option<u32>,
+) -> Option<(u16, u32)> {
     let deadline = Instant::now() + budget;
     loop {
         let status = shared.status();
@@ -76,11 +89,19 @@ fn available_backends() -> Vec<Backend> {
     for backend in [Backend::Swift, Backend::Rust] {
         match backend.binary(&root) {
             Ok(path) => {
-                eprintln!("[selftest] found {} backend: {}", backend.as_str(), path.display());
+                eprintln!(
+                    "[selftest] found {} backend: {}",
+                    backend.as_str(),
+                    path.display()
+                );
                 available.push(backend);
             }
             Err(error) => {
-                eprintln!("[selftest] SKIP {} backend: {}", backend.as_str(), error.message);
+                eprintln!(
+                    "[selftest] SKIP {} backend: {}",
+                    backend.as_str(),
+                    error.message
+                );
             }
         }
     }
@@ -114,7 +135,9 @@ async fn run_one(backend: Backend) -> usize {
     failures += check(
         scope,
         "api before boot => ok:false code=not-ready status=0",
-        !response.ok && response.status == 0 && response.error.as_ref().map(|e| e.code) == Some("not-ready"),
+        !response.ok
+            && response.status == 0
+            && response.error.as_ref().map(|e| e.code) == Some("not-ready"),
         render(&response),
     );
 
@@ -133,19 +156,34 @@ async fn run_one(backend: Backend) -> usize {
             && status.backend == scope
             && status.port == Some(port)
             && status.pid == Some(pid),
-        format!("phase={} backend={} port={port} pid={pid}", status.phase.as_str(), status.backend),
+        format!(
+            "phase={} backend={} port={port} pid={pid}",
+            status.phase.as_str(),
+            status.backend
+        ),
     );
     eprintln!("[selftest {scope}] backend base=http://127.0.0.1:{port}");
 
     // 3. Contract 4.2 happy path.
     let response = api::forward(&shared, request("GET", "/healthz")).await;
-    failures += check(scope, "api GET /healthz => ok:true status=200", response.ok && response.status == 200, render(&response));
+    failures += check(
+        scope,
+        "api GET /healthz => ok:true status=200",
+        response.ok && response.status == 200,
+        render(&response),
+    );
 
     let response = api::forward(&shared, request("GET", "/api/accounts")).await;
     failures += check(
         scope,
         "api GET /api/accounts => ok:true status=200 body=array",
-        response.ok && response.status == 200 && response.body.as_ref().map(|b| b.is_array()).unwrap_or(false),
+        response.ok
+            && response.status == 200
+            && response
+                .body
+                .as_ref()
+                .map(|b| b.is_array())
+                .unwrap_or(false),
         render(&response),
     );
 
@@ -179,16 +217,25 @@ async fn run_one(backend: Backend) -> usize {
     // 6. 401: the proxy always sends the real token, so a wrong one is sent
     //    directly to the same port to show the header is what authorises.
     match sidecar::raw_status(&shared, "/api/accounts", Some("not-the-token")).await {
-        Ok(code) => failures += check(scope, "wrong Bearer => 401", code == 401, format!("status={code}")),
+        Ok(code) => {
+            failures += check(
+                scope,
+                "wrong Bearer => 401",
+                code == 401,
+                format!("status={code}"),
+            )
+        }
         Err(e) => failures += check(scope, "wrong Bearer => 401", false, e),
     }
     match sidecar::raw_status(&shared, "/api/accounts", None).await {
-        Ok(code) => failures += check(
-            scope,
-            "real Bearer => 200 (proves the header is what authorises)",
-            code == 200,
-            format!("status={code}"),
-        ),
+        Ok(code) => {
+            failures += check(
+                scope,
+                "real Bearer => 200 (proves the header is what authorises)",
+                code == 200,
+                format!("status={code}"),
+            )
+        }
         Err(e) => failures += check(scope, "real Bearer => 200", false, e),
     }
 
@@ -213,13 +260,22 @@ async fn run_one(backend: Backend) -> usize {
     eprintln!("[selftest {scope}] SIGKILL backend pid={pid} to exercise the restart path");
     unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     match wait_ready(&shared, Duration::from_secs(25), Some(pid)).await {
-        Some((port2, pid2)) => failures += check(
-            scope,
-            "crash => restarted once, phase=ready with a new pid",
-            pid2 != pid,
-            format!("old pid={pid} -> new pid={pid2} port={port2}"),
-        ),
-        None => failures += check(scope, "crash => restarted once, phase=ready with a new pid", false, "no ready state with a new pid within 25s"),
+        Some((port2, pid2)) => {
+            failures += check(
+                scope,
+                "crash => restarted once, phase=ready with a new pid",
+                pid2 != pid,
+                format!("old pid={pid} -> new pid={pid2} port={port2}"),
+            )
+        }
+        None => {
+            failures += check(
+                scope,
+                "crash => restarted once, phase=ready with a new pid",
+                false,
+                "no ready state with a new pid within 25s",
+            )
+        }
     }
 
     // 9. restart_sidecar (contract 4.3): the command wraps this exact fn.
@@ -227,13 +283,22 @@ async fn run_one(backend: Backend) -> usize {
     let restarter = shared.clone();
     tauri::async_runtime::spawn(async move { sidecar::restart(restarter).await });
     match wait_ready(&shared, Duration::from_secs(25), before_restart).await {
-        Some((restart_port, restart_pid)) => failures += check(
-            scope,
-            "restart_sidecar => phase=ready again with a new pid",
-            Some(restart_pid) != before_restart,
-            format!("before={before_restart:?} after pid={restart_pid} port={restart_port}"),
-        ),
-        None => failures += check(scope, "restart_sidecar => phase=ready again with a new pid", false, "no ready state after restart_sidecar within 25s"),
+        Some((restart_port, restart_pid)) => {
+            failures += check(
+                scope,
+                "restart_sidecar => phase=ready again with a new pid",
+                Some(restart_pid) != before_restart,
+                format!("before={before_restart:?} after pid={restart_pid} port={restart_port}"),
+            )
+        }
+        None => {
+            failures += check(
+                scope,
+                "restart_sidecar => phase=ready again with a new pid",
+                false,
+                "no ready state after restart_sidecar within 25s",
+            )
+        }
     }
     let pid_after_restart = shared.status().pid;
 
@@ -251,7 +316,8 @@ async fn run_one(backend: Backend) -> usize {
 
     // Let the supervisor task observe shutdown before the next backend starts.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while shared.supervising.load(std::sync::atomic::Ordering::SeqCst) && Instant::now() < deadline {
+    while shared.supervising.load(std::sync::atomic::Ordering::SeqCst) && Instant::now() < deadline
+    {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 

@@ -122,7 +122,11 @@ pub fn page(
 }
 
 /// v3 AIActionStore.cursor: the keyset of an existing action, or None.
-pub fn cursor(connection: &Connection, id: i64, account_id: Uuid) -> rusqlite::Result<Option<Cursor>> {
+pub fn cursor(
+    connection: &Connection,
+    id: i64,
+    account_id: Uuid,
+) -> rusqlite::Result<Option<Cursor>> {
     let mut statement =
         connection.prepare("SELECT created_at FROM ai_actions WHERE id = ? AND account_id = ?")?;
     let mut rows = statement.query(rusqlite::params![id, account_id.as_bytes().as_slice()])?;
@@ -243,7 +247,9 @@ fn decode(row: &rusqlite::Row<'_>) -> rusqlite::Result<AIActionRow> {
         id: row.get(0)?,
         account_id: uuid_column(row, 1)?,
         // v3 reads an unrecognised kind as archive rather than dropping the row.
-        kind: row.get::<_, String>(2).unwrap_or_else(|_| "archive".to_owned()),
+        kind: row
+            .get::<_, String>(2)
+            .unwrap_or_else(|_| "archive".to_owned()),
         payload: decode_payload(&payload),
         created_at: timestamp_column(row, 4)?,
         expires_at: optional_timestamp_column(row, 5)?,
@@ -255,7 +261,8 @@ fn decode(row: &rusqlite::Row<'_>) -> rusqlite::Result<AIActionRow> {
 /// (Foundation bridges them through NSNumber), and everything else is dropped.
 pub fn decode_payload(text: &str) -> BTreeMap<String, String> {
     let mut payload = BTreeMap::new();
-    let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(text) else {
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(text)
+    else {
         return payload;
     };
     for (key, value) in object {

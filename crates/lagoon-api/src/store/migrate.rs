@@ -154,11 +154,8 @@ pub fn repair_account_ids(connection: &Connection) -> Result<(), MigrationError>
                  WHERE remote_id IN (SELECT remote_id FROM {table} WHERE account_id = ?1)
                    AND account_id = ?2"
             );
-            let count: i64 = connection.query_row(
-                &sql,
-                rusqlite::params![bytes, text],
-                |row| row.get(0),
-            )?;
+            let count: i64 =
+                connection.query_row(&sql, rusqlite::params![bytes, text], |row| row.get(0))?;
             if count > 0 {
                 collision = true;
                 break;
@@ -278,9 +275,8 @@ pub fn seal_legacy_drafts(
         return Ok(());
     };
 
-    let mut statement = connection.prepare(
-        "SELECT id, variants FROM draft_replies WHERE variants NOT LIKE 'lgb1:%'",
-    )?;
+    let mut statement = connection
+        .prepare("SELECT id, variants FROM draft_replies WHERE variants NOT LIKE 'lgb1:%'")?;
     let rows = statement.query_map([], |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -293,12 +289,10 @@ pub fn seal_legacy_drafts(
     for (id, variants) in pending {
         // The column holds one JSON array; sealing the whole array keeps its
         // length and order unreadable, which is the point (v3 DraftCipher).
-        let payload: Vec<String> = serde_json::from_str(&variants).map_err(|_| {
-            MigrationError::Sqlite(rusqlite::Error::InvalidQuery)
-        })?;
-        let json = serde_json::to_string(&payload).map_err(|_| {
-            MigrationError::Sqlite(rusqlite::Error::InvalidQuery)
-        })?;
+        let payload: Vec<String> = serde_json::from_str(&variants)
+            .map_err(|_| MigrationError::Sqlite(rusqlite::Error::InvalidQuery))?;
+        let json = serde_json::to_string(&payload)
+            .map_err(|_| MigrationError::Sqlite(rusqlite::Error::InvalidQuery))?;
         connection.execute(
             "UPDATE draft_replies SET variants = ?1 WHERE id = ?2",
             rusqlite::params![key.seal(&json)?, id],
@@ -313,14 +307,16 @@ mod tests {
 
     fn test_key() -> BodyKey {
         use base64::Engine as _;
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(b"0123456789abcdef0123456789abcdef");
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(b"0123456789abcdef0123456789abcdef");
         BodyKey::from_base64(&encoded).expect("test key")
     }
 
     fn open() -> Connection {
         let connection = Connection::open_in_memory().expect("in-memory database");
-        connection.execute_batch("PRAGMA foreign_keys = ON").expect("pragmas");
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON")
+            .expect("pragmas");
         connection
     }
 
@@ -390,18 +386,24 @@ mod tests {
             .expect("legacy rows");
         seal_legacy_bodies(&connection, Some(&key)).expect("seal");
         let body: String = connection
-            .query_row("SELECT body_cipher FROM message_bodies", [], |row| row.get(0))
+            .query_row("SELECT body_cipher FROM message_bodies", [], |row| {
+                row.get(0)
+            })
             .expect("body");
         assert!(body.starts_with("lgb1:"));
         assert_eq!(key.open(&body).expect("open"), "plain body");
         let snippet: String = connection
-            .query_row("SELECT snippet_cipher FROM message_headers", [], |row| row.get(0))
+            .query_row("SELECT snippet_cipher FROM message_headers", [], |row| {
+                row.get(0)
+            })
             .expect("snippet");
         assert_eq!(key.open(&snippet).expect("open"), "plain snippet");
         // Running it again changes nothing.
         seal_legacy_bodies(&connection, Some(&key)).expect("second seal");
         let again: String = connection
-            .query_row("SELECT body_cipher FROM message_bodies", [], |row| row.get(0))
+            .query_row("SELECT body_cipher FROM message_bodies", [], |row| {
+                row.get(0)
+            })
             .expect("body");
         assert_eq!(again, body);
     }

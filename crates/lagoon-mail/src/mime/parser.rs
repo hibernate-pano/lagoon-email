@@ -174,7 +174,10 @@ fn parse_part(
         // The forwarded text belongs to the body; its HTML does not — the
         // detail view renders html in preference to text, so promoting it would
         // hide the sender's actual message behind the forward.
-        let mut result = ParseResult { text: inner.text, ..Default::default() };
+        let mut result = ParseResult {
+            text: inner.text,
+            ..Default::default()
+        };
         result.attachments.push(forwarded_attachment(
             part_path,
             filename,

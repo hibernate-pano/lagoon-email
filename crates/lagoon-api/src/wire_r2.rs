@@ -18,7 +18,10 @@ use crate::uuid::Uuid;
 /// Foundation writes a whole Double without a fractional part; serde writes
 /// 0.0. One decimal formatter for every money/minute field keeps a diff against
 /// v3 free of noise.
-pub(crate) fn serialize_double<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+pub(crate) fn serialize_double<S: Serializer>(
+    value: &f64,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     if value.fract() == 0.0 && value.is_finite() && value.abs() < 9.0e15 {
         serializer.serialize_i64(*value as i64)
     } else {

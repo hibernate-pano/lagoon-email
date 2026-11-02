@@ -177,8 +177,7 @@ const SELECT_COLUMNS: &str = "
     FROM message_headers h
     LEFT JOIN message_pins
            ON message_pins.account_id = h.account_id
-          AND message_pins.remote_id = h.remote_id"
-;
+          AND message_pins.remote_id = h.remote_id";
 
 /// v3 `MessageStore.recent(forAccount:limit:...)`.
 pub fn recent(
@@ -203,7 +202,9 @@ pub fn count(connection: &Connection, filter: &MessageFilter) -> rusqlite::Resul
     let (where_clause, arguments) = filter.where_clause();
     let sql = format!("SELECT COUNT(*) AS count FROM message_headers h\n{where_clause}");
     let mut statement = connection.prepare(&sql)?;
-    statement.query_row(rusqlite::params_from_iter(arguments.iter()), |row| row.get(0))
+    statement.query_row(rusqlite::params_from_iter(arguments.iter()), |row| {
+        row.get(0)
+    })
 }
 
 /// v3 `MessageStore.unreadCount` - the inbox clause plus `is_read = FALSE`.
@@ -213,7 +214,9 @@ pub fn unread_count(connection: &Connection, account_id: Uuid) -> rusqlite::Resu
         "SELECT COUNT(*) AS count FROM message_headers h\n{where_clause}\n  AND h.is_read = FALSE"
     );
     let mut statement = connection.prepare(&sql)?;
-    statement.query_row(rusqlite::params_from_iter(arguments.iter()), |row| row.get(0))
+    statement.query_row(rusqlite::params_from_iter(arguments.iter()), |row| {
+        row.get(0)
+    })
 }
 
 /// The six sidebar tallies, read together.
@@ -290,7 +293,10 @@ pub fn find(
     remote_id: &str,
 ) -> rusqlite::Result<Option<StoredMessage>> {
     let mut statement = connection.prepare(FIND_SQL)?;
-    let mut rows = statement.query(rusqlite::params![account_id.as_bytes().as_slice(), remote_id])?;
+    let mut rows = statement.query(rusqlite::params![
+        account_id.as_bytes().as_slice(),
+        remote_id
+    ])?;
     match rows.next()? {
         Some(row) => {
             let mut message = decode_find_row(row)?;
@@ -307,10 +313,12 @@ pub fn find_stack_rule(
     id: Uuid,
     account_id: Uuid,
 ) -> Result<Option<StackMatch>, StoreError> {
-    let mut statement = connection.prepare(
-        "SELECT kind, value FROM stack_rules WHERE id = ? AND account_id = ? LIMIT 1",
-    )?;
-    let mut rows = statement.query(rusqlite::params![id.as_bytes().as_slice(), account_id.as_bytes().as_slice()])?;
+    let mut statement = connection
+        .prepare("SELECT kind, value FROM stack_rules WHERE id = ? AND account_id = ? LIMIT 1")?;
+    let mut rows = statement.query(rusqlite::params![
+        id.as_bytes().as_slice(),
+        account_id.as_bytes().as_slice()
+    ])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
     };

@@ -104,10 +104,7 @@ pub const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
 #[derive(Debug)]
 pub enum DbError {
     Missing(PathBuf),
-    Open {
-        path: PathBuf,
-        message: String,
-    },
+    Open { path: PathBuf, message: String },
     Sqlite(rusqlite::Error),
     Store(StoreError),
     Schema(String),
@@ -310,7 +307,8 @@ fn validate_schema(connection: &Connection) -> Result<SchemaReport, DbError> {
         }
     }
 
-    let mut statement = connection.prepare("SELECT identifier FROM grdb_migrations ORDER BY rowid")?;
+    let mut statement =
+        connection.prepare("SELECT identifier FROM grdb_migrations ORDER BY rowid")?;
     let migrations: Vec<String> = statement
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -400,7 +398,10 @@ pub fn timestamp_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Timesta
     })
 }
 
-pub fn optional_timestamp_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<Timestamp>> {
+pub fn optional_timestamp_column(
+    row: &Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<Timestamp>> {
     let raw: Option<String> = row.get(index)?;
     Ok(crate::timefmt::parse(raw.as_deref()))
 }

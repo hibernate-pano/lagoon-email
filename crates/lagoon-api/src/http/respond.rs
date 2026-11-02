@@ -57,8 +57,9 @@ pub fn text(status: StatusCode, value: &'static str) -> Response {
 fn build(status: StatusCode, content_type: &'static str, body: Body) -> Response {
     let mut response = Response::new(body);
     *response.status_mut() = status;
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, header::HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(content_type),
+    );
     response
 }

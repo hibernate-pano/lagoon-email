@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::BodyKey;
 use crate::db;
-use crate::provider::{MailChangeSet, ProviderFactory, ProviderError};
+use crate::provider::{MailChangeSet, ProviderError, ProviderFactory};
 use crate::store::{self, write};
 use crate::timefmt;
 use crate::token::{ImapCredentials, TokenKey};
@@ -193,7 +193,8 @@ impl SyncEngine {
             return RoundOutcome::Parked(ParkReason::NeedsReconnect);
         };
         let Some(provider) = self.factory.make(&credentials) else {
-            let _ = write::update_health(&connection, account_id, "error", None, Some("no-provider"));
+            let _ =
+                write::update_health(&connection, account_id, "error", None, Some("no-provider"));
             return RoundOutcome::NoProvider;
         };
 
@@ -222,14 +223,12 @@ impl SyncEngine {
                     _ => "provider",
                 };
                 let consecutive = self.next_failure(account_id).await;
-                let status = if consecutive >= 3 { "degraded" } else { "error" };
-                let _ = write::update_health(
-                    &connection,
-                    account_id,
-                    status,
-                    None,
-                    Some(label),
-                );
+                let status = if consecutive >= 3 {
+                    "degraded"
+                } else {
+                    "error"
+                };
+                let _ = write::update_health(&connection, account_id, status, None, Some(label));
                 let backoff = backoff_seconds(consecutive);
                 tracing::warn!(
                     account = %account.email,
@@ -343,8 +342,8 @@ impl SyncEngine {
         // the sentFolder marker. Already-known ids are skipped, which also makes
         // a Sent UIDVALIDITY reset idempotent.
         if !changes.replied_message_ids.is_empty() {
-            let known = store::actions::replied_remote_ids(connection, account_id)
-                .unwrap_or_default();
+            let known =
+                store::actions::replied_remote_ids(connection, account_id).unwrap_or_default();
             let known: HashSet<&str> = known.iter().map(String::as_str).collect();
             for message_id in &changes.replied_message_ids {
                 if !known.contains(message_id.as_str()) {
@@ -418,9 +417,7 @@ fn after_round(outcome: &RoundOutcome) -> AfterRound {
         } => AfterRound::In(std::time::Duration::from_secs_f64(*backoff_seconds)),
         // The pull blocked on IDLE for up to IDLE_BUDGET; sleeping on top
         // would add back exactly the latency IDLE exists to remove.
-        RoundOutcome::Applied { waited: true, .. } => {
-            AfterRound::In(std::time::Duration::ZERO)
-        }
+        RoundOutcome::Applied { waited: true, .. } => AfterRound::In(std::time::Duration::ZERO),
         _ => AfterRound::In(IDLE_WAIT),
     }
 }
@@ -491,7 +488,10 @@ impl SyncSupervisor {
                 return;
             };
             match store::accounts::all(&connection) {
-                Ok(accounts) => accounts.into_iter().map(|account| account.id).collect::<Vec<_>>(),
+                Ok(accounts) => accounts
+                    .into_iter()
+                    .map(|account| account.id)
+                    .collect::<Vec<_>>(),
                 Err(error) => {
                     tracing::error!(err = %error, "sync.accountListFailed");
                     return;
@@ -546,7 +546,13 @@ impl SyncSupervisor {
     }
 
     pub async fn stop(&self) {
-        let tasks: Vec<_> = self.tasks.lock().await.drain().map(|(_, task)| task).collect();
+        let tasks: Vec<_> = self
+            .tasks
+            .lock()
+            .await
+            .drain()
+            .map(|(_, task)| task)
+            .collect();
         for task in tasks {
             task.abort();
         }

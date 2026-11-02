@@ -107,7 +107,10 @@ async fn serves_a_body_sealed_by_swift() {
     assert_eq!(observed.body["to"], json!(["me@example.invalid"]));
     assert_eq!(observed.body["cc"], json!([]));
     assert_eq!(observed.body["hasMore"], json!(false));
-    assert_eq!(observed.body["attachments"][0]["mimeType"], json!("application/pdf"));
+    assert_eq!(
+        observed.body["attachments"][0]["mimeType"],
+        json!("application/pdf")
+    );
     assert_eq!(observed.body["attachments"][0]["size"], json!(1234));
     // v3 passes toAddress nil on this path, and a nil optional is an absent key.
     assert!(
@@ -134,7 +137,10 @@ async fn decrypts_a_swift_sealed_snippet_into_the_list() {
     }
 
     let client = http::client();
-    let url = format!("{}/api/messages?accountId={}", server.base_url, seed.account_id);
+    let url = format!(
+        "{}/api/messages?accountId={}",
+        server.base_url, seed.account_id
+    );
     let observed = get(&client, &url, &server.auth_headers()).await;
     assert_eq!(observed.status, 200);
 
@@ -165,7 +171,10 @@ async fn body_route_status_codes_match_the_contract() {
 
     let malformed = get(
         &client,
-        &format!("{}/api/messages/{remote}/body?accountId=not-a-uuid", server.base_url),
+        &format!(
+            "{}/api/messages/{remote}/body?accountId=not-a-uuid",
+            server.base_url
+        ),
         &auth,
     )
     .await;
@@ -174,7 +183,10 @@ async fn body_route_status_codes_match_the_contract() {
 
     let unknown = get(
         &client,
-        &format!("{}/api/messages/{remote}/body?accountId={UNKNOWN_ACCOUNT}", server.base_url),
+        &format!(
+            "{}/api/messages/{remote}/body?accountId={UNKNOWN_ACCOUNT}",
+            server.base_url
+        ),
         &auth,
     )
     .await;
@@ -183,7 +195,10 @@ async fn body_route_status_codes_match_the_contract() {
 
     let cache_miss = get(
         &client,
-        &format!("{}/api/messages/{remote}/body?accountId={}", server.base_url, seed.account_id),
+        &format!(
+            "{}/api/messages/{remote}/body?accountId={}",
+            server.base_url, seed.account_id
+        ),
         &auth,
     )
     .await;
@@ -251,7 +266,10 @@ async fn stack_rules_narrow_the_list() {
         .count();
     assert_eq!(filtered.body["totalCount"], json!(subject_count));
     assert_eq!(
-        filtered.body["messages"].as_array().expect("messages").len(),
+        filtered.body["messages"]
+            .as_array()
+            .expect("messages")
+            .len(),
         subject_count
     );
 
@@ -280,8 +298,7 @@ async fn stack_rules_narrow_the_list() {
     .await;
     assert_eq!(ignored.status, 200);
     assert_eq!(
-        ignored.body["totalCount"],
-        filtered.body["totalCount"],
+        ignored.body["totalCount"], filtered.body["totalCount"],
         "ignoring the malformed id must leave the unfiltered inbox"
     );
 }
@@ -327,10 +344,16 @@ fn the_service_handle_is_read_only_and_refuses_a_foreign_store() {
 
     let db = Db::open_read_only(&store).expect("open read-only");
     let write = db.with_connection(|connection| connection.execute("DELETE FROM accounts", []));
-    assert!(write.is_err(), "a write through the service handle must fail");
+    assert!(
+        write.is_err(),
+        "a write through the service handle must fail"
+    );
 
     let missing = Db::open_read_only(temp.join("absent.sqlite"));
-    assert!(missing.is_err(), "a missing store is refused, never created");
+    assert!(
+        missing.is_err(),
+        "a missing store is refused, never created"
+    );
 
     let foreign = temp.join("not-a-lagoon-store.sqlite");
     std::fs::write(&foreign, b"this is not sqlite").expect("write junk");
@@ -365,13 +388,23 @@ async fn host_guard_and_auth_gate_match_v3() {
     assert_eq!(health.body, json!("ok"));
 
     // Exact-match gating: a spelling the router may still normalise is gated.
-    let doubled = get(&client, &format!("{server_base}//healthz", server_base = server.base_url), &[]).await;
+    let doubled = get(
+        &client,
+        &format!("{server_base}//healthz", server_base = server.base_url),
+        &[],
+    )
+    .await;
     assert_eq!(doubled.status, 401, "//healthz must not be ungated");
 
     for host in ["localhost:1234", "[::1]:9999"] {
         let mut headers = auth.clone();
         headers.push(("Host".to_owned(), host.to_owned()));
-        let accounts = get(&client, &format!("{}/api/accounts", server.base_url), &headers).await;
+        let accounts = get(
+            &client,
+            &format!("{}/api/accounts", server.base_url),
+            &headers,
+        )
+        .await;
         assert_eq!(accounts.status, 200, "host {host} should be allowed");
     }
 
@@ -384,7 +417,12 @@ async fn host_guard_and_auth_gate_match_v3() {
     // A bad token is the same 401 as no token (v3 hashes both sides).
     let mut wrong = vec![("Authorization".to_owned(), "Bearer nope".to_owned())];
     wrong.push(("Host".to_owned(), format!("127.0.0.1:{port}")));
-    let unauthorized = get(&client, &format!("{}/api/accounts", server.base_url), &wrong).await;
+    let unauthorized = get(
+        &client,
+        &format!("{}/api/accounts", server.base_url),
+        &wrong,
+    )
+    .await;
     assert_eq!(unauthorized.status, 401);
     assert_eq!(unauthorized.body, json!({"error": "api-unauthorized"}));
     assert!(!TEST_API_TOKEN.is_empty());
@@ -401,6 +439,9 @@ async fn a_server_without_a_token_refuses_every_gated_path() {
     let client = http::client();
 
     let accounts = get(&client, &format!("{}/api/accounts", server.base_url), &[]).await;
-    assert_eq!(accounts.status, 401, "a server with no token must fail closed");
+    assert_eq!(
+        accounts.status, 401,
+        "a server with no token must fail closed"
+    );
     assert_eq!(accounts.body, json!({"error": "api-unauthorized"}));
 }

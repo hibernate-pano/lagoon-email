@@ -42,7 +42,9 @@ async fn serves_the_v3_sidecar_store_read_only() {
 
     // The schema probe R1 refuses to start without.
     let db = Db::open_read_only(path.clone()).expect("the v3 store must open read-only");
-    let report = db.validate_schema().expect("the v3 store must satisfy the R1 schema");
+    let report = db
+        .validate_schema()
+        .expect("the v3 store must satisfy the R1 schema");
     assert!(
         report.migrations.contains(&"lagoon-v10".to_owned()),
         "expected the v3.2.0 migration chain, saw {:?}",
@@ -58,13 +60,7 @@ async fn serves_the_v3_sidecar_store_read_only() {
     let client = http::client();
     let auth = server.auth_headers();
 
-    let health = http::request(
-        &client,
-        "GET",
-        &format!("{}/healthz", server.base_url),
-        &[],
-    )
-    .await;
+    let health = http::request(&client, "GET", &format!("{}/healthz", server.base_url), &[]).await;
     assert_eq!(health.status, 200);
     assert_eq!(health.content_type, "text/plain; charset=utf-8");
     assert_eq!(health.body, json!("ok"));
@@ -108,7 +104,10 @@ async fn serves_the_v3_sidecar_store_read_only() {
     let body = http::request(
         &client,
         "GET",
-        &format!("{}/api/messages/whatever/body?accountId={unknown}", server.base_url),
+        &format!(
+            "{}/api/messages/whatever/body?accountId={unknown}",
+            server.base_url
+        ),
         &auth,
     )
     .await;

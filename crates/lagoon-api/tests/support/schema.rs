@@ -184,7 +184,8 @@ pub const MIGRATIONS: &[&str] = &[
 /// Create the schema and record the migration chain.
 pub fn create(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(DDL)?;
-    let mut statement = connection.prepare("INSERT INTO grdb_migrations (identifier) VALUES (?)")?;
+    let mut statement =
+        connection.prepare("INSERT INTO grdb_migrations (identifier) VALUES (?)")?;
     for migration in MIGRATIONS {
         statement.execute([migration])?;
     }

@@ -14,7 +14,7 @@ use lagoon_api::db;
 use lagoon_api::provider::fake::FakeProviderFactory;
 use lagoon_api::provider::{MailChangeSet, ProviderError, RemoteHeader};
 use lagoon_api::store::{self, write};
-use lagoon_api::sync::{backoff_seconds, RoundOutcome, SyncEngine, SyncCursor};
+use lagoon_api::sync::{backoff_seconds, RoundOutcome, SyncCursor, SyncEngine};
 use lagoon_api::token::{ImapCredentials, TokenKey};
 use lagoon_api::uuid::Uuid;
 
@@ -302,7 +302,10 @@ async fn transient_failures_back_off_and_escalate_to_degraded() {
         }
         other => panic!("expected Failed, got {other:?}"),
     }
-    assert_eq!(store.health(account), ("error".to_owned(), Some("unreachable".to_owned())));
+    assert_eq!(
+        store.health(account),
+        ("error".to_owned(), Some("unreachable".to_owned()))
+    );
 
     let second = engine.round(account).await;
     match second {

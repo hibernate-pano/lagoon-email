@@ -29,8 +29,8 @@ pub fn body_key() -> BodyKey {
 /// The token key for the account routes: a different seed from the body key,
 /// so a test that mixes them up fails loudly.
 pub fn token_key() -> lagoon_api::token::TokenKey {
-    let encoded = base64::engine::general_purpose::STANDARD
-        .encode(b"fedcba9876543210fedcba9876543210");
+    let encoded =
+        base64::engine::general_purpose::STANDARD.encode(b"fedcba9876543210fedcba9876543210");
     lagoon_api::token::TokenKey::from_base64(&encoded).expect("test token key")
 }
 
@@ -153,10 +153,7 @@ impl TestServer {
 
     /// Bearer header for this server, as the fixtures the harness sends it.
     pub fn auth_headers(&self) -> Vec<(String, String)> {
-        vec![(
-            "Authorization".to_owned(),
-            format!("Bearer {}", self.token),
-        )]
+        vec![("Authorization".to_owned(), format!("Bearer {}", self.token))]
     }
 }
 

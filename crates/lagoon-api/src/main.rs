@@ -20,7 +20,10 @@ async fn main() -> ExitCode {
     telemetry::init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|argument| argument == "--help" || argument == "-h") {
+    if args
+        .iter()
+        .any(|argument| argument == "--help" || argument == "-h")
+    {
         print_usage();
         return ExitCode::SUCCESS;
     }
@@ -83,7 +86,11 @@ fn run_migrate(config: &Config) -> Result<(), String> {
             report.applied.join(", ")
         );
     }
-    tracing::info!(applied = report.applied.len(), already = report.already_present, "migrated");
+    tracing::info!(
+        applied = report.applied.len(),
+        already = report.already_present,
+        "migrated"
+    );
     Ok(())
 }
 

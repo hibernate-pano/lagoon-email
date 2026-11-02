@@ -126,8 +126,14 @@ mod tests {
     fn accepts_the_canonical_form_in_either_case() {
         let lower = Uuid::parse_strict("11111111-1111-4111-8111-111111111111").unwrap();
         let upper = Uuid::parse_strict("11111111-1111-4111-8111-11111111111A").unwrap();
-        assert_eq!(lower.to_wire_string(), "11111111-1111-4111-8111-111111111111");
-        assert_eq!(upper.to_wire_string(), "11111111-1111-4111-8111-11111111111a");
+        assert_eq!(
+            lower.to_wire_string(),
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(
+            upper.to_wire_string(),
+            "11111111-1111-4111-8111-11111111111a"
+        );
     }
 
     #[test]

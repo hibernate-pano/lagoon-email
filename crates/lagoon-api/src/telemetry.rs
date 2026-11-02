@@ -88,7 +88,8 @@ impl Visit for FieldVisitor {
         if field.name() == "message" {
             self.message = value.to_owned();
         } else {
-            self.fields.push((field.name().to_owned(), value.to_owned()));
+            self.fields
+                .push((field.name().to_owned(), value.to_owned()));
         }
     }
 }

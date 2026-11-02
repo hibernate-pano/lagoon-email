@@ -12,15 +12,14 @@ use serde_json::Value;
 use lagoon_api::crypto::BodyKey;
 use lagoon_api::db;
 use lagoon_api::store::migrate::{migrate, seal_legacy_bodies};
-use lagoon_api::store::write::{
-    self, NewAccount, NewBody, NewHeader,
-};
+use lagoon_api::store::write::{self, NewAccount, NewBody, NewHeader};
 use lagoon_api::uuid::Uuid;
 use support::TempDir;
 
 fn test_key() -> BodyKey {
     use base64::Engine as _;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(b"0123456789abcdef0123456789abcdef");
+    let encoded =
+        base64::engine::general_purpose::STANDARD.encode(b"0123456789abcdef0123456789abcdef");
     BodyKey::from_base64(&encoded).expect("test key")
 }
 
@@ -75,8 +74,8 @@ fn rust_schema_matches_the_v3_golden() {
     assert_eq!(report.applied.len(), 11);
     drop(connection);
 
-    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/golden/v3-schema.json");
+    let golden_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/v3-schema.json");
     let golden: Value =
         serde_json::from_str(&std::fs::read_to_string(&golden_path).expect("read golden"))
             .expect("parse golden");
@@ -92,9 +91,21 @@ fn rust_schema_matches_the_v3_golden() {
     );
     for (index, golden_object) in golden_objects.iter().enumerate() {
         let ours = &objects[index];
-        assert_eq!(ours.kind, golden_object["type"].as_str().unwrap(), "type at {index}");
-        assert_eq!(ours.name, golden_object["name"].as_str().unwrap(), "name at {index}");
-        assert_eq!(ours.table, golden_object["table"].as_str().unwrap(), "table at {index}");
+        assert_eq!(
+            ours.kind,
+            golden_object["type"].as_str().unwrap(),
+            "type at {index}"
+        );
+        assert_eq!(
+            ours.name,
+            golden_object["name"].as_str().unwrap(),
+            "name at {index}"
+        );
+        assert_eq!(
+            ours.table,
+            golden_object["table"].as_str().unwrap(),
+            "table at {index}"
+        );
         assert_eq!(
             ours.sql.as_deref().unwrap_or(""),
             golden_object["sql"].as_str().unwrap_or(""),
@@ -109,7 +120,10 @@ fn rust_schema_matches_the_v3_golden() {
         .iter()
         .map(|value| value.as_str().expect("migration name").to_owned())
         .collect();
-    assert_eq!(migrations, golden_migrations, "grdb_migrations rows differ from v3");
+    assert_eq!(
+        migrations, golden_migrations,
+        "grdb_migrations rows differ from v3"
+    );
 }
 
 #[test]
@@ -177,7 +191,8 @@ fn write_paths_round_trip_through_the_read_store() {
     // the stored id, so a re-authorisation does not orphan the mailbox.
     let stored = write::upsert_account(&connection, &new_account(account_id())).expect("account");
     assert_eq!(stored, account_id());
-    let mut changed = new_account(Uuid::parse_strict("99999999-9999-4999-8999-999999999999").unwrap());
+    let mut changed =
+        new_account(Uuid::parse_strict("99999999-9999-4999-8999-999999999999").unwrap());
     changed.email = "r3-renamed@example.invalid";
     let again = write::upsert_account(&connection, &changed).expect("second upsert");
     assert_eq!(again, account_id(), "stored id wins on conflict");
@@ -248,10 +263,16 @@ fn write_paths_round_trip_through_the_read_store() {
     assert!(!pinned.contains("r3-msg-1"));
 
     // Audit log: an action and its undo row, both visible to the read side.
-    let action = write::record_action(&connection, account_id(), "pin", r#"{"remoteId":"r3-msg-1"}"#)
-        .expect("action");
+    let action = write::record_action(
+        &connection,
+        account_id(),
+        "pin",
+        r#"{"remoteId":"r3-msg-1"}"#,
+    )
+    .expect("action");
     assert!(action > 0);
-    let undo = write::record_undo(&connection, account_id(), action, r#"{"ok":true}"#).expect("undo");
+    let undo =
+        write::record_undo(&connection, account_id(), action, r#"{"ok":true}"#).expect("undo");
     assert!(undo > action);
     let actions = lagoon_api::store::actions::page(&connection, account_id(), None, None, 10)
         .expect("actions page");
@@ -280,9 +301,16 @@ fn write_paths_round_trip_through_the_read_store() {
         .query_row("SELECT COUNT(*) FROM message_headers", [], |row| row.get(0))
         .expect("count");
     assert_eq!(headers, 0);
-    for table in ["message_bodies", "draft_replies", "ai_actions", "message_pins"] {
+    for table in [
+        "message_bodies",
+        "draft_replies",
+        "ai_actions",
+        "message_pins",
+    ] {
         let count: i64 = connection
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
             .expect("count");
         assert_eq!(count, 0, "{table} should cascade");
     }
@@ -307,7 +335,9 @@ fn legacy_plaintext_bodies_are_sealed_by_the_v6_step() {
         .expect("legacy body");
     seal_legacy_bodies(&connection, Some(&key)).expect("seal");
     let sealed: String = connection
-        .query_row("SELECT body_cipher FROM message_bodies", [], |row| row.get(0))
+        .query_row("SELECT body_cipher FROM message_bodies", [], |row| {
+            row.get(0)
+        })
         .expect("body");
     assert!(sealed.starts_with("lgb1:"));
     assert_eq!(key.open(&sealed).expect("open"), "plaintext body");

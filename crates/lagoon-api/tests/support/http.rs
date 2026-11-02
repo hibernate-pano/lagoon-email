@@ -62,7 +62,10 @@ pub async fn request_with_body(
         .to_bytes();
     let (body_kind, body) = if bytes.is_empty() {
         ("empty", serde_json::Value::Null)
-    } else if content_type.to_ascii_lowercase().contains("application/json") {
+    } else if content_type
+        .to_ascii_lowercase()
+        .contains("application/json")
+    {
         match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(value) => ("json", value),
             Err(_) => (

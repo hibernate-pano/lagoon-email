@@ -41,10 +41,7 @@ pub const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
 ///
 /// A published build always receives `--db` or `LAGOON_DB_PATH` from the shell;
 /// this default exists so `cargo run` in a checkout does the obvious thing.
-const DEFAULT_DB_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../.dev/data/lagoon.sqlite"
-);
+const DEFAULT_DB_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.dev/data/lagoon.sqlite");
 
 const DEFAULT_PORT: u16 = 8080;
 
@@ -126,9 +123,10 @@ impl Config {
             let argument = args[index].as_str();
             match argument {
                 "--db" | "--host" | "--port" => {
-                    let value = args.get(index + 1).cloned().ok_or_else(|| {
-                        ConfigError::MissingValue(argument.to_owned())
-                    })?;
+                    let value = args
+                        .get(index + 1)
+                        .cloned()
+                        .ok_or_else(|| ConfigError::MissingValue(argument.to_owned()))?;
                     match argument {
                         "--db" => db_override = Some(PathBuf::from(value)),
                         "--host" => host_override = Some(value),
@@ -208,7 +206,10 @@ impl Config {
 
     /// Host names a request may address - v3 `ServerConfig.allowedHostNames`.
     pub fn allowed_host_names(&self) -> HashSet<String> {
-        let mut names: HashSet<String> = LOOPBACK_HOSTS.iter().map(|name| (*name).to_owned()).collect();
+        let mut names: HashSet<String> = LOOPBACK_HOSTS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
         if self.api_token.is_some() && !self.is_wildcard_bind() {
             let bound = normalize_host(&self.host);
             if !bound.is_empty() {

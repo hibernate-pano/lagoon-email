@@ -42,7 +42,8 @@ struct KeysFile {
 fn random_bytes(n: usize) -> Result<Vec<u8>, String> {
     let mut file = fs::File::open("/dev/urandom").map_err(|e| format!("open /dev/urandom: {e}"))?;
     let mut buf = vec![0u8; n];
-    file.read_exact(&mut buf).map_err(|e| format!("read /dev/urandom: {e}"))?;
+    file.read_exact(&mut buf)
+        .map_err(|e| format!("read /dev/urandom: {e}"))?;
     Ok(buf)
 }
 
@@ -60,7 +61,11 @@ fn validate(keys: KeysFile) -> Result<Keys, String> {
     if keys.api_token.trim().is_empty() {
         return Err("keys.json: apiToken is empty".into());
     }
-    Ok(Keys { token_key: keys.token_key, body_key: keys.body_key, api_token: keys.api_token })
+    Ok(Keys {
+        token_key: keys.token_key,
+        body_key: keys.body_key,
+        api_token: keys.api_token,
+    })
 }
 
 /// Read `path`, or create it once with mode 0600. Never overwrites.
@@ -80,7 +85,10 @@ pub fn load_or_generate(path: &Path) -> Result<Keys, String> {
     let keys = KeysFile {
         token_key: B64.encode(random_bytes(32)?),
         body_key: B64.encode(random_bytes(32)?),
-        api_token: random_bytes(24)?.iter().map(|b| format!("{b:02x}")).collect(),
+        api_token: random_bytes(24)?
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
     };
     let json = format!(
         "{{\"tokenKey\":\"{}\",\"bodyKey\":\"{}\",\"apiToken\":\"{}\"}}\n",

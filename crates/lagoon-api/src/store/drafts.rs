@@ -61,7 +61,10 @@ pub fn list(
          WHERE account_id = ? AND remote_id = ?
          ORDER BY created_at DESC",
     )?;
-    let mut rows = statement.query(rusqlite::params![account_id.as_bytes().as_slice(), remote_id])?;
+    let mut rows = statement.query(rusqlite::params![
+        account_id.as_bytes().as_slice(),
+        remote_id
+    ])?;
     let mut drafts = Vec::new();
     while let Some(row) = rows.next()? {
         let sealed: String = row.get(3)?;

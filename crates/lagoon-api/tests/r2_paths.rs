@@ -29,7 +29,11 @@ async fn get(client: &http::HttpClient, url: &str, headers: &[(String, String)])
     http::request(client, "GET", url, headers).await
 }
 
-async fn post(client: &http::HttpClient, url: &str, headers: &[(String, String)]) -> http::Observed {
+async fn post(
+    client: &http::HttpClient,
+    url: &str,
+    headers: &[(String, String)],
+) -> http::Observed {
     http::request(client, "POST", url, headers).await
 }
 
@@ -85,7 +89,10 @@ async fn advice_queue_and_accepted_stats() {
 
     let all = get(
         &client,
-        &format!("{}/api/advice?accountId={account}&decision=any", server.base_url),
+        &format!(
+            "{}/api/advice?accountId={account}&decision=any",
+            server.base_url
+        ),
         &auth,
     )
     .await;
@@ -98,7 +105,10 @@ async fn advice_queue_and_accepted_stats() {
 
     let stats = get(
         &client,
-        &format!("{}/api/advice/accepted-stats?accountId={account}", server.base_url),
+        &format!(
+            "{}/api/advice/accepted-stats?accountId={account}",
+            server.base_url
+        ),
         &auth,
     )
     .await;
@@ -130,7 +140,10 @@ async fn stacks_reminders_and_notices() {
                 "INSERT INTO stack_rules (id, account_id, name, kind, value, created_at)
                  VALUES (?, ?, 'Sender to archive', 'sender', 'alice.fixture@example.invalid',
                          '2025-02-05 09:00:00.000')",
-                rusqlite::params![uuid_bytes("55555555-5555-4555-8555-555555555551"), uuid_bytes(&account)],
+                rusqlite::params![
+                    uuid_bytes("55555555-5555-4555-8555-555555555551"),
+                    uuid_bytes(&account)
+                ],
             )
             .expect("sender rule");
         connection
@@ -138,7 +151,10 @@ async fn stacks_reminders_and_notices() {
                 "INSERT INTO stack_rules (id, account_id, name, kind, value, created_at)
                  VALUES (?, ?, 'Subject keyword', 'keyword', 'fixture',
                          '2025-02-05 09:01:00.000')",
-                rusqlite::params![uuid_bytes("55555555-5555-4555-8555-555555555552"), uuid_bytes(&account)],
+                rusqlite::params![
+                    uuid_bytes("55555555-5555-4555-8555-555555555552"),
+                    uuid_bytes(&account)
+                ],
             )
             .expect("keyword rule");
         connection
@@ -212,7 +228,12 @@ async fn stacks_reminders_and_notices() {
         2
     );
 
-    let notices = get(&client, &format!("{}/api/store-notices", server.base_url), &auth).await;
+    let notices = get(
+        &client,
+        &format!("{}/api/store-notices", server.base_url),
+        &auth,
+    )
+    .await;
     assert_eq!(notices.status, 200);
     assert_eq!(notices.body["notices"][0]["id"], json!("fixture-notice-1"));
     assert_eq!(notices.body["notices"][0]["detail"], json!("1"));
@@ -301,12 +322,18 @@ async fn drafts_actions_time_saved_and_usage() {
 
     let drafts = get(
         &client,
-        &format!("{}/api/messages/{remote}/drafts?accountId={account}", server.base_url),
+        &format!(
+            "{}/api/messages/{remote}/drafts?accountId={account}",
+            server.base_url
+        ),
         &auth,
     )
     .await;
     assert_eq!(drafts.status, 200, "{:?}", drafts.body);
-    assert_eq!(drafts.body["drafts"][0]["variants"], json!(["Short reply", "Longer reply"]));
+    assert_eq!(
+        drafts.body["drafts"][0]["variants"],
+        json!(["Short reply", "Longer reply"])
+    );
     assert_eq!(drafts.body["drafts"][0]["chosenVariant"], json!(1));
 
     let actions = get(
@@ -336,7 +363,10 @@ async fn drafts_actions_time_saved_and_usage() {
     )
     .await;
     assert_eq!(page_two.status, 200, "{:?}", page_two.body);
-    assert_eq!(page_two.body["actions"].as_array().expect("actions").len(), 1);
+    assert_eq!(
+        page_two.body["actions"].as_array().expect("actions").len(),
+        1
+    );
     assert_eq!(page_two.body["hasMore"], json!(false));
 
     let unknown_before = get(
@@ -361,7 +391,13 @@ async fn drafts_actions_time_saved_and_usage() {
     assert_eq!(time_saved.body["today"]["minutesSaved"], json!(2));
     assert_eq!(time_saved.body["today"]["messagesHandled"], json!(1));
     assert_eq!(time_saved.body["today"]["draftsSent"], json!(1));
-    assert_eq!(time_saved.body["week"]["byDay"].as_array().expect("byDay").len(), 1);
+    assert_eq!(
+        time_saved.body["week"]["byDay"]
+            .as_array()
+            .expect("byDay")
+            .len(),
+        1
+    );
 
     let usage = get(&client, &format!("{}/api/usage", server.base_url), &auth).await;
     assert_eq!(usage.status, 200, "{:?}", usage.body);
@@ -374,7 +410,12 @@ async fn drafts_actions_time_saved_and_usage() {
         json!([{ "accountEmail": "me@example.invalid", "monthUSD": 0.25, "callCount": 1 }])
     );
 
-    let status = get(&client, &format!("{}/api/ai-status", server.base_url), &auth).await;
+    let status = get(
+        &client,
+        &format!("{}/api/ai-status", server.base_url),
+        &auth,
+    )
+    .await;
     assert_eq!(
         status.body,
         json!({ "configured": false, "creditExhausted": false, "circuitOpen": false })
@@ -416,7 +457,10 @@ async fn search_reaches_the_sealed_body_and_the_structured_verdict() {
 
     let subject_hit = get(
         &client,
-        &format!("{}/api/search?accountId={account}&q=fixture", server.base_url),
+        &format!(
+            "{}/api/search?accountId={account}&q=fixture",
+            server.base_url
+        ),
         &auth,
     )
     .await;
@@ -424,12 +468,21 @@ async fn search_reaches_the_sealed_body_and_the_structured_verdict() {
     assert_eq!(subject_hit.body["totalCount"], json!(3));
     assert_eq!(subject_hit.body["truncated"], json!(false));
     assert_eq!(subject_hit.body["bodyScanLimit"], json!(1000));
-    assert_eq!(subject_hit.body["results"].as_array().expect("results").len(), 3);
+    assert_eq!(
+        subject_hit.body["results"]
+            .as_array()
+            .expect("results")
+            .len(),
+        3
+    );
 
     // The sealed arm: no column matches sealedneedle, the body does.
     let sealed_hit = get(
         &client,
-        &format!("{}/api/search?accountId={account}&q=sealedneedle", server.base_url),
+        &format!(
+            "{}/api/search?accountId={account}&q=sealedneedle",
+            server.base_url
+        ),
         &auth,
     )
     .await;
@@ -441,7 +494,10 @@ async fn search_reaches_the_sealed_body_and_the_structured_verdict() {
     // The structured arm: the AI's category is matchable without a model call.
     let verdict_hit = get(
         &client,
-        &format!("{}/api/search?accountId={account}&q=marketing", server.base_url),
+        &format!(
+            "{}/api/search?accountId={account}&q=marketing",
+            server.base_url
+        ),
         &auth,
     )
     .await;
@@ -490,7 +546,10 @@ async fn provider_backed_routes_stop_at_the_same_gate_as_v3() {
     for path in ["summary", "inline-images", "raw.eml"] {
         let hit = get(
             &client,
-            &format!("{}/api/messages/{remote}/{path}?accountId={account}", server.base_url),
+            &format!(
+                "{}/api/messages/{remote}/{path}?accountId={account}",
+                server.base_url
+            ),
             &auth,
         )
         .await;
@@ -501,7 +560,10 @@ async fn provider_backed_routes_stop_at_the_same_gate_as_v3() {
     for path in ["summary", "inline-images", "raw.eml"] {
         let hit = get(
             &client,
-            &format!("{}/api/messages/{remote}/{path}?accountId={unknown}", server.base_url),
+            &format!(
+                "{}/api/messages/{remote}/{path}?accountId={unknown}",
+                server.base_url
+            ),
             &auth,
         )
         .await;
@@ -511,7 +573,10 @@ async fn provider_backed_routes_stop_at_the_same_gate_as_v3() {
 
     let draft = post(
         &client,
-        &format!("{}/api/messages/{remote}/draft?accountId={account}", server.base_url),
+        &format!(
+            "{}/api/messages/{remote}/draft?accountId={account}",
+            server.base_url
+        ),
         &auth,
     )
     .await;
@@ -523,7 +588,10 @@ async fn provider_backed_routes_stop_at_the_same_gate_as_v3() {
     // archive" rather than "the network failed".
     let archive = post(
         &client,
-        &format!("{}/api/messages/{remote}/archive?accountId={account}", server.base_url),
+        &format!(
+            "{}/api/messages/{remote}/archive?accountId={account}",
+            server.base_url
+        ),
         &auth,
     )
     .await;
@@ -532,7 +600,10 @@ async fn provider_backed_routes_stop_at_the_same_gate_as_v3() {
 
     let malformed = post(
         &client,
-        &format!("{}/api/messages/{remote}/archive?accountId=not-a-uuid", server.base_url),
+        &format!(
+            "{}/api/messages/{remote}/archive?accountId=not-a-uuid",
+            server.base_url
+        ),
         &auth,
     )
     .await;

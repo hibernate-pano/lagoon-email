@@ -44,7 +44,8 @@ async fn replays_every_read_only_fixture() {
         return;
     }
 
-    let server = TestServer::spawn_on_store("contract", db_path.clone(), Some(TEST_API_TOKEN)).await;
+    let server =
+        TestServer::spawn_on_store("contract", db_path.clone(), Some(TEST_API_TOKEN)).await;
     let client = http::client();
     let replayable = fixtures.replayable();
     let contract_expected = fixtures.contract_expected_count();

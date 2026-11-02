@@ -36,7 +36,11 @@ async fn boot_status(state: State<'_, AppState>) -> Result<BootStatus, String> {
     let status = state.shared.status();
     // Logged because it doubles as proof that the WebView really loaded and
     // ran our JavaScript: nothing else can call this command.
-    eprintln!("[ipc] boot_status -> phase={} port={:?}", status.phase.as_str(), status.port);
+    eprintln!(
+        "[ipc] boot_status -> phase={} port={:?}",
+        status.phase.as_str(),
+        status.port
+    );
     Ok(status)
 }
 
@@ -87,7 +91,9 @@ fn main() {
     let setup_shared = shared.clone();
 
     tauri::Builder::default()
-        .manage(AppState { shared: shared.clone() })
+        .manage(AppState {
+            shared: shared.clone(),
+        })
         .invoke_handler(tauri::generate_handler![boot_status, api, restart_sidecar])
         .setup(move |app| {
             setup_shared.set_app(app.handle().clone());
@@ -95,16 +101,18 @@ fn main() {
             // that subscribes during boot sees the event stream from the top.
             setup_shared.republish();
             let supervisor_shared = setup_shared.clone();
-            tauri::async_runtime::spawn(async move {
-                sidecar::supervise(supervisor_shared).await
-            });
+            tauri::async_runtime::spawn(async move { sidecar::supervise(supervisor_shared).await });
             Ok(())
         })
         .on_page_load(|_window, payload| {
             // Diagnostics only: names the URL the WebView actually loaded, and
             // whether the navigation finished. A window with no line at all is
             // a different failure from a loaded page whose JS never ran.
-            eprintln!("[ipc] page-load url={} event={:?}", payload.url(), payload.event());
+            eprintln!(
+                "[ipc] page-load url={} event={:?}",
+                payload.url(),
+                payload.event()
+            );
         })
         .build(tauri::generate_context!())
         .expect("failed to build the Lagoon V4 Tauri application")

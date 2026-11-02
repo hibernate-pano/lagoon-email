@@ -284,9 +284,7 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         identifier: "lagoon-v3",
-        statements: &[
-            r##"DROP TABLE IF EXISTS auto_archive_rules"##,
-        ],
+        statements: &[r##"DROP TABLE IF EXISTS auto_archive_rules"##],
         data: DataStep::None,
     },
     Migration {
@@ -377,13 +375,11 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         identifier: "lagoon-v9",
-        statements: &[
-            r##"CREATE TABLE IF NOT EXISTS store_notices (
+        statements: &[r##"CREATE TABLE IF NOT EXISTS store_notices (
         id         TEXT PRIMARY KEY,
         detail     TEXT,
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
-    )"##,
-        ],
+    )"##],
         data: DataStep::SealDrafts,
     },
     Migration {
@@ -409,7 +405,10 @@ pub const MIGRATIONS: &[Migration] = &[
 
 /// Total number of statements, used by the migration log line.
 pub fn statement_count() -> usize {
-    MIGRATIONS.iter().map(|migration| migration.statements.len()).sum()
+    MIGRATIONS
+        .iter()
+        .map(|migration| migration.statements.len())
+        .sum()
 }
 
 /// Executes one migration's SQL and its data step. Kept here so the generated

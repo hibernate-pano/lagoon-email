@@ -28,9 +28,8 @@ const COLUMNS: &str = "id, account_id, name, kind, value, created_at";
 /// behaves as a sender rule on both routes. That normalisation happens once,
 /// here.
 pub fn list(connection: &Connection, account_id: Uuid) -> Result<Vec<StackRuleRow>, StoreError> {
-    let sql = format!(
-        "SELECT {COLUMNS} FROM stack_rules WHERE account_id = ? ORDER BY created_at ASC"
-    );
+    let sql =
+        format!("SELECT {COLUMNS} FROM stack_rules WHERE account_id = ? ORDER BY created_at ASC");
     let mut statement = connection.prepare(&sql)?;
     let mut rows = statement.query([account_id.as_bytes().as_slice()])?;
     let mut rules = Vec::new();

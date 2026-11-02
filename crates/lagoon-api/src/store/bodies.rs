@@ -35,7 +35,10 @@ pub fn find(
     remote_id: &str,
 ) -> rusqlite::Result<Option<StoredBody>> {
     let mut statement = connection.prepare(GET_SQL)?;
-    let mut rows = statement.query(rusqlite::params![account_id.as_bytes().as_slice(), remote_id])?;
+    let mut rows = statement.query(rusqlite::params![
+        account_id.as_bytes().as_slice(),
+        remote_id
+    ])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
     };

@@ -276,7 +276,11 @@ pub fn compare(fixture: &Value, observed: &Observed) -> Vec<String> {
         ));
     }
 
-    let expected_type = expected["content_type"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+    let expected_type = expected["content_type"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     let actual_type = observed.content_type.trim().to_ascii_lowercase();
     if expected_type != actual_type {
         problems.push(format!(
@@ -323,7 +327,9 @@ fn diff(expected: &Value, actual: &Value, path: &str, out: &mut Vec<String>) {
             }
             for key in actual_object.keys() {
                 if !expected_object.contains_key(key) {
-                    out.push(format!("{path}.{key}: unexpected in actual (not in fixture)"));
+                    out.push(format!(
+                        "{path}.{key}: unexpected in actual (not in fixture)"
+                    ));
                 }
             }
         }
@@ -336,7 +342,8 @@ fn diff(expected: &Value, actual: &Value, path: &str, out: &mut Vec<String>) {
                     actual_items.len()
                 ));
             }
-            for (index, (left, right)) in expected_items.iter().zip(actual_items.iter()).enumerate() {
+            for (index, (left, right)) in expected_items.iter().zip(actual_items.iter()).enumerate()
+            {
                 diff(left, right, &format!("{path}[{index}]"), out);
             }
         }

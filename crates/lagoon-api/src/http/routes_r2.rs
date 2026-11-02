@@ -80,30 +80,32 @@ pub async fn senders(State(state): State<AppState>, uri: Uri) -> Response {
 
     let outcome = state
         .db
-        .read(move |connection| -> Result<Option<Vec<wire_r2::SenderSummary>>, StoreError> {
-            if !store::accounts::exists(connection, account_id)? {
-                return Ok(None);
-            }
-            let rows = store::senders::ranking(connection, account_id, limit, query_text.as_deref())?;
-            Ok(Some(
-                rows.into_iter()
-                    .map(|row| wire_r2::SenderSummary {
-                        address: row.address,
-                        display_name: row.display_name,
-                        total_count: row.total_count,
-                        unread_count: row.unread_count,
-                        latest_at: row.latest_at,
-                    })
-                    .collect(),
-            ))
-        })
+        .read(
+            move |connection| -> Result<Option<Vec<wire_r2::SenderSummary>>, StoreError> {
+                if !store::accounts::exists(connection, account_id)? {
+                    return Ok(None);
+                }
+                let rows =
+                    store::senders::ranking(connection, account_id, limit, query_text.as_deref())?;
+                Ok(Some(
+                    rows.into_iter()
+                        .map(|row| wire_r2::SenderSummary {
+                            address: row.address,
+                            display_name: row.display_name,
+                            total_count: row.total_count,
+                            unread_count: row.unread_count,
+                            latest_at: row.latest_at,
+                        })
+                        .collect(),
+                ))
+            },
+        )
         .await;
 
     match outcome {
-        Ok(Some(senders)) => respond::json(
-            StatusCode::OK,
-            &wire_r2::SenderListResponse { senders },
-        ),
+        Ok(Some(senders)) => {
+            respond::json(StatusCode::OK, &wire_r2::SenderListResponse { senders })
+        }
         Ok(None) => respond::error(StatusCode::NOT_FOUND, "unknown-account"),
         Err(error) => internal_error("senders.error", error),
     }
@@ -127,33 +129,35 @@ pub async fn advice(State(state): State<AppState>, uri: Uri) -> Response {
 
     let outcome = state
         .db
-        .read(move |connection| -> Result<Option<Vec<wire_r2::AdviceRecord>>, StoreError> {
-            if !store::accounts::exists(connection, account_id)? {
-                return Ok(None);
-            }
-            let rows = store::advice::list(connection, account_id, filter, limit)?;
-            Ok(Some(
-                rows.into_iter()
-                    .map(|row| wire_r2::AdviceRecord {
-                        id: row.id,
-                        account_id: row.account_id,
-                        remote_id: row.remote_id,
-                        advice: wire_r2::Advice {
-                            action: row.action,
-                            category: row.category,
-                            confidence: row.confidence,
-                            rationale: row.rationale,
-                            due_text: row.due_text,
-                        },
-                        source: row.source,
-                        model: row.model,
-                        decision: row.decision,
-                        created_at: row.created_at,
-                        decided_at: row.decided_at,
-                    })
-                    .collect(),
-            ))
-        })
+        .read(
+            move |connection| -> Result<Option<Vec<wire_r2::AdviceRecord>>, StoreError> {
+                if !store::accounts::exists(connection, account_id)? {
+                    return Ok(None);
+                }
+                let rows = store::advice::list(connection, account_id, filter, limit)?;
+                Ok(Some(
+                    rows.into_iter()
+                        .map(|row| wire_r2::AdviceRecord {
+                            id: row.id,
+                            account_id: row.account_id,
+                            remote_id: row.remote_id,
+                            advice: wire_r2::Advice {
+                                action: row.action,
+                                category: row.category,
+                                confidence: row.confidence,
+                                rationale: row.rationale,
+                                due_text: row.due_text,
+                            },
+                            source: row.source,
+                            model: row.model,
+                            decision: row.decision,
+                            created_at: row.created_at,
+                            decided_at: row.decided_at,
+                        })
+                        .collect(),
+                ))
+            },
+        )
         .await;
 
     match outcome {
@@ -172,22 +176,25 @@ pub async fn accepted_stats(State(state): State<AppState>, uri: Uri) -> Response
 
     let outcome = state
         .db
-        .read(move |connection| -> Result<Option<Vec<wire_r2::AcceptedAdviceStat>>, StoreError> {
-            if !store::accounts::exists(connection, account_id)? {
-                return Ok(None);
-            }
-            let stats = store::advice::accepted_stats(connection, account_id, ADVICE_STATS_LIMIT)?;
-            Ok(Some(
-                stats
-                    .into_iter()
-                    .map(|stat| wire_r2::AcceptedAdviceStat {
-                        category: stat.category,
-                        action: stat.action,
-                        count: stat.count,
-                    })
-                    .collect(),
-            ))
-        })
+        .read(
+            move |connection| -> Result<Option<Vec<wire_r2::AcceptedAdviceStat>>, StoreError> {
+                if !store::accounts::exists(connection, account_id)? {
+                    return Ok(None);
+                }
+                let stats =
+                    store::advice::accepted_stats(connection, account_id, ADVICE_STATS_LIMIT)?;
+                Ok(Some(
+                    stats
+                        .into_iter()
+                        .map(|stat| wire_r2::AcceptedAdviceStat {
+                            category: stat.category,
+                            action: stat.action,
+                            count: stat.count,
+                        })
+                        .collect(),
+                ))
+            },
+        )
         .await;
 
     match outcome {
@@ -212,25 +219,27 @@ pub async fn stacks(State(state): State<AppState>, uri: Uri) -> Response {
 
     let outcome = state
         .db
-        .read(move |connection| -> Result<Vec<wire_r2::StackSummary>, StoreError> {
-            let rules = store::stacks::list(connection, account_id)?;
-            let mut summaries = Vec::with_capacity(rules.len());
-            for rule in rules {
-                let count = store::stacks::message_count(connection, &rule)?;
-                summaries.push(wire_r2::StackSummary {
-                    rule: wire_r2::StackRule {
-                        id: rule.id,
-                        account_id: rule.account_id,
-                        name: rule.name,
-                        kind: rule.kind,
-                        value: rule.value,
-                        created_at: rule.created_at,
-                    },
-                    count,
-                });
-            }
-            Ok(summaries)
-        })
+        .read(
+            move |connection| -> Result<Vec<wire_r2::StackSummary>, StoreError> {
+                let rules = store::stacks::list(connection, account_id)?;
+                let mut summaries = Vec::with_capacity(rules.len());
+                for rule in rules {
+                    let count = store::stacks::message_count(connection, &rule)?;
+                    summaries.push(wire_r2::StackSummary {
+                        rule: wire_r2::StackRule {
+                            id: rule.id,
+                            account_id: rule.account_id,
+                            name: rule.name,
+                            kind: rule.kind,
+                            value: rule.value,
+                            created_at: rule.created_at,
+                        },
+                        count,
+                    });
+                }
+                Ok(summaries)
+            },
+        )
         .await;
 
     match outcome {
@@ -299,27 +308,34 @@ pub async fn sent(State(state): State<AppState>, uri: Uri) -> Response {
 pub async fn store_notices(State(state): State<AppState>) -> Response {
     let outcome = state
         .db
-        .read(|connection| -> Result<Vec<wire_r2::StoreNotice>, StoreError> {
-            Ok(store::notices::list(connection)?
-                .into_iter()
-                .map(|row| wire_r2::StoreNotice {
-                    id: row.id,
-                    created_at: row.created_at,
-                    detail: row.detail,
-                })
-                .collect())
-        })
+        .read(
+            |connection| -> Result<Vec<wire_r2::StoreNotice>, StoreError> {
+                Ok(store::notices::list(connection)?
+                    .into_iter()
+                    .map(|row| wire_r2::StoreNotice {
+                        id: row.id,
+                        created_at: row.created_at,
+                        detail: row.detail,
+                    })
+                    .collect())
+            },
+        )
         .await;
 
     match outcome {
-        Ok(notices) => respond::json(StatusCode::OK, &wire_r2::StoreNoticeListResponse { notices }),
+        Ok(notices) => respond::json(
+            StatusCode::OK,
+            &wire_r2::StoreNoticeListResponse { notices },
+        ),
         Err(error) => internal_error("store-notices.error", error),
     }
 }
 
 /// Local midnight as an instant, the way Calendar.startOfDay means it.
 fn local_midnight(date: chrono::NaiveDate) -> Timestamp {
-    let naive = date.and_hms_opt(0, 0, 0).expect("midnight is always a valid time");
+    let naive = date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is always a valid time");
     match chrono::Local.from_local_datetime(&naive).earliest() {
         Some(datetime) => Timestamp::from_millis(datetime.timestamp_millis()),
         // A DST jump can delete local midnight; fall back to reading the
@@ -402,34 +418,36 @@ pub async fn time_saved(State(state): State<AppState>, uri: Uri) -> Response {
 
     let outcome = state
         .db
-        .read(move |connection| -> Result<wire_r2::TimeSavedReport, StoreError> {
-            let events = store::actions::time_saved_events(connection, account_id, week_start)?;
-            let mut today = WindowAccumulator::default();
-            let mut week = WindowAccumulator::default();
-            let mut by_day: std::collections::BTreeMap<chrono::NaiveDate, WindowAccumulator> =
-                std::collections::BTreeMap::new();
-            for (kind, created_at) in events {
-                week.add(&kind);
-                if created_at.millis() >= today_start.millis() {
-                    today.add(&kind);
+        .read(
+            move |connection| -> Result<wire_r2::TimeSavedReport, StoreError> {
+                let events = store::actions::time_saved_events(connection, account_id, week_start)?;
+                let mut today = WindowAccumulator::default();
+                let mut week = WindowAccumulator::default();
+                let mut by_day: std::collections::BTreeMap<chrono::NaiveDate, WindowAccumulator> =
+                    std::collections::BTreeMap::new();
+                for (kind, created_at) in events {
+                    week.add(&kind);
+                    if created_at.millis() >= today_start.millis() {
+                        today.add(&kind);
+                    }
+                    // v3 creates a by-day entry for every event, even one whose kind
+                    // saves no time (a pin shows up as a 0-minute day).
+                    by_day.entry(local_date(created_at)).or_default().add(&kind);
                 }
-                // v3 creates a by-day entry for every event, even one whose kind
-                // saves no time (a pin shows up as a 0-minute day).
-                by_day.entry(local_date(created_at)).or_default().add(&kind);
-            }
-            let by_day: Vec<wire_r2::TimeSavedDay> = by_day
-                .into_iter()
-                .map(|(date, accumulator)| wire_r2::TimeSavedDay {
-                    date: local_midnight(date),
-                    minutes_saved: (accumulator.minutes * 10.0).round() / 10.0,
-                    messages_handled: accumulator.handled,
+                let by_day: Vec<wire_r2::TimeSavedDay> = by_day
+                    .into_iter()
+                    .map(|(date, accumulator)| wire_r2::TimeSavedDay {
+                        date: local_midnight(date),
+                        minutes_saved: (accumulator.minutes * 10.0).round() / 10.0,
+                        messages_handled: accumulator.handled,
+                    })
+                    .collect();
+                Ok(wire_r2::TimeSavedReport {
+                    today: today.finish(Vec::new()),
+                    week: week.finish(by_day),
                 })
-                .collect();
-            Ok(wire_r2::TimeSavedReport {
-                today: today.finish(Vec::new()),
-                week: week.finish(by_day),
-            })
-        })
+            },
+        )
         .await;
 
     match outcome {
@@ -444,26 +462,29 @@ pub async fn usage(State(state): State<AppState>) -> Response {
     let cap_usd = state.budget_cap_usd;
     let outcome = state
         .db
-        .read(move |connection| -> Result<wire_r2::UsageReport, StoreError> {
-            let summary = store::usage::month_summary(connection, &month)?;
-            // v3 degrades a failed breakdown to an empty list: the headline total
-            // is what the cap is about, and it is already in hand.
-            let breakdown = store::usage::account_breakdown(connection, &month).unwrap_or_default();
-            Ok(wire_r2::UsageReport {
-                month_usd: summary.cost_micro_usd as f64 / 1_000_000.0,
-                cap_usd,
-                call_count: summary.call_count,
-                cost_tracking_available: false,
-                accounts: breakdown
-                    .into_iter()
-                    .map(|share| wire_r2::UsageAccountShare {
-                        account_email: share.account_email,
-                        month_usd: share.cost_micro_usd as f64 / 1_000_000.0,
-                        call_count: share.calls,
-                    })
-                    .collect(),
-            })
-        })
+        .read(
+            move |connection| -> Result<wire_r2::UsageReport, StoreError> {
+                let summary = store::usage::month_summary(connection, &month)?;
+                // v3 degrades a failed breakdown to an empty list: the headline total
+                // is what the cap is about, and it is already in hand.
+                let breakdown =
+                    store::usage::account_breakdown(connection, &month).unwrap_or_default();
+                Ok(wire_r2::UsageReport {
+                    month_usd: summary.cost_micro_usd as f64 / 1_000_000.0,
+                    cap_usd,
+                    call_count: summary.call_count,
+                    cost_tracking_available: false,
+                    accounts: breakdown
+                        .into_iter()
+                        .map(|share| wire_r2::UsageAccountShare {
+                            account_email: share.account_email,
+                            month_usd: share.cost_micro_usd as f64 / 1_000_000.0,
+                            call_count: share.calls,
+                        })
+                        .collect(),
+                })
+            },
+        )
         .await;
 
     match outcome {
@@ -562,37 +583,38 @@ pub async fn reminders(State(state): State<AppState>, uri: Uri) -> Response {
 
     let outcome = state
         .db
-        .read(move |connection| -> Result<Option<Vec<wire_r2::Reminder>>, StoreError> {
-            if !store::accounts::exists(connection, account_id)? {
-                return Ok(None);
-            }
-            let rows = if include_dismissed {
-                store::reminders::all(connection, account_id)?
-            } else {
-                store::reminders::pending(connection, account_id)?
-            };
-            Ok(Some(
-                rows.into_iter()
-                    .map(|row| wire_r2::Reminder {
-                        id: row.id,
-                        account_id: row.account_id,
-                        remote_id: row.remote_id,
-                        subject: row.subject,
-                        due_at: row.due_at,
-                        note: row.note,
-                        created_at: row.created_at,
-                        dismissed_at: row.dismissed_at,
-                    })
-                    .collect(),
-            ))
-        })
+        .read(
+            move |connection| -> Result<Option<Vec<wire_r2::Reminder>>, StoreError> {
+                if !store::accounts::exists(connection, account_id)? {
+                    return Ok(None);
+                }
+                let rows = if include_dismissed {
+                    store::reminders::all(connection, account_id)?
+                } else {
+                    store::reminders::pending(connection, account_id)?
+                };
+                Ok(Some(
+                    rows.into_iter()
+                        .map(|row| wire_r2::Reminder {
+                            id: row.id,
+                            account_id: row.account_id,
+                            remote_id: row.remote_id,
+                            subject: row.subject,
+                            due_at: row.due_at,
+                            note: row.note,
+                            created_at: row.created_at,
+                            dismissed_at: row.dismissed_at,
+                        })
+                        .collect(),
+                ))
+            },
+        )
         .await;
 
     match outcome {
-        Ok(Some(reminders)) => respond::json(
-            StatusCode::OK,
-            &wire_r2::ReminderListResponse { reminders },
-        ),
+        Ok(Some(reminders)) => {
+            respond::json(StatusCode::OK, &wire_r2::ReminderListResponse { reminders })
+        }
         Ok(None) => respond::error(StatusCode::NOT_FOUND, "unknown-account"),
         Err(error) => internal_error("reminders.error", error),
     }
@@ -608,24 +630,26 @@ pub async fn export_index(State(state): State<AppState>, uri: Uri) -> Response {
 
     let outcome = state
         .db
-        .read(move |connection| -> Result<Option<wire_r2::ExportIndexResponse>, StoreError> {
-            if !store::accounts::exists(connection, account_id)? {
-                return Ok(None);
-            }
-            let rows = store::messages::export_index(connection, account_id)?;
-            let total_count = rows.len() as i64;
-            let (deleted_count, sent_count) =
-                store::messages::deleted_and_sent_counts(connection, account_id)?;
-            Ok(Some(wire_r2::ExportIndexResponse {
-                messages: rows
-                    .into_iter()
-                    .map(|message| routes::to_wire_header(&body_key, message))
-                    .collect(),
-                total_count,
-                deleted_count,
-                sent_count,
-            }))
-        })
+        .read(
+            move |connection| -> Result<Option<wire_r2::ExportIndexResponse>, StoreError> {
+                if !store::accounts::exists(connection, account_id)? {
+                    return Ok(None);
+                }
+                let rows = store::messages::export_index(connection, account_id)?;
+                let total_count = rows.len() as i64;
+                let (deleted_count, sent_count) =
+                    store::messages::deleted_and_sent_counts(connection, account_id)?;
+                Ok(Some(wire_r2::ExportIndexResponse {
+                    messages: rows
+                        .into_iter()
+                        .map(|message| routes::to_wire_header(&body_key, message))
+                        .collect(),
+                    total_count,
+                    deleted_count,
+                    sent_count,
+                }))
+            },
+        )
         .await;
 
     match outcome {
@@ -670,7 +694,14 @@ pub async fn search(State(state): State<AppState>, uri: Uri) -> Response {
     let outcome = state
         .db
         .read(move |connection| {
-            store::search::search(connection, &key_for_read, scope, &needle, sender.as_deref(), since)
+            store::search::search(
+                connection,
+                &key_for_read,
+                scope,
+                &needle,
+                sender.as_deref(),
+                since,
+            )
         })
         .await;
 
@@ -768,7 +799,11 @@ enum DraftsOutcome {
 
 /// The account-existence gate every provider-backed route runs before it needs
 /// a provider. Some(Response) means "answer this and stop".
-async fn provider_gate(state: &AppState, account_id: Uuid, label: &'static str) -> Option<Response> {
+async fn provider_gate(
+    state: &AppState,
+    account_id: Uuid,
+    label: &'static str,
+) -> Option<Response> {
     let outcome = state
         .db
         .read(move |connection| -> Result<bool, StoreError> {
@@ -784,7 +819,10 @@ async fn provider_gate(state: &AppState, account_id: Uuid, label: &'static str) 
 
 fn parse_remote_id(remote_id: &str) -> Option<Response> {
     if remote_id.is_empty() {
-        Some(respond::error(StatusCode::BAD_REQUEST, "malformed-remoteId"))
+        Some(respond::error(
+            StatusCode::BAD_REQUEST,
+            "malformed-remoteId",
+        ))
     } else {
         None
     }
@@ -920,9 +958,8 @@ pub async fn briefing(State(state): State<AppState>, uri: Uri) -> Response {
         .unwrap_or(BRIEFING_MAX);
     let limit = requested.clamp(1, BRIEFING_MAX);
     let now = timefmt::now();
-    let window_start = Timestamp::from_millis(
-        now.millis() - store::briefing::WINDOW_DAYS * 24 * 60 * 60 * 1000,
-    );
+    let window_start =
+        Timestamp::from_millis(now.millis() - store::briefing::WINDOW_DAYS * 24 * 60 * 60 * 1000);
     let body_key = Arc::clone(&state.body_key);
 
     let outcome = state

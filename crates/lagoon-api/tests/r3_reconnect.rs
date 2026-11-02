@@ -55,7 +55,8 @@ async fn re_authenticating_a_parked_account_restarts_its_sync_loop() {
         Ok(MailChangeSet::default()),
         Ok(MailChangeSet::default()),
     ]);
-    let (server, _fixtures) = TestServer::spawn_with_provider("r3-reconnect", factory.clone()).await;
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-reconnect", factory.clone()).await;
     let client = http::client();
 
     let observed = connect(&client, &server, "reconnect@example.invalid", "code-1").await;

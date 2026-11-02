@@ -69,7 +69,10 @@ pub struct NewAccount<'a> {
 ///
 /// Returns the stored id: a re-authorisation of the same mailbox must not mint a
 /// second account, and everything the user accumulated hangs off the first one.
-pub fn upsert_account(connection: &Connection, account: &NewAccount<'_>) -> Result<Uuid, WriteError> {
+pub fn upsert_account(
+    connection: &Connection,
+    account: &NewAccount<'_>,
+) -> Result<Uuid, WriteError> {
     connection.execute(
         "INSERT INTO accounts (id, provider, oauth_user, email, credentials,
                                capabilities, sync_state)
@@ -150,8 +153,8 @@ pub fn set_folder_role(
         )
         .optional()?
         .ok_or(WriteError::UnknownAccount)?;
-    let mut parsed: Value =
-        serde_json::from_str(&current).map_err(|error| WriteError::MalformedJson(error.to_string()))?;
+    let mut parsed: Value = serde_json::from_str(&current)
+        .map_err(|error| WriteError::MalformedJson(error.to_string()))?;
     let object = parsed
         .as_object_mut()
         .ok_or_else(|| WriteError::MalformedJson("capabilities is not an object".to_owned()))?;
@@ -452,7 +455,10 @@ pub fn update_health(
 /// v3 AccountStore.setActive: exactly one account is active at a time.
 pub fn set_active(connection: &Connection, account_id: Uuid) -> Result<(), WriteError> {
     let transaction = connection.unchecked_transaction()?;
-    connection.execute("UPDATE accounts SET is_active = FALSE WHERE is_active = TRUE", [])?;
+    connection.execute(
+        "UPDATE accounts SET is_active = FALSE WHERE is_active = TRUE",
+        [],
+    )?;
     connection.execute(
         "UPDATE accounts
             SET is_active = TRUE, updated_at = strftime('%Y-%m-%d %H:%M:%f','now')
@@ -491,8 +497,12 @@ pub fn reconcile_active(connection: &Connection) -> Result<(), WriteError> {
 }
 
 /// The sealed credential blob, for the sync engine's provider factory.
-pub fn credentials(connection: &Connection, account_id: Uuid) -> Result<Option<Vec<u8>>, WriteError> {
-    let mut statement = connection.prepare("SELECT credentials FROM accounts WHERE id = ? LIMIT 1")?;
+pub fn credentials(
+    connection: &Connection,
+    account_id: Uuid,
+) -> Result<Option<Vec<u8>>, WriteError> {
+    let mut statement =
+        connection.prepare("SELECT credentials FROM accounts WHERE id = ? LIMIT 1")?;
     let mut rows = statement.query([account_id.as_bytes().as_slice()])?;
     match rows.next()? {
         Some(row) => Ok(row.get(0)?),
@@ -568,7 +578,10 @@ pub fn reconcile_inbox(
 
 /// The remote ids of live inbox rows (v3 filterSQL's live lens). The engine
 /// uses it to derive deletions from provider membership.
-pub fn live_remote_ids(connection: &Connection, account_id: Uuid) -> Result<Vec<String>, WriteError> {
+pub fn live_remote_ids(
+    connection: &Connection,
+    account_id: Uuid,
+) -> Result<Vec<String>, WriteError> {
     let mut statement = connection.prepare(
         "SELECT remote_id FROM message_headers
          WHERE account_id = ? AND is_archived = FALSE AND is_deleted = FALSE AND is_sent = FALSE",
@@ -624,12 +637,11 @@ pub fn message_exists(
     remote_id: &str,
 ) -> Result<bool, WriteError> {
     let found = connection
-        .prepare(
-            "SELECT 1 FROM message_headers WHERE account_id = ? AND remote_id = ? LIMIT 1",
-        )?
-        .query_row(rusqlite::params![account_id.as_bytes().as_slice(), remote_id], |_| {
-            Ok(())
-        })
+        .prepare("SELECT 1 FROM message_headers WHERE account_id = ? AND remote_id = ? LIMIT 1")?
+        .query_row(
+            rusqlite::params![account_id.as_bytes().as_slice(), remote_id],
+            |_| Ok(()),
+        )
         .optional()?;
     Ok(found.is_some())
 }
@@ -673,9 +685,10 @@ pub fn set_read_flag(
         .prepare(
             "SELECT is_read FROM message_headers WHERE account_id = ? AND remote_id = ? LIMIT 1",
         )?
-        .query_row(rusqlite::params![account_id.as_bytes().as_slice(), remote_id], |row| {
-            row.get::<_, Option<bool>>(0)
-        })
+        .query_row(
+            rusqlite::params![account_id.as_bytes().as_slice(), remote_id],
+            |row| row.get::<_, Option<bool>>(0),
+        )
         .optional()?;
     // NULL is_read does not occur in the schema (NOT NULL DEFAULT FALSE); the
     // double Option is just rusqlite's shape for the row value.
@@ -705,19 +718,14 @@ pub fn delete_message_row(
 /// `purged` after the remote EXPUNGE succeeds.
 pub fn trashed_count(connection: &Connection, account_id: Uuid) -> Result<i64, WriteError> {
     connection
-        .prepare(
-            "SELECT COUNT(*) FROM message_headers WHERE account_id = ? AND is_deleted = TRUE",
-        )?
+        .prepare("SELECT COUNT(*) FROM message_headers WHERE account_id = ? AND is_deleted = TRUE")?
         .query_row([account_id.as_bytes().as_slice()], |row| row.get(0))
         .map_err(WriteError::Sqlite)
 }
 
 /// Remove every trashed row for the account after a successful remote
 /// EXPUNGE; returns how many local rows went away.
-pub fn delete_trashed_rows(
-    connection: &Connection,
-    account_id: Uuid,
-) -> Result<usize, WriteError> {
+pub fn delete_trashed_rows(connection: &Connection, account_id: Uuid) -> Result<usize, WriteError> {
     let changed = connection.execute(
         "DELETE FROM message_headers WHERE account_id = ? AND is_deleted = TRUE",
         [account_id.as_bytes().as_slice()],
@@ -735,7 +743,10 @@ pub fn find_action(
             "SELECT id, kind, payload, created_at, expires_at FROM ai_actions
              WHERE id = ? AND account_id = ? LIMIT 1",
         )?
-        .query_row(rusqlite::params![id, account_id.as_bytes().as_slice()], decode_action)
+        .query_row(
+            rusqlite::params![id, account_id.as_bytes().as_slice()],
+            decode_action,
+        )
         .optional()
         .map_err(WriteError::Sqlite)
 }
@@ -768,12 +779,16 @@ pub fn action_cursor(
     id: i64,
 ) -> Result<Option<ActionCursor>, WriteError> {
     connection
-        .prepare(
-            "SELECT created_at, id FROM ai_actions WHERE id = ? AND account_id = ? LIMIT 1",
-        )?
-        .query_row(rusqlite::params![id, account_id.as_bytes().as_slice()], |row| {
-            Ok(ActionCursor { created_at: row.get(0)?, id: row.get(1)? })
-        })
+        .prepare("SELECT created_at, id FROM ai_actions WHERE id = ? AND account_id = ? LIMIT 1")?
+        .query_row(
+            rusqlite::params![id, account_id.as_bytes().as_slice()],
+            |row| {
+                Ok(ActionCursor {
+                    created_at: row.get(0)?,
+                    id: row.get(1)?,
+                })
+            },
+        )
         .optional()
         .map_err(WriteError::Sqlite)
 }
@@ -824,11 +839,16 @@ pub fn actions_page(
              WHERE account_id = ? AND created_at >= ? AND {}",
             PAGE_PREDICATE
         ))?
-        .query_row(rusqlite::params![account_id.as_bytes().as_slice(), lower], |row| {
-            row.get(0)
-        })
+        .query_row(
+            rusqlite::params![account_id.as_bytes().as_slice(), lower],
+            |row| row.get(0),
+        )
         .map_err(WriteError::Sqlite)?;
-    Ok(ActionPage { actions, total_count, has_more })
+    Ok(ActionPage {
+        actions,
+        total_count,
+        has_more,
+    })
 }
 
 fn decode_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionRecord> {
@@ -840,4 +860,3 @@ fn decode_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionRecord> {
         expires_at: row.get(4)?,
     })
 }
-
