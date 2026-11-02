@@ -39,19 +39,22 @@ pub async fn enforce(State(state): State<AppState>, request: Request, next: Next
         return respond::error(StatusCode::FORBIDDEN, "forbidden-host");
     }
 
-    // 2. Bearer auth. Unset/empty token keeps the legacy loopback posture
-    //    (v3 `APIAuthMiddleware(token:)`), which is why this is a conditional.
-    if let Some(token) = state.api_token.as_deref() {
-        let ungated = UNGATED_PATHS.contains(&request.uri().path());
-        if !ungated {
-            let presented = request
-                .headers()
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok());
-            let expected = format!("Bearer {token}");
-            if !timing_safe_eq(presented, &expected) {
-                return respond::error(StatusCode::UNAUTHORIZED, "api-unauthorized");
-            }
+    // 2. Bearer auth. Fail closed: no token means "this server cannot
+    //    authenticate anyone", and the only safe answer is 401. `Config::load`
+    //    refuses to start without one, so this branch is defence in depth
+    //    against a `Config` built by hand (tests, future embedders).
+    let ungated = UNGATED_PATHS.contains(&request.uri().path());
+    if !ungated {
+        let Some(token) = state.api_token.as_deref().filter(|token| !token.is_empty()) else {
+            return respond::error(StatusCode::UNAUTHORIZED, "api-unauthorized");
+        };
+        let presented = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        let expected = format!("Bearer {token}");
+        if !timing_safe_eq(presented, &expected) {
+            return respond::error(StatusCode::UNAUTHORIZED, "api-unauthorized");
         }
     }
 

@@ -10,14 +10,17 @@
 //! | `LAGOON_V4_DATA_DIR` | v4's data dir; used when `LAGOON_DB_PATH` is unset |
 //! | `LAGOON_SERVER_HOST` / `--host` | bind address (default `127.0.0.1`) |
 //! | `LAGOON_SERVER_PORT` / `--port` | bind port (default 8080, `0` = ephemeral) |
-//! | `LAGOON_API_TOKEN` | bearer token; unset/empty disables authentication |
+//! | `LAGOON_API_TOKEN` | bearer token; **required** - no token, no server |
 //! | `LAGOON_BODY_KEY` | base64 of the 32-byte body key; **required** |
 //!
 //! Deliberate refusals, copied from v3 rather than reinvented:
 //!
-//! * A non-loopback bind without `LAGOON_API_TOKEN` refuses to start (v3
-//!   `startupRefusal`). Binding and then answering 403/401 to everybody is not
-//!   an option - the process would still be listening.
+//! * A missing `LAGOON_API_TOKEN` refuses to start. The shell always sets one
+//!   (it generates `keys.json`); a server that starts without it would answer
+//!   every local request unauthenticated, so there is no "auth disabled" mode
+//!   to fall into by forgetting an env var. v3 only refused for non-loopback
+//!   binds - this is deliberately stricter, because the threat model includes
+//!   other local processes, not just the network.
 //! * A missing or malformed `LAGOON_BODY_KEY` refuses to start (v3 CLI). It is
 //!   the key that makes cached bodies readable; serving a store whose bodies
 //!   cannot be opened would answer 503 for every message with no explanation.
@@ -52,7 +55,7 @@ pub enum ConfigError {
     MissingBodyKey,
     MalformedBodyKey(crate::crypto::CipherError),
     MalformedTokenKey(crate::token::TokenCipherError),
-    NonLoopbackBindWithoutToken(String),
+    MissingApiToken,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -76,12 +79,11 @@ impl std::fmt::Display for ConfigError {
                 formatter,
                 "refusing to start: LAGOON_TOKEN_KEY is malformed ({cause})"
             ),
-            ConfigError::NonLoopbackBindWithoutToken(host) => write!(
-                formatter,
-                "refusing to start: LAGOON_SERVER_HOST={host} is not a loopback address.\n\
-                 This server has NO API authentication without LAGOON_API_TOKEN; binding a\n\
-                 non-loopback interface would expose the API to the network. Bind loopback\n\
-                 (127.0.0.1, ::1, localhost), or set LAGOON_API_TOKEN."
+            ConfigError::MissingApiToken => formatter.write_str(
+                "refusing to start: LAGOON_API_TOKEN is missing.\n\
+                 This server has no unauthenticated mode: without a token every local\n\
+                 request would be accepted. The shell generates one in keys.json and\n\
+                 always passes it; a manual run must set it too.",
             ),
         }
     }
@@ -157,13 +159,12 @@ impl Config {
             .and_then(|raw| raw.trim().parse::<u16>().ok())
             .unwrap_or(DEFAULT_PORT);
 
-        let api_token = non_empty(env("LAGOON_API_TOKEN"));
-        if !is_loopback(&host) && api_token.is_none() {
-            return Err(ConfigError::NonLoopbackBindWithoutToken(host));
-        }
-
         let raw_key = non_empty(env("LAGOON_BODY_KEY")).ok_or(ConfigError::MissingBodyKey)?;
         let body_key = BodyKey::from_base64(&raw_key).map_err(ConfigError::MalformedBodyKey)?;
+
+        // Required for every bind, loopback included. A missing token is a
+        // broken deployment, never "auth disabled" (see the module doc).
+        let api_token = non_empty(env("LAGOON_API_TOKEN")).ok_or(ConfigError::MissingApiToken)?;
 
         // v3 reads the cap the same way and treats an unusable value as "no
         // cap"; a non-finite cap must not reach the JSON encoder.
@@ -184,7 +185,7 @@ impl Config {
             db_path: collapse_dots(&db_path),
             host,
             port,
-            api_token,
+            api_token: Some(api_token),
             body_key,
             budget_cap_usd,
             token_key,
@@ -302,6 +303,7 @@ mod tests {
             ("LAGOON_DB_PATH", "/tmp/from-db-path.sqlite".to_owned()),
             ("LAGOON_V4_DATA_DIR", "/tmp/data-dir".to_owned()),
             ("LAGOON_BODY_KEY", key_b64()),
+            ("LAGOON_API_TOKEN", "token".to_owned()),
         ]);
         let config = Config::load_with(&args(&["--db", "/tmp/flag.sqlite"]), &env).unwrap();
         assert_eq!(config.db_path, PathBuf::from("/tmp/flag.sqlite"));
@@ -312,6 +314,7 @@ mod tests {
         let env = env_of(vec![
             ("LAGOON_V4_DATA_DIR", "/tmp/data-dir".to_owned()),
             ("LAGOON_BODY_KEY", key_b64()),
+            ("LAGOON_API_TOKEN", "token".to_owned()),
         ]);
         let config = Config::load_with(&args(&[]), &env).unwrap();
         assert_eq!(config.db_path, PathBuf::from("/tmp/data-dir/lagoon.sqlite"));
@@ -319,16 +322,33 @@ mod tests {
 
     #[test]
     fn unknown_flags_refuse_instead_of_being_ignored() {
-        let env = env_of(vec![("LAGOON_BODY_KEY", key_b64())]);
+        let env = env_of(vec![
+            ("LAGOON_BODY_KEY", key_b64()),
+            ("LAGOON_API_TOKEN", "token".to_owned()),
+        ]);
         let error = Config::load_with(&args(&["--dbb", "/tmp/x"]), &env).unwrap_err();
         assert!(matches!(error, ConfigError::UnknownArgument(_)));
     }
 
     #[test]
-    fn non_loopback_bind_requires_a_token() {
+    fn a_token_is_required_for_every_bind() {
+        // Non-loopback without a token: refused (this was v3's rule).
         let env = env_of(vec![("LAGOON_BODY_KEY", key_b64())]);
         let error = Config::load_with(&args(&["--host", "192.168.1.5"]), &env).unwrap_err();
-        assert!(matches!(error, ConfigError::NonLoopbackBindWithoutToken(_)));
+        assert!(matches!(error, ConfigError::MissingApiToken));
+
+        // Loopback without a token: also refused. There is no unauthenticated
+        // mode to fall into by forgetting the variable.
+        let error = Config::load_with(&args(&[]), &env).unwrap_err();
+        assert!(matches!(error, ConfigError::MissingApiToken));
+
+        // Blank is the same state as unset.
+        let blank = env_of(vec![
+            ("LAGOON_BODY_KEY", key_b64()),
+            ("LAGOON_API_TOKEN", "   ".to_owned()),
+        ]);
+        let error = Config::load_with(&args(&[]), &blank).unwrap_err();
+        assert!(matches!(error, ConfigError::MissingApiToken));
 
         let env = env_of(vec![
             ("LAGOON_BODY_KEY", key_b64()),
@@ -368,11 +388,13 @@ mod tests {
     fn port_parsing_matches_v3_fallback() {
         let env = env_of(vec![
             ("LAGOON_BODY_KEY", key_b64()),
+            ("LAGOON_API_TOKEN", "token".to_owned()),
             ("LAGOON_SERVER_PORT", "nonsense".to_owned()),
         ]);
         assert_eq!(Config::load_with(&args(&[]), &env).unwrap().port, 8080);
         let env = env_of(vec![
             ("LAGOON_BODY_KEY", key_b64()),
+            ("LAGOON_API_TOKEN", "token".to_owned()),
             ("LAGOON_SERVER_PORT", "18099".to_owned()),
         ]);
         assert_eq!(Config::load_with(&args(&[]), &env).unwrap().port, 18099);

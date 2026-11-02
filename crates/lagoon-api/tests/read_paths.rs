@@ -389,3 +389,18 @@ async fn host_guard_and_auth_gate_match_v3() {
     assert_eq!(unauthorized.body, json!({"error": "api-unauthorized"}));
     assert!(!TEST_API_TOKEN.is_empty());
 }
+
+#[tokio::test]
+async fn a_server_without_a_token_refuses_every_gated_path() {
+    // The shell always hands the backend a token, so "no token" is a
+    // misconfiguration, not a mode. Fail closed: a missing token must never
+    // mean "no auth required".
+    let fixtures = Fixtures::load();
+    let seed = Seed::from_fixtures(&fixtures);
+    let server = TestServer::spawn_with("no-token", &seed, None).await;
+    let client = http::client();
+
+    let accounts = get(&client, &format!("{}/api/accounts", server.base_url), &[]).await;
+    assert_eq!(accounts.status, 401, "a server with no token must fail closed");
+    assert_eq!(accounts.body, json!({"error": "api-unauthorized"}));
+}

@@ -1,7 +1,7 @@
 //! lagoon-api - the v4 read-only backend, R1.
 //!
 //!     export LAGOON_BODY_KEY=...            # base64 of the 32-byte body key
-//!     export LAGOON_API_TOKEN=...           # optional; enables bearer auth
+//!     export LAGOON_API_TOKEN=...           # required; bearer auth for every route
 //!     cargo run                             # serves v4/.dev/data/lagoon.sqlite
 //!     cargo run -- --db /path/lagoon.sqlite --port 18099
 //!
@@ -205,7 +205,7 @@ fn print_usage() {
     println!();
     println!("environment:");
     println!("  LAGOON_BODY_KEY    required, base64 of the 32-byte body key");
-    println!("  LAGOON_API_TOKEN   optional, bearer token; also required for a non-loopback bind");
+    println!("  LAGOON_API_TOKEN   required, bearer token (the shell generates one in keys.json)");
     println!();
     println!("secrets come from the environment only, never from argv: arguments are");
     println!("visible in ps to every local process.");
