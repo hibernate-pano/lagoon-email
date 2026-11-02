@@ -45,11 +45,11 @@ pub const KNOWN_MIGRATIONS: &[&str] = &[
     "lagoon-v10",
 ];
 
-/// v4's own migration, appended after v3's chain. It is additive (one nullable
-/// column) and the read path works without it, so it is not *required* the way
-/// the v3 list is — but a store carrying it is not "newer than this build
-/// knows", and must not be reported as such.
-pub const V4_MIGRATIONS: &[&str] = &["lagoon-v11"];
+/// v4's own migrations, appended after v3's chain. Both are additive (one
+/// nullable column, one new table) and the read path works without them, so
+/// they are not *required* the way the v3 list is — but a store carrying them
+/// is not "newer than this build knows", and must not be reported as such.
+pub const V4_MIGRATIONS: &[&str] = &["lagoon-v11", "lagoon-v12"];
 
 /// Whether `path` is a store this build may migrate: a SQLite file whose
 /// `grdb_migrations` records the end of the v3 chain. Checked before opening

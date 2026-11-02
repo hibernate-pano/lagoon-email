@@ -444,3 +444,22 @@ fn a_foreign_file_is_never_migrated() {
         "a foreign database must not grow our tables"
     );
 }
+
+/// A store carrying this build's own migrations is not "newer than this build
+/// knows" - it is exactly what this build produces. Reporting it as unknown
+/// would make every fresh install print a false warning on every start.
+#[test]
+fn a_store_with_this_builds_own_migrations_is_not_reported_as_unknown() {
+    let temp = TempDir::new("r3-own-migrations");
+    let path = temp.join("lagoon.sqlite");
+    prepare(&path, Some(&test_key()))
+        .expect("prepare")
+        .expect("a fresh store is migrated");
+    let db = lagoon_api::db::Db::open_read_only(&path).expect("open");
+    let report = db.validate_schema().expect("report");
+    assert!(
+        report.unknown_migrations.is_empty(),
+        "{:?}",
+        report.unknown_migrations
+    );
+}
