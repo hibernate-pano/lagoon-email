@@ -21,6 +21,7 @@ import type {
   AiStatus,
   ConnectedAccount,
   FolderCountResponse,
+  SearchResponse,
   SentResponse,
   StoreNoticesResponse,
   SyncResponse,
@@ -28,6 +29,16 @@ import type {
 import { apiCall } from "./core/api";
 import { COMMON_UNAVAILABLE, describeHttpFailure } from "./core/errors";
 import { useApiOutcome, useBoot, useOnline } from "./core/hooks";
+import {
+  canLoadMore,
+  DEFAULT_LIST_ROWS,
+  debounce,
+  isSearching,
+  nextListLimit,
+  searchNotes,
+  searchRequest,
+  searchTerm,
+} from "./core/search";
 import { useMailboxOverlay } from "./core/mutations";
 import { BYPASS_CAPABILITY_GATE, UNDO_WINDOW_MS } from "./core/config";
 import { LENS_EMPTY } from "./core/empty";
@@ -89,8 +100,8 @@ interface WriteError {
   status?: number;
 }
 
-function queryForLens(lens: LensId, accountId: string): Record<string, string> {
-  const base: Record<string, string> = { accountId };
+function queryForLens(lens: LensId, accountId: string, limit: number): Record<string, string> {
+  const base: Record<string, string> = { accountId, limit: String(limit) };
   if (lens === "unread") base.unread = "true";
   if (lens === "pinned") base.pinned = "true";
   if (lens === "archived") base.archived = "true";
@@ -155,8 +166,30 @@ export function App(): ReactNode {
   const [composer, setComposer] = useState<{ mode: SendMode; original?: SendOriginal } | null>(null);
   /** The message the reader would reply to. */
   const [replyTarget, setReplyTarget] = useState<SendOriginal | undefined>(undefined);
+  /** The search box's text, and the term the request actually uses. */
+  const [query, setQuery] = useState("");
+  const [term, setTerm] = useState("");
+  /** How many rows the list window holds; "load more" grows it. */
+  const [listLimit, setListLimit] = useState(DEFAULT_LIST_ROWS);
 
   const overlay = useMailboxOverlay();
+
+  /**
+   * The query the request uses lags the query in the box.
+   *
+   * The server decrypts sealed bodies under a budget while it searches, so a
+   * request per keystroke would spend that budget on prefixes nobody meant to
+   * search for. The box shows what was typed; the request waits.
+   */
+  const applyTerm = useMemo(() => debounce((value: string) => setTerm(value), 250), []);
+  useEffect(() => () => applyTerm.cancel(), [applyTerm]);
+
+  function onQueryChange(value: string): void {
+    setQuery(value);
+    // The term is trimmed: a box with only spaces is not a question, and the
+    // server would answer "nothing" for it.
+    applyTerm(searchTerm(value));
+  }
 
   useEffect(() => {
     const onHash = () => setRoute(parseHash(window.location.hash));
@@ -285,7 +318,7 @@ export function App(): ReactNode {
 
   const messages = useApiOutcome<SyncResponse>({
     enabled: Boolean(accountId) && route.view === "list",
-    deps: [accountId, route.view, route.lens],
+    deps: [accountId, route.view, route.lens, listLimit],
     pollMs: POLL_MS,
     load: async () => {
       if (!accountId) return { kind: "fail", code: "not-ready", message: t.six.unavailable };
@@ -302,7 +335,11 @@ export function App(): ReactNode {
           },
         };
       }
-      return apiCall<SyncResponse>({ method: "GET", path: "/api/messages", query: queryForLens(route.lens, accountId) });
+      return apiCall<SyncResponse>({
+        method: "GET",
+        path: "/api/messages",
+        query: queryForLens(route.lens, accountId, listLimit),
+      });
     },
     translate: {
       errorTitle: t.list.loadFailed,
@@ -311,6 +348,43 @@ export function App(): ReactNode {
       isEmpty: (data) => data.messages.length === 0,
     },
   });
+
+  /**
+   * The search is the server's job.
+   *
+   * The list used to filter its own rows, which meant mail older than the
+   * window could not be found and the empty copy claimed the server had said
+   * "no matches". This asks `GET /api/search`, which searches the whole
+   * account - including the bodies of the mails that have been opened - and
+   * says out loud what it could not reach.
+   */
+  const search = useApiOutcome<SearchResponse>({
+    enabled: Boolean(accountId) && route.view === "list" && term !== "",
+    deps: [accountId, route.view, term],
+    load: async () => {
+      if (!accountId) return { kind: "fail", code: "not-ready", message: t.six.unavailable };
+      const request = searchRequest(accountId, term);
+      return apiCall<SearchResponse>({ method: "GET", path: request.path, query: request.query });
+    },
+    translate: {
+      errorTitle: t.list.searchFailed,
+      unavailableCodes: COMMON_UNAVAILABLE,
+      describeCode: describeHttpFailure,
+      isEmpty: (data) => data.results.length === 0,
+      notes: searchNotes,
+    },
+  });
+
+  const searching = isSearching(term);
+
+  // A different lens or a different account is a different question: the old
+  // query and the old window do not carry over.
+  useEffect(() => {
+    setTerm("");
+    setQuery("");
+    applyTerm.cancel();
+    setListLimit(DEFAULT_LIST_ROWS);
+  }, [accountId, route.lens, applyTerm]);
 
   const adviceByRemoteId = useMemo(() => {
     const map: Record<string, AdviceRecord> = {};
@@ -328,6 +402,15 @@ export function App(): ReactNode {
   }, [counts.outcome]);
 
   const serverRows = useMemo(() => {
+    // A query replaces the lens list: the search answers a different question
+    // (the whole account), and mixing the two in one list would be a lie about
+    // what the user is looking at.
+    if (route.view === "list" && searching) {
+      if (search.outcome.phase === "ready" || search.outcome.phase === "empty") {
+        return search.outcome.data.results;
+      }
+      return [];
+    }
     if (route.view === "list" && (messages.outcome.phase === "ready" || messages.outcome.phase === "empty")) {
       return messages.outcome.data.messages;
     }
@@ -335,7 +418,7 @@ export function App(): ReactNode {
       return briefing.outcome.data.items.map((item) => item.message);
     }
     return [];
-  }, [route.view, messages.outcome, briefing.outcome]);
+  }, [route.view, searching, search.outcome, messages.outcome, briefing.outcome]);
 
   const rows = useMemo(() => overlay.rows(serverRows), [overlay, serverRows]);
   const rowsById = useMemo(() => {
@@ -867,13 +950,18 @@ export function App(): ReactNode {
             />
           ) : (
             <MessageList
-              title={LENS_TITLE[route.lens]}
+              title={searching ? t.list.searchTitle : LENS_TITLE[route.lens]}
               lens={route.lens}
               empty={LENS_EMPTY[route.lens]}
-              outcome={messages.outcome}
+              outcome={searching ? search.outcome : messages.outcome}
               rows={rows}
-              onRetry={messages.refresh}
-              onRefresh={messages.refresh}
+              query={query}
+              onQueryChange={onQueryChange}
+              searching={searching}
+              onLoadMore={() => setListLimit((current) => nextListLimit(current))}
+              canLoadMore={canLoadMore(listLimit)}
+              onRetry={searching ? search.refresh : messages.refresh}
+              onRefresh={searching ? search.refresh : messages.refresh}
               openedId={openedId}
               cursor={cursor}
               selection={selection}

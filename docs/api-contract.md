@@ -166,7 +166,7 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 
 | Method Path | 入参 | 成功 | 错误 | 远端 | fixture |
 |---|---|---|---|---|---|
-| `GET /api/messages` | query：`accountId`（**必**，UUID）、`limit`（默认 500，上限 1000）、`sender`（精确 from_address）、`archived`/`deleted`/`pinned`/`unread`（字符串 `"true"`；其他值视为 false）、`stackId`（UUID） | 200 `SyncResponse` | 400 `malformed-accountId`；404 `unknown-stack`；500 | — | `messages.list*`（6 条） |
+| `GET /api/messages` | query：`accountId`（**必**，UUID）、`limit`（默认 500，上限 1000）、`sender`（精确 from_address）、`archived`/`deleted`/`pinned`/`unread`（字符串 `"true"`；其他值视为 false）、`stackId`（UUID） | 200 `SyncResponse`（`totalCount` 是该 lens 的**全部**数量，不是窗口内的数量——两者不等时界面必须说「还有 N 封没显示」） | 400 `malformed-accountId`；404 `unknown-stack`；500 | — | `messages.list*`（6 条） |
 | `POST /api/sync` | 无 | 204 | — | ✉读（重启同步循环） | — |
 
 列表语义：`pinned` 是**独立 lens**（忽略 archived/deleted 轴）；`deleted` 忽略 archived 轴；`sent` 只能通过 `/api/sent` 看到（列表接口没有 sent 参数）。`totalCount` 忽略 `limit`，用于"被截断但仍真实"的显示。
@@ -231,7 +231,7 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | Method Path | 入参 | 成功 | 错误 | fixture |
 |---|---|---|---|---|
 | `GET /api/briefing` | query `accountId`；`limit` 默认/上限 500；header `Accept-Language` | 200 `BriefingResponse` | 400 `malformed-accountId`；404；500 | `briefing` |
-| `GET /api/search` | query `q`（空 → 空结果 200）；`accountId`=UUID｜`all`｜缺省；`sender`；`since` | 200 `SearchResponse`（结果上限 100；解封扫描预算 1000） | 400 `malformed-accountId`；500 | `search.contract`、`search.contract.sealed-body`（contract_expected，见 §7.1） |
+| `GET /api/search` | query `q`（空 → 空结果 200）；`accountId`=UUID｜`all`｜缺省；`sender`；`since` | 200 `SearchResponse`（结果上限 100；解封扫描预算 1000）。**范围 = 整个账号的未删除邮件**（收件箱 / 归档 / 已发送），不含废纸篓 | 400 `malformed-accountId`；500 | `search.contract`、`search.contract.sealed-body`（contract_expected，见 §7.1）+ `r2_paths.rs` 的 `the_search_covers_sent_mail_and_leaves_the_trash_alone`（锁定范围） |
 | `GET /api/advice` | query `accountId`；`decision`（缺省/空=pending，`any`=全部，或 accepted/dismissed）；`limit` 默认 200 上限 500 | 200 `{advice: AdviceRecord[]}` | 400 `malformed-decision`；404 | `advice.list` |
 | `GET /api/advice/accepted-stats` | query `accountId` | 200 `{stats: {category?, action, count}[]}`（最多 5） | 400；404 | — |
 | `POST /api/advice/:id/decision` | query `accountId`；body `{decision}` | 200 `{id, decision}` | 400；404 `unknown-advice` | — |

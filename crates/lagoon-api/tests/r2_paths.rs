@@ -533,6 +533,88 @@ async fn search_reaches_the_sealed_body_and_the_structured_verdict() {
     assert_eq!(cross_account.body["totalCount"], json!(3));
 }
 
+/// The reader tells the user what the search covers. This pins that promise:
+/// sent mail is in, trashed mail is out. Both are facts about the store, and
+/// the copy in the search panel quotes them.
+#[tokio::test]
+async fn the_search_covers_sent_mail_and_leaves_the_trash_alone() {
+    let (server, fixtures) = TestServer::spawn("r2-search-scope").await;
+    let seed = seeded(&fixtures);
+    let account = seed.account_id.clone();
+    {
+        let connection = open_read_write(&server.db_path);
+        for (id, remote_id, subject, is_deleted, is_sent) in [
+            (
+                "33333333-3333-4333-8333-333333333331",
+                "sent-mail",
+                "Sentneedle report",
+                0i64,
+                1i64,
+            ),
+            (
+                "33333333-3333-4333-8333-333333333332",
+                "trashed-mail",
+                "Trashneedle report",
+                1i64,
+                0i64,
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO message_headers (
+                         id, account_id, remote_id, thread_id, from_address, subject,
+                         snippet_cipher, received_at, is_read, is_archived, is_deleted,
+                         is_sent, fetched_at
+                     ) VALUES (?, ?, ?, 'thread', 'me@example.invalid', ?, NULL,
+                               '2025-01-04 09:00:00.000', 1, 0, ?, ?, '2025-01-04 09:00:00.000')",
+                    rusqlite::params![
+                        uuid_bytes(id),
+                        uuid_bytes(&account),
+                        remote_id,
+                        subject,
+                        is_deleted,
+                        is_sent
+                    ],
+                )
+                .expect("seed a mail outside the inbox");
+        }
+    }
+
+    let client = http::client();
+    let auth = server.auth_headers();
+
+    let sent_hit = get(
+        &client,
+        &format!(
+            "{}/api/search?accountId={account}&q=Sentneedle",
+            server.base_url
+        ),
+        &auth,
+    )
+    .await;
+    assert_eq!(sent_hit.status, 200, "{:?}", sent_hit.body);
+    assert_eq!(sent_hit.body["totalCount"], json!(1));
+    assert_eq!(sent_hit.body["results"][0]["remoteId"], json!("sent-mail"));
+
+    let trash_hit = get(
+        &client,
+        &format!(
+            "{}/api/search?accountId={account}&q=Trashneedle",
+            server.base_url
+        ),
+        &auth,
+    )
+    .await;
+    assert_eq!(trash_hit.status, 200, "{:?}", trash_hit.body);
+    assert_eq!(
+        trash_hit.body["totalCount"],
+        json!(0),
+        "trashed mail is out of the search: {:?}",
+        trash_hit.body
+    );
+    assert_eq!(trash_hit.body["results"], json!([]));
+}
+
 #[tokio::test]
 async fn provider_backed_routes_stop_at_the_same_gate_as_v3() {
     let (server, fixtures) = TestServer::spawn("r2-gates").await;

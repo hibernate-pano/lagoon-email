@@ -1,12 +1,15 @@
 /**
  * The inbox list (MessageListView.swift, 2752 lines in v3 — this is the M2
- * slice: rows, per-lens empty copy, client-side search, bulk verbs, partial
+ * slice: rows, per-lens empty copy, server-side search, bulk verbs, partial
  * window note).
  *
- * Search is CLIENT-SIDE and makes no request (v4/docs/m1-checklist.md §1.1):
- * v3.2.0's GET /api/search always answers 500 because pass-B references an
- * advice alias it never joins. M1 shipped the filter; M2 keeps it and adds the
- * selection model the write paths need.
+ * Search is the SERVER's job (v4/docs/m1-checklist.md §1.1 said otherwise, and
+ * that was wrong): the front end used to filter the rows it happened to have
+ * loaded, so mail older than the window could not be found - and the empty copy
+ * said "no matches" as if the server had answered. `GET /api/search` searches
+ * the whole account (subject, sender, the AI's verdict, and the sealed body of
+ * every mail that has been opened), so the list asks the server and shows what
+ * the server said, including what it could not reach.
  *
  * Selection model (v3 semantics):
  *   - plain click  = open this row (cursor follows);
@@ -16,27 +19,35 @@
  *                    the server" — that is the two-stage rule, and M2 keeps the
  *                    first stage only because there is no server-wide verb here).
  */
-import { useMemo, useRef, useState, type ReactNode } from "react";
-import type { MessageHeader, SyncResponse } from "../core/types";
+import { useRef, type ReactNode } from "react";
+import type { MessageHeader, SearchResponse, SyncResponse } from "../core/types";
 import type { LensId } from "../core/router";
 import type { Outcome } from "../core/async";
 import type { WriteBridge } from "../core/uiBridge";
 import { emptyStateFor } from "../core/empty";
+import { MAX_LIST_ROWS } from "../core/search";
 import { AsyncSurface } from "../ui/AsyncSurface";
 import { BulkBar } from "../ui/BulkBar";
 import { MailRow } from "../ui/MailRow";
 import { RowActions } from "../ui/RowActions";
 import { t } from "../l10n/zh";
 
-const SEARCH_CAP = 1000;
-
 export interface MessageListProps {
   title: string;
   lens: LensId;
   empty: { title: string; detail?: string };
-  outcome: Outcome<SyncResponse>;
+  outcome: Outcome<SyncResponse | SearchResponse>;
   /** Server rows with the optimistic overlay already applied by App. */
   rows: MessageHeader[];
+  /** The search box's text. Controlled by App: the query decides the request. */
+  query: string;
+  onQueryChange: (query: string) => void;
+  /** True while the server is answering a query (not the lens list). */
+  searching: boolean;
+  /** "Load more": the server holds more than the window shows. */
+  onLoadMore?: () => void;
+  /** False once the window has reached the server's cap. */
+  canLoadMore?: boolean;
   onRetry: () => void;
   onRefresh: () => void;
   openedId: string | null;
@@ -50,24 +61,8 @@ export interface MessageListProps {
   onEmptyTrash?: () => void;
 }
 
-function matches(query: string, subject?: string | null, sender?: string | null, snippet?: string | null): boolean {
-  const needle = query.trim().toLowerCase();
-  if (!needle) return true;
-  const haystack = (subject ?? "") + "\n" + (sender ?? "") + "\n" + (snippet ?? "");
-  return haystack.toLowerCase().includes(needle);
-}
-
 export function MessageList(props: MessageListProps): ReactNode {
-  const [query, setQuery] = useState("");
   const listRef = useRef<HTMLDivElement | null>(null);
-
-  const filtered = useMemo(
-    () =>
-      props.rows
-        .slice(0, SEARCH_CAP)
-        .filter((m) => matches(query, m.subject, m.fromName ?? m.fromAddress, m.snippet)),
-    [props.rows, query],
-  );
 
   // Unknown, not zero: the server omits totalCount when it does not know.
   const total =
@@ -75,23 +70,25 @@ export function MessageList(props: MessageListProps): ReactNode {
       ? props.outcome.data.totalCount ?? null
       : null;
 
-  // A known zero earns the lens copy; anything else keeps the copy the caller
-  // passed (AsyncSurface uses it for the "empty" phase).
-  const emptyCopy = emptyStateFor(props.lens, props.rows.length) ?? props.empty;
+  // A filtered-to-zero list is not the same as an empty mailbox: the search
+  // copy belongs to a query, the lens copy to a known zero with no query.
+  const emptyCopy = props.searching
+    ? { title: t.list.searchEmpty, detail: props.query }
+    : (emptyStateFor(props.lens, props.rows.length) ?? props.empty);
 
   return (
     <div className="pane">
       <div className="pane-head">
         <span className="surface-title">{props.title}</span>
-        <span className="badge">{filtered.length + (total === null ? " / —" : " / " + String(total))}</span>
+        <span className="badge">{props.rows.length + (total === null ? " / —" : " / " + String(total))}</span>
         <span className="spacer" />
         <input
           className="search-input"
           type="search"
           placeholder={t.list.searchPlaceholder}
-          value={query}
+          value={props.query}
           aria-label={t.list.searchPlaceholder}
-          onChange={(event) => setQuery(event.target.value)}
+          onChange={(event) => props.onQueryChange(event.target.value)}
         />
         {props.lens === "trash" && props.onEmptyTrash ? (
           <button className="btn danger" onClick={props.onEmptyTrash} title={t.m2.actions.emptyTrash}>
@@ -110,29 +107,19 @@ export function MessageList(props: MessageListProps): ReactNode {
           outcome={props.outcome}
           onRetry={props.onRetry}
           onRefresh={props.onRefresh}
-          empty={props.empty}
-          loadingLabel={t.list.loading}
+          empty={emptyCopy}
+          loadingLabel={props.searching ? t.list.searching : t.list.loading}
         >
           {() => (
             <>
-              {filtered.length === 0 ? (
-                // A filtered-to-zero list is not the same as an empty mailbox:
-                // the search copy belongs to a query, the lens copy to a known
-                // zero with no query.
-                query.trim() === "" ? (
-                  <div className="surface compact" role="status">
-                    <div className="surface-title">{emptyCopy.title}</div>
-                    {emptyCopy.detail ? <div className="surface-detail">{emptyCopy.detail}</div> : null}
-                  </div>
-                ) : (
-                  <div className="surface compact" role="status">
-                    <div className="surface-title">{t.list.searchEmpty}</div>
-                    <div className="surface-detail">{query}</div>
-                  </div>
-                )
+              {props.rows.length === 0 ? (
+                <div className="surface compact" role="status">
+                  <div className="surface-title">{emptyCopy.title}</div>
+                  {emptyCopy.detail ? <div className="surface-detail">{emptyCopy.detail}</div> : null}
+                </div>
               ) : (
                 <div className="rows" role="listbox" aria-multiselectable="true" aria-label={props.title}>
-                  {filtered.map((message) => (
+                  {props.rows.map((message) => (
                     <MailRow
                       key={message.remoteId}
                       message={message}
@@ -154,9 +141,23 @@ export function MessageList(props: MessageListProps): ReactNode {
                   ))}
                 </div>
               )}
-              {total !== null && total > filtered.length && query.trim() === "" ? (
+              {!props.searching && total !== null && total > props.rows.length ? (
                 <div className="surface compact" role="status">
-                  <div className="surface-detail">{t.list.truncated(total - filtered.length)}</div>
+                  <div className="surface-detail">{t.list.truncated(total - props.rows.length)}</div>
+                  {props.canLoadMore && props.onLoadMore ? (
+                    <div className="surface-actions">
+                      <button className="btn" onClick={props.onLoadMore}>
+                        {t.list.loadMore}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="surface-detail">{t.list.listCapped(MAX_LIST_ROWS)}</div>
+                  )}
+                </div>
+              ) : null}
+              {props.searching ? (
+                <div className="surface compact" role="status">
+                  <div className="surface-detail">{t.list.searchScope}</div>
                 </div>
               ) : null}
             </>

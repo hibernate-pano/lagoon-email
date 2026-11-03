@@ -98,7 +98,12 @@ export const zh = {
     searchNotRun: "输入关键词后回车搜索",
     searchFailed: "搜索失败——答案未知，不是“没有结果”。",
     searchPartial: "正文扫描有预算上限，结果可能不全。",
-    truncated: (n: number) => `另有 ${n} 封未加载（服务端窗口上限）`,
+    searching: "正在搜索整个邮箱…",
+    searchScope: "搜索覆盖整个账号（收件箱、归档、已发送），不含废纸篓；正文只搜打开过的邮件。",
+    searchTitle: "搜索",
+    loadMore: "加载更多",
+    listCapped: (n: number) => `服务端最多列出 ${n} 封，更早的用搜索找。`,
+    truncated: (n: number) => `另有 ${n} 封没显示（窗口上限）`,
     sentStale: (reason: string) => `已发送可能不是最新：${reason}`,
     empty: {
       inbox: ["收件箱是空的", "还没有任何邮件进来，或者同步还没跑完。"],

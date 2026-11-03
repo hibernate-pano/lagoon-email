@@ -75,6 +75,23 @@ export interface SyncResponse {
   totalCount?: number | null;
 }
 
+/**
+ * The server's answer to a search (contract §4.4).
+ *
+ * `results` is capped by the server (100 rows); `truncated` says whether
+ * there were more matches than rows. `bodyScanSkipped` counts the mailbox
+ * rows the decryption budget did not reach - those mails were never opened,
+ * so their body was never stored and could not be searched.
+ */
+export interface SearchResponse {
+  results: MessageHeader[];
+  query: string;
+  totalCount: number;
+  truncated: boolean;
+  bodyScanSkipped: number;
+  bodyScanLimit: number;
+}
+
 export type AttachmentDisposition = "attachment" | "inline";
 
 export interface Attachment {
@@ -152,15 +169,6 @@ export interface AdviceResponse {
 
 export interface FolderCountResponse {
   counts: { id: string; count: number }[];
-}
-
-export interface SearchResponse {
-  results: MessageHeader[];
-  query: string;
-  totalCount?: number | null;
-  truncated?: boolean | null;
-  bodyScanSkipped?: boolean | null;
-  bodyScanLimit?: number | null;
 }
 
 export interface AiStatus {
