@@ -147,14 +147,18 @@ capability（409 archive-unavailable / delete-unavailable / not-in-trash、503 p
 
 **能力闸门**：allows(x) = x !== false（与 MailCapabilities.swift:121-156 一致）；false → 按钮禁用并在 title 说明；nil（未探测）→ 允许，由服务端 409 裁决。
 
-**验证用开关**：\`?bypass-caps=1\`（仅 dev）让按钮在 capabilities=false 时仍可点，用来从浏览器打到真实 409。默认不开。
+**验证用开关**：`?bypass-caps=1`（仅 dev）让按钮在 capabilities=false 时仍可点，用来从浏览器打到真实 409。默认不开。
 
 ### 写路径怎么验（不需要真实邮箱）
 
-\`\`\`bash
-bash v4/web/scripts/synth-sidecar.sh start     # 合成账号 + 5 封邮件 + 审计行（临时库，凭据不可解 → 远端必失败）
-LAGOON_WEB_ENV=v4/web/.synth/web.env npm run dev -- --port 5190
+```bash
+bash web/scripts/synth-sidecar.sh start     # 合成账号 + 5 封邮件 + 审计行（临时库，凭据不可解 → 远端必失败）
+cd web && LAGOON_WEB_ENV=web/.synth/web.env npm run dev -- --port 5190
 # 打开 http://127.0.0.1:5190/?bypass-caps=1#/list/inbox
-\`\`\`
+# 收工：bash web/scripts/synth-sidecar.sh stop
+```
+
+`LAGOON_WEB_ENV` 是**相对仓库根目录**的路径（vite.config.ts 这么读，见该文件顶部注释）。
+脚本只写 `web/.synth/`（已 gitignore），不碰 `.dev/` 里的真实库。
 
 合成账号的 capabilities 全为 false（archiveFolder/trashFolder/uidplus/sentFolder），所以：归档 → 409；置顶/标已读 → 200 且带 actionId（本地动作，可撤销）。

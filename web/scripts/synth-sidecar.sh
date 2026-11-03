@@ -1,28 +1,29 @@
 #!/usr/bin/env bash
 # A throwaway sidecar seeded with the contract harness's SYNTHETIC store.
 #
-# Why this exists: v4/.dev/data is empty (creating an account needs a real QQ
-# auth code we do not have), and v4/web must not write into v4/.dev/data (other
-# owner, other write scope). The M2 write UI still has to be exercised
-# end-to-end, so this spins a *separate* sidecar with its own SQLite file under
-# v4/web/.synth/ (gitignored), seeded by the same harness that produces the
-# golden contract fixtures:
+# Why this exists: the developer's own store (`.dev/`) is off limits - it holds
+# the real mailbox, and the rule is that nothing here ever writes to it. The
+# UI still has to be exercised end-to-end, so this spins a *separate* sidecar
+# with its own SQLite file under web/.synth/ (gitignored), seeded by the same
+# harness that produces the golden contract fixtures:
 #
-#   v4/tests/contract/harness.py  ->  seed(db_path, body_key)
+#   tests/contract/harness.py  ->  seed(db_path, body_key)
 #
 # Safety properties, inherited from the harness:
 #   * the seeded account's credential blob is unreadable, so every provider path
 #     fails at credential open -- no socket to any mail server is ever created;
-#   * no real account, no real mail, nothing written outside v4/web/.synth/.
+#   * LAGOON_MAIL_PROVIDER=none, so the sidecar never even installs a provider;
+#   * no real account, no real mail, nothing written outside web/.synth/.
 #
-#   bash v4/web/scripts/synth-sidecar.sh start|stop|status|env
+#   bash web/scripts/synth-sidecar.sh start|stop|status|env
 #
-# Then point a dev server at it:
-#   LAGOON_WEB_ENV=v4/web/.synth/web.env npm run dev
+# Then point a dev server at it (LAGOON_WEB_ENV is read relative to the
+# repository root - see web/vite.config.ts):
+#   cd web && LAGOON_WEB_ENV=web/.synth/web.env npm run dev
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-WEB="$ROOT/v4/web"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+WEB="$ROOT/web"
 SYNTH="${LAGOON_SYNTH_DIR:-$WEB/.synth}"
 DB="$SYNTH/lagoon.sqlite"
 KEYS="$SYNTH/keys.env"
@@ -32,11 +33,13 @@ LOG="$SYNTH/sidecar.log"
 mkdir -p "$SYNTH"
 
 sidecar_bin() {
-  if [ -n "${LAGOON_V4_SIDECAR:-}" ]; then echo "$LAGOON_V4_SIDECAR"; return; fi
-  for candidate in "$ROOT/.build/release/LagoonServerCLI" "$ROOT/.build/debug/LagoonServerCLI"; do
-    if [ -x "$candidate" ]; then echo "$candidate"; return; fi
-  done
-  echo "ERROR: LagoonServerCLI not built (swift build --product LagoonServerCLI)" >&2
+  if [ -n "${LAGOON_SIDECAR_BIN:-}" ]; then echo "$LAGOON_SIDECAR_BIN"; return; fi
+  local candidate="$ROOT/crates/target/debug/lagoon-api"
+  if [ -x "$candidate" ]; then echo "$candidate"; return; fi
+  echo "building the Rust backend (cargo build -p lagoon-api)..."
+  (cd "$ROOT/crates" && cargo build --quiet -p lagoon-api)
+  if [ -x "$candidate" ]; then echo "$candidate"; return; fi
+  echo "ERROR: lagoon-api not built (cargo build --manifest-path crates/Cargo.toml -p lagoon-api)" >&2
   exit 1
 }
 
@@ -89,12 +92,13 @@ case "${1:-start}" in
     API_TOKEN="$(read_key API_TOKEN)"
     BIN="$(sidecar_bin)"
 
-    # Phase 1 -- let GRDB create the schema (the seeder INSERTs into real tables).
+    # Phase 1 -- let the backend create the schema (the seeder INSERTs into real tables).
     rm -f "$DB" "$DB-wal" "$DB-shm"
     PORT="$(free_port)"
     echo "phase 1: create schema on port $PORT"
     LAGOON_DB_PATH="$DB" LAGOON_SERVER_PORT="$PORT" \
     LAGOON_TOKEN_KEY="$TOKEN_KEY" LAGOON_BODY_KEY="$BODY_KEY" LAGOON_API_TOKEN="$API_TOKEN" \
+    LAGOON_MAIL_PROVIDER=none \
       "$BIN" >"$LOG" 2>&1 &
     SCHEMA_PID=$!
     wait_healthy "$PORT" "$API_TOKEN" "schema"
@@ -102,8 +106,8 @@ case "${1:-start}" in
     wait "$SCHEMA_PID" 2>/dev/null || true
 
     # Phase 2 -- seed the synthetic account + messages + actions.
-    echo "phase 2: seed via v4/tests/contract/harness.py"
-    PYTHONPATH="$ROOT/v4/tests/contract" python3 - "$DB" "$BODY_KEY" <<'PY'
+    echo "phase 2: seed via tests/contract/harness.py"
+    PYTHONPATH="$ROOT/tests/contract" python3 - "$DB" "$BODY_KEY" <<'PY'
 import sys
 sys.dont_write_bytecode = True
 import harness
@@ -116,6 +120,7 @@ PY
     echo "phase 3: serve on port $PORT"
     LAGOON_DB_PATH="$DB" LAGOON_SERVER_PORT="$PORT" \
     LAGOON_TOKEN_KEY="$TOKEN_KEY" LAGOON_BODY_KEY="$BODY_KEY" LAGOON_API_TOKEN="$API_TOKEN" \
+    LAGOON_MAIL_PROVIDER=none \
       nohup "$BIN" >>"$LOG" 2>&1 &
     echo $! > "$PIDFILE"
     wait_healthy "$PORT" "$API_TOKEN" "serve"
@@ -123,7 +128,7 @@ PY
     printf 'VITE_SIDECAR_URL=http://127.0.0.1:%s\nVITE_SIDECAR_TOKEN=%s\n' "$PORT" "$API_TOKEN" > "$ENVFILE"
     chmod 600 "$ENVFILE"
     echo "ready: http://127.0.0.1:$PORT (pid $(cat "$PIDFILE"), synthetic db $DB)"
-    echo "run:  LAGOON_WEB_ENV=v4/web/.synth/web.env npm run dev"
+    echo "run:  cd web && LAGOON_WEB_ENV=web/.synth/web.env npm run dev"
     ;;
   stop)
     if [ ! -f "$PIDFILE" ]; then echo "not running"; exit 0; fi
