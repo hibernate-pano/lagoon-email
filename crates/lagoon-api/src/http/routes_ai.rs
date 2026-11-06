@@ -146,7 +146,7 @@ pub async fn summary(
     }
     record_usage(
         &state,
-        account_id,
+        Some(account_id),
         "summary",
         &completion.model,
         completion.prompt_tokens,
@@ -212,7 +212,7 @@ pub async fn draft_generate(
     // whether the answer is usable. An answer we throw away is still a bill.
     record_usage(
         &state,
-        account_id,
+        Some(account_id),
         "draft",
         &completion.model,
         completion.prompt_tokens,
@@ -274,15 +274,29 @@ pub async fn ai_reload(State(state): State<AppState>) -> Response {
 /// down", and a probe is the only way to tell.
 pub async fn ai_probe(State(state): State<AppState>) -> Response {
     match state.ai.probe().await {
-        Ok(probe) => respond::json(
-            StatusCode::OK,
-            &wire_r2::AiProbeResponse {
-                ok: true,
-                provider: probe.provider,
-                model: probe.model,
-                latency_ms: probe.latency_ms,
-            },
-        ),
+        Ok(probe) => {
+            // The probe is a model call: the provider bills it, so the ledger
+            // has to know or the monthly cap is blind to it.
+            record_usage(
+                &state,
+                None,
+                "probe",
+                &probe.model,
+                probe.prompt_tokens,
+                probe.completion_tokens,
+                probe.cost_micro_usd,
+            )
+            .await;
+            respond::json(
+                StatusCode::OK,
+                &wire_r2::AiProbeResponse {
+                    ok: true,
+                    provider: probe.provider,
+                    model: probe.model,
+                    latency_ms: probe.latency_ms,
+                },
+            )
+        }
         Err(error) => ai_error_response(error),
     }
 }
@@ -587,9 +601,13 @@ async fn store_draft(
 }
 
 /// Write one row into the cost ledger.
+///
+/// `account_id` is `None` for a call that belongs to no mailbox (the probe).
+/// The row is still written: the budget gate reads only this ledger, so an
+/// unrecorded call is spend the monthly cap cannot see.
 async fn record_usage(
     state: &AppState,
-    account_id: Uuid,
+    account_id: Option<Uuid>,
     capability: &str,
     model: &str,
     prompt_tokens: u32,
@@ -597,15 +615,20 @@ async fn record_usage(
     cost_micro_usd: i64,
 ) {
     let month = chrono::Local::now().format("%Y-%m").to_string();
-    let email = state
-        .db
-        .read(move |connection| -> Result<String, StoreError> {
-            Ok(store::accounts::find(connection, account_id)?
-                .map(|account| account.email)
-                .unwrap_or_default())
-        })
-        .await
-        .unwrap_or_default();
+    let email = match account_id {
+        Some(account_id) => state
+            .db
+            .read(move |connection| -> Result<String, StoreError> {
+                Ok(store::accounts::find(connection, account_id)?
+                    .map(|account| account.email)
+                    .unwrap_or_default())
+            })
+            .await
+            .unwrap_or_default(),
+        // No mailbox: the probe asks "is the provider there?", not "what is in
+        // this inbox". An empty label keeps the sum correct.
+        None => String::new(),
+    };
     let connection = match state.write_connection() {
         Ok(connection) => connection,
         Err(error) => {

@@ -266,14 +266,22 @@ fn parse_part(
         // An explicit `Content-Disposition: attachment` on a text part is still
         // an attachment (rare but legal).
         if disposition_raw.starts_with("attachment") {
+            // The policy is consulted *before* the decode. Evaluating
+            // `decode_body(...)` as an argument decoded a 25 MB text
+            // attachment on every body-route open and threw the bytes away.
+            let decode = policy.decodes(part_path, &mime_type, AttachmentDisposition::Attachment);
             return attachment_result(
                 part_path,
                 filename,
                 &mime_type,
-                decode_body(&encoding, body),
+                if decode {
+                    decode_body(&encoding, body)
+                } else {
+                    Vec::new()
+                },
                 body,
                 &encoding,
-                policy.decodes(part_path, &mime_type, AttachmentDisposition::Attachment),
+                decode,
                 content_id,
                 AttachmentDisposition::Attachment,
             );
@@ -865,6 +873,42 @@ Content-Disposition: attachment; filename=\"r.pdf\"\r\nContent-Transfer-Encoding
         );
         // The size is still reported: it is estimated, not decoded.
         assert_eq!(file.size, 4);
+    }
+
+    #[test]
+    fn a_text_attachment_obeys_the_decode_policy() {
+        // The text/* branch used to decode unconditionally; this pins that it
+        // asks the policy like every other attachment branch does.
+        let message = b"Content-Type: multipart/mixed; boundary=m\r\n\r\n\
+--m\r\nContent-Type: text/plain\r\n\r\nbody\r\n\
+--m\r\nContent-Type: text/csv; name=\"rows.csv\"\r\n\
+Content-Disposition: attachment; filename=\"rows.csv\"\r\n\r\na,b\r\n1,2\r\n\
+--m--\r\n"
+            .to_vec();
+
+        let metadata_only = parse_with_policy(&message, &DecodePolicy::None);
+        let attachment = metadata_only
+            .attachments
+            .iter()
+            .find(|attachment| attachment.mime_type == "text/csv")
+            .expect("the csv attachment");
+        assert!(
+            attachment.data.is_empty(),
+            "the body route asks for metadata, not bytes"
+        );
+        assert!(attachment.size > 0, "the size is still reported");
+
+        let wanted = parse_with_policy(&message, &DecodePolicy::Part("1.2".to_owned()));
+        let attachment = wanted
+            .attachments
+            .iter()
+            .find(|attachment| attachment.mime_type == "text/csv")
+            .expect("the csv attachment");
+        assert_eq!(
+            attachment.data,
+            b"a,b\r\n1,2".to_vec(),
+            "the download route gets the bytes it asked for"
+        );
     }
 
     #[test]

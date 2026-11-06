@@ -484,6 +484,14 @@ async fn a_probe_without_a_key_is_503_and_with_one_answers() {
     assert_eq!(observed.body["ok"], json!(true));
     assert_eq!(observed.body["model"], json!("MiniMax-M3"));
     assert_eq!(observed.body["provider"], json!("minimax"));
+
+    // A probe is a model call the provider bills, so it must land in the
+    // ledger the budget gate reads. Unrecorded spend is spend the monthly cap
+    // cannot see.
+    assert_eq!(usage_rows(&server), 1, "the probe's cost must be recorded");
+    let usage = get(&client, &server, "/api/usage").await;
+    assert_eq!(usage.status, 200, "{:?}", usage.body);
+    assert_eq!(usage.body["callCount"], json!(1));
 }
 
 #[tokio::test]

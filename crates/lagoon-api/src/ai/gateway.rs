@@ -328,6 +328,12 @@ pub struct AiProbe {
     pub provider: String,
     pub model: String,
     pub latency_ms: u128,
+    /// What the probe cost. A probe is a model call like any other, so it is
+    /// billed by the provider and has to reach the ledger the budget gate
+    /// reads - otherwise `/api/ai/probe` is spend the monthly cap cannot see.
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub cost_micro_usd: i64,
 }
 
 impl AiGateway {
@@ -371,12 +377,16 @@ impl AiGateway {
             .await;
         let latency_ms = started.elapsed().as_millis();
         match reply {
-            Ok(_) => {
+            Ok(reply) => {
                 self.record_success();
                 Ok(AiProbe {
                     provider: provider.name.clone(),
                     model: provider.model.clone(),
                     latency_ms,
+                    prompt_tokens: reply.prompt_tokens,
+                    completion_tokens: reply.completion_tokens,
+                    cost_micro_usd: provider
+                        .cost_micro_usd(reply.prompt_tokens, reply.completion_tokens),
                 })
             }
             Err(error) => Err(self.record_failure(&provider, error)),

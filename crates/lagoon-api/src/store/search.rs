@@ -107,20 +107,27 @@ pub fn search(
         cheap_arguments.push(rusqlite::types::Value::Text(pattern.clone()));
     }
 
-    // Pass A - the cheap arms, in SQL.
+    // Pass A - the cheap arms, in SQL. Only the newest window is fetched: the
+    // merged top-N cannot need a cheap hit older than the newest N, and a
+    // broad query (one letter matches most of a mailbox) would otherwise load
+    // every matching id into memory just to sort and drop them. `totalCount`
+    // comes from the COUNT below, so the window costs no honesty.
     let cheap_sql = format!(
         "SELECT m.id, m.received_at
          FROM message_headers m
          LEFT JOIN advice a
            ON a.account_id = m.account_id AND a.remote_id = m.remote_id
-         WHERE {filters} AND {cheap_arms}"
+         WHERE {filters} AND {cheap_arms}
+         ORDER BY m.received_at DESC, m.id DESC
+         LIMIT ?"
     );
     let mut cheap_hits: Vec<(Uuid, Timestamp)> = Vec::new();
     {
+        let mut arguments: Vec<rusqlite::types::Value> = filter_arguments.clone();
+        arguments.extend(cheap_arguments.iter().cloned());
+        arguments.push(rusqlite::types::Value::Integer(RESULT_LIMIT));
         let mut statement = connection.prepare(&cheap_sql)?;
-        let mut rows = statement.query(rusqlite::params_from_iter(
-            filter_arguments.iter().chain(cheap_arguments.iter()),
-        ))?;
+        let mut rows = statement.query(rusqlite::params_from_iter(arguments.iter()))?;
         while let Some(row) = rows.next()? {
             cheap_hits.push((
                 crate::db::uuid_column(row, 0)?,
@@ -128,6 +135,23 @@ pub fn search(
             ));
         }
     }
+
+    // The exact size of pass A's set, which the window above cannot report.
+    // Pass B excludes these rows, so the total is a sum, not a union count.
+    let cheap_count: i64 = {
+        let count_sql = format!(
+            "SELECT COUNT(*)
+             FROM message_headers m
+             LEFT JOIN advice a
+               ON a.account_id = m.account_id AND a.remote_id = m.remote_id
+             WHERE {filters} AND {cheap_arms}"
+        );
+        let mut statement = connection.prepare(&count_sql)?;
+        statement.query_row(
+            rusqlite::params_from_iter(filter_arguments.iter().chain(cheap_arguments.iter())),
+            |row| row.get(0),
+        )?
+    };
 
     // Pass B - the sealed arms, in Rust, under a budget. The advice join is the
     // fix: without it the cheap arms cannot be evaluated inside this statement.
@@ -200,7 +224,10 @@ pub fn search(
         body_scan_skipped = (candidates - scanned).max(0);
     }
 
-    // The two passes are disjoint by construction, so the merge is a sort.
+    // The two passes are disjoint by construction (pass B excludes every row
+    // pass A matched), so the total is their sum. Pass A is counted, not
+    // enumerated, because only its newest window was fetched.
+    let sealed_count = sealed_hits.len() as i64;
     let mut ordered: Vec<(Uuid, Timestamp)> = cheap_hits;
     ordered.extend(sealed_hits);
     ordered.sort_by(|left, right| {
@@ -211,7 +238,7 @@ pub fn search(
     });
     let mut seen: HashSet<Uuid> = HashSet::new();
     ordered.retain(|(id, _)| seen.insert(*id));
-    let total_count = ordered.len() as i64;
+    let total_count = (cheap_count + sealed_count).max(ordered.len() as i64);
     let top: Vec<Uuid> = ordered
         .into_iter()
         .take(usize::try_from(RESULT_LIMIT).unwrap_or(usize::MAX))
