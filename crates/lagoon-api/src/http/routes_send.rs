@@ -534,11 +534,14 @@ async fn deliver(
     if let (Some(action_id), Some(provider_message_id)) =
         (action_id, sent.provider_message_id.as_deref())
     {
+        // `remote_id` is the message this send answers (reply/forward), which
+        // is what the "already replied" signal matches against the inbox row;
+        // a brand-new mail answers nothing and passes None.
         if let Err(error) = write::complete_send(
             &connection,
             action_id,
             Some(provider_message_id),
-            provider_message_id,
+            remote_id.as_deref(),
         ) {
             tracing::error!(err = %error, "send.auditFailed: the message was delivered");
         }

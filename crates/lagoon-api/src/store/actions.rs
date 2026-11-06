@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use rusqlite::Connection;
 
 use crate::db::{optional_timestamp_column, timestamp_column, uuid_column};
+use crate::store::write::send_status;
 use crate::timefmt::{self, Timestamp};
 use crate::uuid::Uuid;
 
@@ -37,28 +38,32 @@ const COLUMNS: &str = "id, account_id, kind, payload, created_at, expires_at";
 /// Filters every audit query in v3 applies: an action that was later undone is
 /// not history, a Sent-folder harvest is not something Lagoon did, and a send
 /// that is still claimed or that failed never happened.
-const VISIBLE_ACTIONS: &str = "
-      NOT EXISTS (
+///
+/// The send half comes from `write::send_status::visible`, so the writer and
+/// every reader cannot disagree about what a finished send is called.
+fn visible_actions() -> String {
+    format!(
+        "NOT EXISTS (
           SELECT 1 FROM ai_actions u
           WHERE u.account_id = ai_actions.account_id
             AND u.kind = 'undo'
             AND json_extract(u.payload, '$.undoOf') = ai_actions.id
       )
       AND NOT (kind = 'send' AND json_extract(payload, '$.sentFolder') IS NOT NULL)
-      AND (
-          kind <> 'send'
-          OR json_extract(payload, '$.status') IS NULL
-          OR json_extract(payload, '$.status') = 'sent'
-      )";
+      AND {}",
+        send_status::visible("")
+    )
+}
 
 fn page_sql() -> String {
     format!(
         "SELECT {COLUMNS} FROM ai_actions
          WHERE account_id = ? AND created_at >= ?
            AND (created_at, id) < (?, ?)
-           AND {VISIBLE_ACTIONS}
+           AND {}
          ORDER BY created_at DESC, id DESC
-         LIMIT ?"
+         LIMIT ?",
+        visible_actions()
     )
 }
 
@@ -66,7 +71,8 @@ fn count_sql() -> String {
     format!(
         "SELECT COUNT(*) FROM ai_actions
          WHERE account_id = ? AND created_at >= ?
-           AND {VISIBLE_ACTIONS}"
+           AND {}",
+        visible_actions()
     )
 }
 
@@ -145,14 +151,14 @@ pub fn replied_remote_ids(
     connection: &Connection,
     account_id: Uuid,
 ) -> rusqlite::Result<HashSet<String>> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT DISTINCT json_extract(payload, '$.remoteId') AS rid
          FROM ai_actions
          WHERE account_id = ? AND kind = 'send'
            AND json_extract(payload, '$.remoteId') IS NOT NULL
-           AND (json_extract(payload, '$.status') IS NULL
-                OR json_extract(payload, '$.status') = 'sent')",
-    )?;
+           AND {}",
+        send_status::visible("")
+    ))?;
     let mut rows = statement.query([account_id.as_bytes().as_slice()])?;
     let mut ids = HashSet::new();
     while let Some(row) = rows.next()? {
@@ -216,20 +222,19 @@ pub fn time_saved_events(
     account_id: Uuid,
     since: Timestamp,
 ) -> rusqlite::Result<Vec<(String, Timestamp)>> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&format!(
         "SELECT a.kind, a.created_at
          FROM ai_actions a
          WHERE a.account_id = ? AND a.created_at >= ?
            AND NOT (a.kind = 'send' AND json_extract(a.payload, '$.sentFolder') IS NOT NULL)
-           AND (a.kind <> 'send'
-                OR json_extract(a.payload, '$.status') IS NULL
-                OR json_extract(a.payload, '$.status') = 'sent')
+           AND {}
            AND NOT EXISTS (
                SELECT 1 FROM ai_actions u
                WHERE u.account_id = a.account_id AND u.kind = 'undo'
                  AND json_extract(u.payload, '$.undoOf') = CAST(a.id AS TEXT)
            )",
-    )?;
+        send_status::visible("a.")
+    ))?;
     let mut rows = statement.query(rusqlite::params![
         account_id.as_bytes().as_slice(),
         timefmt::to_stored(since)

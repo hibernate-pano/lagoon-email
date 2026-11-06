@@ -15,6 +15,35 @@ use serde_json::Value;
 use crate::crypto::BodyKey;
 use crate::uuid::Uuid;
 
+/// The `payload.status` values a `send` action can carry.
+///
+/// Both sides of the audit name these constants: the writer here and the
+/// readers in `store::actions`. A writer that invents one spelling while the
+/// readers test another (`completed` vs `sent`) makes the row invisible to
+/// every history query with no error anywhere - the row exists, nothing shows
+/// it, and `repliedRemoteIds` silently stays empty.
+pub mod send_status {
+    /// Claimed by a request that has not heard back from SMTP yet.
+    pub const PENDING: &str = "pending";
+    /// SMTP accepted the message. This is the one state that is history.
+    pub const SENT: &str = "sent";
+    /// SMTP refused it; a retry needs a fresh requestId (the same one replays).
+    pub const FAILED: &str = "failed";
+
+    /// SQL predicate: is this `send` row real history?
+    ///
+    /// `alias` is `""` for an unaliased `ai_actions` row and `"a."` for a
+    /// joined one, so the same rule serves every history query. A row with no
+    /// status is the v3-era shape and counts as sent.
+    pub fn visible(alias: &str) -> String {
+        format!(
+            "({alias}kind <> 'send'
+              OR json_extract({alias}payload, '$.status') IS NULL
+              OR json_extract({alias}payload, '$.status') = '{SENT}')"
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum WriteError {
     Sqlite(rusqlite::Error),
@@ -413,21 +442,34 @@ pub enum SendClaim {
     Failed(String),
 }
 
+/// How long a claimed send owns its requestId before another request may take
+/// it over.
+///
+/// Without a lease, a process killed between the claim and the SMTP answer
+/// left the row `pending` forever: every replay answered 409 `send-in-flight`,
+/// and the web client reuses the same requestId on an `inflight` outcome - so
+/// the user could never resend that mail. Five minutes is far longer than a
+/// send takes and short enough that a crash does not cost the draft.
+const SEND_CLAIM_LEASE_MS: i64 = 5 * 60 * 1000;
+
 /// Atomically claim a send requestId.
 ///
 /// The unique index `ai_actions_send_request_idx` is the lock: the INSERT that
 /// wins is the only request allowed to talk to SMTP, so two concurrent retries
 /// can never both deliver. A send that fails is marked failed rather than left
 /// pending, so the same key replays the first result instead of hanging in
-/// flight forever; a new requestId starts a fresh attempt.
+/// flight forever; a new requestId starts a fresh attempt. A claim that
+/// outlives `SEND_CLAIM_LEASE_MS` is treated as a crash and may be taken over.
 pub fn claim_send(
     connection: &Connection,
     account_id: Uuid,
     request_id: &str,
 ) -> Result<SendClaim, WriteError> {
+    let claimed_at = crate::timefmt::now().millis();
     let payload = serde_json::json!({
         "requestId": request_id,
-        "status": "pending",
+        "status": send_status::PENDING,
+        "claimedAt": claimed_at,
     })
     .to_string();
     match connection.execute(
@@ -436,17 +478,17 @@ pub fn claim_send(
     ) {
         Ok(_) => Ok(SendClaim::Claimed(connection.last_insert_rowid())),
         Err(error) if is_unique_violation(&error) => {
-            let existing: Option<String> = connection
+            let existing: Option<(i64, String)> = connection
                 .query_row(
-                    "SELECT payload FROM ai_actions
+                    "SELECT id, payload FROM ai_actions
                      WHERE account_id = ?1 AND kind = 'send'
                        AND json_extract(payload, '$.requestId') = ?2
                      LIMIT 1",
                     rusqlite::params![account_id.as_bytes().as_slice(), request_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            let Some(existing) = existing else {
+            let Some((row_id, existing)) = existing else {
                 // The row vanished between the INSERT and this read. Treating
                 // it as in-flight is the safe answer: the other request may
                 // still deliver.
@@ -455,13 +497,13 @@ pub fn claim_send(
             let value: serde_json::Value =
                 serde_json::from_str(&existing).unwrap_or(serde_json::json!({}));
             match value.get("status").and_then(|status| status.as_str()) {
-                Some("completed") => Ok(SendClaim::Completed(
+                Some(send_status::SENT) => Ok(SendClaim::Completed(
                     value
                         .get("providerMessageId")
                         .and_then(|id| id.as_str())
                         .map(str::to_owned),
                 )),
-                Some("failed") => Ok(SendClaim::Failed(
+                Some(send_status::FAILED) => Ok(SendClaim::Failed(
                     value
                         .get("error")
                         .and_then(|error| error.as_str())
@@ -475,7 +517,40 @@ pub fn claim_send(
                         .and_then(|id| id.as_str())
                         .map(str::to_owned),
                 )),
-                _ => Ok(SendClaim::InFlight),
+                _ => {
+                    // Still claimed. Take it over only when the claim is older
+                    // than the lease; a claim with no timestamp cannot be aged,
+                    // so it stays in flight (the cautious answer).
+                    let stale = value
+                        .get("claimedAt")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|at| claimed_at - at > SEND_CLAIM_LEASE_MS);
+                    if stale {
+                        let taken = connection.execute(
+                            "UPDATE ai_actions
+                             SET payload = json_set(payload,
+                                                    '$.status', ?1,
+                                                    '$.claimedAt', ?2)
+                             WHERE id = ?3
+                               AND json_extract(payload, '$.status') = ?1
+                               AND json_extract(payload, '$.claimedAt') = ?4",
+                            rusqlite::params![
+                                send_status::PENDING,
+                                claimed_at,
+                                row_id,
+                                value.get("claimedAt").and_then(serde_json::Value::as_i64),
+                            ],
+                        )?;
+                        if taken == 1 {
+                            tracing::warn!(
+                                request_id,
+                                "send.staleClaim: taking over an expired send claim"
+                            );
+                            return Ok(SendClaim::Claimed(row_id));
+                        }
+                    }
+                    Ok(SendClaim::InFlight)
+                }
             }
         }
         Err(error) => Err(WriteError::Sqlite(error)),
@@ -483,20 +558,30 @@ pub fn claim_send(
 }
 
 /// Mark a claimed send as delivered, recording what the client can retry with.
+///
+/// `replied_to` is the `remote_id` of the message this send answers (reply and
+/// forward); `None` for a brand-new mail. It is *not* the new Message-ID: the
+/// "already replied" signal matches it against the inbox row, so storing the
+/// outgoing id there would make the signal permanently dead.
 pub fn complete_send(
     connection: &Connection,
     action_id: i64,
     provider_message_id: Option<&str>,
-    remote_id: &str,
+    replied_to: Option<&str>,
 ) -> Result<(), WriteError> {
     connection.execute(
         "UPDATE ai_actions
          SET payload = json_set(payload,
-                                '$.status', 'completed',
-                                '$.providerMessageId', ?1,
-                                '$.remoteId', ?2)
-         WHERE id = ?3",
-        rusqlite::params![provider_message_id, remote_id, action_id],
+                                '$.status', ?1,
+                                '$.providerMessageId', ?2,
+                                '$.remoteId', ?3)
+         WHERE id = ?4",
+        rusqlite::params![
+            send_status::SENT,
+            provider_message_id,
+            replied_to,
+            action_id
+        ],
     )?;
     Ok(())
 }
@@ -505,9 +590,9 @@ pub fn complete_send(
 pub fn fail_send(connection: &Connection, action_id: i64, code: &str) -> Result<(), WriteError> {
     connection.execute(
         "UPDATE ai_actions
-         SET payload = json_set(payload, '$.status', 'failed', '$.error', ?1)
-         WHERE id = ?2",
-        rusqlite::params![code, action_id],
+         SET payload = json_set(payload, '$.status', ?1, '$.error', ?2)
+         WHERE id = ?3",
+        rusqlite::params![send_status::FAILED, code, action_id],
     )?;
     Ok(())
 }

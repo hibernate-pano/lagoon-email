@@ -523,3 +523,141 @@ async fn the_production_adapter_sends_by_smtp_and_appends_the_same_bytes_to_sent
         "SMTP and the Sent copy must carry the same message: {writes}"
     );
 }
+
+/// The send writer and the audit readers must agree on the seam between them.
+///
+/// Two failures this pins, both silent: a status the readers do not know (the
+/// row exists, no history query returns it) and a `remoteId` holding the new
+/// Message-ID instead of the message being answered (the "already replied"
+/// signal can never match an inbox row). Neither causes an error anywhere.
+#[tokio::test]
+async fn a_reply_is_history_against_the_message_it_answers() {
+    let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
+    factory.send_script(vec![Ok(SentMail {
+        provider_message_id: Some("<audit-reply@lagoon>".to_owned()),
+    })]);
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-send-audit", factory.clone()).await;
+    prepare_account(&server);
+    let client = http::client();
+
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/messages/{REMOTE}/send?accountId={ACCOUNT_A}"),
+        &json!({ "body": "answering", "requestId": REQUEST_ID }),
+    )
+    .await;
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+
+    // The row the writer produced: the status the readers test, and the
+    // message it answers.
+    let connection = open_read_write(&server.db_path);
+    let (status, remote_id): (Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT json_extract(payload, '$.status'), json_extract(payload, '$.remoteId')
+             FROM ai_actions WHERE account_id = ? AND kind = 'send' LIMIT 1",
+            rusqlite::params![uuid_bytes(ACCOUNT_A)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("audit row");
+    assert_eq!(
+        status.as_deref(),
+        Some("sent"),
+        "the one status every history reader treats as delivered"
+    );
+    assert_eq!(
+        remote_id.as_deref(),
+        Some(REMOTE),
+        "the audit names the message it answers, not the outgoing Message-ID"
+    );
+
+    // Reader 1: the audit log.
+    let actions = http::request(
+        &client,
+        "GET",
+        &format!("{}/api/actions?accountId={ACCOUNT_A}", server.base_url),
+        &server.auth_headers(),
+    )
+    .await;
+    assert_eq!(actions.status, 200, "{:?}", actions.body);
+    let shown = actions.body["actions"]
+        .as_array()
+        .expect("actions array")
+        .iter()
+        .any(|row| row["kind"] == json!("send"));
+    assert!(
+        shown,
+        "a delivered send is history, so /api/actions must list it: {}",
+        actions.body
+    );
+
+    // Reader 2: the briefing's "already replied" signal.
+    let account = Uuid::parse_strict(ACCOUNT_A).expect("uuid");
+    let replied =
+        lagoon_api::store::actions::replied_remote_ids(&connection, account).expect("replied ids");
+    assert!(
+        replied.contains(REMOTE),
+        "the briefing cannot mark the mail as replied; it has {replied:?}"
+    );
+
+    // Reader 3: the time-saved report counts a send as an action.
+    let since = lagoon_api::timefmt::Timestamp::from_millis(0);
+    let events = lagoon_api::store::actions::time_saved_events(&connection, account, since)
+        .expect("time saved");
+    assert!(
+        events.iter().any(|(kind, _)| kind == "send"),
+        "a delivered send must count toward time saved: {events:?}"
+    );
+}
+
+/// A claim left behind by a crash must not wedge that requestId forever.
+///
+/// The web client deliberately reuses the same requestId after an `inflight`
+/// outcome, so a permanent 409 means the user can never send that mail again.
+#[tokio::test]
+async fn an_expired_claim_is_taken_over_so_the_mail_can_be_sent() {
+    let factory = Arc::new(FakeProviderFactory::new(FakeOutcome::succeeds()));
+    factory.send_script(vec![Ok(SentMail {
+        provider_message_id: Some("<reclaimed@lagoon>".to_owned()),
+    })]);
+    let (server, _fixtures) =
+        TestServer::spawn_with_provider("r3-send-lease", factory.clone()).await;
+    prepare_account(&server);
+
+    // What a kill between the claim and the SMTP answer leaves behind: a
+    // pending row whose claim is older than the lease.
+    let stale = lagoon_api::timefmt::now().millis() - 60 * 60 * 1000;
+    let connection = open_read_write(&server.db_path);
+    connection
+        .execute(
+            "INSERT INTO ai_actions (account_id, kind, payload) VALUES (?1, 'send', ?2)",
+            rusqlite::params![
+                uuid_bytes(ACCOUNT_A),
+                json!({"requestId": REQUEST_ID, "status": "pending", "claimedAt": stale})
+                    .to_string()
+            ],
+        )
+        .expect("stale claim");
+    drop(connection);
+
+    let client = http::client();
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/compose/send?accountId={ACCOUNT_A}"),
+        &json!({
+            "to": "bob@example.invalid",
+            "subject": "After the crash",
+            "body": "again",
+            "requestId": REQUEST_ID,
+        }),
+    )
+    .await;
+    assert_eq!(
+        observed.status, 200,
+        "an expired claim must not block the retry: {:?}",
+        observed.body
+    );
+    assert_eq!(factory.send_calls().len(), 1, "the retry is the delivery");
+}
