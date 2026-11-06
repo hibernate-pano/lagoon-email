@@ -45,7 +45,15 @@ export function ConfirmDialog(props: {
         aria-modal="true"
         aria-label={request.title}
         onKeyDown={(event) => {
-          if (event.key === "Escape") props.onCancel();
+          if (event.key === "Escape") {
+            // Escape belongs to the dialog that is on top. Without this the
+            // native event keeps bubbling to the window handler and cancels
+            // whatever the dialog was guarding - here, it would close the
+            // composer and destroy the draft the confirmation exists to save.
+            event.stopPropagation();
+            event.preventDefault();
+            props.onCancel();
+          }
         }}
       >
         <h2>{request.title}</h2>

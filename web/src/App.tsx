@@ -323,7 +323,14 @@ export function App(): ReactNode {
     load: async () => {
       if (!accountId) return { kind: "fail", code: "not-ready", message: t.six.unavailable };
       if (route.lens === "sent") {
-        const sent = await apiCall<SentResponse>({ method: "GET", path: "/api/sent", query: { accountId } });
+        // The window parameter is the same for every lens: without it the
+        // server takes its own default (1000), and "load more" could not grow
+        // the window - the button re-issued an identical request.
+        const sent = await apiCall<SentResponse>({
+          method: "GET",
+          path: "/api/sent",
+          query: { accountId, limit: String(listLimit) },
+        });
         if (sent.kind !== "ok") return sent;
         return {
           kind: "ok",
@@ -729,11 +736,11 @@ export function App(): ReactNode {
 
       // A composer is open: nothing behind it may act on mail. ⌘K would take
       // the caret out of the draft; ⌫ would delete the message behind it.
+      //
+      // The composer owns Escape, because closing a draft with text in it is a
+      // question ("discard?"), not an action. Doing `setComposer(null)` here
+      // was how pressing Escape on that question threw the draft away.
       if (composer) {
-        if (event.key === "Escape") {
-          event.preventDefault();
-          setComposer(null);
-        }
         return;
       }
 

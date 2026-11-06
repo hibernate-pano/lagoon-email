@@ -634,6 +634,7 @@ button.chip:focus-visible { outline: 2px solid var(--lagoon-accent); outline-off
 .compose-head h2 { font-size: var(--fs-title); margin: 0; }
 .compose-field { display: flex; flex-direction: column; gap: 2px; }
 .compose-field > span { font-size: var(--fs-caption); color: var(--fg-secondary); }
+.compose-add-cc { display: flex; align-items: center; }
 .compose-field input {
   font: inherit;
   font-size: var(--fs-body);

@@ -68,6 +68,16 @@ export function Composer(props: ComposerProps): ReactNode {
   const [confirmClose, setConfirmClose] = useState(false);
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const [attempt, setAttempt] = useState<SendAttempt | null>(null);
+  /**
+   * Whether the Cc/Bcc fields are shown.
+   *
+   * It used to be derived from `form.cc !== "" || form.bcc !== ""`, which no
+   * control could ever set: the fields were gated on having been filled in.
+   * The user opens them; an already-filled draft starts open.
+   */
+  const [showCc, setShowCc] = useState(
+    () => initial.cc.trim() !== "" || initial.bcc.trim() !== "",
+  );
   const [fieldError, setFieldError] = useState<{ field: string; reason: string } | null>(null);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -110,13 +120,16 @@ export function Composer(props: ComposerProps): ReactNode {
         setAttachmentError(t.compose.attachmentTooLarge);
         continue;
       }
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const dataBase64 = bytesToBase64(bytes);
-      total += bytes.length;
-      if (total > MAX_TOTAL_ATTACHMENT_BYTES) {
+      // Check before committing: adding to the running total first meant a
+      // rejected file still counted, so a later file that would have fit was
+      // refused too.
+      if (total + file.size > MAX_TOTAL_ATTACHMENT_BYTES) {
         setAttachmentError(t.compose.attachmentTotalTooLarge);
         continue;
       }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const dataBase64 = bytesToBase64(bytes);
+      total += bytes.length;
       next.push({
         filename: file.name,
         mimeType: file.type || "application/octet-stream",
@@ -199,7 +212,28 @@ export function Composer(props: ComposerProps): ReactNode {
     }
   }
 
-  const showCc = form.cc.trim() !== "" || form.bcc.trim() !== "";
+  /**
+   * Escape has to work wherever focus is.
+   *
+   * The sheet's own handler covers the case where focus is inside it. After the
+   * discard confirmation closes, focus is back on the document body, and
+   * `App`'s window handler deliberately returns early while a composer is
+   * open - so without this listener Escape would silently stop working.
+   *
+   * While the confirmation is up it owns Escape: `ConfirmDialog` stops the
+   * event, and the `confirmClose` guard covers the case where focus sits
+   * outside the dialog.
+   */
+  useEffect(() => {
+    const onWindowKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || confirmClose) return;
+      event.preventDefault();
+      requestClose();
+    };
+    window.addEventListener("keydown", onWindowKeyDown);
+    return () => window.removeEventListener("keydown", onWindowKeyDown);
+  });
+
   const attachmentNames = form.attachments.map((a) => a.filename);
 
   return (
@@ -267,7 +301,18 @@ export function Composer(props: ComposerProps): ReactNode {
               />
             </label>
           </>
-        ) : null}
+        ) : (
+          <div className="compose-add-cc">
+            <button
+              type="button"
+              className="btn link"
+              disabled={sending}
+              onClick={() => setShowCc(true)}
+            >
+              {t.compose.addCc}
+            </button>
+          </div>
+        )}
 
         <label className="compose-field">
           <span>{t.compose.subject}</span>

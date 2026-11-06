@@ -217,6 +217,7 @@ export const zh = {
     to: "收件人",
     cc: "抄送",
     bcc: "密送",
+    addCc: "添加抄送 / 密送",
     subject: "主题",
     body: "正文",
     bodyPlaceholder: "写点什么…",

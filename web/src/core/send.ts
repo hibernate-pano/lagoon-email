@@ -300,6 +300,32 @@ export function requestIdFor(
   return { requestId: mint(), warnDuplicate: uncertain };
 }
 
+/** How much of each end of an attachment's base64 the fingerprint samples. */
+const FINGERPRINT_SAMPLE = 2048;
+
+/**
+ * A cheap content digest for one attachment.
+ *
+ * Length alone collides: replacing `report.pdf` with a corrected `report.pdf`
+ * of the same size left the fingerprint unchanged, so a retry after an
+ * "unknown" outcome reused the requestId and the server replayed the first
+ * (old) result - the corrected mail was never sent. Sampling both ends and
+ * hashing them catches a different file without walking 25 MB of base64 on
+ * every keystroke.
+ */
+function attachmentDigest(attachment: SendAttachment): string {
+  const data = attachment.dataBase64;
+  const head = data.slice(0, FINGERPRINT_SAMPLE);
+  const tail = data.slice(Math.max(0, data.length - FINGERPRINT_SAMPLE));
+  const sample = head + tail;
+  let hash = 0x811c9dc5; // FNV-1a, 32 bit
+  for (let index = 0; index < sample.length; index += 1) {
+    hash ^= sample.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return data.length + ":" + hash.toString(16);
+}
+
 /** What the content is, for the fingerprint above. */
 export function fingerprintOf(form: SendForm): string {
   return JSON.stringify([
@@ -308,7 +334,9 @@ export function fingerprintOf(form: SendForm): string {
     form.bcc.trim(),
     form.subject,
     form.body,
-    form.attachments.map((a) => a.filename + ":" + a.mimeType + ":" + a.dataBase64.length),
+    form.attachments.map(
+      (a) => a.filename + ":" + a.mimeType + ":" + attachmentDigest(a),
+    ),
   ]);
 }
 

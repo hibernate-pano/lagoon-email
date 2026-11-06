@@ -196,15 +196,22 @@ describe("what closing the composer would throw away", () => {
 });
 
 describe("the idempotency key", () => {
-  /** A counter that restarts for every test, so the ids are predictable. */
+  /**
+   * A counter that restarts for every test, so the ids are predictable.
+   *
+   * The prefix is deliberately *not* the one the fixtures use for the previous
+   * attempt: with `"id-"` the first mint equalled `last.requestId`, and every
+   * "is fresh" assertion below passed even when the implementation reused the
+   * old key.
+   */
   const freshMint = () => {
     let n = 0;
-    return () => "id-" + String(++n);
+    return () => "minted-" + String(++n);
   };
 
   it("is fresh for the first attempt", () => {
     const result = requestIdFor(null, "fp", freshMint());
-    expect(result.requestId).toBe("id-1");
+    expect(result.requestId).toBe("minted-1");
     expect(result.warnDuplicate).toBe(false);
   });
 
@@ -233,7 +240,7 @@ describe("the idempotency key", () => {
       "fp",
       freshMint(),
     );
-    expect(result.requestId).toBe("id-1");
+    expect(result.requestId).toBe("minted-1");
   });
 
   it("is fresh when the content changed, and says the previous mail may still arrive", () => {
@@ -242,7 +249,7 @@ describe("the idempotency key", () => {
       "other",
       freshMint(),
     );
-    expect(result.requestId).toBe("id-1");
+    expect(result.requestId).toBe("minted-1");
     expect(result.warnDuplicate).toBe(true);
   });
 
@@ -271,6 +278,17 @@ describe("the content fingerprint", () => {
       form({ body: "x", attachments: [{ filename: "a.txt", mimeType: "text/plain", dataBase64: "aGk=" }] }),
     );
     expect(without).not.toBe(with_);
+  });
+
+  it("changes when an attachment of the same size is replaced", () => {
+    // Same filename, same MIME type, same encoded length; different bytes.
+    const original = fingerprintOf(
+      form({ attachments: [{ filename: "a.txt", mimeType: "text/plain", dataBase64: "aGk=" }] }),
+    );
+    const corrected = fingerprintOf(
+      form({ attachments: [{ filename: "a.txt", mimeType: "text/plain", dataBase64: "aHI=" }] }),
+    );
+    expect(original).not.toBe(corrected);
   });
 });
 
