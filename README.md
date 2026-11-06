@@ -48,7 +48,7 @@ Lagoon.app
 bash scripts/build-product.sh
 open dist/Lagoon.app
 
-# 后端测试（199 个 lagoon-api 测试 + 210 个 lagoon-mail 测试）
+# 后端测试（201 个 lagoon-api 测试 + 211 个 lagoon-mail 测试）
 cargo test --manifest-path crates/Cargo.toml
 
 # 前端：类型检查与构建
