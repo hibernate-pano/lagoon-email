@@ -730,8 +730,13 @@ pub fn update_health(
 }
 
 /// v3 AccountStore.setActive: exactly one account is active at a time.
+///
+/// IMMEDIATE, not the deferred default: this transaction's first statement is a
+/// write, and a deferred transaction that upgrades mid-way can be refused with
+/// SQLITE_BUSY_SNAPSHOT, which the busy timeout never retries.
 pub fn set_active(connection: &Connection, account_id: Uuid) -> Result<(), WriteError> {
-    let transaction = connection.unchecked_transaction()?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
     connection.execute(
         "UPDATE accounts SET is_active = FALSE WHERE is_active = TRUE",
         [],
@@ -747,8 +752,16 @@ pub fn set_active(connection: &Connection, account_id: Uuid) -> Result<(), Write
 }
 
 /// v3 AccountStore.reconcileActive: repair a zero-selected state after a delete.
+///
+/// This one reads before it writes (COUNT, then maybe UPDATE). Under the
+/// deferred default that read is a snapshot, and a sync round committing
+/// between the read and the write makes the UPDATE fail with
+/// SQLITE_BUSY_SNAPSHOT — an immediate `database is locked` with no retry, not
+/// the queued wait the busy timeout provides. IMMEDIATE takes the write lock
+/// up front so there is no snapshot to go stale.
 pub fn reconcile_active(connection: &Connection) -> Result<(), WriteError> {
-    let transaction = connection.unchecked_transaction()?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
     let active: i64 = connection.query_row(
         "SELECT COUNT(*) FROM accounts WHERE is_active = TRUE",
         [],

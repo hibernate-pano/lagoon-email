@@ -120,7 +120,14 @@ pub fn migrate(
         }
         // One transaction per migration, like DatabaseMigrator: either the DDL,
         // the data rewrite and the identifier row all land, or none of them do.
-        let transaction = connection.unchecked_transaction()?;
+        // IMMEDIATE because a data step reads before it rewrites (see
+        // `repair_account_ids`); a deferred snapshot that goes stale under a
+        // concurrent writer is refused with SQLITE_BUSY_SNAPSHOT, which no busy
+        // timeout retries.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         migrations::apply(connection, migration, body_key)?;
         connection.execute(
             "INSERT INTO grdb_migrations (identifier) VALUES (?1)",
@@ -166,7 +173,14 @@ pub fn prepare(
 
 /// The child tables that carry an account_id, with whether they also carry the
 /// (account_id, remote_id) uniqueness a text-to-binary rewrite can collide with.
-const CHILD_TABLES: [(&str, bool); 8] = [
+///
+/// This list must stay complete: a table that is missing here keeps its old
+/// text account_id, so its rows stop matching the account after the rewrite
+/// (and ON DELETE CASCADE stops firing). `reminders` was the case that got
+/// away — it has had account_id since lagoon-v1, so it exists when v5b runs.
+/// Tables added after v5b (message_summaries, lagoon-v12) do not exist yet at
+/// that point and must not be listed.
+const CHILD_TABLES: [(&str, bool); 9] = [
     ("message_headers", true),
     ("message_bodies", false),
     ("advice", true),
@@ -175,6 +189,7 @@ const CHILD_TABLES: [(&str, bool); 8] = [
     ("message_pins", false),
     ("stack_rules", false),
     ("ai_overrides", false),
+    ("reminders", true),
 ];
 
 /// lagoon-v5b: move account ids stored as text onto the 16-byte form.
@@ -377,6 +392,129 @@ mod tests {
             .execute_batch("PRAGMA foreign_keys = ON")
             .expect("pragmas");
         connection
+    }
+
+    #[test]
+    fn every_table_with_an_account_id_is_repaired() {
+        // lagoon-v5b rewrites every child row's account_id from text to bytes.
+        // A table it does not know about keeps the text form, so its rows stop
+        // matching the account (and ON DELETE CASCADE stops firing) — the exact
+        // defect v5b exists to remove, left half-done. `reminders` was missing.
+        let connection = open();
+        let key = test_key();
+        migrate(&connection, Some(&key)).expect("migrate");
+
+        // Tables this build creates after lagoon-v5b runs: they do not exist
+        // when it is applied, so they cannot be in CHILD_TABLES.
+        let created_after_v5b = ["message_summaries"];
+
+        let tables: Vec<String> = {
+            let mut statement = connection
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .expect("prepare");
+            statement
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("rows")
+        };
+
+        let repaired: Vec<&str> = CHILD_TABLES.iter().map(|(table, _)| *table).collect();
+        for table in tables {
+            if table == "accounts" || created_after_v5b.contains(&table.as_str()) {
+                continue;
+            }
+            let has_account_id: bool = {
+                let mut statement = connection
+                    .prepare(&format!("PRAGMA table_info({table})"))
+                    .expect("pragma");
+                let columns: Vec<String> = statement
+                    .query_map([], |row| row.get(1))
+                    .expect("query")
+                    .collect::<rusqlite::Result<Vec<String>>>()
+                    .expect("rows");
+                columns.iter().any(|column| column == "account_id")
+            };
+            if has_account_id {
+                assert!(
+                    repaired.contains(&table.as_str()),
+                    "`{table}` carries an account_id but is not in CHILD_TABLES: \
+                     lagoon-v5b would leave it pointing at the old text id"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repair_moves_a_reminder_off_the_legacy_text_account_id() {
+        // The behaviour behind the guard above, on the table that was missing.
+        // A v3 install could hold the same UUID twice: as text in accounts.id
+        // and (correctly) as bytes in every child row. The repair rewrites both
+        // sides onto the bytes; if it skips reminders, store::reminders::pending
+        // (which binds the bytes) can never find the row again.
+        let connection = open();
+        let key = test_key();
+        migrate(&connection, Some(&key)).expect("migrate");
+        let text_id = "11111111-1111-4111-8111-111111111111";
+        let bytes = Uuid::parse_strict(text_id)
+            .expect("uuid")
+            .as_bytes()
+            .to_vec();
+        connection
+            .execute(
+                "INSERT INTO accounts (id, email, provider, oauth_user, is_active)
+                 VALUES (?1, 'user@example.com', 'qq', 'user@example.com', TRUE)",
+                [text_id],
+            )
+            .expect("text-shaped account");
+        connection
+            .execute(
+                "INSERT INTO message_headers
+                   (id, account_id, remote_id, thread_id, from_address, received_at)
+                 VALUES (?1, ?2, 'm1', 'm1', 'sender@example.com', '2026-01-01 00:00:00.000')",
+                rusqlite::params![vec![1u8; 16], text_id],
+            )
+            .expect("header under the text id");
+        connection
+            .execute(
+                "INSERT INTO reminders (account_id, remote_id, due_at)
+                 VALUES (?1, 'm1', '2026-01-02 00:00:00.000')",
+                [text_id],
+            )
+            .expect("reminder under the text id");
+
+        // The repair is a migration data step: it relies on running inside one
+        // transaction so its deferred foreign-key checks are evaluated at
+        // commit, after both sides have moved. Calling it in autocommit mode
+        // checks after each statement and fails half-way.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .expect("begin");
+        repair_account_ids(&connection).expect("repair");
+        transaction.commit().expect("commit");
+
+        let account_id: Vec<u8> = connection
+            .query_row("SELECT id FROM accounts", [], |row| row.get(0))
+            .expect("account id");
+        assert_eq!(account_id, bytes, "the account id must become the bytes");
+        let reminder_account_id: Vec<u8> = connection
+            .query_row("SELECT account_id FROM reminders", [], |row| row.get(0))
+            .expect("reminder account id");
+        assert_eq!(
+            reminder_account_id, bytes,
+            "the reminder must follow the account onto the bytes, or it is orphaned"
+        );
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("foreign_key_check");
+        assert_eq!(
+            violations, 0,
+            "the repair must not leave the store inconsistent"
+        );
     }
 
     #[test]

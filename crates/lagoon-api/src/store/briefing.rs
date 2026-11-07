@@ -67,11 +67,14 @@ pub fn snapshot(
     let (backlog_axes, backlog_arguments) = backlog_filter.where_clause();
     let backlog_clause = format!("{backlog_axes}\nAND h.received_at < ?");
 
+    // Both queries end in LIMIT, and `received_at` is whole seconds (IMAP
+    // INTERNALDATE), so ties are the normal case and the boundary rows would
+    // otherwise be free to swap between polls. `id` makes the order total.
     let window_rows_sql =
-        format!("{MESSAGE_ROWS} {window_clause} ORDER BY h.received_at DESC LIMIT ?");
+        format!("{MESSAGE_ROWS} {window_clause} ORDER BY h.received_at DESC, h.id DESC LIMIT ?");
     let window_count_sql = format!("SELECT COUNT(*) FROM message_headers h {window_clause}");
     let backlog_rows_sql =
-        format!("{MESSAGE_ROWS} {backlog_clause} ORDER BY h.received_at ASC LIMIT ?");
+        format!("{MESSAGE_ROWS} {backlog_clause} ORDER BY h.received_at ASC, h.id ASC LIMIT ?");
     let backlog_count_sql = format!("SELECT COUNT(*) FROM message_headers h {backlog_clause}");
 
     // Two different statements share one WHERE clause, so the LIMIT value is

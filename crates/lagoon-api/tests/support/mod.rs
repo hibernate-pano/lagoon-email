@@ -21,13 +21,20 @@ pub struct TempDir {
 
 impl TempDir {
     pub fn new(label: &str) -> Self {
+        // A counter, not just the clock: tests inside one binary run on several
+        // threads, and two calls in the same clock tick produced the same path.
+        // One test then finished, dropped its guard and removed the directory
+        // the other was still using — which surfaces as "disk I/O error" in
+        // whichever test lost the race, not as a temp-dir bug.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = format!(
-            "lagoon-api-{label}-{}-{}",
+            "lagoon-api-{label}-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let path = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&path).expect("create temp dir");

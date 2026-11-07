@@ -766,10 +766,17 @@ async fn undo_one(state: &AppState, account_id: Uuid, action_id: i64) -> UndoOut
         Err(error) => return UndoOutcome::Failed(error.to_string()),
     };
     let (verb, remote_write, remote_id, claim_row) = {
-        let transaction = match connection.transaction() {
-            Ok(transaction) => transaction,
-            Err(error) => return UndoOutcome::Failed(error.to_string()),
-        };
+        // IMMEDIATE, not the deferred default. This transaction reads (find the
+        // action, check it is not already undone) and then writes the undo row.
+        // A deferred transaction takes its read snapshot at the first SELECT;
+        // if a sync round commits before the INSERT, the upgrade is refused with
+        // SQLITE_BUSY_SNAPSHOT — and the busy timeout is not consulted for it.
+        // The user would see "撤销失败" with nothing they could do about it.
+        let transaction =
+            match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+                Ok(transaction) => transaction,
+                Err(error) => return UndoOutcome::Failed(error.to_string()),
+            };
         let action = match write::find_action(&transaction, account_id, action_id) {
             Ok(Some(action)) => action,
             Ok(None) => return UndoOutcome::Rejected(StatusCode::NOT_FOUND, "unknown-action"),

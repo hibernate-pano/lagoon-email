@@ -59,7 +59,7 @@ pub fn list(
         "SELECT id, account_id, remote_id, variants, chosen_variant, created_at
          FROM draft_replies
          WHERE account_id = ? AND remote_id = ?
-         ORDER BY created_at DESC",
+         ORDER BY created_at DESC, id DESC",
     )?;
     let mut rows = statement.query(rusqlite::params![
         account_id.as_bytes().as_slice(),

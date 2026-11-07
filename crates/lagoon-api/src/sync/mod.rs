@@ -10,8 +10,10 @@
 //!   after three consecutive failures;
 //! * auth failures park the account at needsReconnect and stop its loop;
 //! * one account's trouble never touches another account;
-//! * all writes go through one writer lock, so two accounts syncing at once
-//!   cannot interleave a reset with an upsert.
+//! * sync rounds are serialised by one writer mutex, so two accounts cannot
+//!   interleave a reset with an upsert, and each round applies in a single
+//!   IMMEDIATE transaction (see `apply`). HTTP write routes are a separate
+//!   writer; the transaction is what keeps them from interleaving with a round.
 //!
 //! The engine only asks the provider for a sync surface (probe + pull). It has
 //! no archive/trash/send verbs to call, which is the compile-time version of
@@ -306,6 +308,36 @@ impl SyncEngine {
     }
 
     fn apply(
+        &self,
+        connection: &Connection,
+        account_id: Uuid,
+        changes: &MailChangeSet,
+        previous_sync_state: &str,
+    ) -> Result<(), write::WriteError> {
+        // One transaction for the whole round, and IMMEDIATE so the write lock
+        // is taken before the first read.
+        //
+        // Two failures this prevents:
+        //  * A UIDVALIDITY reset deletes the inbox and then lands the new rows.
+        //    Without a transaction, a failing upsert half-way leaves the reader
+        //    looking at an empty inbox whose cursor never moved.
+        //  * reconcile_inbox reads the live rows and then updates or deletes
+        //    them. Without a transaction a write route can archive a row
+        //    between those two steps, and the reconcile then deletes the row it
+        //    had just read as live.
+        //
+        // The writer mutex above still serialises rounds across accounts; this
+        // makes each round atomic against the HTTP writes.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        self.apply_inner(connection, account_id, changes, previous_sync_state)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn apply_inner(
         &self,
         connection: &Connection,
         account_id: Uuid,

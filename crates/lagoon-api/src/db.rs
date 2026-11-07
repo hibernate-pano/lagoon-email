@@ -200,9 +200,18 @@ pub struct Db {
 
 /// Open a store for writing, creating the file when it does not exist.
 ///
-/// This exists for the migration path only: the server itself always opens
-/// read-only, and R3.2 does not serve writes yet. WAL is the journal v3 uses,
-/// so a store this creates behaves the same under a concurrent reader.
+/// Every write route takes its own connection from here, so two of them can
+/// meet: the sync round finishing while the user clicks undo. WAL is the
+/// journal v3 uses, so a store this creates behaves the same under a concurrent
+/// reader.
+///
+/// The busy timeout is set explicitly rather than inherited. The bundled SQLite
+/// happens to default to five seconds today, but that is a compile-time option
+/// of the build, not part of this code — a future libsqlite3-sys that drops it
+/// would turn every concurrent write from "waits its turn" into "database is
+/// locked". The timeout alone is not enough, though: it is not consulted for
+/// SQLITE_BUSY_SNAPSHOT, so write transactions also begin IMMEDIATE (see
+/// `store::write` and `routes_r5::undo_one`).
 pub fn open_writable(path: impl Into<PathBuf>) -> Result<Connection, DbError> {
     let path = path.into();
     if let Some(parent) = path.parent() {
@@ -217,6 +226,9 @@ pub fn open_writable(path: impl Into<PathBuf>) -> Result<Connection, DbError> {
         path: path.clone(),
         message: error.to_string(),
     })?;
+    connection
+        .busy_timeout(BUSY_TIMEOUT)
+        .map_err(DbError::Sqlite)?;
     connection
         .execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
         .map_err(DbError::Sqlite)?;
@@ -296,7 +308,15 @@ impl Db {
             .idle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        idle.push(connection);
+        // The pool is a cache, not a history. Without this cap it grew to the
+        // peak number of concurrent requests and kept every one of those file
+        // handles and WAL index maps open for the life of the process — one
+        // bulk undo of 500 actions was enough to leave 500 live connections.
+        // Dropping the extra handle here closes it; the next checkout opens a
+        // fresh one if it needs to.
+        if idle.len() < POOL_SIZE {
+            idle.push(connection);
+        }
     }
 }
 
@@ -431,4 +451,45 @@ pub fn optional_timestamp_column(
 ) -> rusqlite::Result<Option<Timestamp>> {
     let raw: Option<String> = row.get(index)?;
     Ok(crate::timefmt::parse(raw.as_deref()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_read_pool_never_keeps_more_than_its_size() {
+        // The pool is a bounded cache. A bulk undo checks out and returns
+        // hundreds of connections; before the cap, every one of them stayed
+        // open (and stored in the idle Vec) for the life of the process.
+        let directory = std::env::temp_dir().join(format!(
+            "lagoon-pool-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("store.sqlite");
+        // A read-only handle needs the file to exist; the pool does not read
+        // its schema until open_read_only, which this test does not use.
+        Connection::open(&path).expect("create file");
+
+        let db = Db {
+            path: path.clone(),
+            idle: Mutex::new(Vec::new()),
+        };
+        for _ in 0..(POOL_SIZE * 4) {
+            db.checkin(open_connection(&path).expect("open read-only"));
+        }
+        let retained = db
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        assert_eq!(retained, POOL_SIZE, "the pool must stay bounded");
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
 }

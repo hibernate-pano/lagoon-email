@@ -187,7 +187,14 @@ pub fn recent(
 ) -> rusqlite::Result<Vec<StoredMessage>> {
     let (where_clause, mut arguments) = filter.where_clause();
     arguments.push(Value::Integer(limit.max(1)));
-    let sql = format!("{SELECT_COLUMNS}\n{where_clause}\nORDER BY h.received_at DESC\nLIMIT ?");
+    // `received_at` comes from IMAP INTERNALDATE, which is whole seconds: a
+    // busy inbox has many rows sharing one value. Without a tiebreaker the
+    // LIMIT boundary is free to reorder between two polls, so a mail can show
+    // up twice while scrolling or drop out of the list entirely. `id` (the
+    // primary key) makes the order total, the same way store::search does it.
+    let sql = format!(
+        "{SELECT_COLUMNS}\n{where_clause}\nORDER BY h.received_at DESC, h.id DESC\nLIMIT ?"
+    );
     let mut statement = connection.prepare(&sql)?;
     let mut rows = statement.query(rusqlite::params_from_iter(arguments.iter()))?;
     let mut messages = Vec::new();
@@ -391,7 +398,7 @@ pub fn export_index(
                 message_id_header, in_reply_to, references_header
          FROM message_headers
          WHERE account_id = ?
-         ORDER BY received_at ASC",
+         ORDER BY received_at ASC, id ASC",
     )?;
     let mut rows = statement.query([account_id.as_bytes().as_slice()])?;
     let mut messages = Vec::new();
