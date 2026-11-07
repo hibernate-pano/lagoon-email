@@ -77,6 +77,27 @@ async fn download(
     Ok(download::run(&state.shared, parsed).await)
 }
 
+/// Whether a navigation leaves the app for the open web.
+///
+/// The app itself loads from `tauri://localhost`, and nothing else in the
+/// window navigates: API calls go through the `api` command, not the document.
+/// So an http(s) navigation can only come from a link inside a mail body.
+fn leaves_the_app(url: &tauri::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+}
+
+/// Hand a mail link to the system browser.
+///
+/// The message iframe is sandboxed with no scripts, so a click is the only way
+/// a link can produce a navigation — and navigating *inside* the app both kept
+/// foreign content in the app's window and made the request from the app's
+/// webview before the reader had actually decided to visit the site.
+fn open_in_browser(url: &str) {
+    if let Err(error) = std::process::Command::new("open").arg(url).spawn() {
+        eprintln!("[ipc] could not open {url}: {error}");
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -106,6 +127,22 @@ fn main() {
     let setup_shared = shared.clone();
 
     tauri::Builder::default()
+        // Mail links open in the reader's browser, never inside the app's
+        // window. This hook fires for every frame of the webview, which is what
+        // makes it the right place: the message body is an iframe, and the
+        // sandbox that keeps scripts out does not stop the frame from
+        // navigating itself. See leaves_the_app.
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("lagoon-navigation")
+                .on_navigation(|_webview, url| {
+                    if !leaves_the_app(url) {
+                        return true;
+                    }
+                    open_in_browser(url.as_str());
+                    false
+                })
+                .build(),
+        )
         .manage(AppState {
             shared: shared.clone(),
         })
@@ -146,4 +183,34 @@ fn main() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(text: &str) -> tauri::Url {
+        tauri::Url::parse(text).expect("url")
+    }
+
+    #[test]
+    fn the_app_itself_stays_in_the_window() {
+        assert!(!leaves_the_app(&url("tauri://localhost/index.html")));
+        assert!(!leaves_the_app(&url("about:srcdoc")));
+    }
+
+    #[test]
+    fn a_mail_link_leaves_the_app() {
+        assert!(leaves_the_app(&url("https://example.com/reset?token=1")));
+        assert!(leaves_the_app(&url("http://example.com/")));
+    }
+
+    #[test]
+    fn other_schemes_are_not_handed_to_open() {
+        // `open` would happily launch a handler for these. Only web links are
+        // a mail's business; everything else is cancelled by not reaching
+        // open_in_browser.
+        assert!(!leaves_the_app(&url("file:///etc/passwd")));
+        assert!(!leaves_the_app(&url("mailto:someone@example.com")));
+    }
 }
