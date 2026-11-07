@@ -56,6 +56,13 @@ export const COMMON_UNAVAILABLE: Record<string, CodeCopy> = {
     reason: "not-configured",
     title: t.reader.summaryCircuit,
   },
+  // The monthly budget gate (503 ai-budget-exceeded). It is deliberately not
+  // retryable: retrying spends nothing more until the month rolls over or the
+  // cap is raised, so offering "重试" would be a button that cannot work.
+  "ai-budget-exceeded": {
+    reason: "not-configured",
+    title: t.reader.summaryBudget,
+  },
 };
 
 /**

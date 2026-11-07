@@ -191,6 +191,7 @@ export const zh = {
     summaryNotConfigured: "AI 还没配置：这不是失败，是没开。",
     summaryCredit: "AI 额度用尽，充值后自动恢复。",
     summaryCircuit: "AI 熔断中，过一会儿自己恢复。",
+    summaryBudget: "本月 AI 预算已用完，下个月自动恢复；要现在继续用就调高 LAGOON_BUDGET_USD_PER_MONTH。",
     capabilities: "能力",
     capAllowed: "支持",
     capDenied: "不支持",

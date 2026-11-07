@@ -543,9 +543,18 @@ export function App(): ReactNode {
     refreshAll();
   }
 
-  async function runBulk(verb: "archive" | "delete") {
+  /**
+   * One bulk request for many rows.
+   *
+   * `explicitIds` exists for the keyboard shortcuts: they act on the row under
+   * the cursor even when nothing is checked, and they must take the same path.
+   * Looping `runRowVerb` instead sent one request per row (⌘⌫ on 50 rows = 50
+   * writes + 200 reads, all racing each other), kept only the last row's undo
+   * toast, and cleared `busy` as soon as the first reply landed.
+   */
+  async function runBulk(verb: "archive" | "delete", explicitIds?: string[]) {
     if (!active || busy) return;
-    const ids = [...selection];
+    const ids = explicitIds && explicitIds.length > 0 ? explicitIds : [...selection];
     if (ids.length === 0) return;
     setBusy(true);
     const rollback = overlay.remove(ids);
@@ -567,6 +576,12 @@ export function App(): ReactNode {
     // rows the server actually moved.
     rollback();
     if (okItems.length > 0) overlay.remove(okItems.map((item) => item.remoteId));
+    // The cursor and the open message point at rows that may have just left
+    // this lens; leaving them set would let a following keystroke act on a row
+    // the user can no longer see.
+    const moved = new Set(okItems.map((item) => item.remoteId));
+    setOpenedId((current) => (current !== null && moved.has(current) ? null : current));
+    setCursor((current) => (current !== null && moved.has(current) ? null : current));
     setSelection(new Set());
     setAnchor(null);
     setWriteError(
@@ -608,6 +623,13 @@ export function App(): ReactNode {
       return;
     }
     setWriteError(null);
+    // An undo moves the mail back, so the server is the truth again — and the
+    // old optimism has to go with it. Without this the row the user just
+    // restored is still in overlay's `removed` set, so refreshAll() fetches it
+    // and the overlay hides it again: the toast says "已撤销" while the list
+    // shows nothing. Same for a patch: the row would keep wearing its
+    // archived/pinned flag from before the undo.
+    overlay.clear();
     setToast({ id: Date.now(), text: t.m2.toast.undone });
     refreshAll();
   }
@@ -769,12 +791,15 @@ export function App(): ReactNode {
       }
       if (mod && (event.key === "Backspace" || event.key === "Delete")) {
         event.preventDefault();
-        for (const id of targetIds()) void runRowVerb("delete", id);
+        // One bulk request, not one per row: the bulk endpoint already exists
+        // and is what the toolbar uses, so the keyboard must not take a slower,
+        // less reversible path (see runBulk).
+        void runBulk("delete", targetIds());
         return;
       }
       if (mod && event.shiftKey && event.key.toLowerCase() === "a") {
         event.preventDefault();
-        for (const id of targetIds()) void runRowVerb("archive", id);
+        void runBulk("archive", targetIds());
         return;
       }
       if (mod && event.key.toLowerCase() === "a") {
@@ -1037,7 +1062,14 @@ export function App(): ReactNode {
         <ActionHistoryPanel
           accountId={accountId}
           onClose={() => setHistoryOpen(false)}
-          onUndone={(text) => setToast({ id: Date.now(), text })}
+          onUndone={(text) => {
+            // Same rule as undoLatest: the panel undid a real action, so drop
+            // the optimistic overlay and re-read the server instead of leaving
+            // the list 30 seconds behind (and possibly hiding the row twice).
+            overlay.clear();
+            setToast({ id: Date.now(), text });
+            refreshAll();
+          }}
           onFailure={(failure) =>
             setWriteError({ title: t.m2.write.failedTitle + " · " + t.m2.actions.undo, detail: failure.message, code: failure.code })
           }

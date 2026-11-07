@@ -1,69 +1,48 @@
 import { describe, expect, it } from "vitest";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { emptyStateFor } from "../empty";
 import { codeSentenceFor, describeHttpFailure } from "../errors";
 import { classifyFailure } from "../writes";
 
-// Generated from crates/lagoon-api/src/http/*.rs on 2026-11-02.
-// Regenerate with:
-//   grep -rhoE '"[a-z][a-zA-Z0-9]*(-[a-zA-Z0-9]+)+"' crates/lagoon-api/src/http/*.rs | sort -u
-// ...then hand-check that every literal is an error envelope, not a health
-// label (e.g. "not-configured" is a sync_state value, not a response code).
-const BACKEND_CODES = [
-  "account-exists",
-  "action-expired",
-  "ai-circuit-open",
-  "ai-credit-exhausted",
-  "ai-error",
-  "ai-not-configured",
-  "already-undone",
-  "api-unauthorized",
-  "archive-unavailable",
-  "attachment-not-found",
-  "attachment-too-large",
-  "delete-unavailable",
-  "draft-unreadable",
-  "empty-actionIds",
-  "empty-remoteIds",
-  "encoding-failed",
-  "forbidden-host",
-  "forward-original-unavailable",
-  "imap-auth-failed",
-  "imap-unreachable",
-  "internal-error",
-  "invalid-body",
-  "malformed-accountId",
-  "malformed-action-id",
-  "malformed-attachment",
-  "malformed-attachmentId",
-  "malformed-before",
-  "malformed-body",
-  "malformed-compose",
-  "malformed-decision",
-  "malformed-forward",
-  "malformed-pinned",
-  "malformed-recipient",
-  "malformed-remoteId",
-  "malformed-request-id",
-  "message-gone",
-  "missing-body",
-  "missing-field",
-  "not-undoable",
-  "provider-auth-failed",
-  "provider-not-configured",
-  "provider-unreachable",
-  "send-in-flight",
-  "smtp-auth-failed",
-  "smtp-send-failed",
-  "uidplus-missing",
-  "undo-failed",
-  "unknown-account",
-  "unknown-action",
-  "unknown-before",
-  "unknown-message",
-  "unknown-stack",
-] as const;
+/**
+ * Every error code the Rust routes can put in a response envelope.
+ *
+ * This is read from the source at test time, not kept as a hand-made list. The
+ * list used to be a snapshot taken on one day, which is how `ai-budget-exceeded`
+ * slipped through: the backend learned a new code, the dictionary did not, and
+ * the test that was supposed to catch it was checking the stale snapshot
+ * against itself. Reading the routes means a new code fails this test the day it
+ * is written, which is the only version of the guard that keeps working.
+ *
+ * The pattern is the shape every route uses to answer an error:
+ *     respond::error(StatusCode::BAD_REQUEST, "malformed-recipient")
+ * spread over one or more lines. `StatusCode::OK` is excluded: "ok" is a health
+ * body, not an error envelope.
+ */
+function backendErrorCodes(): string[] {
+  const here = fileURLToPath(new URL(".", import.meta.url));
+  const directory = join(here, "../../../../crates/lagoon-api/src/http");
+  const codes = new Set<string>();
+  const pattern = /StatusCode::(?!OK\b)[A-Z_]+\s*,\s*"([a-z0-9A-Z-]+)"/g;
+  for (const file of readdirSync(directory)) {
+    if (!file.endsWith(".rs")) continue;
+    const source = readFileSync(join(directory, file), "utf8");
+    for (const match of source.matchAll(pattern)) codes.add(match[1]);
+  }
+  return [...codes].sort();
+}
+
+const BACKEND_CODES = backendErrorCodes();
 
 describe("the backend error-code dictionary", () => {
+  it("found the routes at all", () => {
+    // A silent empty list would make every assertion below vacuous.
+    expect(BACKEND_CODES.length).toBeGreaterThan(40);
+    expect(BACKEND_CODES).toContain("ai-budget-exceeded");
+  });
+
   it("has a human sentence for every code the Rust routes return", () => {
     const missing = BACKEND_CODES.filter((code) => !codeSentenceFor(code));
     expect(missing).toEqual([]);

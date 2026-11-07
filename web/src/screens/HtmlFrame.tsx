@@ -79,15 +79,84 @@ export function resolveCidReferences(
   });
 }
 
+/**
+ * Find the first match of `pattern` that is NOT inside an HTML comment.
+ *
+ * This exists because a plain `html.replace(/<head[^>]*>/i, ...)` is not safe:
+ * Outlook's conditional comments put a whole `<head>` in a comment, and they
+ * come first in the document:
+ *
+ *     <!--[if mso]><head><style>...</style></head><![endif]-->
+ *     <html><head><body>...
+ *
+ * A naive replace injects the CSP meta *into the comment*, so the document's
+ * real <head> is left untouched and the CSP never applies. The mail then
+ * loads its remote images and stylesheets, which is exactly the leak the CSP
+ * exists to prevent. A comment is also not rendered, so skipping it does not
+ * change what the reader sees.
+ *
+ * Returns the index of the match, or -1 when there is none.
+ */
+function indexOutsideComments(html: string, pattern: RegExp): number {
+  let cursor = 0;
+  for (;;) {
+    const match = pattern.exec(html.slice(cursor));
+    if (!match) return -1;
+    const at = cursor + match.index;
+    const comment = html.indexOf("<!--", cursor);
+    // The tag comes before the next comment start: it is real.
+    if (comment === -1 || at < comment) return at;
+    const commentEnd = html.indexOf("-->", comment + 4);
+    // An unterminated comment swallows the rest of the document.
+    if (commentEnd === -1) return -1;
+    cursor = commentEnd + 3;
+  }
+}
+
+/**
+ * A `<meta http-equiv="refresh">` navigates the frame on its own, with no
+ * click. That is a silent request to a third-party host, so it goes the same
+ * way as a remote image: removed before the document reaches the frame.
+ */
+function stripMetaRefresh(html: string): string {
+  return html.replace(/<meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*>/gi, "");
+}
+
 function wrapDocument(html: string): string {
   const head =
     '<meta charset="utf-8">' +
     '<meta http-equiv="Content-Security-Policy" content="' + CSP + '">' +
     '<meta name="referrer" content="no-referrer">' +
     "<style>" + FLUID_CSS + "</style>";
-  if (/<head[^>]*>/i.test(html)) return html.replace(/<head([^>]*)>/i, "<head$1>" + head);
-  if (/<html[^>]*>/i.test(html)) return html.replace(/<html([^>]*)>/i, "<html$1><head>" + head + "</head>");
-  return "<!doctype html><html><head>" + head + "</head><body>" + html + "</body></html>";
+  const body = stripMetaRefresh(html);
+
+  const headAt = indexOutsideComments(body, /<head(\s[^>]*)?>/i);
+  if (headAt >= 0) {
+    const match = /<head(\s[^>]*)?>/i.exec(body.slice(headAt))!;
+    return (
+      body.slice(0, headAt) +
+      "<head" +
+      (match[1] ?? "") +
+      ">" +
+      head +
+      body.slice(headAt + match[0].length)
+    );
+  }
+
+  const htmlAt = indexOutsideComments(body, /<html(\s[^>]*)?>/i);
+  if (htmlAt >= 0) {
+    const match = /<html(\s[^>]*)?>/i.exec(body.slice(htmlAt))!;
+    return (
+      body.slice(0, htmlAt) +
+      "<html" +
+      (match[1] ?? "") +
+      "><head>" +
+      head +
+      "</head>" +
+      body.slice(htmlAt + match[0].length)
+    );
+  }
+  return "<!doctype html><html><head>" + head + "</head><body>" + body + "</body></html>";
 }
 
 export function buildSrcdoc(html: string, images: Record<string, string>, mimeByCid: Record<string, string>): string {

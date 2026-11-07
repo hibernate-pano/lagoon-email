@@ -99,5 +99,13 @@ export function useMailboxOverlay(): MailboxOverlay {
 
   const pendingCount = useMemo(() => Object.keys(removed).length + Object.keys(patched).length, [removed, patched]);
 
-  return { rows, remove, patch, clear, pendingCount };
+  // The object itself has to be stable too. Callers write
+  //   useMemo(() => overlay.rows(serverRows), [overlay, serverRows])
+  // and a fresh literal on every render made that dependency change every
+  // render, so the memo never hit: each keystroke in the search box re-filtered
+  // and re-mapped the whole (up to 1000 row) list.
+  return useMemo(
+    () => ({ rows, remove, patch, clear, pendingCount }),
+    [rows, remove, patch, clear, pendingCount],
+  );
 }
