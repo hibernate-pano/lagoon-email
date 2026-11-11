@@ -450,3 +450,32 @@ pub fn deleted_and_sent_counts(
         row.get::<_, Option<i64>>(1)?.unwrap_or(0),
     ))
 }
+
+/// The `List-Unsubscribe` links stored for one message, as JSON text.
+///
+/// A separate read rather than a field on [`StoredMessage`]: the links are only
+/// wanted when one message is opened, and the list query runs on every view, so
+/// widening the row would pay for this on every page for nothing.
+///
+/// `None` means the row is gone; `Some("[]")` means it exists and offers no way
+/// out, which the reader shows by not showing the strip.
+pub fn unsubscribe_links(
+    connection: &Connection,
+    account_id: Uuid,
+    remote_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    let mut statement = connection.prepare(
+        "SELECT unsubscribe_links FROM message_headers WHERE account_id = ? AND remote_id = ?",
+    )?;
+    let mut rows = statement.query(rusqlite::params![
+        account_id.as_bytes().as_slice(),
+        remote_id
+    ])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let raw: Option<String> = row.get(0)?;
+    // An older row may hold nothing usable; the reader treats `[]` and NULL the
+    // same, so one normalisation here keeps both callers simple.
+    Ok(Some(raw.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "[]".to_owned())))
+}

@@ -116,7 +116,7 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | `ConnectedAccount` | `id: UUID, provider: "qq", email: string, isActive: bool, unreadCount: int, syncHealth: SyncHealth, capabilities: MailCapabilities` |
 | `SyncHealth` | `status: "ok"｜"degraded"｜"needsReconnect"｜"error"｜"accountMissing", lastSyncAt?: ISO date, lastError?: string` |
 | `MailCapabilities` | `archiveFolder?: bool, idle: bool, move: bool, serverSnippet: bool, uidplus?: bool, sentFolder?: bool, trashFolder?: bool, archiveFolderName?: string` |
-| `MessageBody` | `remoteId: string, subject?: string, fromAddress: string, fromName?: string, toAddress?: string, receivedAt: ISO date, text: string, html?: string, attachments: Attachment[], hasMore: bool, to: string[], cc: string[]` |
+| `MessageBody` | `remoteId: string, subject?: string, fromAddress: string, fromName?: string, toAddress?: string, receivedAt: ISO date, text: string, html?: string, attachments: Attachment[], hasMore: bool, to: string[], cc: string[], unsubscribeLinks?: string` |
 | `Attachment` | `id: string, filename?: string, mimeType: string, size: int, contentId?: string, disposition: "attachment"｜"inline"` |
 | `MessageSummary` | `remoteId: string, summary: string, actionItems: string[], provider?: string` |
 | `InlineImagesResponse` | `images: { [contentIdLowercase: string]: base64 }` |
@@ -145,6 +145,23 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | `AIProbeResult` | **v3 遗留，本文不再使用**。v0.1 形状：`outcome: reachable｜unauthorized｜notFound｜outOfCredit｜rateLimited｜rejected｜providerError｜unexpectedResponse｜timedOut｜unreachable｜redirected｜invalidSettings｜serviceError, httpStatus?: int, detail?: string` |
 | `SentResponse` | `messages: MessageHeader[], totalCount: int, refreshedFromServer: int, staleReason?: string` |
 | `StoreNotice` | `id: string, createdAt: ISO date, detail?: string` |
+
+### v0.3 变更（2026-11-11，R6 决策批）
+
+只做**新增**，不动任何既有字段与状态码（§8 允许的向后兼容变更）：
+
+| 变更 | 内容 |
+|---|---|
+| 新增端点 | `POST /api/advice/:id/decision`、`POST /api/advice/decisions-bulk`（§4.8） |
+| 新增端点 | `GET /api/triage/status`、`POST /api/triage/run`、`POST /api/triage/cancel`（§4.9） |
+| 新增端点 | `POST /api/advice/{id}/decision` 此前只在本文档声明、实现缺失；现已实现 |
+| 新增可选响应字段 | `MessageBody.unsubscribeLinks`：`List-Unsubscribe` 的目标，JSON 文本（`[]` 表示没有） |
+| 新增可选 query | `GET /api/senders?pending=true`：只统计**未归档**的邮件（默认行为不变，逐字节一致） |
+| 新增错误 code | `invalid-decision`、`empty-ids`、`too-many-ids`、`malformed-advice-id`、`unknown-advice` |
+
+**为什么不改 `list_unsubscribe`**：它仍是布尔，简报分组在用。新增的 `unsubscribeLinks` 是**解析后的目标**，两者说的是不同的事（"有没有"vs"往哪去"），合并会让简报分组退化。
+
+**`unsubscribeLinks` 的安全边界**：服务端只解析并按 `https:` / `mailto:` 过滤，**不发任何请求**。客户端只呈现目标主机名，点击交给系统浏览器（与 `568dfe3` 同一条路径）。服务端代发退订需要独立的 SSRF 设计（DNS 后校验 IP、禁私网、禁重定向、RFC 8058 语义），不在本版范围内。
 
 ---
 
@@ -234,7 +251,8 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | `GET /api/search` | query `q`（空 → 空结果 200）；`accountId`=UUID｜`all`｜缺省；`sender`；`since` | 200 `SearchResponse`（结果上限 100；解封扫描预算 1000）。**范围 = 整个账号的未删除邮件**（收件箱 / 归档 / 已发送），不含废纸篓 | 400 `malformed-accountId`；500 | `search.contract`、`search.contract.sealed-body`（contract_expected，见 §7.1）+ `r2_paths.rs` 的 `the_search_covers_sent_mail_and_leaves_the_trash_alone`（锁定范围） |
 | `GET /api/advice` | query `accountId`；`decision`（缺省/空=pending，`any`=全部，或 accepted/dismissed）；`limit` 默认 200 上限 500 | 200 `{advice: AdviceRecord[]}` | 400 `malformed-decision`；404 | `advice.list` |
 | `GET /api/advice/accepted-stats` | query `accountId` | 200 `{stats: {category?, action, count}[]}`（最多 5） | 400；404 | — |
-| `POST /api/advice/:id/decision` | query `accountId`；body `{decision}` | 200 `{id, decision}` | 400；404 `unknown-advice` | — |
+| `POST /api/advice/:id/decision` | query `accountId`；body `{decision}` | 200 `{id, decision}` | 400 `malformed-advice-id`/`invalid-body`/`invalid-decision`；404 `unknown-account`/`unknown-advice` | — |
+| `POST /api/advice/decisions-bulk` | query `accountId`；body `{ids: int64[], decision}`（≤500） | 200 `{items: {id, ok, decision?, errorCode?}[], decided: int}` | 400 `invalid-body`/`invalid-decision`/`empty-ids`/`too-many-ids`；404 `unknown-account` | — |
 | `GET /api/stacks` | query `accountId` | 200 `{stacks: StackSummary[]}` | 400；500 | `stacks.list` |
 | `POST /api/stacks` | query `accountId`；body `{name, kind, value}`（name ≤80，value ≤200） | 201 `{stack: StackSummary}` | 400 `invalid-name`/`-value`/`-kind`；500 | — |
 | `PATCH /api/stacks/:id` | query `accountId`；body `{name?, kind?, value?}` | 200 `{stack: StackSummary}` | 400；404 `unknown-stack` | — |
@@ -255,6 +273,39 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | `POST /api/ai/reload` | 无 body（v0.2：不再收 `environment`） | 200 `AIReloadResult` | 500 `internal-error`（配置文件读不出来） | — |
 | `POST /api/ai/probe` | 无 body（v0.2：不再收 `environment`） | 200 `AIProbeResponse` | 503 `ai-not-configured`/`ai-credit-exhausted`/`ai-circuit-open`；502 `provider-unreachable`/`ai-error` | — |
 
+### 4.9 分诊批（two-layer triage）
+
+分诊分两层，**先免费后付费**：L1 用本构建自带的规则（`List-Unsubscribe`、订阅类发件人）判全量，
+成本为零；L2 只把 L1 判不了的交给模型。参考库实测 322/430 由 L1 判掉。
+
+| Method Path | 入参 | 成功 | 错误 | 说明 |
+|---|---|---|---|---|
+| `GET /api/triage/status` | query `accountId` | 200 `TriageStatus` | 400 `malformed-accountId`；404 `unknown-account` | 所有计数都是查询结果，不是内存计数器 |
+| `POST /api/triage/run` | query `accountId` | **202** `TriageStatus` | 400；404 | 已在跑时返回同一份（不启第二个 worker） |
+| `POST /api/triage/cancel` | query `accountId` | 200 `TriageStatus` | 400；404 | 批次之间生效；返回的是「此刻」的状态 |
+
+`TriageStatus`：
+
+```jsonc
+{
+  "configured": true,           // 与 /api/ai-status 同一真相
+  "running": true,
+  "suggested": 322,             // 有 advice 行的邮件数
+  "unsuggested": 108,
+  "bySource": { "heuristic": 322, "ai": 0 },
+  "spendMonthMicroUsd": 4321,   // 与 /api/usage 同源
+  "capMonthMicroUsd": 5000000,  // 0 = 无上限
+  "run": {                      // 从未跑过时 null
+    "startedAt": "…", "phase": "heuristic" | "ai" | null,
+    "target": 108, "done": 40, "failed": 0,
+    "state": "running" | "done" | "stopped-budget" | "stopped-unconfigured" | "stopped-error" | "cancelled",
+    "lastError": null
+  }
+}
+```
+
+**没有 key 时 L1 仍然运行**，`run.state` 落在 `stopped-unconfigured`——那不是失败，是「免费那层做完了」。
+
 ---
 
 ## 5. 语义规则（跨端点）
@@ -268,6 +319,8 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | 附件下载 | 每次都从 IMAP 重新解析整封（无缓存）；单附件 25 MB 上限；下载响应带 RFC 6266 `filename*` |
 | 列表截断 | 列表上限 1000；超限由 `totalCount` 暴露；**禁止**把截断列表当全量渲染 |
 | AI 只读 | AI 永不直接写邮箱；AI 侧产生的写只有 `advice`/`ai_overrides`/`draft_replies`/`usage_log`/`ai_actions` |
+| 建议 ≠ 动作 | `POST /api/advice/*/decision` 只写 `advice.decision`，**不改任何邮件状态**。执行走 `archive`/`delete`，由客户端先执行后记账；执行失败则 decision 保持 `pending` |
+| 动作即决定 | 归档 / 删除 / 彻底删除一封有 pending 建议的邮件，把该建议置为 `accepted`（只动 pending 行）。标记已读**不**消费建议——读信不是分诊决定 |
 
 ---
 

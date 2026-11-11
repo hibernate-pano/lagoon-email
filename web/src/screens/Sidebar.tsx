@@ -14,13 +14,16 @@ import { t } from "../l10n/zh";
 import type { LensId, Route } from "../core/router";
 
 interface Destination {
-  lens: LensId | "briefing";
+  lens: LensId | "briefing" | "decisions";
   label: string;
   glyph: string;
   countKey?: string;
 }
 
 const SMART: Destination[] = [
+  // The decision board is first because it is the screen that asks for the
+  // fewest decisions: opening the app onto a list is opening it onto 430 rows.
+  { lens: "decisions", label: t.sidebar.decisions, glyph: "◆", countKey: "decisions" },
   { lens: "briefing", label: t.sidebar.briefing, glyph: "▦" },
   { lens: "inbox", label: t.sidebar.inbox, glyph: "▤", countKey: "live" },
   { lens: "unread", label: t.sidebar.unread, glyph: "✉", countKey: "unread" },
@@ -58,8 +61,9 @@ function Row(props: {
   const { destination, active, counts, disabled, onNavigate } = props;
   const count = countText(counts, destination.countKey);
   const go = () => {
-    if (destination.lens === "briefing") onNavigate({ view: "briefing", lens: "inbox" });
-    else onNavigate({ view: "list", lens: destination.lens });
+    if (destination.lens === "decisions") onNavigate({ view: "decisions", lens: "inbox" });
+    else if (destination.lens === "briefing") onNavigate({ view: "briefing", lens: "inbox" });
+    else onNavigate({ view: "list", lens: destination.lens as LensId });
   };
   return (
     <button
@@ -80,7 +84,8 @@ function Row(props: {
 
 export function Sidebar(props: SidebarProps): ReactNode {
   const { route } = props;
-  const activeLens = route.view === "briefing" ? "briefing" : route.lens;
+  const activeLens: Destination["lens"] =
+    route.view === "decisions" ? "decisions" : route.view === "briefing" ? "briefing" : route.lens;
   return (
     <nav className="sidebar" aria-label={t.sidebar.navigation}>
       <section>

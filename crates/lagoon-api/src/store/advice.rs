@@ -289,3 +289,223 @@ pub fn upsert_ai(
     )?;
     Ok(())
 }
+
+/* ------------------------------------------------------- the triage batch ---- */
+
+/// One mail with no suggestion yet, in the shape the two triage layers need.
+///
+/// The subject is plaintext (`message_headers.subject` is deliberately not
+/// sealed - contract §6), so a triage that only reads headers never touches a
+/// sealed column. `has_cached_body` says whether the prompt may include the
+/// opening of the letter; the heuristic layer does not need it at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriageCandidate {
+    pub remote_id: String,
+    pub from_address: String,
+    pub subject: Option<String>,
+    pub list_unsubscribe: bool,
+    pub has_cached_body: bool,
+}
+
+/// The mails nobody has looked at yet, newest first.
+///
+/// "Not yet triaged" is a query result, not a column (plan D7): a row in
+/// `advice` *is* the record that this mail was looked at, so the left join is
+/// the whole state machine. That also makes a second run free - it simply
+/// finds nothing.
+///
+/// Newest first, because the mail the user has to deal with is the mail that
+/// arrived, not the mail from 2025.
+pub fn triage_candidates(
+    connection: &Connection,
+    account_id: Uuid,
+    limit: i64,
+) -> rusqlite::Result<Vec<TriageCandidate>> {
+    let mut statement = connection.prepare(
+        "SELECT h.remote_id, h.from_address, h.subject, h.list_unsubscribe,
+                (b.remote_id IS NOT NULL) AS has_body
+         FROM message_headers h
+         LEFT JOIN advice a
+                ON a.account_id = h.account_id AND a.remote_id = h.remote_id
+         LEFT JOIN message_bodies b
+                ON b.account_id = h.account_id AND b.remote_id = h.remote_id
+         WHERE h.account_id = ?1
+           AND h.is_deleted = 0
+           AND h.is_sent = 0
+           AND a.id IS NULL
+         ORDER BY h.received_at DESC
+         LIMIT ?2",
+    )?;
+    let mut rows = statement.query(rusqlite::params![
+        account_id.as_bytes().as_slice(),
+        limit.max(1)
+    ])?;
+    let mut candidates = Vec::new();
+    while let Some(row) = rows.next()? {
+        candidates.push(TriageCandidate {
+            remote_id: row.get(0)?,
+            from_address: row.get(1)?,
+            subject: row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty()),
+            list_unsubscribe: row.get::<_, i64>(3)? != 0,
+            has_cached_body: row.get::<_, i64>(4)? != 0,
+        });
+    }
+    Ok(candidates)
+}
+
+/// How many mails have a suggestion, and how many do not.
+///
+/// Both numbers come from the same predicate the batch query uses, so the
+/// progress the UI shows and the work the worker does can never disagree.
+/// Deleted and sent mail is out of scope for both, exactly like the batch.
+pub fn triage_counts(connection: &Connection, account_id: Uuid) -> rusqlite::Result<(i64, i64)> {
+    let suggested: i64 = connection.query_row(
+        "SELECT count(*) FROM advice a
+           JOIN message_headers h
+             ON h.account_id = a.account_id AND h.remote_id = a.remote_id
+          WHERE a.account_id = ?1 AND h.is_deleted = 0 AND h.is_sent = 0",
+        rusqlite::params![account_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let unsuggested: i64 = connection.query_row(
+        "SELECT count(*) FROM message_headers h
+           LEFT JOIN advice a
+                  ON a.account_id = h.account_id AND a.remote_id = h.remote_id
+          WHERE h.account_id = ?1 AND h.is_deleted = 0 AND h.is_sent = 0
+            AND a.id IS NULL",
+        rusqlite::params![account_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    Ok((suggested, unsuggested))
+}
+
+/// How many suggestions came from each source.
+///
+/// The plan's §6.3 requires the card to say who judged a mail: a rule this
+/// build ships, or a model that read it. That is only showable if the two are
+/// counted apart, so this is the query behind it rather than a UI guess.
+pub fn source_counts(connection: &Connection, account_id: Uuid) -> rusqlite::Result<(i64, i64)> {
+    let count = |source: &str| -> rusqlite::Result<i64> {
+        connection.query_row(
+            "SELECT count(*) FROM advice a
+               JOIN message_headers h
+                 ON h.account_id = a.account_id AND h.remote_id = a.remote_id
+              WHERE a.account_id = ?1 AND a.source = ?2
+                AND h.is_deleted = 0 AND h.is_sent = 0",
+            rusqlite::params![account_id.as_bytes().as_slice(), source],
+            |row| row.get(0),
+        )
+    };
+    Ok((count("heuristic")?, count("ai")?))
+}
+
+/// A suggestion produced without a model: the free layer (plan D8).
+#[derive(Debug, Clone, Copy)]
+pub struct HeuristicSuggestion<'a> {
+    pub action: &'a str,
+    pub category: Option<&'a str>,
+    pub rationale: &'a str,
+}
+
+/// Store a rule's suggestion for one message.
+///
+/// Confidence is pinned to `medium` on purpose (plan D9): a rule recognised
+/// the mail as subscription-shaped, it did not read it. Claiming `high` here
+/// would make the confidence histogram on the decision card a lie.
+///
+/// Like [`upsert_ai`], a row the user already decided is left alone: the
+/// worker may re-read the mailbox, it may not overrule the user.
+pub fn upsert_heuristic(
+    connection: &Connection,
+    account_id: Uuid,
+    remote_id: &str,
+    suggestion: &HeuristicSuggestion<'_>,
+) -> rusqlite::Result<()> {
+    let action = if ACTIONS.contains(&suggestion.action) {
+        suggestion.action
+    } else {
+        "nothing"
+    };
+    let category = suggestion
+        .category
+        .filter(|value| CATEGORIES.contains(value));
+    connection.execute(
+        "INSERT INTO advice
+            (account_id, remote_id, action, category, confidence, rationale,
+             due_text, source, model, decision)
+         VALUES (?1, ?2, ?3, ?4, 'medium', ?5, NULL, 'heuristic', NULL, 'pending')
+         ON CONFLICT (account_id, remote_id) DO UPDATE SET
+            action = excluded.action,
+            category = excluded.category,
+            rationale = excluded.rationale,
+            source = 'heuristic'
+         WHERE advice.decision = 'pending'",
+        rusqlite::params![
+            account_id.as_bytes().as_slice(),
+            remote_id,
+            action,
+            category,
+            suggestion.rationale,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Mark a pending suggestion as decided by the user.
+///
+/// Only `accepted` and `dismissed` are legal (plan §5.2): `pending` as an input
+/// would mean "un-decide", which breaks `upsert_ai`'s `WHERE decision =
+/// 'pending'` guard and lets a worker overwrite a decision the user made.
+///
+/// Idempotent: deciding twice keeps the first `decided_at`, so the UI may
+/// retry a batch without writing churn. Returns `Ok(false)` when no pending row
+/// with that id exists for this account.
+pub fn decide(
+    connection: &Connection,
+    account_id: Uuid,
+    id: i64,
+    decision: &str,
+) -> rusqlite::Result<bool> {
+    if decision != "accepted" && decision != "dismissed" {
+        return Ok(false);
+    }
+    let changed = connection.execute(
+        "UPDATE advice
+            SET decision = ?3,
+                decided_at = COALESCE(decided_at, strftime('%Y-%m-%d %H:%M:%f','now'))
+          WHERE id = ?1 AND account_id = ?2 AND decision = 'pending'",
+        rusqlite::params![id, account_id.as_bytes().as_slice(), decision],
+    )?;
+    if changed > 0 {
+        return Ok(true);
+    }
+    // Already decided, or no such row: the two are different answers, and only
+    // one of them is success.
+    let exists: i64 = connection.query_row(
+        "SELECT count(*) FROM advice WHERE id = ?1 AND account_id = ?2",
+        rusqlite::params![id, account_id.as_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    Ok(exists > 0)
+}
+
+/// A pending suggestion for this mail is settled by the user acting on the
+/// mail itself.
+///
+/// Archiving by hand is an accept: leaving the advice pending would put the
+/// same mail back in the queue tomorrow, and inflate every count that says
+/// "still to decide". Only `pending` rows are touched, so a decision the user
+/// already made (accept or dismiss) is never rewritten.
+pub fn accept_pending_for_message(
+    connection: &Connection,
+    account_id: Uuid,
+    remote_id: &str,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "UPDATE advice
+            SET decision = 'accepted',
+                decided_at = COALESCE(decided_at, strftime('%Y-%m-%d %H:%M:%f','now'))
+          WHERE account_id = ?1 AND remote_id = ?2 AND decision = 'pending'",
+        rusqlite::params![account_id.as_bytes().as_slice(), remote_id],
+    )
+}

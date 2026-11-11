@@ -55,6 +55,12 @@ pub struct RemoteHeader {
     pub received_at: i64,
     pub is_read: bool,
     pub list_unsubscribe: bool,
+    /// The parsed `List-Unsubscribe` links, as JSON text (`mime::unsubscribe`).
+    ///
+    /// Text rather than a typed field because this value crosses the crate
+    /// boundary into the store and the wire, and both want the same string. It
+    /// is never empty work: an empty header stores `[]` and costs nothing.
+    pub unsubscribe_links: String,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Option<String>,

@@ -119,6 +119,12 @@ const CODE_SENTENCES: Record<string, string> = {
   "uidplus-missing": "这个邮箱服务器不支持 UIDPLUS，不能彻底删除；只能移入垃圾箱。",
   "unknown-before": "before 指向的动作不存在（可能已被另一个窗口清掉）。",
   "unknown-stack": "没有这个 stack 参数（前端 bug）。",
+  // R6: the triage batch and the advice decision出口.
+  "invalid-decision": "决定的取值不合法：只接受 accepted 或 dismissed（pending 不是决定）。",
+  "empty-ids": "批量决定没有带建议 id（前端 bug）。",
+  "too-many-ids": "一次最多决定 500 条建议，超出的请分批。",
+  "malformed-advice-id": "建议 id 格式不对（前端 bug）。",
+  "unknown-advice": "这条建议不存在，或已经不在这个账号下。",
 };
 
 /** The human sentence for a backend code, or null when the dictionary lacks one. */

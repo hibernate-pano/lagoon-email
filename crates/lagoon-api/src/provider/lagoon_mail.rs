@@ -107,7 +107,9 @@ fn convert_header(header: MailRemoteHeader) -> RemoteHeader {
         in_reply_to: header.in_reply_to,
         references: header.references,
         list_unsubscribe: header.list_unsubscribe,
-        unsubscribe_links: "[]".to_owned(),
+        // Carried through from the parser. The hardcoded `"[]"` here was the
+        // reason the reader could never offer a way out of a mailing list.
+        unsubscribe_links: header.unsubscribe_links,
     }
 }
 

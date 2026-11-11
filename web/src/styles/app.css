@@ -665,3 +665,180 @@ button.chip:focus-visible { outline: 2px solid var(--lagoon-accent); outline-off
 }
 .compose-attachments { display: flex; align-items: center; gap: var(--sp-xs); flex-wrap: wrap; }
 .compose-actions { display: flex; align-items: center; gap: var(--sp-sm); }
+
+/* ------------------------------------------------------- decision board ---- */
+
+.decisions {
+  padding: 20px 24px 40px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.decisions-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.decisions-head h1 {
+  font-size: 18px;
+  margin: 0 0 4px;
+}
+
+.decisions-empty {
+  padding: 32px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.decisions-empty h2 {
+  font-size: 15px;
+  margin: 0;
+}
+
+/* The progress line. It always shows both layers apart, plus the remainder. */
+.triage-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  font-size: 12px;
+}
+
+.triage-bar.running {
+  border-color: var(--primary);
+}
+
+.triage-bar.warn {
+  border-color: var(--destructive);
+}
+
+.decision-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.decision-card.destructive {
+  border-left: 3px solid var(--destructive);
+}
+
+.decision-card > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.decision-card > header .count {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.decision-card .chip.src {
+  /* The layer that judged it: a shipped rule, or the model. */
+  opacity: 0.85;
+}
+
+.decision-samples {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 13px;
+}
+
+.decision-samples .muted {
+  color: var(--muted-foreground);
+}
+
+.decision-why {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.decision-card > footer {
+  display: flex;
+  gap: 8px;
+}
+
+.decisions-overflow {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  margin: 0;
+}
+
+.decisions-personal {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.decisions-personal h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.decisions-personal ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.decisions-personal li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.decisions-personal .rationale {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.btn.primary {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+.link.small {
+  font-size: 12px;
+}
+
+/* The way out of a mailing list, with its host visible. */
+.unsub-strip {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.unsub-link {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}

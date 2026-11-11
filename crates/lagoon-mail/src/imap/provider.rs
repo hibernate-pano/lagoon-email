@@ -1075,6 +1075,10 @@ fn remote_header(fetched: &ImapFetchedHeader) -> RemoteHeader {
             .filter(|value| !value.is_empty())
             .map(|value| decode_rfc2047(value))
     };
+    let unsubscribe = crate::mime::unsubscribe::parse_unsubscribe_headers(
+        decoded("list-unsubscribe").as_deref(),
+        decoded("list-unsubscribe-post").as_deref(),
+    );
     let (from_address, from_name) = parse_from_header(decoded("from").as_deref().unwrap_or(""));
     let message_id = decoded("message-id");
     let references = decoded("references");
@@ -1090,7 +1094,12 @@ fn remote_header(fetched: &ImapFetchedHeader) -> RemoteHeader {
         snippet: None,
         received_at: fetched.internal_date.unwrap_or_else(now_unix),
         is_read: sync::is_read(&fetched.flags),
-        list_unsubscribe: decoded("list-unsubscribe").is_some(),
+        // The boolean the briefing grouping uses, and the parsed links the
+        // reader shows. Parsed here, at the one place a header block is turned
+        // into a RemoteHeader, so the two can never disagree about whether the
+        // mail offers a way out.
+        list_unsubscribe: !unsubscribe.is_empty(),
+        unsubscribe_links: unsubscribe.to_json(),
         message_id,
         in_reply_to: decoded("in-reply-to"),
         references,

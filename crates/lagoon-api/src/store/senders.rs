@@ -16,6 +16,22 @@ pub struct SenderRow {
     pub latest_at: Timestamp,
 }
 
+/// As [`ranking`], but only mail still waiting for a decision.
+///
+/// The decision board asks "how much of this address's mail is still on my
+/// plate", and archived mail is not on the plate - it is where finished mail
+/// lives. The plain [`ranking`] deliberately includes archived mail (that is the
+/// right answer for "who writes to me most"), so the two are separate queries
+/// rather than one query with a flag that callers could forget.
+pub fn pending_ranking(
+    connection: &Connection,
+    account_id: crate::uuid::Uuid,
+    limit: i64,
+    query: Option<&str>,
+) -> rusqlite::Result<Vec<SenderRow>> {
+    ranking_with(connection, account_id, limit, query, true)
+}
+
 /// Senders ranked by how much mail they have written.
 ///
 /// Deleted mail is excluded (a sender whose mail was thrown away is not still
@@ -27,6 +43,16 @@ pub fn ranking(
     limit: i64,
     query: Option<&str>,
 ) -> rusqlite::Result<Vec<SenderRow>> {
+    ranking_with(connection, account_id, limit, query, false)
+}
+
+fn ranking_with(
+    connection: &Connection,
+    account_id: crate::uuid::Uuid,
+    limit: i64,
+    query: Option<&str>,
+    pending_only: bool,
+) -> rusqlite::Result<Vec<SenderRow>> {
     let mut sql = String::from(
         "SELECT from_address AS address,
                 MAX(NULLIF(from_name, '')) AS display_name,
@@ -36,6 +62,11 @@ pub fn ranking(
          FROM message_headers
          WHERE account_id = ? AND is_deleted = FALSE AND is_sent = FALSE",
     );
+    if pending_only {
+        // Archived mail is finished mail. Counting it would let the board say
+        // "80 from this address" when three are actually left to decide.
+        sql.push_str(" AND is_archived = FALSE");
+    }
     let mut arguments: Vec<rusqlite::types::Value> =
         vec![rusqlite::types::Value::Blob(account_id.as_bytes().to_vec())];
     if let Some(query) = query {

@@ -1428,7 +1428,8 @@
           "text": "Contract fixture body: sealedneedle appears here.",
           "to": [
             "contract-fixture-b@example.invalid"
-          ]
+          ],
+          "unsubscribeLinks": "[]"
         },
         "body_kind": "json",
         "content_type": "application/json; charset=utf-8",

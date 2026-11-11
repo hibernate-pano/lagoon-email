@@ -17,6 +17,7 @@ pub mod charset;
 pub mod headers;
 pub mod html;
 pub mod parser;
+pub mod unsubscribe;
 
 pub use builder::{
     build_new_message, build_reply, OutboundAttachment, OutboundMessage, MAX_ATTACHMENT_BYTES,

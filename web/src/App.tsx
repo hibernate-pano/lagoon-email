@@ -21,10 +21,13 @@ import type {
   AiStatus,
   ConnectedAccount,
   FolderCountResponse,
+  MessageHeader,
   SearchResponse,
+  SenderListResponse,
   SentResponse,
   StoreNoticesResponse,
   SyncResponse,
+  TriageStatus,
 } from "./core/types";
 import { apiCall } from "./core/api";
 import { COMMON_UNAVAILABLE, describeHttpFailure } from "./core/errors";
@@ -47,10 +50,13 @@ import type { SendMode, SendOriginal } from "./core/send";
 import { roundSettled, syncStateOf } from "./core/syncWait";
 import {
   bulkAction,
+  recordDecisions,
+  cancelTriage,
   emptyTrash,
   setPinned,
   setRead,
   singleAction,
+  startTriage,
   undoBulk,
   undoAction,
   allows,
@@ -61,6 +67,7 @@ import type { RowVerb, WriteBridge } from "./core/uiBridge";
 import { hashFor, navigate, parseHash, type LensId, type Route } from "./core/router";
 import { ActionHistoryPanel } from "./screens/ActionHistory";
 import { BriefingFeed } from "./screens/BriefingFeed";
+import { DecisionsBoard } from "./screens/DecisionsBoard";
 import { BootScreen } from "./screens/BootScreen";
 import { CommandPalette, buildCommands } from "./screens/CommandPalette";
 import { Composer } from "./screens/Composer";
@@ -161,6 +168,8 @@ export function App(): ReactNode {
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [busy, setBusy] = useState(false);
+  /** One suggestion being executed from its row (the strip's 照做 button). */
+  const [adviceBusy, setAdviceBusy] = useState(false);
   const [syncBusy, setSyncBusy] = useState(false);
   /** The open composer, if any. */
   const [composer, setComposer] = useState<{ mode: SendMode; original?: SendOriginal } | null>(null);
@@ -309,10 +318,20 @@ export function App(): ReactNode {
   });
 
   const advice = useApiOutcome<AdviceResponse>({
-    enabled: Boolean(accountId) && route.view === "briefing",
+    // The board is the surface that consumes this; the briefing feed shows the
+    // inline strip. Both need it, so it loads for either.
+    enabled: Boolean(accountId) && (route.view === "briefing" || route.view === "decisions"),
     deps: [accountId, route.view],
     pollMs: POLL_MS,
-    load: () => apiCall<AdviceResponse>({ method: "GET", path: "/api/advice", query: { accountId: accountId ?? "" } }),
+    // `decision=any`: the board needs the whole picture. It filters to pending
+    // itself, and it must be able to tell "never suggested" from "already
+    // decided" instead of showing a decided row as if it were waiting.
+    load: () =>
+      apiCall<AdviceResponse>({
+        method: "GET",
+        path: "/api/advice",
+        query: { accountId: accountId ?? "", decision: "any", limit: "500" },
+      }),
     translate: { errorTitle: "建议队列读取失败", unavailableCodes: COMMON_UNAVAILABLE, describeCode: describeHttpFailure },
   });
 
@@ -382,6 +401,46 @@ export function App(): ReactNode {
     },
   });
 
+  const triage = useApiOutcome<TriageStatus>({
+    enabled: Boolean(accountId) && route.view === "decisions",
+    deps: [accountId, route.view],
+    // A run is on its own task, so the only way to see progress is to ask. Fast
+    // poll while it is going, slow poll when it is not: the second case is
+    // "did anything change since I last looked", not a progress bar.
+    pollMs: 1500,
+    // `apiCall` directly, not the typed helper: the helper answers a
+    // `WriteFailure` the write UI understands, while this surface needs the
+    // `CallResult` shape `useApiOutcome` already knows how to classify.
+    load: () =>
+      apiCall<TriageStatus>({
+        method: "GET",
+        path: "/api/triage/status",
+        query: { accountId: accountId ?? "" },
+      }),
+    translate: {
+      errorTitle: t.decisions.loading,
+      unavailableCodes: COMMON_UNAVAILABLE,
+      describeCode: describeHttpFailure,
+    },
+  });
+
+  const senders = useApiOutcome<SenderListResponse>({
+    enabled: Boolean(accountId) && route.view === "decisions",
+    deps: [accountId, route.view],
+    pollMs: POLL_MS,
+    load: () =>
+      apiCall<SenderListResponse>({
+        method: "GET",
+        path: "/api/senders",
+        query: { accountId: accountId ?? "", pending: "true", limit: "120" },
+      }),
+    translate: {
+      errorTitle: t.decisions.loading,
+      unavailableCodes: COMMON_UNAVAILABLE,
+      describeCode: describeHttpFailure,
+    },
+  });
+
   const searching = isSearching(term);
 
   // A different lens or a different account is a different question: the old
@@ -402,11 +461,17 @@ export function App(): ReactNode {
   }, [advice.outcome]);
 
   const countMap = useMemo(() => {
-    if (counts.outcome.phase !== "ready" && counts.outcome.phase !== "empty") return undefined;
     const map: Record<string, number> = {};
-    for (const entry of counts.outcome.data.counts) map[entry.id] = entry.count;
+    if (counts.outcome.phase === "ready" || counts.outcome.phase === "empty") {
+      for (const entry of counts.outcome.data.counts) map[entry.id] = entry.count;
+    }
+    // The badge on 决定 is the number of mails with a pending suggestion, which
+    // is the number of things the user can act on from that screen.
+    if (advice.outcome.phase === "ready" || advice.outcome.phase === "empty") {
+      map.decisions = advice.outcome.data.advice.filter((row) => row.decision === "pending").length;
+    }
     return map;
-  }, [counts.outcome]);
+  }, [counts.outcome, advice.outcome]);
 
   const serverRows = useMemo(() => {
     // A query replaces the lens list: the search answers a different question
@@ -428,6 +493,27 @@ export function App(): ReactNode {
   }, [route.view, searching, search.outcome, messages.outcome, briefing.outcome]);
 
   const rows = useMemo(() => overlay.rows(serverRows), [overlay, serverRows]);
+
+  /**
+   * The suggestions' rows, indexed by `remoteId`.
+   *
+   * The board needs the subject and sender of the mail behind each suggestion.
+   * A suggestion whose row is not loaded is still shown (by its id) rather than
+   * dropped: hiding it would make the queue look shorter than it is.
+   */
+  const rowIndex = useMemo(() => {
+    const map = new Map<string, MessageHeader>();
+    for (const row of serverRows) map.set(row.remoteId, row);
+    return map;
+  }, [serverRows]);
+
+  const unsuggestedCount = useMemo(() => {
+    if (triage.outcome.phase === "ready" || triage.outcome.phase === "empty") {
+      return triage.outcome.data.unsuggested;
+    }
+    return 0;
+  }, [triage.outcome]);
+
   const rowsById = useMemo(() => {
     const map: Record<string, (typeof rows)[number]> = {};
     for (const row of rows) map[row.remoteId] = row;
@@ -647,6 +733,110 @@ export function App(): ReactNode {
         setConfirm(null);
       },
     });
+  }
+
+  /**
+   * Carry out one suggestion from the briefing strip.
+   *
+   * Same order as the board: execute first, record the decision only for the
+   * mail that really moved. A failure leaves the suggestion pending, so the
+   * queue keeps telling the truth.
+   */
+  async function acceptAdvice(record: AdviceRecord) {
+    const action = record.advice.action;
+    if (!accountId || (action !== "archive" && action !== "delete")) return;
+    setAdviceBusy(true);
+    try {
+      const result = await bulkAction(action, [record.remoteId], accountId);
+      if (!result.ok) {
+        reportWriteFailure(result);
+        return;
+      }
+      const moved = result.items.find((item) => item.remoteId === record.remoteId && item.ok);
+      if (!moved) {
+        reportWriteFailure({
+          message: t.decisions.partial(1),
+          code: null,
+          status: 0,
+        });
+        return;
+      }
+      await recordDecisions([record.id], accountId, "accepted");
+      setToast({ id: Date.now(), text: toastTextFor(action === "archive" ? "archive" : "delete", 1) });
+      advice.refresh();
+      briefing.refresh();
+      counts.refresh();
+    } finally {
+      setAdviceBusy(false);
+    }
+  }
+
+  /** Dismiss a suggestion without touching the mail. */
+  async function dismissAdvice(record: AdviceRecord) {
+    if (!accountId) return;
+    setAdviceBusy(true);
+    try {
+      const result = await recordDecisions([record.id], accountId, "dismissed");
+      if (!result.ok) {
+        reportWriteFailure(result);
+        return;
+      }
+      advice.refresh();
+    } finally {
+      setAdviceBusy(false);
+    }
+  }
+
+  /** A bulk delete from the decision board: same dialog shape, its own sentence. */
+  function requestConfirmDelete(count: number, run: () => void) {
+    setConfirm({
+      title: t.decisions.actionDelete,
+      message: t.decisions.deleteConfirm(count),
+      destructive: true,
+      confirmLabel: t.decisions.actionDelete,
+      onConfirm: () => {
+        setConfirm(null);
+        run();
+      },
+    });
+  }
+
+  /** A failed board write: the same banner the row verbs use. */
+  function reportWriteFailure(failure: {
+    message: string;
+    code: string | null;
+    status: number;
+  }) {
+    setWriteError({
+      title: t.m2.write.failedTitle,
+      detail: failure.message,
+      code: failure.code,
+      status: failure.status,
+    });
+  }
+
+  function showToast(text: string) {
+    setToast({ id: Date.now(), text });
+  }
+
+  async function startTriageRun() {
+    if (!accountId) return;
+    const result = await startTriage(accountId);
+    if ("ok" in result && result.ok === false) {
+      reportWriteFailure(result);
+      return;
+    }
+    triage.refresh();
+  }
+
+  async function cancelTriageRun() {
+    if (!accountId) return;
+    const result = await cancelTriage(accountId);
+    if ("ok" in result && result.ok === false) {
+      reportWriteFailure(result);
+      return;
+    }
+    triage.refresh();
   }
 
   function requestEmptyTrash() {
@@ -964,7 +1154,35 @@ export function App(): ReactNode {
       <div className="shell">
         <Sidebar route={route} counts={countMap} disabled={false} onNavigate={(next) => go(next)} />
         <div className="panes">
-          {route.view === "briefing" ? (
+          {route.view === "decisions" ? (
+            <DecisionsBoard
+              advice={advice}
+              messages={rowIndex}
+              senders={
+                senders.outcome.phase === "ready" || senders.outcome.phase === "empty"
+                  ? senders.outcome.data.senders
+                  : []
+              }
+              unsuggested={unsuggestedCount}
+              triage={
+                triage.outcome.phase === "ready" || triage.outcome.phase === "empty"
+                  ? triage.outcome.data
+                  : null
+              }
+              onStartTriage={() => void startTriageRun()}
+              onCancelTriage={() => void cancelTriageRun()}
+              writes={writes}
+              onOpenMessage={(remoteId) => setOpenedId(remoteId)}
+              onSettled={() => {
+                advice.refresh();
+                triage.refresh();
+                senders.refresh();
+              }}
+              onConfirmDelete={(count, run) => requestConfirmDelete(count, run)}
+              onError={(failure) => reportWriteFailure(failure)}
+              onToast={showToast}
+            />
+          ) : route.view === "briefing" ? (
             <BriefingFeed
               outcome={briefing.outcome}
               adviceByRemoteId={adviceByRemoteId}
@@ -979,6 +1197,9 @@ export function App(): ReactNode {
               writes={writes}
               onPurge={requestPurge}
               onOpenHistory={() => setHistoryOpen(true)}
+              onAcceptAdvice={(record) => void acceptAdvice(record)}
+              onDismissAdvice={(record) => void dismissAdvice(record)}
+              adviceBusy={adviceBusy}
             />
           ) : (
             <MessageList

@@ -46,3 +46,4 @@ __pycache__/
 .zcode/
 .zcodeignore
 dsh-obsidian/
+.alma-snapshots

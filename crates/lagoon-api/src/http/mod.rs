@@ -15,6 +15,7 @@ pub mod query;
 pub mod respond;
 pub mod routes;
 /// The AI routes: status, summary, draft, reload, probe.
+pub mod routes_advice;
 pub mod routes_ai;
 /// The mailbox reads that need a provider: inline images and attachments.
 pub mod routes_attachments;
@@ -22,6 +23,7 @@ pub mod routes_r2;
 pub mod routes_r3;
 pub mod routes_r5;
 pub mod routes_send;
+pub mod routes_triage;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -83,6 +85,12 @@ pub struct AppState {
     /// route answers 503 ai-not-configured, which is the truth rather than a
     /// crash.
     pub ai: Arc<AiGateway>,
+    /// The two-layer triage batch (plan §4): the rules layer is free and always
+    /// available, the model layer needs a configured gateway.
+    ///
+    /// It holds its own handle to the gateway so `with_ai_gateway` can rebuild
+    /// both, exactly like the supervisor.
+    pub triage: Arc<crate::triage::TriageWorker>,
 }
 
 impl AppState {
@@ -105,6 +113,11 @@ impl AppState {
             .with_budget(budget_source(Arc::clone(&db), config.budget_cap_usd)),
         );
         let sync = build_supervisor(&db, &body_key, &token_key, &provider_factory, &ai);
+        let triage = Arc::new(crate::triage::TriageWorker::new(
+            db.path().to_path_buf(),
+            Arc::clone(&ai),
+            config.budget_cap_usd,
+        ));
         Self {
             db,
             body_key,
@@ -115,6 +128,7 @@ impl AppState {
             provider_factory,
             sync,
             ai,
+            triage,
         }
     }
 
@@ -131,6 +145,13 @@ impl AppState {
             &self.provider_factory,
             &self.ai,
         );
+        // The worker must see the same gateway, or `POST /api/ai/reload` would
+        // reach the routes and leave the batch on the old keys.
+        self.triage = Arc::new(crate::triage::TriageWorker::new(
+            self.db.path().to_path_buf(),
+            Arc::clone(&self.ai),
+            self.budget_cap_usd,
+        ));
         self
     }
 
@@ -160,6 +181,25 @@ impl AppState {
     /// readers.
     pub fn write_connection(&self) -> Result<rusqlite::Connection, crate::db::DbError> {
         crate::db::open_writable(self.db.path())
+    }
+
+    /// Run `f` on a fresh writable connection, off the async reactor.
+    ///
+    /// The read pool is read-only by design, so a write opens its own
+    /// connection. It runs on a blocking worker for the same reason the reads
+    /// do: rusqlite is synchronous, and a write on the reactor thread would
+    /// stall every other request behind a fsync.
+    pub async fn write<T, F>(&self, f: F) -> Result<T, crate::db::DbError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<T, crate::store::StoreError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let path = self.db.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let connection = crate::db::open_writable(&path)?;
+            f(&connection).map_err(crate::db::DbError::Store)
+        })
+        .await?
     }
 
     /// Build a body provider from the account's stored credentials.
@@ -356,6 +396,21 @@ pub fn router(state: AppState) -> Router {
         )
         // R3.4a: trigger a sync round and answer immediately (v3 204).
         .route("/api/sync", axum::routing::post(routes_r3::sync_now))
+        // R6: the two-layer triage batch (plan §4.6). `status` is a read; `run`
+        // answers 202 immediately and `cancel` is the only way to stop one.
+        .route("/api/triage/status", get(routes_triage::status))
+        .route("/api/triage/run", axum::routing::post(routes_triage::run))
+        .route("/api/triage/cancel", axum::routing::post(routes_triage::cancel))
+        // R6: recording what the user decided about a suggestion. Separate from
+        // the mail write paths on purpose - see routes_advice's header.
+        .route(
+            "/api/advice/{id}/decision",
+            axum::routing::post(routes_advice::decision),
+        )
+        .route(
+            "/api/advice/decisions-bulk",
+            axum::routing::post(routes_advice::decisions_bulk),
+        )
         .fallback(routes::not_found)
         // One middleware, with the Host check before the token check inside it:
         // v3's stack order is Host -> auth -> routes (Runtime.swift:187-191).

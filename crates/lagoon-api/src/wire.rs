@@ -250,4 +250,12 @@ pub struct MessageBody {
     pub has_more: bool,
     pub to: Vec<String>,
     pub cc: Vec<String>,
+    /// The parsed `List-Unsubscribe` destinations, JSON text (an empty array
+    /// when the sender offers no way out).
+    ///
+    /// Optional in the wire sense (§8: a new optional field is compatible), and
+    /// it is a string rather than a typed array because the column is text and
+    /// re-encoding it here would only add a failure mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsubscribe_links: Option<String>,
 }

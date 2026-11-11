@@ -175,7 +175,17 @@ fn fetch_headers_parses_flags_date_and_unfolded_raw_values() {
     );
     let command = &transport.command_lines()[0];
     assert!(command.starts_with("A0001 UID FETCH 7:* "), "{command}");
-    assert!(command.contains("BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE)]"), "{command}");
+    // LIST-UNSUBSCRIBE-POST (RFC 8058) joined the set in R6: the one-click
+    // fact has to be fetched to be recorded. An assertion on the exact field
+    // list is what caught this, which is why it is written as an equality of
+    // the whole parenthesised set rather than a `contains` per field.
+    assert!(
+        command.contains(
+            "BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES \
+             LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)]"
+        ),
+        "{command}"
+    );
 }
 
 #[test]

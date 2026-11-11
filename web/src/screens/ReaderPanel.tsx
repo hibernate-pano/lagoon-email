@@ -28,6 +28,7 @@ import { TriBadge, Banner } from "../ui/atoms";
 import { formatWhen } from "../ui/format";
 import type { WriteBridge } from "../core/uiBridge";
 import { HtmlFrame } from "./HtmlFrame";
+import { UnsubscribeStrip } from "../ui/UnsubscribeStrip";
 import { t } from "../l10n/zh";
 
 function mimeMapOf(attachments: Attachment[]): Record<string, string> {  const map: Record<string, string> = {};
@@ -308,6 +309,7 @@ export function ReaderPanel(props: ReaderPanelProps): ReactNode {
                   <span>{t.reader.attachments(bodyData.attachments.filter(isDownloadable).length)}</span>
                 ) : null}
               </div>
+              <UnsubscribeStrip links={bodyData.unsubscribeLinks} />
             </div>
           ) : null}
 

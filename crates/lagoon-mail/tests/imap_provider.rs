@@ -635,7 +635,7 @@ fn list_sent_reads_the_sent_role_and_decodes_headers() {
     assert_eq!(sent[0].subject.as_deref(), Some("你好"));
     assert_eq!(sent[0].from_address, "chen@example.com");
     assert_eq!(sent[0].thread_id, "<root@example.com>");
-    assert!(transport.command_lines().contains(&"A0005 FETCH 1:* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE)])".to_owned()));
+    assert!(transport.command_lines().contains(&"A0005 FETCH 1:* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)])".to_owned()));
 }
 
 #[test]
@@ -667,7 +667,7 @@ fn pull_changes_fetches_new_headers_and_reports_the_cursor() {
     // Unknown membership sets must stay unknown: the store deletes nothing.
     assert!(changes.inbox_remote_ids.is_none());
     assert!(changes.removed_remote_ids.is_none());
-    assert!(transport.command_lines().contains(&"A0004 UID FETCH 10:* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE)])".to_owned()));
+    assert!(transport.command_lines().contains(&"A0004 UID FETCH 10:* (UID FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)])".to_owned()));
 }
 
 #[test]

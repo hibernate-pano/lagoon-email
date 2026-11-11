@@ -1,15 +1,18 @@
 /**
- * The AI suggestion inside the row (RowAdviceStrip.swift:4-49).
+ * The AI suggestion inside a briefing row.
  *
- * Read-only in M1 and it says so: the two verbs that would *act* (照做 / 忽略)
- * are rendered disabled with "M2 开放" rather than hidden, because a strip that
- * silently loses its buttons reads as a broken panel, while a disabled button
- * with a reason reads as a schedule.
+ * This used to be read-only with the two verbs disabled and the tooltip "M2
+ * 开放". That made the strip a dead panel: it told the user what to do and then
+ * refused to help do it. Now the verbs are live, and the rules that keep them
+ * honest are the same three v3 wrote:
  *
- * Three rules copied from v3 and from the constitution it cites:
- *   - every label reads "建议…", never a past tense (nothing has happened);
+ *   - every label reads 建议…, never a past tense (nothing has happened yet);
  *   - confidence is shown, and a low one never reads as a bare imperative;
- *   - delete / unsubscribe carry an extra "不可撤销" marker.
+ *   - delete / unsubscribe carry an extra 不可撤销 marker.
+ *
+ * The strip never executes anything itself. It calls back into the same write
+ * path the row verbs use, so the decision recording and the undo window stay in
+ * one place (`App.tsx`), not duplicated here.
  */
 import type { ReactNode } from "react";
 import type { AdviceRecord } from "../core/types";
@@ -17,13 +20,29 @@ import { t } from "../l10n/zh";
 
 const DESTRUCTIVE: ReadonlySet<string> = new Set(["delete", "unsubscribe"]);
 
-export function AdviceStrip(props: { record: AdviceRecord }): ReactNode {
+/** Actions a click can actually carry out from this strip. */
+const EXECUTABLE: ReadonlySet<string> = new Set(["archive", "delete"]);
+
+export interface AdviceStripProps {
+  record: AdviceRecord;
+  /** Run the suggestion. Absent disables the verb with a reason. */
+  onAccept?: () => void;
+  /** Dismiss the suggestion without touching the mail. */
+  onDismiss?: () => void;
+  busy?: boolean;
+}
+
+export function AdviceStrip(props: AdviceStripProps): ReactNode {
   const { advice } = props.record;
   const label = t.briefing.advice.actions[advice.action] ?? advice.action;
   const confidence = advice.confidence;
   const confidenceLabel =
     confidence === "high" ? t.briefing.advice.high : confidence === "medium" ? t.briefing.advice.medium : t.briefing.advice.low;
   const destructive = DESTRUCTIVE.has(advice.action);
+  // A suggestion this build cannot carry out ("reply", "wait", "remind") says
+  // so instead of offering a button that would do the wrong thing.
+  const executable = EXECUTABLE.has(advice.action);
+  const acceptDisabled = props.busy || !executable || !props.onAccept;
   return (
     <span className="advice">
       <span>{label}</span>
@@ -32,10 +51,23 @@ export function AdviceStrip(props: { record: AdviceRecord }): ReactNode {
       </span>
       {destructive ? <span className="chip err">不可撤销</span> : null}
       <span className="spacer" />
-      <button type="button" disabled title={t.briefing.advice.acceptDisabled}>
+      <button
+        type="button"
+        disabled={acceptDisabled}
+        title={
+          executable
+            ? undefined
+            : t.briefing.advice.notBatchable(advice.action)
+        }
+        onClick={props.onAccept}
+      >
         {t.briefing.advice.accept}
       </button>
-      <button type="button" disabled title={t.briefing.advice.dismissDisabled}>
+      <button
+        type="button"
+        disabled={props.busy || !props.onDismiss}
+        onClick={props.onDismiss}
+      >
         {t.briefing.advice.dismiss}
       </button>
       {advice.rationale ? <span className="rationale">{t.briefing.advice.why} {advice.rationale}</span> : null}

@@ -51,6 +51,7 @@ export const zh = {
     navigation: "导航",
     smartViews: "智能视图",
     places: "地方",
+    decisions: "决定",
     briefing: "简报",
     inbox: "收件箱",
     unread: "未读",
@@ -61,6 +62,55 @@ export const zh = {
     myGroups: "我的分组",
     noCount: "计数未知",
     hint: "侧边栏只负责“去哪儿”，不做归档/删除。",
+  },
+
+  decisions: {
+    title: "待你决定",
+    subtitle: "AI 把邮件压成几个决定；执行权始终在你手里。",
+    loading: "正在读取建议…",
+    // Three different empty states, never merged into one.
+    emptyNoAccount: "还没有连接账号，所以没有可判断的邮件。",
+    emptyNoAdvice: "还没有任何建议。先让规则过一遍邮件。",
+    emptyAllDone: "没有待决定的事。",
+    emptyAllDoneHint: "队列清空了；新邮件到达后会自动重新分诊。",
+    actionArchive: "归档这批",
+    actionDelete: "移到废纸篓",
+    // Every destructive verb states its own reversibility.
+    deleteConfirm: (n: number) => `把 ${n} 封移到废纸篓？可以撤销。`,
+    cardMailCount: (n: number) => `${n} 封`,
+    cardConfidence: (high: number, medium: number, low: number) =>
+      [high ? `高 ${high}` : "", medium ? `中 ${medium}` : "", low ? `低 ${low}` : ""]
+        .filter(Boolean)
+        .join(" · "),
+    cardSource: (heuristic: number, ai: number) =>
+      [heuristic ? `规则 ${heuristic}` : "", ai ? `AI ${ai}` : ""].filter(Boolean).join(" · "),
+    cardWhy: "为什么这么判：",
+    topSenders: "主要是这些发件人",
+    moreSenders: (n: number) => `另有 ${n} 个发件人`,
+    cardShowAll: (n: number) => `查看全部 ${n} 封`,
+    cardHideAll: "收起",
+    senderCardTitle: "同一个发件人发来的",
+    overflow: (cards: number, mail: number) => `还有 ${cards} 个小批，共 ${mail} 封`,
+    personalTitle: (n: number) => `需要你亲自处理（${n}）`,
+    personalHint: "回复、等待、提醒这类事 AI 替不了，也不该替你按批量按钮。",
+    dismiss: "忽略",
+    dismissAll: "全部忽略",
+    unsuggested: (n: number) => `还有 ${n} 封没被 AI 看过`,
+    unsuggestedHint: "先跑一遍规则（免费），规则判不了的才交给模型。",
+    startTriage: "开始分诊",
+    running: "正在分诊…",
+    cancelTriage: "停止",
+    phaseHeuristic: "正在用规则过一遍（免费）",
+    phaseAi: "正在问模型",
+    spent: (usd: string) => `本月已花 ${usd}`,
+    budgetReached: "本月预算已用完，分诊停在这里。",
+    unconfigured: "没有配置模型密钥：规则那层已经跑完，剩下的不会送出去。",
+    stoppedError: (reason: string) => `分诊停下了：${reason}`,
+    cancelled: "已停止。",
+    doneAll: "分诊完成。",
+    busy: "处理中…",
+    partial: (failed: number) => `${failed} 封没有成功，仍留在队列里。`,
+    noCards: "没有可以批量执行的批次。",
   },
 
   onboarding: {
@@ -143,6 +193,13 @@ export const zh = {
       acceptDisabled: "M2 开放",
       dismiss: "忽略",
       dismissDisabled: "M2 开放",
+      // 这条建议不是"批量动作"能替的事：回复要用户自己写，提醒要选时间。
+      notBatchable: (action: string) =>
+        action === "reply"
+          ? "回复需要你自己写，AI 不代笔"
+          : action === "remind"
+            ? "提醒要你自己选时间"
+            : "这条建议需要你自己处理",
       actions: {
         reply: "建议回复",
         wait: "建议等一等",
@@ -169,6 +226,9 @@ export const zh = {
 
   reader: {
     title: "阅读",
+    unsubscribeOffer: "此发件人提供退订",
+    unsubscribeByMail: "发邮件退订",
+    unsubscribeOneClick: "支持一键退订",
     aiNotConfigured: "AI 未配置",
     emptyTitle: "没有选中邮件",
     emptyDetail: "从中间一列选一封，正文会出现在这里。",

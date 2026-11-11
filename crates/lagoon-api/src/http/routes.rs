@@ -253,6 +253,11 @@ pub async fn message_body(
                 },
                 None => None,
             };
+            // The publisher's way out, if it offered one. It is attacker-written
+            // text, so it is passed through verbatim and the client is the only
+            // thing that decides whether to show it (see mime::unsubscribe).
+            let unsubscribe_links =
+                store::messages::unsubscribe_links(connection, account_id, &remote_id_for_read)?;
             Ok(BodyOutcome::Found(wire::MessageBody {
                 remote_id: remote_id_for_read.clone(),
                 subject: header.as_ref().and_then(|row| row.subject.clone()),
@@ -272,6 +277,7 @@ pub async fn message_body(
                 has_more: stored.has_more,
                 to: stored.to,
                 cc: stored.cc,
+                unsubscribe_links,
             }))
         })
         .await;
@@ -348,6 +354,16 @@ async fn fetch_and_answer(state: &AppState, account_id: Uuid, remote_id: &str) -
         .ok()
         .flatten();
 
+    let remote_id_for_links = remote_id.to_owned();
+    let unsubscribe_links = state
+        .db
+        .read(move |connection| {
+            store::messages::unsubscribe_links(connection, account_id, &remote_id_for_links)
+        })
+        .await
+        .ok()
+        .flatten();
+
     respond::json(
         StatusCode::OK,
         &wire::MessageBody {
@@ -369,6 +385,7 @@ async fn fetch_and_answer(state: &AppState, account_id: Uuid, remote_id: &str) -
             has_more: fetched.has_more,
             to: fetched.to,
             cc: fetched.cc,
+            unsubscribe_links,
         },
     )
 }

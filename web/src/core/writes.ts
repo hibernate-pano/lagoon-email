@@ -24,6 +24,8 @@ import { describeWriteFailure } from "./errors";
 import type {
   ActionsResponse,
   BulkResponse,
+  DecisionBulkResponse,
+  TriageStatus,
   EmptyTrashResponse,
   PurgeResponse,
   StateChangeResponse,
@@ -233,4 +235,67 @@ export async function fetchActions(
  */
 export function allows(gate: boolean | null | undefined): boolean {
   return gate !== false;
+}
+
+/* ------------------------------------------------------- R6 · triage batch --- */
+
+/**
+ * Where the two-layer batch is, plus the two counts that say how much mail is
+ * still unjudged.
+ *
+ * `ok:false` here is not an empty mailbox: it is "the answer is unknown", and
+ * the board shows that instead of a zero (P3).
+ */
+export async function fetchTriageStatus(accountId: string): Promise<TriageStatus | WriteFailure> {
+  const result = await apiCall<TriageStatus>({
+    method: "GET",
+    path: "/api/triage/status",
+    query: { accountId },
+  });
+  if (result.kind === "ok") return result.data;
+  if (result.kind === "http") return failure(result.code, result.status);
+  return failure(null, 0, "transport");
+}
+
+/**
+ * Start the batch. 202 either way - a second call while a run is going answers
+ * the same run instead of starting another, which is why this is safe to retry.
+ */
+export async function startTriage(accountId: string): Promise<TriageStatus | WriteFailure> {
+  const result = await post<TriageStatus>("/api/triage/run", { accountId });
+  if (result.kind === "fail") return transportFailure(result.message);
+  if (result.kind === "http") return failure(result.code, result.status);
+  return result.data;
+}
+
+export async function cancelTriage(accountId: string): Promise<TriageStatus | WriteFailure> {
+  const result = await post<TriageStatus>("/api/triage/cancel", { accountId });
+  if (result.kind === "fail") return transportFailure(result.message);
+  if (result.kind === "http") return failure(result.code, result.status);
+  return result.data;
+}
+
+/**
+ * Record what the user decided about a set of suggestions.
+ *
+ * Called *after* the mails really moved. Recording first would tell the user
+ * "12 handled" with the mail still in the inbox.
+ */
+export async function recordDecisions(
+  ids: number[],
+  accountId: string,
+  decision: "accepted" | "dismissed",
+): Promise<{ ok: true; decided: number; items: DecisionBulkResponse["items"] } | WriteFailure> {
+  if (ids.length === 0) return { ok: true, decided: 0, items: [] };
+  const result = await post<DecisionBulkResponse>("/api/advice/decisions-bulk", { accountId }, {
+    ids,
+    decision,
+  });
+  if (result.kind === "fail") return transportFailure(result.message);
+  if (result.kind === "http") return failure(result.code, result.status);
+  return {
+    ok: true,
+    decided: result.data.decided ?? 0,
+    items: result.data.items ?? [],
+  };
 }

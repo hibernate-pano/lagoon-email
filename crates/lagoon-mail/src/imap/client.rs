@@ -65,7 +65,7 @@ pub struct ImapFlagRow {
     pub flags: Vec<String>,
 }
 
-pub const DEFAULT_HEADER_FIELDS: [&str; 7] = [
+pub const DEFAULT_HEADER_FIELDS: [&str; 8] = [
     "FROM",
     "SUBJECT",
     "DATE",
@@ -73,6 +73,9 @@ pub const DEFAULT_HEADER_FIELDS: [&str; 7] = [
     "IN-REPLY-TO",
     "REFERENCES",
     "LIST-UNSUBSCRIBE",
+    // RFC 8058's companion header. Fetched so the one-click fact can be
+    // recorded; nothing acts on it (see mime::unsubscribe for why).
+    "LIST-UNSUBSCRIBE-POST",
 ];
 
 /// v3 `IMAPClient.uidsPerCommand`: the session is strictly serial, so a bulk

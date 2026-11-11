@@ -116,6 +116,19 @@ export interface MessageBody {
   hasMore: boolean;
   to: string[];
   cc: string[];
+  /**
+   * The publisher's `List-Unsubscribe` destinations, JSON text (`[]` when there
+   * are none). Parsed on the server; this client only decides how to show them.
+   */
+  unsubscribeLinks?: string | null;
+}
+
+export type UnsubscribeKind = "https" | "mailto";
+
+export interface UnsubscribeLink {
+  url: string;
+  kind: UnsubscribeKind;
+  oneClick?: boolean;
 }
 
 export type BriefingGroupId =
@@ -298,4 +311,65 @@ export interface UndoBulkItem {
 export interface UndoBulkResponse {
   items: UndoBulkItem[];
   undone: number;
+}
+
+/* ---------------------------------------------------------------- R6 · triage ---- */
+
+/**
+ * Where the two-layer triage batch is.
+ *
+ * Every count is a server query result, not a client counter: the same
+ * predicate drives "310 left" in the UI and the worker's next pass, so the two
+ * cannot disagree (constitution P3).
+ */
+export type TriageRunState =
+  | "running"
+  | "done"
+  | "stopped-budget"
+  | "stopped-unconfigured"
+  | "stopped-error"
+  | "cancelled";
+
+export type TriagePhase = "heuristic" | "ai";
+
+export interface TriageRun {
+  startedAt: ISO8601;
+  phase?: TriagePhase | null;
+  target: number;
+  done: number;
+  failed: number;
+  state: TriageRunState;
+  lastError?: string | null;
+}
+
+export interface TriageStatus {
+  configured: boolean;
+  running: boolean;
+  suggested: number;
+  unsuggested: number;
+  bySource: { heuristic: number; ai: number };
+  spendMonthMicroUsd: number;
+  capMonthMicroUsd: number;
+  run?: TriageRun | null;
+}
+
+/** Which layer produced a suggestion. The card shows this: it is not ours to hide. */
+export type AdviceSource = "heuristic" | "ai";
+
+export interface DecisionBulkResponse {
+  items: { id: number; ok: boolean; decision?: string; errorCode?: string }[];
+  decided: number;
+}
+
+/** `GET /api/senders` — the ranking the decision board uses for sender cards. */
+export interface SenderSummary {
+  address: string;
+  displayName?: string | null;
+  totalCount: number;
+  unreadCount: number;
+  latestAt: ISO8601;
+}
+
+export interface SenderListResponse {
+  senders: SenderSummary[];
 }

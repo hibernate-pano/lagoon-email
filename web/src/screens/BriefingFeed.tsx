@@ -75,6 +75,13 @@ export interface BriefingFeedProps {
   onRowSelect: (remoteId: string, event: { shiftKey: boolean; metaKey: boolean }) => void;
   writes: WriteBridge;
   onPurge: (remoteId: string) => void;
+  /**
+   * Carry out one suggestion from its row. The caller owns the write and the
+   * decision recording; this surface only asks.
+   */
+  onAcceptAdvice?: (record: AdviceRecord) => void;
+  onDismissAdvice?: (record: AdviceRecord) => void;
+  adviceBusy?: boolean;
   onOpenHistory: () => void;
 }
 
@@ -161,7 +168,18 @@ export function BriefingFeed(props: BriefingFeedProps): ReactNode {
                               thirdLine={reason ?? item.message.snippet}
                               advice={
                                 advice && advice.advice.action !== "nothing" ? (
-                                  <AdviceStrip record={advice} />
+                                  <AdviceStrip
+                                    record={advice}
+                                    busy={props.adviceBusy}
+                                    onAccept={
+                                      props.onAcceptAdvice &&
+                                      (() => props.onAcceptAdvice?.(advice))
+                                    }
+                                    onDismiss={
+                                      props.onDismissAdvice &&
+                                      (() => props.onDismissAdvice?.(advice))
+                                    }
+                                  />
                                 ) : null
                               }
                               opened={props.openedId === item.message.remoteId}

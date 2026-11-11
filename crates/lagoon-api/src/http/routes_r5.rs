@@ -192,6 +192,18 @@ impl WriteVerb {
         !matches!(self, WriteVerb::SetPinned(_))
     }
 
+    /// Whether acting on the mail settles a pending suggestion about it.
+    ///
+    /// Archive and trash do: the user just did the thing the queue was going to
+    /// suggest. Marking read does not - reading a mail is not a triage
+    /// decision, and treating it as one would empty the queue by opening it.
+    fn consumes_pending_advice(&self) -> bool {
+        matches!(
+            self,
+            WriteVerb::Archive | WriteVerb::Trash | WriteVerb::PermanentDelete
+        )
+    }
+
     async fn remote(
         &self,
         provider: &dyn MailWriteProvider,
@@ -291,6 +303,20 @@ async fn run_message_action(
     let action_id: Option<i64> =
         match verb.local(&context.connection, context.account_id, &remote_id) {
             Ok(previous) => {
+                // Acting on the mail *is* the decision (see store::advice).
+                // Leaving the suggestion pending would put the same mail back
+                // in the queue tomorrow and inflate every "still to decide"
+                // count. A failure here is logged, not fatal: the mail action
+                // itself already succeeded.
+                if verb.consumes_pending_advice() {
+                    if let Err(error) = store::advice::accept_pending_for_message(
+                        &context.connection,
+                        context.account_id,
+                        &remote_id,
+                    ) {
+                        tracing::warn!(err = %error, remoteId = %remote_id, "actions.adviceConsumeFailed");
+                    }
+                }
                 let payload = verb.audit_payload(&remote_id, verb.touches_remote(), previous);
                 match verb.audit_kind() {
                     Some(kind) => {
@@ -581,6 +607,15 @@ async fn run_bulk(
         let mut item = json!({ "remoteId": remote_id, "ok": true });
         match verb.local(&context.connection, account_id, remote_id) {
             Ok(previous) => {
+                if verb.consumes_pending_advice() {
+                    if let Err(error) = store::advice::accept_pending_for_message(
+                        &context.connection,
+                        account_id,
+                        remote_id,
+                    ) {
+                        tracing::warn!(err = %error, remoteId = %remote_id, "bulk.adviceConsumeFailed");
+                    }
+                }
                 if let Some(kind) = verb.audit_kind() {
                     let payload = verb.audit_payload(remote_id, true, previous);
                     match write::record_action(&context.connection, account_id, kind, &payload) {

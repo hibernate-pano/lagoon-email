@@ -77,6 +77,10 @@ pub async fn senders(State(state): State<AppState>, uri: Uri) -> Response {
     let query_text = query::get(&params, "q")
         .map(|raw| raw.trim().to_owned())
         .filter(|raw| !raw.is_empty());
+    // `pending=true` counts only mail still waiting for a decision. The
+    // default stays exactly as it was: this ranking is also the "who writes to
+    // me most" answer, and archived mail belongs in it.
+    let pending_only = query::get(&params, "pending") == Some("true");
 
     let outcome = state
         .db
@@ -85,8 +89,16 @@ pub async fn senders(State(state): State<AppState>, uri: Uri) -> Response {
                 if !store::accounts::exists(connection, account_id)? {
                     return Ok(None);
                 }
-                let rows =
-                    store::senders::ranking(connection, account_id, limit, query_text.as_deref())?;
+                let rows = if pending_only {
+                    store::senders::pending_ranking(
+                        connection,
+                        account_id,
+                        limit,
+                        query_text.as_deref(),
+                    )?
+                } else {
+                    store::senders::ranking(connection, account_id, limit, query_text.as_deref())?
+                };
                 Ok(Some(
                     rows.into_iter()
                         .map(|row| wire_r2::SenderSummary {
