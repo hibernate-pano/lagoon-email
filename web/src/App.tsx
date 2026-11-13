@@ -14,7 +14,7 @@
  * The rule that keeps this honest: a failure never leaves the screen showing the
  * thing it claimed to do. Rollback happens before the banner is rendered.
  */
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   AdviceRecord,
   AdviceResponse,
@@ -507,6 +507,31 @@ export function App(): ReactNode {
     return map;
   }, [serverRows]);
 
+  /**
+   * When a run stops, read the advice list once more.
+   *
+   * The poll already refreshes `triage/status`, but the suggestions the run
+   * produced arrive as `advice` rows, and nothing else would fetch them until
+   * the next manual action. Without this the board stays empty after a
+   * successful batch - which is worse than wrong numbers: it looks like the
+   * work was lost.
+   */
+  const triageWasRunning = useRef(false);
+  // The refresh callback is read through a ref so this effect depends only on
+  // the run state: `advice` is a fresh object every render, and putting it in
+  // the dependency list would re-run this check on every render for nothing.
+  const refreshAdviceRef = useRef(advice.refresh);
+  refreshAdviceRef.current = advice.refresh;
+  useEffect(() => {
+    const phase = triage.outcome.phase;
+    const running =
+      phase === "ready" || phase === "empty" ? triage.outcome.data.running : false;
+    if (triageWasRunning.current && !running) {
+      refreshAdviceRef.current();
+    }
+    triageWasRunning.current = running;
+  }, [triage.outcome]);
+
   const unsuggestedCount = useMemo(() => {
     if (triage.outcome.phase === "ready" || triage.outcome.phase === "empty") {
       return triage.outcome.data.unsuggested;
@@ -819,6 +844,15 @@ export function App(): ReactNode {
     setToast({ id: Date.now(), text });
   }
 
+  /**
+   * Start the batch, then keep the screen in step with it.
+   *
+   * STARTING IS ONLY HALF THE JOB. The cards are built from `advice`, and the
+   * progress line from `triage/status`; refreshing only the latter produced a
+   * screen that said 「还有 108 封没被看过」 with 322 suggestions already in
+   * the database. While a run is in flight the poll keeps both moving; when it
+   * stops, one last read of each closes the gap.
+   */
   async function startTriageRun() {
     if (!accountId) return;
     const result = await startTriage(accountId);
@@ -827,6 +861,7 @@ export function App(): ReactNode {
       return;
     }
     triage.refresh();
+    advice.refresh();
   }
 
   async function cancelTriageRun() {
@@ -837,6 +872,7 @@ export function App(): ReactNode {
       return;
     }
     triage.refresh();
+    advice.refresh();
   }
 
   function requestEmptyTrash() {

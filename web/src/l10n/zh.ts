@@ -73,6 +73,9 @@ export const zh = {
     emptyNoAdvice: "还没有任何建议。先让规则过一遍邮件。",
     emptyAllDone: "没有待决定的事。",
     emptyAllDoneHint: "队列清空了；新邮件到达后会自动重新分诊。",
+    // 「还没看过」和「看过了没有要做的」是两件事，不能共用一句话。
+    emptyNotJudged: (n: number) => `还有 ${n} 封邮件没被 AI 看过。`,
+    emptyNotJudgedHint: "它们不是「没有要决定的事」，只是还没被判断过。先跑一遍分诊。",
     actionArchive: "归档这批",
     actionDelete: "移到废纸篓",
     // Every destructive verb states its own reversibility.
@@ -105,6 +108,7 @@ export const zh = {
     spent: (usd: string) => `本月已花 ${usd}`,
     budgetReached: "本月预算已用完，分诊停在这里。",
     unconfigured: "没有配置模型密钥：规则那层已经跑完，剩下的不会送出去。",
+    unconfiguredBeforeRun: "没有配置模型密钥：模型那层不会送出请求，但规则那层还能免费跑一遍。",
     stoppedError: (reason: string) => `分诊停下了：${reason}`,
     cancelled: "已停止。",
     doneAll: "分诊完成。",

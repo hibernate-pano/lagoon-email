@@ -162,13 +162,27 @@ export function DecisionsBoard(props: DecisionsBoardProps): ReactNode {
     }
     const empty = board.cards.length === 0 && board.personal.length === 0;
     if (empty) {
-      // Three different facts, three different sentences: never one "nothing".
+      // Three different facts, three different sentences - and the middle one
+      // used to be missing: "nothing to decide" while the progress line said
+      // "430 unjudged" is a contradiction the user can see with their own eyes.
+      // Nothing judged yet is not an empty queue; it is a queue nobody has read.
       const noAccount = advice.outcome.phase === "empty" && props.unsuggested === 0 && messages.size === 0;
+      const notJudgedYet = props.unsuggested > 0;
       return (
         <div className="decisions-empty">
-          <h2>{noAccount ? t.decisions.emptyNoAccount : t.decisions.emptyAllDone}</h2>
+          <h2>
+            {noAccount
+              ? t.decisions.emptyNoAccount
+              : notJudgedYet
+                ? t.decisions.emptyNotJudged(props.unsuggested)
+                : t.decisions.emptyAllDone}
+          </h2>
           <p className="muted">
-            {noAccount ? t.decisions.unsuggestedHint : t.decisions.emptyAllDoneHint}
+            {noAccount
+              ? t.decisions.unsuggestedHint
+              : notJudgedYet
+                ? t.decisions.emptyNotJudgedHint
+                : t.decisions.emptyAllDoneHint}
           </p>
         </div>
       );
@@ -291,7 +305,14 @@ function TriageBar(props: {
   return (
     <div className={"triage-bar" + (needsAttention ? " warn" : "")}>
       <span>{summary}</span>
-      {!triage.configured ? <span className="muted">{t.decisions.unconfigured}</span> : null}
+      {/* The sentence depends on what actually happened: "the rules layer is
+        done" is only true after it ran. Before that it is "the rules layer can
+        still run, for free". */}
+    {!triage.configured ? (
+      <span className="muted">
+        {triage.bySource.heuristic > 0 ? t.decisions.unconfigured : t.decisions.unconfiguredBeforeRun}
+      </span>
+    ) : null}
       {state === "stopped-budget" ? <span className="chip warn">{t.decisions.budgetReached}</span> : null}
       {state === "stopped-error" && run?.lastError ? (
         <span className="chip err">{t.decisions.stoppedError(run.lastError)}</span>
