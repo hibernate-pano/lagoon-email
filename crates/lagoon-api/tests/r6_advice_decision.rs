@@ -17,10 +17,10 @@ mod support;
 use rusqlite::params;
 use serde_json::Value;
 
+use support::fixtures::Fixtures;
 use support::http;
 use support::seed::Seed;
 use support::server::TestServer;
-use support::fixtures::Fixtures;
 
 /// Insert a pending suggestion for a mail that already exists in the seed.
 fn insert_advice(server: &TestServer, seed: &Seed, remote_id: &str, action: &str) -> i64 {
@@ -146,14 +146,23 @@ async fn deciding_a_pending_advice_records_it_and_writes_no_mail() {
         "{}/api/advice/{}/decision?accountId={}",
         server.base_url, id, seed.account_id
     );
-    let observed = post_json(&client, &url, &server.auth_headers(), r#"{"decision":"accepted"}"#).await;
+    let observed = post_json(
+        &client,
+        &url,
+        &server.auth_headers(),
+        r#"{"decision":"accepted"}"#,
+    )
+    .await;
     assert_eq!(observed.status, 200, "{:?}", observed.body);
     assert_eq!(observed.body["id"], id);
     assert_eq!(observed.body["decision"], "accepted");
 
     let (decision, decided_at) = decision_of(&server, id);
     assert_eq!(decision, "accepted");
-    assert!(decided_at.is_some(), "the timestamp is the evidence it happened");
+    assert!(
+        decided_at.is_some(),
+        "the timestamp is the evidence it happened"
+    );
 
     // ★ A decision changes no mail. This is the constitution in one assertion.
     let connection = support::server::open_read_write(&server.db_path);
@@ -181,15 +190,30 @@ async fn deciding_twice_is_idempotent_and_keeps_the_first_timestamp() {
         server.base_url, id, seed.account_id
     );
 
-    let first = post_json(&client, &url, &server.auth_headers(), r#"{"decision":"accepted"}"#).await;
+    let first = post_json(
+        &client,
+        &url,
+        &server.auth_headers(),
+        r#"{"decision":"accepted"}"#,
+    )
+    .await;
     assert_eq!(first.status, 200);
     let (_, first_at) = decision_of(&server, id);
 
-    let second = post_json(&client, &url, &server.auth_headers(), r#"{"decision":"accepted"}"#).await;
+    let second = post_json(
+        &client,
+        &url,
+        &server.auth_headers(),
+        r#"{"decision":"accepted"}"#,
+    )
+    .await;
     assert_eq!(second.status, 200, "a retry is not a conflict");
     let (decision, second_at) = decision_of(&server, id);
     assert_eq!(decision, "accepted");
-    assert_eq!(first_at, second_at, "the first timestamp is the one that happened");
+    assert_eq!(
+        first_at, second_at,
+        "the first timestamp is the one that happened"
+    );
 }
 
 #[tokio::test]
@@ -205,7 +229,13 @@ async fn pending_is_not_a_legal_decision() {
         server.base_url, id, seed.account_id
     );
 
-    let observed = post_json(&client, &url, &server.auth_headers(), r#"{"decision":"pending"}"#).await;
+    let observed = post_json(
+        &client,
+        &url,
+        &server.auth_headers(),
+        r#"{"decision":"pending"}"#,
+    )
+    .await;
     assert_eq!(observed.status, 400);
     assert_eq!(observed.body["error"], "invalid-decision");
     // Un-deciding would reopen the row for the worker to overwrite.
@@ -223,7 +253,13 @@ async fn an_unknown_advice_id_is_a_404() {
         "{}/api/advice/999999/decision?accountId={}",
         server.base_url, seed.account_id
     );
-    let observed = post_json(&client, &url, &server.auth_headers(), r#"{"decision":"accepted"}"#).await;
+    let observed = post_json(
+        &client,
+        &url,
+        &server.auth_headers(),
+        r#"{"decision":"accepted"}"#,
+    )
+    .await;
     assert_eq!(observed.status, 404);
     assert_eq!(observed.body["error"], "unknown-advice");
 }
@@ -243,9 +279,7 @@ async fn a_bulk_decision_reports_each_row() {
         "{}/api/advice/decisions-bulk?accountId={}",
         server.base_url, seed.account_id
     );
-    let body = format!(
-        r#"{{"ids":[{first},{second},999999],"decision":"dismissed"}}"#
-    );
+    let body = format!(r#"{{"ids":[{first},{second},999999],"decision":"dismissed"}}"#);
     let observed = post_json(&client, &url, &server.auth_headers(), &body).await;
     assert_eq!(observed.status, 200, "{:?}", observed.body);
     // Partial success is a normal outcome: two landed, one did not exist.
@@ -274,7 +308,13 @@ async fn an_empty_or_oversized_bulk_is_refused_before_anything_is_written() {
         server.base_url, seed.account_id
     );
 
-    let observed = post_json(&client, &url, &server.auth_headers(), r#"{"ids":[],"decision":"accepted"}"#).await;
+    let observed = post_json(
+        &client,
+        &url,
+        &server.auth_headers(),
+        r#"{"ids":[],"decision":"accepted"}"#,
+    )
+    .await;
     assert_eq!(observed.status, 400);
     assert_eq!(observed.body["error"], "empty-ids");
 
@@ -298,7 +338,13 @@ async fn an_unknown_account_is_a_404_and_writes_nothing() {
         "{}/api/advice/{}/decision?accountId=99999999-9999-4999-8999-999999999999",
         server.base_url, id
     );
-    let observed = post_json(&client, &url, &server.auth_headers(), r#"{"decision":"accepted"}"#).await;
+    let observed = post_json(
+        &client,
+        &url,
+        &server.auth_headers(),
+        r#"{"decision":"accepted"}"#,
+    )
+    .await;
     assert_eq!(observed.status, 404);
     assert_eq!(observed.body["error"], "unknown-account");
     assert_eq!(decision_of(&server, id).0, "pending");
@@ -408,7 +454,11 @@ async fn marking_read_does_not_consume_a_suggestion() {
         server.base_url, remote_id, seed.account_id
     );
     let observed = post_json(&client, &url, &server.auth_headers(), "").await;
-    assert!(observed.status == 204 || observed.status == 200, "{}", observed.status);
+    assert!(
+        observed.status == 204 || observed.status == 200,
+        "{}",
+        observed.status
+    );
 
     // Reading a mail is not a triage decision; treating it as one would empty
     // the queue by opening it.

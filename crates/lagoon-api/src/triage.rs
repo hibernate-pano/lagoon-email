@@ -300,7 +300,10 @@ impl TriageWorker {
         // because a batch over a few hundred mails takes minutes.
         tokio::spawn(async move {
             batch.execute().await;
-            running.lock().expect("triage running lock").remove(&account_id);
+            running
+                .lock()
+                .expect("triage running lock")
+                .remove(&account_id);
         });
         Ok(())
     }
@@ -505,9 +508,8 @@ impl Batch {
     /// one: retrying inside the run is how a broken provider becomes a loop.
     fn next_ai_batch(&self, seen: &HashSet<String>) -> Result<Vec<TriageCandidate>, String> {
         let connection = db::open_writable(&self.db_path).map_err(|error| error.to_string())?;
-        let candidates =
-            store::advice::triage_candidates(&connection, self.account_id, PASS_SIZE)
-                .map_err(|error| error.to_string())?;
+        let candidates = store::advice::triage_candidates(&connection, self.account_id, PASS_SIZE)
+            .map_err(|error| error.to_string())?;
         Ok(candidates
             .into_iter()
             .filter(|candidate| !seen.contains(&candidate.remote_id))
@@ -525,10 +527,8 @@ impl Batch {
             let ai = Arc::clone(&self.ai);
             set.spawn(async move { classify_one(ai, candidate).await });
             if set.len() >= AI_CONCURRENCY {
-                if let Some(joined) = set.join_next().await {
-                    if let Ok(outcome) = joined {
-                        outcomes.push(outcome);
-                    }
+                if let Some(Ok(outcome)) = set.join_next().await {
+                    outcomes.push(outcome);
                 }
             }
         }

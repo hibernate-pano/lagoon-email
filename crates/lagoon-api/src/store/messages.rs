@@ -477,5 +477,8 @@ pub fn unsubscribe_links(
     let raw: Option<String> = row.get(0)?;
     // An older row may hold nothing usable; the reader treats `[]` and NULL the
     // same, so one normalisation here keeps both callers simple.
-    Ok(Some(raw.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "[]".to_owned())))
+    Ok(Some(
+        raw.filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "[]".to_owned()),
+    ))
 }

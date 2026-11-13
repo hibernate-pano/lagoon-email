@@ -300,50 +300,53 @@ async fn run_message_action(
             return provider_error_response(error, &remote_id);
         }
     }
-    let action_id: Option<i64> =
-        match verb.local(&context.connection, context.account_id, &remote_id) {
-            Ok(previous) => {
-                // Acting on the mail *is* the decision (see store::advice).
-                // Leaving the suggestion pending would put the same mail back
-                // in the queue tomorrow and inflate every "still to decide"
-                // count. A failure here is logged, not fatal: the mail action
-                // itself already succeeded.
-                if verb.consumes_pending_advice() {
-                    if let Err(error) = store::advice::accept_pending_for_message(
+    let action_id: Option<i64> = match verb.local(
+        &context.connection,
+        context.account_id,
+        &remote_id,
+    ) {
+        Ok(previous) => {
+            // Acting on the mail *is* the decision (see store::advice).
+            // Leaving the suggestion pending would put the same mail back
+            // in the queue tomorrow and inflate every "still to decide"
+            // count. A failure here is logged, not fatal: the mail action
+            // itself already succeeded.
+            if verb.consumes_pending_advice() {
+                if let Err(error) = store::advice::accept_pending_for_message(
+                    &context.connection,
+                    context.account_id,
+                    &remote_id,
+                ) {
+                    tracing::warn!(err = %error, remoteId = %remote_id, "actions.adviceConsumeFailed");
+                }
+            }
+            let payload = verb.audit_payload(&remote_id, verb.touches_remote(), previous);
+            match verb.audit_kind() {
+                Some(kind) => {
+                    match write::record_action(
                         &context.connection,
                         context.account_id,
-                        &remote_id,
+                        kind,
+                        &payload,
                     ) {
-                        tracing::warn!(err = %error, remoteId = %remote_id, "actions.adviceConsumeFailed");
-                    }
-                }
-                let payload = verb.audit_payload(&remote_id, verb.touches_remote(), previous);
-                match verb.audit_kind() {
-                    Some(kind) => {
-                        match write::record_action(
-                            &context.connection,
-                            context.account_id,
-                            kind,
-                            &payload,
-                        ) {
-                            Ok(id) => Some(id),
-                            Err(error) => {
-                                tracing::error!(err = %error, "actions.auditFailed");
-                                return respond::error(
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "internal-error",
-                                );
-                            }
+                        Ok(id) => Some(id),
+                        Err(error) => {
+                            tracing::error!(err = %error, "actions.auditFailed");
+                            return respond::error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "internal-error",
+                            );
                         }
                     }
-                    None => None,
                 }
+                None => None,
             }
-            Err(error) => {
-                tracing::error!(err = %error, "actions.localFailed");
-                return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
-            }
-        };
+        }
+        Err(error) => {
+            tracing::error!(err = %error, "actions.localFailed");
+            return respond::error(StatusCode::INTERNAL_SERVER_ERROR, "internal-error");
+        }
+    };
     respond::json(
         StatusCode::OK,
         &json!({ "ok": true, "remoteId": remote_id, "remote": true, "actionId": action_id }),

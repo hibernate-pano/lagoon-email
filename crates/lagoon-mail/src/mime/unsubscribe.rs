@@ -165,7 +165,8 @@ pub fn is_one_click(raw: &str) -> bool {
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>()
         .to_ascii_lowercase();
-    normalised.contains("list-unsubscribe=one-click") || normalised.contains("list-unsubscribe=oneclick")
+    normalised.contains("list-unsubscribe=one-click")
+        || normalised.contains("list-unsubscribe=oneclick")
 }
 
 /// Split on commas that are outside angle brackets.
@@ -302,7 +303,10 @@ mod tests {
             let parsed = parse_list_unsubscribe(raw);
             // `<https://>` has a scheme and no host: it is dropped by the
             // host-less check below, not by panicking.
-            assert!(parsed.links.is_empty() || parsed.links[0].url.len() > 8, "{raw:?}");
+            assert!(
+                parsed.links.is_empty() || parsed.links[0].url.len() > 8,
+                "{raw:?}"
+            );
         }
     }
 
@@ -355,8 +359,14 @@ mod tests {
         // The raw quote must appear escaped, never bare: `\"` is legal inside a
         // JSON string, a lone `"` ends it early and the whole column is corrupt.
         assert!(json.contains("\\\""), "the quote must be escaped: {json}");
-        assert!(!json.contains("weird\\path"), "the backslash must be escaped: {json}");
-        assert!(json.contains("weird\\\\path"), "the backslash must be escaped: {json}");
+        assert!(
+            !json.contains("weird\\path"),
+            "the backslash must be escaped: {json}"
+        );
+        assert!(
+            json.contains("weird\\\\path"),
+            "the backslash must be escaped: {json}"
+        );
     }
 
     #[test]

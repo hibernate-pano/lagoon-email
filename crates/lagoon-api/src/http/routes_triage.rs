@@ -93,7 +93,10 @@ fn status_response(state: &AppState, account_id: Uuid) -> Response {
 
 /// Turn the worker's answer into the route's answer, for the two routes that
 /// change something.
-fn mutation_response(outcome: Result<Option<TriageStatus>, crate::db::DbError>, label: &str) -> Response {
+fn mutation_response(
+    outcome: Result<Option<TriageStatus>, crate::db::DbError>,
+    label: &str,
+) -> Response {
     match outcome {
         Ok(Some(status)) => respond::json(StatusCode::ACCEPTED, &wire(&status)),
         Ok(None) => respond::error(StatusCode::NOT_FOUND, "unknown-account"),

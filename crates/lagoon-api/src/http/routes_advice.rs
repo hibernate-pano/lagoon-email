@@ -87,8 +87,7 @@ pub async fn decision(
 
     let outcome = state
         .write(move |connection| {
-            store::advice::decide(connection, account_id, id, decision)
-                .map_err(|error| StoreError::Sqlite(error))
+            store::advice::decide(connection, account_id, id, decision).map_err(StoreError::Sqlite)
         })
         .await;
     match outcome {
@@ -143,14 +142,12 @@ pub async fn decisions_bulk(
             for id in ids {
                 match store::advice::decide(connection, account_id, id, decision) {
                     Ok(true) => items.push(json!({ "id": id, "ok": true, "decision": decision })),
-                    Ok(false) => items.push(
-                        json!({ "id": id, "ok": false, "errorCode": "unknown-advice" }),
-                    ),
+                    Ok(false) => {
+                        items.push(json!({ "id": id, "ok": false, "errorCode": "unknown-advice" }))
+                    }
                     Err(error) => {
                         tracing::error!(err = %error, "advice.bulkDecideFailed");
-                        items.push(
-                            json!({ "id": id, "ok": false, "errorCode": "internal-error" }),
-                        );
+                        items.push(json!({ "id": id, "ok": false, "errorCode": "internal-error" }));
                     }
                 }
             }

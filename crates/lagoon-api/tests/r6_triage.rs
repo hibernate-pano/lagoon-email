@@ -27,10 +27,10 @@ use lagoon_api::ai::fake::ScriptedTransport;
 use lagoon_api::ai::gateway::AiGateway;
 use lagoon_api::ai::transport::{AiReply, AiTransport};
 
+use support::fixtures::Fixtures;
 use support::http;
 use support::seed::Seed;
 use support::server::TestServer;
-use support::fixtures::Fixtures;
 
 /// The env var the shipped `providers.json` reads the key from.
 const KEY_ENV: &str = "LLM_PROVIDER_PRIMARY_API_KEY";
@@ -49,13 +49,15 @@ fn gateway_with_budget(
         AiConfig::embedded().expect("the shipped config parses"),
         Arc::clone(&transport) as Arc<dyn AiTransport>,
     )
-    .with_keys(Arc::new(move |name| {
-        if name == KEY_ENV {
-            owned.clone()
-        } else {
-            None
-        }
-    }));
+    .with_keys(Arc::new(
+        move |name| {
+            if name == KEY_ENV {
+                owned.clone()
+            } else {
+                None
+            }
+        },
+    ));
     if cap_usd <= 0.0 {
         Arc::new(gateway)
     } else {
@@ -144,11 +146,7 @@ fn clear_messages(server: &TestServer) {
         .expect("clear messages");
 }
 
-async fn get_status(
-    client: &http::HttpClient,
-    server: &TestServer,
-    seed: &Seed,
-) -> Value {
+async fn get_status(client: &http::HttpClient, server: &TestServer, seed: &Seed) -> Value {
     let url = format!(
         "{}/api/triage/status?accountId={}",
         server.base_url, seed.account_id
@@ -164,7 +162,10 @@ async fn post(
     seed: &Seed,
     path: &str,
 ) -> http::Observed {
-    let url = format!("{}/api/triage/{}?accountId={}", server.base_url, path, seed.account_id);
+    let url = format!(
+        "{}/api/triage/{}?accountId={}",
+        server.base_url, path, seed.account_id
+    );
     http::request(client, "POST", &url, &server.auth_headers()).await
 }
 
@@ -173,11 +174,7 @@ async fn post(
 /// The worker runs on its own task, so a test must wait for it rather than
 /// sleep an arbitrary amount: the assertion is about the end state, and polling
 /// for it is the only honest way to reach it.
-async fn wait_for_terminal(
-    client: &http::HttpClient,
-    server: &TestServer,
-    seed: &Seed,
-) -> Value {
+async fn wait_for_terminal(client: &http::HttpClient, server: &TestServer, seed: &Seed) -> Value {
     for _ in 0..400 {
         let status = get_status(client, server, seed).await;
         let state = status["run"]["state"].as_str().unwrap_or("");
@@ -186,7 +183,10 @@ async fn wait_for_terminal(
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    panic!("the run never left `running`: {:?}", get_status(client, server, seed).await);
+    panic!(
+        "the run never left `running`: {:?}",
+        get_status(client, server, seed).await
+    );
 }
 
 fn heuristic_count(server: &TestServer, seed: &Seed) -> i64 {
@@ -207,7 +207,6 @@ fn usage_rows(server: &TestServer) -> i64 {
         .expect("count usage")
 }
 
-
 /* ---------------------------------------------------------------- reads ---- */
 
 #[tokio::test]
@@ -218,8 +217,24 @@ async fn status_reports_counts_it_can_stand_behind() {
     let client = http::client();
 
     clear_messages(&server);
-    insert_mail(&server, &seed, "m-1", "noreply@example.com", "hi", false, "2026-01-01 00:00:00.000");
-    insert_mail(&server, &seed, "m-2", "friend@example.com", "hey", false, "2026-01-02 00:00:00.000");
+    insert_mail(
+        &server,
+        &seed,
+        "m-1",
+        "noreply@example.com",
+        "hi",
+        false,
+        "2026-01-01 00:00:00.000",
+    );
+    insert_mail(
+        &server,
+        &seed,
+        "m-2",
+        "friend@example.com",
+        "hey",
+        false,
+        "2026-01-02 00:00:00.000",
+    );
 
     let status = get_status(&client, &server, &seed).await;
     assert_eq!(status["suggested"], 0);
@@ -262,10 +277,42 @@ async fn the_heuristic_layer_never_calls_the_model() {
 
     clear_messages(&server);
     // Three mails a rule can judge, one it cannot.
-    insert_mail(&server, &seed, "u-1", "news@shop.example", "促销", true, "2026-01-01 00:00:00.000");
-    insert_mail(&server, &seed, "u-2", "noreply@service.example", "账单", false, "2026-01-02 00:00:00.000");
-    insert_mail(&server, &seed, "u-3", "Newsletter@list.example", "周刊", false, "2026-01-03 00:00:00.000");
-    insert_mail(&server, &seed, "u-4", "friend@example.com", "你好", false, "2026-01-04 00:00:00.000");
+    insert_mail(
+        &server,
+        &seed,
+        "u-1",
+        "news@shop.example",
+        "促销",
+        true,
+        "2026-01-01 00:00:00.000",
+    );
+    insert_mail(
+        &server,
+        &seed,
+        "u-2",
+        "noreply@service.example",
+        "账单",
+        false,
+        "2026-01-02 00:00:00.000",
+    );
+    insert_mail(
+        &server,
+        &seed,
+        "u-3",
+        "Newsletter@list.example",
+        "周刊",
+        false,
+        "2026-01-03 00:00:00.000",
+    );
+    insert_mail(
+        &server,
+        &seed,
+        "u-4",
+        "friend@example.com",
+        "你好",
+        false,
+        "2026-01-04 00:00:00.000",
+    );
 
     let started = post(&client, &server, &seed, "run").await;
     assert_eq!(started.status, 202, "{:?}", started.body);
@@ -281,7 +328,10 @@ async fn the_heuristic_layer_never_calls_the_model() {
         status["run"]["state"], "stopped-unconfigured",
         "layer 2 has no key, and the run says so"
     );
-    assert_eq!(status["unsuggested"], 1, "the one mail the rules could not judge");
+    assert_eq!(
+        status["unsuggested"], 1,
+        "the one mail the rules could not judge"
+    );
 }
 
 #[tokio::test]
@@ -292,7 +342,15 @@ async fn layer_one_writes_medium_confidence_never_high() {
     let client = http::client();
 
     clear_messages(&server);
-    insert_mail(&server, &seed, "c-1", "news@shop.example", "促销", true, "2026-01-01 00:00:00.000");
+    insert_mail(
+        &server,
+        &seed,
+        "c-1",
+        "news@shop.example",
+        "促销",
+        true,
+        "2026-01-01 00:00:00.000",
+    );
 
     let started = post(&client, &server, &seed, "run").await;
     assert_eq!(started.status, 202);
@@ -330,8 +388,24 @@ async fn layer_two_asks_about_the_mail_layer_one_left_and_bills_the_ledger() {
     // The fixture seed brings its own account; find it.
     let seed = Seed::from_fixtures(&fixtures);
     clear_messages(&server);
-    insert_mail(&server, &seed, "a-1", "friend@example.com", "会议", false, "2026-01-01 00:00:00.000");
-    insert_mail(&server, &seed, "a-2", "boss@example.com", "报告", false, "2026-01-02 00:00:00.000");
+    insert_mail(
+        &server,
+        &seed,
+        "a-1",
+        "friend@example.com",
+        "会议",
+        false,
+        "2026-01-01 00:00:00.000",
+    );
+    insert_mail(
+        &server,
+        &seed,
+        "a-2",
+        "boss@example.com",
+        "报告",
+        false,
+        "2026-01-02 00:00:00.000",
+    );
 
     let status_before = get_status(&client, &server, &seed).await;
     assert_eq!(status_before["configured"], true);
@@ -343,7 +417,11 @@ async fn layer_two_asks_about_the_mail_layer_one_left_and_bills_the_ledger() {
     assert_eq!(status["run"]["state"], "done", "{status:?}");
     assert_eq!(status["bySource"]["ai"], 2);
     assert_eq!(status["unsuggested"], 0);
-    assert_eq!(transport.calls().len(), 2, "one call per mail, no batch prompt");
+    assert_eq!(
+        transport.calls().len(),
+        2,
+        "one call per mail, no batch prompt"
+    );
     assert_eq!(usage_rows(&server), 2, "every paid call reaches the ledger");
 }
 
@@ -364,8 +442,24 @@ async fn the_model_never_sees_a_mail_the_heuristic_already_decided() {
     let client = http::client();
 
     clear_messages(&server);
-    insert_mail(&server, &seed, "d-1", "news@shop.example", "促销", true, "2026-01-01 00:00:00.000");
-    insert_mail(&server, &seed, "d-2", "friend@example.com", "你好", false, "2026-01-02 00:00:00.000");
+    insert_mail(
+        &server,
+        &seed,
+        "d-1",
+        "news@shop.example",
+        "促销",
+        true,
+        "2026-01-01 00:00:00.000",
+    );
+    insert_mail(
+        &server,
+        &seed,
+        "d-2",
+        "friend@example.com",
+        "你好",
+        false,
+        "2026-01-02 00:00:00.000",
+    );
 
     let started = post(&client, &server, &seed, "run").await;
     assert_eq!(started.status, 202);
@@ -398,7 +492,15 @@ async fn a_second_run_does_not_charge_for_the_same_mail() {
     let client = http::client();
 
     clear_messages(&server);
-    insert_mail(&server, &seed, "t-1", "friend@example.com", "你好", false, "2026-01-01 00:00:00.000");
+    insert_mail(
+        &server,
+        &seed,
+        "t-1",
+        "friend@example.com",
+        "你好",
+        false,
+        "2026-01-01 00:00:00.000",
+    );
 
     let started = post(&client, &server, &seed, "run").await;
     assert_eq!(started.status, 202);
@@ -452,12 +554,19 @@ async fn a_second_run_while_running_does_not_start_another_worker() {
     let first = post(&client, &server, &seed, "run").await;
     assert_eq!(first.status, 202);
     let second = post(&client, &server, &seed, "run").await;
-    assert_eq!(second.status, 202, "a double click is still an accepted request");
+    assert_eq!(
+        second.status, 202,
+        "a double click is still an accepted request"
+    );
 
     let status = wait_for_terminal(&client, &server, &seed).await;
     assert_eq!(status["run"]["state"], "done");
     // Eight mails, eight calls: a second worker would have made sixteen.
-    assert_eq!(transport.calls().len(), 8, "the second run was refused, not started");
+    assert_eq!(
+        transport.calls().len(),
+        8,
+        "the second run was refused, not started"
+    );
     assert_eq!(status["bySource"]["ai"], 8);
 }
 
@@ -469,7 +578,15 @@ async fn a_decision_the_user_made_is_never_overwritten_by_either_layer() {
     let client = http::client();
 
     clear_messages(&server);
-    insert_mail(&server, &seed, "r-1", "news@shop.example", "促销", true, "2026-01-01 00:00:00.000");
+    insert_mail(
+        &server,
+        &seed,
+        "r-1",
+        "news@shop.example",
+        "促销",
+        true,
+        "2026-01-01 00:00:00.000",
+    );
 
     // Someone decided before the batch ran.
     {
@@ -496,7 +613,10 @@ async fn a_decision_the_user_made_is_never_overwritten_by_either_layer() {
         )
         .expect("advice row");
     assert_eq!(decision, "dismissed", "the user's decision stands");
-    assert_eq!(action, "reply", "and the suggestion it was made about is untouched");
+    assert_eq!(
+        action, "reply",
+        "and the suggestion it was made about is untouched"
+    );
 }
 
 #[tokio::test]
@@ -508,7 +628,15 @@ async fn a_run_with_no_key_says_so_without_touching_the_model() {
     let client = http::client();
 
     clear_messages(&server);
-    insert_mail(&server, &seed, "n-1", "friend@example.com", "你好", false, "2026-01-01 00:00:00.000");
+    insert_mail(
+        &server,
+        &seed,
+        "n-1",
+        "friend@example.com",
+        "你好",
+        false,
+        "2026-01-01 00:00:00.000",
+    );
 
     let status_before = get_status(&client, &server, &seed).await;
     assert_eq!(status_before["configured"], false);
@@ -518,7 +646,10 @@ async fn a_run_with_no_key_says_so_without_touching_the_model() {
     let status = wait_for_terminal(&client, &server, &seed).await;
 
     assert_eq!(status["run"]["state"], "stopped-unconfigured");
-    assert_eq!(status["unsuggested"], 1, "nothing was judged, and the count says so");
+    assert_eq!(
+        status["unsuggested"], 1,
+        "nothing was judged, and the count says so"
+    );
     assert_eq!(usage_rows(&server), 0);
 }
 
@@ -535,7 +666,10 @@ struct SlowTransport {
 }
 
 impl AiTransport for SlowTransport {
-    fn chat(&self, request: lagoon_api::ai::transport::AiRequest) -> lagoon_api::ai::transport::AiFuture<'_> {
+    fn chat(
+        &self,
+        request: lagoon_api::ai::transport::AiRequest,
+    ) -> lagoon_api::ai::transport::AiFuture<'_> {
         let inner = Arc::clone(&self.inner);
         let delay = self.delay;
         Box::pin(async move {
@@ -558,13 +692,15 @@ fn slow_gateway(delay_ms: u64) -> (Arc<AiGateway>, Arc<ScriptedTransport>) {
             AiConfig::embedded().expect("the shipped config parses"),
             transport as Arc<dyn AiTransport>,
         )
-        .with_keys(Arc::new(move |name| {
-            if name == KEY_ENV {
-                owned.clone()
-            } else {
-                None
-            }
-        })),
+        .with_keys(Arc::new(
+            move |name| {
+                if name == KEY_ENV {
+                    owned.clone()
+                } else {
+                    None
+                }
+            },
+        )),
     );
     (gateway, inner)
 }

@@ -56,11 +56,7 @@ fn insert_mail(
         .execute(
             "INSERT INTO message_bodies (account_id, remote_id, body_cipher)
              VALUES (?, ?, ?)",
-            params![
-                seed.account_uuid().as_bytes().as_slice(),
-                remote_id,
-                sealed
-            ],
+            params![seed.account_uuid().as_bytes().as_slice(), remote_id, sealed],
         )
         .expect("insert body");
     let _ = one_click;
@@ -184,7 +180,14 @@ async fn the_stored_links_are_what_the_reader_reads() {
     let server = TestServer::spawn_with_seed("r6-unsub-store", &seed).await;
     let client = http::client();
 
-    insert_mail(&server, &seed, "u-4", "<https://x.example/u>", true, r#"[{"url":"https://x.example/u","kind":"https","oneClick":true}]"#);
+    insert_mail(
+        &server,
+        &seed,
+        "u-4",
+        "<https://x.example/u>",
+        true,
+        r#"[{"url":"https://x.example/u","kind":"https","oneClick":true}]"#,
+    );
 
     let body = body_of(&client, &server, &seed, "u-4").await;
     let raw = body["unsubscribeLinks"].as_str().expect("a string field");

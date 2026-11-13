@@ -400,7 +400,10 @@ pub fn router(state: AppState) -> Router {
         // answers 202 immediately and `cancel` is the only way to stop one.
         .route("/api/triage/status", get(routes_triage::status))
         .route("/api/triage/run", axum::routing::post(routes_triage::run))
-        .route("/api/triage/cancel", axum::routing::post(routes_triage::cancel))
+        .route(
+            "/api/triage/cancel",
+            axum::routing::post(routes_triage::cancel),
+        )
         // R6: recording what the user decided about a suggestion. Separate from
         // the mail write paths on purpose - see routes_advice's header.
         .route(
