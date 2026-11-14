@@ -1,6 +1,6 @@
 [package]
 name = "lagoon-api"
-version = "4.0.0"
+version = "0.4.1"
 edition.workspace = true
 publish.workspace = true
 description = "Lagoon v4 read-only Rust backend (R1+R2): health, accounts, messages, bodies, folder-counts plus the local-only read endpoints (briefing/advice/stacks/senders/sent/notices/time-saved/usage/actions/drafts/search/export)"

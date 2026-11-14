@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "lagoon-api"
-version = "4.0.0"
+version = "0.4.1"
 dependencies = [
  "aes-gcm",
  "axum",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "lagoon-mail"
-version = "4.0.0"
+version = "0.4.1"
 dependencies = [
  "base64",
  "encoding_rs",
