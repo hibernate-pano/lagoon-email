@@ -671,6 +671,92 @@ fn pull_changes_fetches_new_headers_and_reports_the_cursor() {
 }
 
 #[test]
+fn a_first_pull_fetches_the_backfill_without_idling_first() {
+    // Measured 2026-11-14: a fresh QQ connect sat in IDLE for the full budget
+    // (290 s) before the first FETCH, so a brand-new account showed an empty
+    // inbox for minutes. There is nothing to wait for when the cursor is empty.
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1 IDLE");
+    select_script(&transport, "A0003", 2, 7, 20);
+    let header = header_literal("First backfill");
+    transport.enqueue_line(format!(
+        "* 1 FETCH (UID 10 BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES LIST-UNSUBSCRIBE)] {{{}}}",
+        header.len()
+    ));
+    transport.enqueue_literal(header);
+    transport.enqueue_line(")");
+    transport.enqueue_line("A0004 OK FETCH completed");
+    let mut provider = provider(&transport);
+
+    let changes = provider
+        .pull_changes(
+            SyncCursor {
+                uid_next: 0,
+                uid_validity: 0,
+            },
+            std::time::Duration::from_secs(290),
+        )
+        .unwrap();
+
+    assert_eq!(changes.upserts.len(), 1);
+    assert_eq!(changes.cursor.uid_validity, 7);
+    assert!(!changes.waited, "a first sync has nothing to wait for");
+    assert!(
+        !transport.writes_text().contains("IDLE"),
+        "IDLE before the backfill would hide the whole mailbox for the budget"
+    );
+}
+
+#[test]
+fn a_uidvalidity_change_does_not_idle_before_answering_reset() {
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1 IDLE");
+    select_script(&transport, "A0003", 3, 99, 20);
+    let mut provider = provider(&transport);
+
+    let changes = provider
+        .pull_changes(
+            SyncCursor {
+                uid_next: 10,
+                uid_validity: 7,
+            },
+            std::time::Duration::from_secs(290),
+        )
+        .unwrap();
+
+    assert!(changes.reset_required);
+    assert!(!changes.waited);
+    assert!(!transport.writes_text().contains("IDLE"));
+}
+
+#[test]
+fn an_incremental_pull_still_waits_on_idle() {
+    // The fix above must not remove the long-poll for accounts that already
+    // have a cursor: that is what makes new mail arrive without polling.
+    let transport = ScriptedTransport::new();
+    imap_session_script(&transport, "IMAP4rev1 IDLE");
+    select_script(&transport, "A0003", 3, 7, 20);
+    // IDLE: the command line, then a DONE write; the server answers tagged.
+    transport.enqueue_line("+ idling");
+    select_script(&transport, "A0004", 3, 7, 20);
+    transport.enqueue_line("A0005 OK FETCH completed");
+    let mut provider = provider(&transport);
+
+    let changes = provider
+        .pull_changes(
+            SyncCursor {
+                uid_next: 10,
+                uid_validity: 7,
+            },
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+
+    assert!(changes.waited, "an established account still long-polls");
+    assert!(transport.writes_text().contains("IDLE"));
+}
+
+#[test]
 fn a_uidvalidity_change_requires_a_reset_and_fetches_nothing() {
     let transport = ScriptedTransport::new();
     imap_session_script(&transport, "IMAP4rev1");

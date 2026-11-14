@@ -743,7 +743,16 @@ impl ImapProvider {
             let state = client.select(INBOX)?;
             *selected = Some(state.clone());
             let mut state = state;
+            // IDLE only when there is something to wait for. A first sync (no
+            // cursor) has the whole mailbox to fetch, and a reset round fetches
+            // nothing at all; idling first only delays them by the budget.
+            // Measured 2026-11-14: a fresh QQ connect sat in IDLE for the full
+            // 290 s with an empty inbox before the backfill started.
+            let first_sync = after.uid_validity == 0;
+            let resets = after.uid_validity != 0 && after.uid_validity != state.uid_validity;
             let supports_idle = wait_up_to > Duration::ZERO
+                && !first_sync
+                && !resets
                 && client
                     .capability()
                     .map(|capabilities| capabilities.contains("IDLE"))
