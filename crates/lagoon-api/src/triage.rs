@@ -799,6 +799,16 @@ fn prompt_for(candidate: &TriageCandidate) -> String {
 /// "nothing else matched" - and treating it as a suggestion would turn every
 /// remaining mail into "reply", which is not a judgement, it is noise.
 fn judge_by_rule(candidate: &TriageCandidate) -> Option<HeuristicSuggestion<'_>> {
+    // One-click wins over plain archive: the header says the publisher accepts
+    // a machine request, and the decision board can then settle the whole
+    // subscription in one click instead of leaving the mail behind.
+    if candidate.one_click {
+        return Some(HeuristicSuggestion {
+            action: "unsubscribe",
+            category: Some("newsletter"),
+            rationale: "发布方声明支持一键退订（RFC 8058）",
+        });
+    }
     if candidate.list_unsubscribe {
         return Some(HeuristicSuggestion {
             action: "archive",

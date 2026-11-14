@@ -58,7 +58,12 @@ export function hostOf(link: UnsubscribeLink): string {
   return withoutScheme.split(/[/?#]/)[0] || withoutScheme;
 }
 
-export function UnsubscribeStrip(props: { links?: string | null }): ReactNode {
+export function UnsubscribeStrip(props: {
+  links?: string | null;
+  /** Runs the RFC 8058 POST; absent in surfaces that cannot write. */
+  onOneClick?: () => void;
+  busy?: boolean;
+}): ReactNode {
   const links = parseUnsubscribeLinks(props.links);
   if (links.length === 0) return null;
   // One https destination is the interesting one; a mailto is offered second,
@@ -79,7 +84,22 @@ export function UnsubscribeStrip(props: { links?: string | null }): ReactNode {
           </a>
         </>
       ) : null}
-      {primary.oneClick ? <span className="chip">{t.reader.unsubscribeOneClick}</span> : null}
+      {primary.oneClick ? (
+        props.onOneClick ? (
+          // Irreversible, so the button says so; the confirm lives in the caller,
+          // which owns the dialog and the error copy.
+          <button
+            type="button"
+            className="btn small"
+            disabled={props.busy}
+            onClick={props.onOneClick}
+          >
+            {props.busy ? t.reader.unsubscribeBusy : t.reader.unsubscribeAction}
+          </button>
+        ) : (
+          <span className="chip">{t.reader.unsubscribeOneClick}</span>
+        )
+      ) : null}
     </div>
   );
 }

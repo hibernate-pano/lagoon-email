@@ -74,7 +74,7 @@ pub fn send(
     outcome
 }
 
-fn exchange(
+pub(crate) fn exchange(
     transport: &mut dyn Transport,
     request: &HttpRequest,
 ) -> Result<HttpResponse, HttpError> {

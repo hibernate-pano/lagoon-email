@@ -184,6 +184,45 @@ export async function bulkAction(
   };
 }
 
+/**
+ * RFC 8058 one-click unsubscribe, one request per publisher URL on the server.
+ *
+ * Not part of `bulkAction`: the verb is not a mail move, and its failure codes
+ * (page-required, manual-required) are answers the UI has to show rather than
+ * retry.
+ */
+export async function unsubscribeBulk(
+  remoteIds: string[],
+  accountId: string,
+): Promise<BulkResult | WriteFailure> {
+  const result = await post<BulkResponse>("/api/unsubscribe-bulk", { accountId }, { remoteIds });
+  if (result.kind === "fail") return transportFailure(result.message);
+  if (result.kind === "http") return failure(result.code, result.status);
+  return {
+    ok: true,
+    items: result.data.items ?? [],
+    truncatedCount: result.data.truncatedCount ?? undefined,
+  };
+}
+
+/** One mail. The server answers 422 when the publisher offers only a page. */
+export async function unsubscribeOne(
+  remoteId: string,
+  accountId: string,
+): Promise<WriteResult & { unsubscribed?: boolean }> {
+  const result = await post<{ ok: boolean; unsubscribed?: boolean; actionId?: number }>(
+    messagePath(remoteId, "unsubscribe"),
+    { accountId },
+  );
+  if (result.kind === "fail") return transportFailure(result.message);
+  if (result.kind === "http") return failure(result.code, result.status);
+  return {
+    ok: true,
+    actionId: result.data.actionId,
+    unsubscribed: result.data.unsubscribed,
+  };
+}
+
 export async function emptyTrash(accountId: string): Promise<WriteResult> {
   const result = await post<EmptyTrashResponse>("/api/trash/empty", { accountId });
   if (result.kind === "fail") return transportFailure(result.message);

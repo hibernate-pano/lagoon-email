@@ -15,7 +15,7 @@
 //! a literal byte run that is not a line.
 
 use std::io::{BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use rustls::pki_types::ServerName;
@@ -83,23 +83,17 @@ impl Default for TlsTransport {
     }
 }
 
-impl Transport for TlsTransport {
-    fn connect(&mut self, host: &str, port: u16) -> Result<(), TransportError> {
-        let addrs = (host, port)
-            .to_socket_addrs()
+impl TlsTransport {
+    /// Connect to one address the caller already resolved and vetted, while
+    /// still verifying the certificate for `host`.
+    ///
+    /// `connect` resolves the name itself. A caller that must not let the
+    /// resolver pick a different address a second time (the unsubscribe client
+    /// checks every answer is public before dialing) needs this: resolving
+    /// again would reintroduce the DNS-rebinding window the check closed.
+    pub fn connect_to(&mut self, host: &str, address: SocketAddr) -> Result<(), TransportError> {
+        let socket = TcpStream::connect_timeout(&address, DEFAULT_CONNECT_TIMEOUT)
             .map_err(|error| TransportError::Io(error.kind()))?;
-        let mut last_error = std::io::ErrorKind::AddrNotAvailable;
-        let mut socket = None;
-        for address in addrs {
-            match TcpStream::connect_timeout(&address, DEFAULT_CONNECT_TIMEOUT) {
-                Ok(stream) => {
-                    socket = Some(stream);
-                    break;
-                }
-                Err(error) => last_error = error.kind(),
-            }
-        }
-        let socket = socket.ok_or(TransportError::Io(last_error))?;
         socket.set_nodelay(true).ok();
         socket
             .set_read_timeout(Some(self.read_timeout))
@@ -115,6 +109,23 @@ impl Transport for TlsTransport {
             .map_err(|error| TransportError::Tls(tls::static_label(&error)))?;
         self.stream = Some(BufReader::new(StreamOwned::new(connection, socket)));
         Ok(())
+    }
+}
+
+impl Transport for TlsTransport {
+    fn connect(&mut self, host: &str, port: u16) -> Result<(), TransportError> {
+        let addrs = (host, port)
+            .to_socket_addrs()
+            .map_err(|error| TransportError::Io(error.kind()))?;
+        let mut last_error = std::io::ErrorKind::AddrNotAvailable;
+        for address in addrs {
+            match self.connect_to(host, address) {
+                Ok(()) => return Ok(()),
+                Err(TransportError::Io(kind)) => last_error = kind,
+                Err(other) => return Err(other),
+            }
+        }
+        Err(TransportError::Io(last_error))
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), TransportError> {

@@ -304,6 +304,10 @@ pub struct TriageCandidate {
     pub from_address: String,
     pub subject: Option<String>,
     pub list_unsubscribe: bool,
+    /// The publisher declared RFC 8058 one-click (parsed from the stored links
+    /// at sync time). The rule layer may then suggest "unsubscribe": that is
+    /// the only form this product can carry out automatically.
+    pub one_click: bool,
     pub has_cached_body: bool,
 }
 
@@ -323,6 +327,7 @@ pub fn triage_candidates(
 ) -> rusqlite::Result<Vec<TriageCandidate>> {
     let mut statement = connection.prepare(
         "SELECT h.remote_id, h.from_address, h.subject, h.list_unsubscribe,
+                h.unsubscribe_links,
                 (b.remote_id IS NOT NULL) AS has_body
          FROM message_headers h
          LEFT JOIN advice a
@@ -342,12 +347,17 @@ pub fn triage_candidates(
     ])?;
     let mut candidates = Vec::new();
     while let Some(row) = rows.next()? {
+        let links: Option<String> = row.get(4)?;
         candidates.push(TriageCandidate {
             remote_id: row.get(0)?,
             from_address: row.get(1)?,
             subject: row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty()),
             list_unsubscribe: row.get::<_, i64>(3)? != 0,
-            has_cached_body: row.get::<_, i64>(4)? != 0,
+            one_click: links
+                .as_deref()
+                .and_then(crate::unsubscribe::declared_one_click)
+                .unwrap_or(false),
+            has_cached_body: row.get::<_, i64>(5)? != 0,
         });
     }
     Ok(candidates)

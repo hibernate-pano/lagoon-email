@@ -35,6 +35,7 @@ import {
   bulkAction,
   recordDecisions,
   undoBulk,
+  unsubscribeBulk,
   type WriteFailure,
 } from "../core/writes";
 import { AsyncSurface } from "../ui/AsyncSurface";
@@ -62,6 +63,8 @@ export interface DecisionsBoardProps {
   onSettled: () => void;
   /** Confirmation for a destructive batch; the caller owns the dialog. */
   onConfirmDelete: (count: number, run: () => void) => void;
+  /** Confirmation for an irreversible batch (unsubscribe). */
+  onConfirmUnsubscribe: (count: number, publishers: number, run: () => void) => void;
   onError: (failure: WriteFailure) => void;
   onToast: (text: string) => void;
 }
@@ -81,7 +84,11 @@ export function DecisionsBoard(props: DecisionsBoardProps): ReactNode {
       messages,
       senders,
       unsuggested: props.unsuggested,
-      labels: { archive: t.decisions.actionArchive, delete: t.decisions.actionDelete },
+      labels: {
+        archive: t.decisions.actionArchive,
+        delete: t.decisions.actionDelete,
+        unsubscribe: t.decisions.actionUnsubscribe,
+      },
     });
   }, [advice.outcome, messages, senders, props.unsuggested]);
 
@@ -91,7 +98,10 @@ export function DecisionsBoard(props: DecisionsBoardProps): ReactNode {
     const execute = async () => {
       setBusyCard(card.id);
       try {
-        const result = await bulkAction(card.action, card.remoteIds, accountId);
+        const result =
+          card.action === "unsubscribe"
+            ? await unsubscribeBulk(card.remoteIds, accountId)
+            : await bulkAction(card.action, card.remoteIds, accountId);
         if (!result.ok) {
           props.onError(result);
           return;
@@ -109,7 +119,13 @@ export function DecisionsBoard(props: DecisionsBoardProps): ReactNode {
           setLastBatch({ actionIds, count: split.acceptedRemoteIds.length });
         }
         if (split.failed > 0) {
-          props.onToast(t.decisions.partial(split.failed));
+          props.onToast(
+            card.action === "unsubscribe"
+              ? t.decisions.unsubscribeFailed(split.failed)
+              : t.decisions.partial(split.failed),
+          );
+        } else if (card.action === "unsubscribe") {
+          props.onToast(t.decisions.unsubscribeDone(split.acceptedRemoteIds.length));
         } else {
           props.onToast(
             card.action === "archive"
@@ -126,6 +142,12 @@ export function DecisionsBoard(props: DecisionsBoardProps): ReactNode {
       // A bulk delete is the one verb that has to ask first, and its sentence
       // has to name the count and the way back.
       props.onConfirmDelete(card.remoteIds.length, () => void execute());
+      return;
+    }
+    if (card.action === "unsubscribe") {
+      // Irreversible: ask, and name how many publishers are being told.
+      const publishers = new Set(card.samples.map((sample) => sample.fromAddress)).size;
+      props.onConfirmUnsubscribe(card.remoteIds.length, publishers, () => void execute());
       return;
     }
     await execute();

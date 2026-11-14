@@ -89,6 +89,7 @@ cargo run --manifest-path shell/Cargo.toml -- --selftest
 - **契约先行**：改协议先改 `docs/api-contract.md`；`cargo test` 里的契约回放会逐字节比对。
 - **密钥**：首次启动在 `~/Library/Application Support/` 的应用数据目录生成 `keys.json`（权限 0600），不打印、不覆盖。Keychain 存储尚未实现。
 - **AI 只读**：AI 平面没有写接口，不依赖 `MailProvider`，永不发信；分诊建议只落 `advice`，执行永远是用户的点击。AI 的花费按调用记进 `usage_log`，`/api/usage` 能查到。`LAGOON_BUDGET_USD_PER_MONTH` 是**可选**闸门：设了才在达到上限后拒绝调用（503 `ai-budget-exceeded`）；**不设（默认 0）就是没有上限**。本机当前不设——只有本人使用，量级是几毛钱一次全量。
+- **一键退订只走 RFC 8058**：发布方在 `List-Unsubscribe-Post` 里声明接受机器 POST 时，服务端才会代发一次请求（`lagoon-api/src/unsubscribe.rs`）——只认 `https:`、主机名、443，DNS 全部解析结果必须是公网，并用**校验过的地址**建连（防 rebinding），不跟随重定向。没有这份声明的链接仍然只交给系统浏览器；`mailto:` 预填草稿，不代发。退订不可撤销，所以确认框会写明；同时做的归档可撤销。
 - **测试不联网**：`lagoon-mail` 与 `lagoon-api` 的测试都用脚本化传输，真实邮箱只在显式设置 `LAGOON_MAIL_PROVIDER=production` 时才会被连接，AI 测试从不发请求。
 
 ## 文档

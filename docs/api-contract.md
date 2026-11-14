@@ -155,13 +155,21 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | 新增端点 | `POST /api/advice/:id/decision`、`POST /api/advice/decisions-bulk`（§4.8） |
 | 新增端点 | `GET /api/triage/status`、`POST /api/triage/run`、`POST /api/triage/cancel`（§4.9） |
 | 新增端点 | `POST /api/advice/{id}/decision` 此前只在本文档声明、实现缺失；现已实现 |
+| 新增端点 | `POST /api/messages/:remoteId/unsubscribe`（§4.5 早已声明，v0.4.1 实现）与批量形式 `POST /api/unsubscribe-bulk` |
 | 新增可选响应字段 | `MessageBody.unsubscribeLinks`：`List-Unsubscribe` 的目标，JSON 文本（`[]` 表示没有） |
 | 新增可选 query | `GET /api/senders?pending=true`：只统计**未归档**的邮件（默认行为不变，逐字节一致） |
 | 新增错误 code | `invalid-decision`、`empty-ids`、`too-many-ids`、`malformed-advice-id`、`unknown-advice` |
 
 **为什么不改 `list_unsubscribe`**：它仍是布尔，简报分组在用。新增的 `unsubscribeLinks` 是**解析后的目标**，两者说的是不同的事（"有没有"vs"往哪去"），合并会让简报分组退化。
 
-**`unsubscribeLinks` 的安全边界**：服务端只解析并按 `https:` / `mailto:` 过滤，**不发任何请求**。客户端只呈现目标主机名，点击交给系统浏览器（与 `568dfe3` 同一条路径）。服务端代发退订需要独立的 SSRF 设计（DNS 后校验 IP、禁私网、禁重定向、RFC 8058 语义），不在本版范围内。
+**`unsubscribeLinks` 的安全边界（已实现，v0.4.1）**：解析与展示不变（只认 `https:` / `mailto:`，客户端只显示主机名）。新的执行端点只对 **RFC 8058 one-click** 目标发请求，守卫在 `lagoon-api/src/unsubscribe.rs`：
+
+- 只接受 `https:`、无 userinfo、443 端口、主机名（不接受 IP 字面量）；
+- DNS 解析后**每个地址都必须是公网**（拒 loopback / 私网 / link-local / CGNAT / 组播 / `169.254.169.254`），并**用校验过的那个地址建连**（`TlsTransport::connect_to`），杜绝 DNS rebinding；
+- 不跟随重定向（3xx 算失败、转人工），超时 10 s，不带 cookie / referer / 认证头；
+- 请求形状固定：`POST` + `application/x-www-form-urlencoded`，body 恰为 `List-Unsubscribe=One-Click`；
+- 2xx 与 404/410（订阅已不存在）算成功；其余转人工。
+- 没有 one-click 声明的 `https:` 只给浏览器（422 `unsubscribe-page-required`）；`mailto:` 预填草稿，不代发。
 
 ---
 
@@ -218,7 +226,8 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | `POST /api/trash/empty` | query `accountId` | 200 `PurgeResponse`（`remoteId:"", purged:N`） | 500 | ✉写 批量 EXPUNGE | — |
 | `POST /api/delete-bulk` | query `accountId`；body `{remoteIds?: string[], allMatching?: bool, archived?: bool, deleted?: bool, sent?: bool, stackId?: UUID}` | 200 `ArchiveBulkResponse`（单次最多 500 条） | 400 `empty-remoteIds`/`invalid-body`/`missing-body`；404 `unknown-stack` | ✉写（逐条） | — |
 | `POST /api/archive-bulk` | query `accountId`；body `{remoteIds: string[]}` | 200 `ArchiveBulkResponse` | 400 `empty-remoteIds`/`invalid-body`；409 `archive-unavailable` | ✉写（逐条） | — |
-| `POST /api/messages/:remoteId/unsubscribe` | query `accountId` | 200 `UnsubscribeResponse` | 422 `unsubscribe-unavailable`/`-manual-required`/`-page-required`；502 `unsubscribe-failed`/`provider-unreachable`；401；500 | ⊕ 向发布方发 HTTP；本地归档+已读 | — |
+| `POST /api/messages/:remoteId/unsubscribe` | query `accountId` | 200 `UnsubscribeResponse` | 404 `message-not-found`；422 `unsubscribe-unavailable`/`-manual-required`/`-page-required`；502 `unsubscribe-failed`；401；500 | ⊕ 仅 RFC 8058 one-click；随后本地归档+已读 | — |
+| `POST /api/unsubscribe-bulk` | query `accountId`；body `{remoteIds: string[]}`（单次最多 500） | 200 `{items: [{remoteId, ok, actionId?, errorCode?}]}` | 400 `empty-remoteIds`/`invalid-body`/`missing-body`；404 `message-not-found` | ⊕ 同一发布方 URL 只发一次 | — |
 
 批量语义：`remoteIds` 与 `allMatching` 二选一；单次最多 500，超出部分由 `truncatedCount` 报告；`items` 逐条报告成功/失败（部分成功是正常结果，**不是**错误）。
 
@@ -384,7 +393,8 @@ bash v4/scripts/contract-check.sh <base_url> <token>                # 对实现�
 | 覆盖程度 | 端点 |
 |---|---|
 | **有 fixture（56 条抓取，成功或错误路径）** | `healthz`、accounts 列表、messages 列表（5 个 lens + 2 个 400 + 账号 B 列表）、folder-counts、senders（空/有数据）、export/index、advice 列表（空/有数据/`decision=any`）、advice accepted-stats、stacks（空/有数据）、reminders（空/有数据/含 dismissed）、time-saved（零/非零）、actions 列表（有数据）、usage、ai-status、ai/reload、ai/probe、store-notices（1 条）、briefing、body（缓存 **200** / 无 provider 503）、inline-images(503)、raw.eml(503)、summary(503)、draft 生成(503)、drafts 列表（有数据）、sent(200+stale)、archive(409)、folder-counts(404)、read(204+200)、pin(200)、sync(204)、accounts IMAP（空体/缺字段/未知服务商/已存在）、auth 401×2、host 403、unknown-route 404×2 |
-| **只有本文定义（实现前必须补 fixture）** | accounts 激活/删除、send/compose/forward、draft choose、delete/unarchive/restore/purge/trash-empty、delete-bulk/archive-bulk、unsubscribe、classify、actions undo/undo-bulk、advice decision、stacks 增删改、reminders 写、store-notices ack |
+| **只有本文定义（实现前必须补 fixture）** | accounts 激活/删除、send/compose/forward、draft choose、delete/unarchive/restore/purge/trash-empty、delete-bulk/archive-bulk、classify、actions undo/undo-bulk、advice decision、stacks 增删改、reminders 写、store-notices ack |
+| 已补 fixture（contract_expected，不联网） | `unsubscribe.unavailable`、`unsubscribe.unknown-mail`、`unsubscribe-bulk.empty`——200 路径需要真实发布方，按设计不进 CI |
 | **集成测试锁住（fake provider，非抓取 fixture）** | `GET …/attachments/:id`（200 字节 + 文件名、404、410、413、503）、`GET …/inline-images`（200 base64、410、40 张上限）——见 `crates/lagoon-api/tests/r5_attachments.rs` |
 | **contract_expected（v3 不通过，对实现断言）** | `GET /api/search` ×2：subject 命中、sealed-body 命中（见 §7.1） |
 | **r2_skip（写路径，R2 不断言）** | `POST /api/messages/:remoteId/read`（默认 + `record=true` 两态）、`POST /api/messages/:remoteId/pin` |

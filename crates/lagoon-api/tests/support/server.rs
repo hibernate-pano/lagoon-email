@@ -131,6 +131,27 @@ impl TestServer {
         )
     }
 
+    /// Start with a scripted unsubscribe firer, so the route can be tested
+    /// without a socket and without unsubscribing anyone for real.
+    pub async fn spawn_with_unsubscribe_firer(
+        label: &str,
+        firer: Arc<dyn lagoon_api::unsubscribe::Firer>,
+    ) -> (Self, Fixtures) {
+        let fixtures = Fixtures::load();
+        let seed = Seed::from_fixtures(&fixtures);
+        let temp = TempDir::new(label);
+        let db_path = temp.join("lagoon.sqlite");
+        {
+            let connection = open_read_write(&db_path);
+            schema::create(&connection).expect("schema");
+            seed.apply(&connection).expect("seed");
+        }
+        (
+            Self::start_with_firer(db_path, Some(TEST_API_TOKEN), temp, firer).await,
+            fixtures,
+        )
+    }
+
     /// Serve an *existing* store read-only - the mode R1 runs in.
     pub async fn spawn_on_store(label: &str, db_path: PathBuf, token: Option<&str>) -> Self {
         // The temp dir is unused here, but keeping one field means the type does
@@ -143,12 +164,32 @@ impl TestServer {
         Self::start_with(db_path, token, temp, None, None).await
     }
 
+    async fn start_with_firer(
+        db_path: PathBuf,
+        token: Option<&str>,
+        temp: TempDir,
+        firer: Arc<dyn lagoon_api::unsubscribe::Firer>,
+    ) -> Self {
+        Self::serve(db_path, token, temp, None, None, Some(firer)).await
+    }
+
     async fn start_with(
         db_path: PathBuf,
         token: Option<&str>,
         temp: TempDir,
         factory: Option<Arc<dyn lagoon_api::provider::ProviderFactory>>,
         ai: Option<Arc<lagoon_api::ai::gateway::AiGateway>>,
+    ) -> Self {
+        Self::serve(db_path, token, temp, factory, ai, None).await
+    }
+
+    async fn serve(
+        db_path: PathBuf,
+        token: Option<&str>,
+        temp: TempDir,
+        factory: Option<Arc<dyn lagoon_api::provider::ProviderFactory>>,
+        ai: Option<Arc<lagoon_api::ai::gateway::AiGateway>>,
+        firer: Option<Arc<dyn lagoon_api::unsubscribe::Firer>>,
     ) -> Self {
         let db = Db::open_read_only(db_path.clone()).expect("open the store read-only");
         let body_key = body_key();
@@ -164,6 +205,9 @@ impl TestServer {
         let mut state = AppState::new(Arc::new(db), &config);
         if let Some(factory) = factory {
             state = state.with_provider_factory(factory);
+        }
+        if let Some(firer) = firer {
+            state = state.with_unsubscribe_firer(firer);
         }
         match ai {
             Some(ai) => state = state.with_ai_gateway(ai),

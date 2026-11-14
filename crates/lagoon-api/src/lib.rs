@@ -36,6 +36,7 @@ pub mod telemetry;
 pub mod timefmt;
 pub mod token;
 pub mod triage;
+pub mod unsubscribe;
 pub mod uuid;
 pub mod wire;
 pub mod wire_r2;

@@ -8,7 +8,7 @@ R2 把抓取面扩大到纯本地只读端点并准备了**有数据**的种子�
 
 | 文件 | 作用 |
 |---|---|
-| `fixtures/fixtures.json` | 58 条 golden 响应（56 抓取 + 2 contract_expected），**version 2** |
+| `fixtures/fixtures.json` | 61 条 golden 响应（56 抓取 + 5 contract_expected），**version 2** |
 | `harness.py` | seed / capture / check / diff（python3 标准库，无第三方依赖） |
 | `aesgcm.py` | 纯 stdlib 的 AES-256-GCM，只用于给 seed 生成 `lgb1:` 封存行 |
 | `../../scripts/capture-contract.sh` | 起临时边车 → seed → 抓取 → 写 fixtures |
@@ -68,7 +68,9 @@ body key 生成：正文缓存让 `GET /body` 走到 **200**（不需要 provide
   旧数据的兜底判据。
 - `contract_expected`：期望值是**契约应为**，不是 v3 实测。默认跳过；
   `--assert-contract-expected`（两参数模式的 contract-check 默认开启）时断言。
-  目前 2 条：`search.contract`、`search.contract.sealed-body`，均附 `defect_evidence`。
+  目前 5 条：`search.contract`、`search.contract.sealed-body`（附 `defect_evidence`），
+  以及退订的三条拒绝路径（`unsubscribe.unavailable`、`unsubscribe.unknown-mail`、
+  `unsubscribe-bulk.empty`）——退订的 200 路径要真实发布方，按设计不进 CI。
 - `request.raw_body`：发送**精确字节**而不是 JSON 对象（用来表达「空 body」）。
   与 `request.json` 二选一；两者都为 null 则不发 body。
 - `pre`：**请求前钩子的名字**（JSON 里存不了可调用对象）。目前只有

@@ -78,16 +78,19 @@ fn write_provider(
     Ok(state.provider_factory.make_write(&credentials))
 }
 
-struct ActionContext {
-    account_id: Uuid,
-    connection: rusqlite::Connection,
-    capabilities: MailCapabilities,
-    write: Option<Arc<dyn MailWriteProvider>>,
+pub(crate) struct ActionContext {
+    pub(crate) account_id: Uuid,
+    pub(crate) connection: rusqlite::Connection,
+    pub(crate) capabilities: MailCapabilities,
+    pub(crate) write: Option<Arc<dyn MailWriteProvider>>,
 }
 
 /// Load the account, its capabilities and its write provider, or answer the
 /// error v3 would answer. Shared by every action route.
-async fn action_context(state: &AppState, account_id: Uuid) -> Result<ActionContext, Response> {
+pub(crate) async fn action_context(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<ActionContext, Response> {
     let account = {
         let outcome = state
             .db

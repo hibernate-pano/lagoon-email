@@ -6,9 +6,12 @@
 //! * only `https:` and `mailto:` survive - everything else a stranger can write
 //!   into a header is dropped before it can become a button;
 //! * the body route reports them, so the reader can offer a way out;
-//! * **nothing issues a request.** There is no server-side unsubscribe call in
-//!   this build, and this file is where that stays true: the assertion is that
-//!   the parsed value arrives, not that anything was contacted.
+//! * **only an RFC 8058 one-click target is ever contacted**, and only through
+//!   the guards in `lagoon_api::unsubscribe`; a page link, a private address or
+//!   a mailto is refused with the contract's 422 code instead of a request.
+//!
+//! The route tests inject a scripted firer (`Firer`), so this file can prove
+//! what would be sent without a socket and without unsubscribing anyone.
 
 mod support;
 
@@ -218,4 +221,316 @@ async fn an_old_row_with_no_links_column_still_answers() {
 
     let body = body_of(&client, &server, &seed, "u-5").await;
     assert_eq!(body["unsubscribeLinks"].as_str(), Some("[]"));
+}
+
+/* ------------------------------------------------- one-click execution ---- */
+
+/// A firer that records what it was asked to do and answers from a script.
+struct ScriptedFirer {
+    reply: lagoon_api::unsubscribe::Reply,
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+impl ScriptedFirer {
+    fn new(reply: lagoon_api::unsubscribe::Reply) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            reply,
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().expect("seen lock").clone()
+    }
+}
+
+impl lagoon_api::unsubscribe::Firer for ScriptedFirer {
+    fn fire(&self, target: &lagoon_api::unsubscribe::Target) -> lagoon_api::unsubscribe::Reply {
+        self.seen
+            .lock()
+            .expect("seen lock")
+            .push(target.url.clone());
+        self.reply.clone()
+    }
+}
+
+fn one_click_links(url: &str) -> String {
+    format!(r#"[{{"url":"{url}","kind":"https","oneClick":true}}]"#)
+}
+
+async fn post(
+    client: &http::HttpClient,
+    server: &TestServer,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> http::Observed {
+    let url = format!("{}{}", server.base_url, path);
+    let mut headers = server.auth_headers();
+    headers.push(("content-type".to_owned(), "application/json".to_owned()));
+    match body {
+        Some(value) => {
+            http::request_with_body(client, "POST", &url, &headers, value.to_string().as_bytes())
+                .await
+        }
+        None => http::request_with_body(client, "POST", &url, &headers, &[]).await,
+    }
+}
+
+#[tokio::test]
+async fn a_one_click_target_is_fired_once_and_the_mail_is_settled() {
+    let firer = ScriptedFirer::new(lagoon_api::unsubscribe::Reply::Unsubscribed {
+        status: 200,
+        publisher: "a.example".to_owned(),
+    });
+    let (server, fixtures) =
+        TestServer::spawn_with_unsubscribe_firer("unsub-run", firer.clone()).await;
+    let seed = Seed::from_fixtures(&fixtures);
+    let client = http::client();
+    insert_mail(
+        &server,
+        &seed,
+        "u-run",
+        "<https://a.example/u?id=1>",
+        true,
+        &one_click_links("https://a.example/u?id=1"),
+    );
+    {
+        let connection = support::server::open_read_write(&server.db_path);
+        connection
+            .execute(
+                "INSERT INTO advice (account_id, remote_id, action, category, confidence, rationale, source, decision)
+                 VALUES (?, 'u-run', 'unsubscribe', 'newsletter', 'high', '发布方支持一键退订', 'heuristic', 'pending')",
+                params![seed.account_uuid().as_bytes().as_slice()],
+            )
+            .expect("advice row");
+    }
+
+    let observed = post(
+        &client,
+        &server,
+        &format!(
+            "/api/messages/u-run/unsubscribe?accountId={}",
+            seed.account_id
+        ),
+        None,
+    )
+    .await;
+
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+    assert_eq!(observed.body["unsubscribed"], true);
+    assert_eq!(observed.body["publisher"], "a.example");
+    assert!(observed.body["actionId"].as_i64().unwrap_or(0) > 0);
+    assert_eq!(firer.seen(), vec!["https://a.example/u?id=1".to_owned()]);
+
+    let connection = support::server::open_read_write(&server.db_path);
+    let (archived, read): (i64, i64) = connection
+        .query_row(
+            "SELECT is_archived, is_read FROM message_headers WHERE remote_id = 'u-run'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("mail row");
+    assert_eq!(
+        (archived, read),
+        (1, 1),
+        "unsubscribed mail leaves the inbox"
+    );
+    let decision: String = connection
+        .query_row(
+            "SELECT decision FROM advice WHERE remote_id = 'u-run'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("advice row");
+    assert_eq!(decision, "accepted");
+    // Two rows: the irreversible fact and the undoable side effect.
+    let kinds: Vec<String> = {
+        let mut statement = connection
+            .prepare("SELECT kind FROM ai_actions ORDER BY id")
+            .expect("statement");
+        statement
+            .query_map([], |row| row.get(0))
+            .expect("rows")
+            .map(|row| row.expect("kind"))
+            .collect()
+    };
+    assert_eq!(kinds, ["archive", "unsubscribe"]);
+}
+
+#[tokio::test]
+async fn a_page_only_target_is_refused_without_contacting_anyone() {
+    let firer = ScriptedFirer::new(lagoon_api::unsubscribe::Reply::Failed {
+        reason: "must-not-fire".to_owned(),
+    });
+    let (server, fixtures) =
+        TestServer::spawn_with_unsubscribe_firer("unsub-page", firer.clone()).await;
+    let seed = Seed::from_fixtures(&fixtures);
+    let client = http::client();
+    insert_mail(
+        &server,
+        &seed,
+        "u-page",
+        "<https://a.example/prefs>",
+        false,
+        r#"[{"url":"https://a.example/prefs","kind":"https","oneClick":false}]"#,
+    );
+
+    let observed = post(
+        &client,
+        &server,
+        &format!(
+            "/api/messages/u-page/unsubscribe?accountId={}",
+            seed.account_id
+        ),
+        None,
+    )
+    .await;
+
+    assert_eq!(observed.status, 422, "{:?}", observed.body);
+    assert_eq!(observed.body["error"], "unsubscribe-page-required");
+    assert!(
+        firer.seen().is_empty(),
+        "a page link is not a machine request"
+    );
+}
+
+#[tokio::test]
+async fn a_private_address_is_refused_by_the_guard() {
+    let firer = ScriptedFirer::new(lagoon_api::unsubscribe::Reply::Failed {
+        reason: "must-not-fire".to_owned(),
+    });
+    let (server, fixtures) =
+        TestServer::spawn_with_unsubscribe_firer("unsub-private", firer.clone()).await;
+    let seed = Seed::from_fixtures(&fixtures);
+    let client = http::client();
+    insert_mail(
+        &server,
+        &seed,
+        "u-private",
+        "<https://127.0.0.1/unsub>",
+        true,
+        &one_click_links("https://127.0.0.1/unsub"),
+    );
+
+    let observed = post(
+        &client,
+        &server,
+        &format!(
+            "/api/messages/u-private/unsubscribe?accountId={}",
+            seed.account_id
+        ),
+        None,
+    )
+    .await;
+
+    assert_eq!(observed.status, 422, "{:?}", observed.body);
+    assert_eq!(observed.body["error"], "unsubscribe-manual-required");
+    assert!(firer.seen().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_request_leaves_the_mail_in_the_inbox() {
+    let firer = ScriptedFirer::new(lagoon_api::unsubscribe::Reply::Failed {
+        reason: "http-405".to_owned(),
+    });
+    let (server, fixtures) =
+        TestServer::spawn_with_unsubscribe_firer("unsub-fail", firer.clone()).await;
+    let seed = Seed::from_fixtures(&fixtures);
+    let client = http::client();
+    insert_mail(
+        &server,
+        &seed,
+        "u-fail",
+        "<https://a.example/u>",
+        true,
+        &one_click_links("https://a.example/u"),
+    );
+
+    let observed = post(
+        &client,
+        &server,
+        &format!(
+            "/api/messages/u-fail/unsubscribe?accountId={}",
+            seed.account_id
+        ),
+        None,
+    )
+    .await;
+
+    assert_eq!(observed.status, 502, "{:?}", observed.body);
+    assert_eq!(observed.body["error"], "unsubscribe-failed");
+    let archived: i64 = support::server::open_read_write(&server.db_path)
+        .query_row(
+            "SELECT is_archived FROM message_headers WHERE remote_id = 'u-fail'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("mail row");
+    assert_eq!(archived, 0, "nothing moved, so nothing claims it did");
+}
+
+#[tokio::test]
+async fn unknown_mail_answers_404() {
+    let firer = ScriptedFirer::new(lagoon_api::unsubscribe::Reply::Failed {
+        reason: "must-not-fire".to_owned(),
+    });
+    let (server, fixtures) =
+        TestServer::spawn_with_unsubscribe_firer("unsub-404", firer.clone()).await;
+    let seed = Seed::from_fixtures(&fixtures);
+    let client = http::client();
+
+    let observed = post(
+        &client,
+        &server,
+        &format!(
+            "/api/messages/nope/unsubscribe?accountId={}",
+            seed.account_id
+        ),
+        None,
+    )
+    .await;
+
+    assert_eq!(observed.status, 404);
+    assert!(firer.seen().is_empty());
+}
+
+#[tokio::test]
+async fn bulk_asks_each_publisher_once_and_reports_every_mail() {
+    let firer = ScriptedFirer::new(lagoon_api::unsubscribe::Reply::Unsubscribed {
+        status: 200,
+        publisher: "a.example".to_owned(),
+    });
+    let (server, fixtures) =
+        TestServer::spawn_with_unsubscribe_firer("unsub-bulk", firer.clone()).await;
+    let seed = Seed::from_fixtures(&fixtures);
+    let client = http::client();
+    // One newsletter sent twice: one subscription, two mails.
+    for remote_id in ["u-b1", "u-b2"] {
+        insert_mail(
+            &server,
+            &seed,
+            remote_id,
+            "<https://a.example/u>",
+            true,
+            &one_click_links("https://a.example/u"),
+        );
+    }
+
+    let observed = post(
+        &client,
+        &server,
+        &format!("/api/unsubscribe-bulk?accountId={}", seed.account_id),
+        Some(&serde_json::json!({ "remoteIds": ["u-b1", "u-b2"] })),
+    )
+    .await;
+
+    assert_eq!(observed.status, 200, "{:?}", observed.body);
+    let items = observed.body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|item| item["ok"] == true));
+    assert_eq!(
+        firer.seen(),
+        vec!["https://a.example/u".to_owned()],
+        "one subscription is one request"
+    );
 }

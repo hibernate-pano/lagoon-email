@@ -748,3 +748,50 @@ async fn cancel_stops_the_run_and_the_state_says_cancelled() {
         transport.calls().len()
     );
 }
+
+#[tokio::test]
+async fn a_one_click_subscription_is_suggested_as_unsubscribe_not_archive() {
+    let fixtures = Fixtures::load();
+    let seed = Seed::from_fixtures(&fixtures);
+    let server = TestServer::spawn_with_seed("r6-oneclick", &seed).await;
+    let client = http::client();
+
+    clear_messages(&server);
+    insert_mail(
+        &server,
+        &seed,
+        "u-1",
+        "news@shop.example",
+        "促销",
+        true,
+        "2026-01-01 00:00:00.000",
+    );
+    // Same header, but the publisher declared RFC 8058: this one can be settled
+    // by a single request, so the rule suggests the action that exists.
+    {
+        let connection = support::server::open_read_write(&server.db_path);
+        connection
+            .execute(
+                "UPDATE message_headers
+                    SET unsubscribe_links = '[{\"url\":\"https://shop.example/u\",\"kind\":\"https\",\"oneClick\":true}]'
+                  WHERE remote_id = 'u-1'",
+                [],
+            )
+            .expect("declare one-click");
+    }
+
+    let started = post(&client, &server, &seed, "run").await;
+    assert_eq!(started.status, 202, "{:?}", started.body);
+    let _ = wait_for_terminal(&client, &server, &seed).await;
+
+    let connection = support::server::open_read_write(&server.db_path);
+    let (action, source): (String, String) = connection
+        .query_row(
+            "SELECT action, source FROM advice WHERE remote_id = 'u-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("advice row");
+    assert_eq!(action, "unsubscribe");
+    assert_eq!(source, "heuristic");
+}

@@ -9,7 +9,7 @@ import {
 } from "../decisions";
 import type { AdviceRecord, MessageHeader, SenderSummary } from "../types";
 
-const LABELS = { archive: "归档", delete: "删除" };
+const LABELS = { archive: "归档", delete: "删除", unsubscribe: "退订" };
 
 function message(remoteId: string, from: string, subject: string): MessageHeader {
   return {
@@ -338,6 +338,28 @@ describe("the decision board groups mail into decisions", () => {
     const [card] = board({ advice: records, messages }).cards;
     expect(card.reasons).toEqual(["带一键退订的群发邮件"]);
     expect(card.samples).toHaveLength(2);
+  });
+});
+
+describe("an unsubscribe suggestion becomes its own card", () => {
+  it("batches one-click unsubscribes instead of leaving them personal", () => {
+    const messages: MessageHeader[] = [];
+    const records: AdviceRecord[] = [];
+    for (let index = 0; index < 3; index += 1) {
+      const remoteId = `news-${index}`;
+      messages.push(message(remoteId, "news@example.com", `周刊 ${index}`));
+      records.push(advice(index + 1, remoteId, "unsubscribe", { category: "newsletter" }));
+    }
+    // A page-only unsubscribe still has no batch: the publisher wants a human.
+    messages.push(message("page-1", "shop@example.com", "订阅中心"));
+    records.push(advice(50, "page-1", "wait", { category: "marketing" }));
+
+    const result = board({ advice: records, messages });
+
+    const card = result.cards.find((entry) => entry.action === "unsubscribe");
+    expect(card).toBeDefined();
+    expect(card?.remoteIds).toEqual(["news-0", "news-1", "news-2"]);
+    expect(result.personal.map((item) => item.advice.remoteId)).toEqual(["page-1"]);
   });
 });
 

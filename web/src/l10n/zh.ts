@@ -78,8 +78,15 @@ export const zh = {
     emptyNotJudgedHint: "它们不是「没有要决定的事」，只是还没被判断过。先跑一遍分诊。",
     actionArchive: "归档这批",
     actionDelete: "移到废纸篓",
+    actionUnsubscribe: "退订这批",
     // Every destructive verb states its own reversibility.
     deleteConfirm: (n: number) => `把 ${n} 封移到废纸篓？可以撤销。`,
+    // Unsubscribe is the one batch verb that cannot be undone: the mail moves
+    // are now, the subscription is gone for good.
+    unsubscribeConfirm: (n: number, publishers: number) =>
+      `对 ${n} 封邮件退订（${publishers} 个发布方）？退订不可撤销；邮件会归档，归档可以撤销。`,
+    unsubscribeDone: (n: number) => `已退订 ${n} 封`,
+    unsubscribeFailed: (n: number) => `${n} 封退订失败，可以打开发布方页面手动处理`,
     cardMailCount: (n: number) => `${n} 封`,
     cardConfidence: (high: number, medium: number, low: number) =>
       [high ? `高 ${high}` : "", medium ? `中 ${medium}` : "", low ? `低 ${low}` : ""]
@@ -233,6 +240,8 @@ export const zh = {
     unsubscribeOffer: "此发件人提供退订",
     unsubscribeByMail: "发邮件退订",
     unsubscribeOneClick: "支持一键退订",
+    unsubscribeAction: "一键退订",
+    unsubscribeBusy: "正在退订…",
     aiNotConfigured: "AI 未配置",
     emptyTitle: "没有选中邮件",
     emptyDetail: "从中间一列选一封，正文会出现在这里。",

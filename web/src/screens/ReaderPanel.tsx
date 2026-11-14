@@ -133,6 +133,8 @@ export interface ReaderPanelProps {
   onReplyTarget: (original: SendOriginal | undefined) => void;
   /** One line of feedback for the toast (a download has a visible result). */
   onToast: (text: string) => void;
+  /** RFC 8058 one-click for the open mail; the caller owns confirm + errors. */
+  onUnsubscribe: (remoteId: string) => void;
 }
 
 export function ReaderPanel(props: ReaderPanelProps): ReactNode {
@@ -309,7 +311,12 @@ export function ReaderPanel(props: ReaderPanelProps): ReactNode {
                   <span>{t.reader.attachments(bodyData.attachments.filter(isDownloadable).length)}</span>
                 ) : null}
               </div>
-              <UnsubscribeStrip links={bodyData.unsubscribeLinks} />
+              <UnsubscribeStrip
+                links={bodyData.unsubscribeLinks}
+                onOneClick={
+                  remoteId ? () => props.onUnsubscribe(remoteId) : undefined
+                }
+              />
             </div>
           ) : null}
 

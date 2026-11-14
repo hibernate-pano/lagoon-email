@@ -9,15 +9,17 @@
  * Two card kinds:
  *
  *   action     - mails a rule or the model judged the same way (`archive`,
- *                `delete`). One click settles every mail in the group.
+ *                `delete`, and `unsubscribe` when the publisher declared
+ *                RFC 8058 one-click). One click settles every mail in it.
  *   sender     - one address that writes a lot (>= `SENDER_THRESHOLD`), even
  *                when the judgments differ. Killing spam is a sender-level act,
  *                not a message-level one.
  *
- * Everything else - `reply`, `wait`, `remind`, `unsubscribe`, `nothing` - is
- * deliberately *not* a card: those need the user's own words or a trip to the
- * publisher's page, and a batch button would be a lie. They go in a separate
- * list so they are not lost either.
+ * Everything else - `reply`, `wait`, `remind`, `nothing` - is deliberately
+ * *not* a card: those need the user's own words, and a batch button would be a
+ * lie. They go in a separate list so they are not lost either. An
+ * `unsubscribe` suggestion without a one-click target lands there too: the only
+ * way out is the publisher's page, which the reader offers as a link.
  *
  * Pure functions only: no fetch, no React. The grouping is the part worth
  * testing, so it does not live inside a component.
@@ -36,10 +38,21 @@ export const SENDER_THRESHOLD = 10;
 /** How many cards the board shows before folding the rest into one row. */
 export const VISIBLE_CARDS = 6;
 
-/** The actions a card may offer to execute. */
-export type ExecutableAction = "archive" | "delete";
+/**
+ * The actions a card may offer to execute.
+ *
+ * `unsubscribe` is one of them because the publisher declared RFC 8058
+ * one-click in the header: a machine POST is what it asked for. A mail whose
+ * only "way out" is a page stays out of the cards - there is nothing this
+ * board could run.
+ */
+export type ExecutableAction = "archive" | "delete" | "unsubscribe";
 
-const EXECUTABLE: ReadonlySet<AdvisedAction> = new Set<AdvisedAction>(["archive", "delete"]);
+const EXECUTABLE: ReadonlySet<AdvisedAction> = new Set<AdvisedAction>([
+  "archive",
+  "delete",
+  "unsubscribe",
+]);
 
 export interface DecisionGroup {
   /** Stable key, so React and the URL round-trip the same group. */
@@ -94,7 +107,7 @@ export interface DecisionBoard {
   cards: DecisionGroup[];
   /** The cards beyond `VISIBLE_CARDS`, folded into one row by the UI. */
   overflow: { cards: number; mail: number };
-  /** reply / wait / remind / unsubscribe / nothing - shown, never batched. */
+  /** reply / wait / remind / nothing (and page-only unsubscribe) - never batched. */
   personal: PersonalItem[];
   /** Mails with no suggestion yet. The board says so instead of pretending. */
   unsuggested: number;
@@ -108,7 +121,7 @@ export interface BuildInput {
   senders: SenderSummary[];
   unsuggested: number;
   /** Shown in `label`; kept as a parameter so the function stays pure. */
-  labels: { archive: string; delete: string };
+  labels: { archive: string; delete: string; unsubscribe: string };
 }
 
 /**
@@ -226,7 +239,12 @@ export function buildDecisionBoard(input: BuildInput): DecisionBoard {
       id: key,
       kind: "action",
       action,
-      label: action === "archive" ? labels.archive : labels.delete,
+      label:
+        action === "archive"
+          ? labels.archive
+          : action === "delete"
+            ? labels.delete
+            : labels.unsubscribe,
       remoteIds: [],
       samples: [],
       bySource: { heuristic: 0, ai: 0 },
@@ -315,7 +333,13 @@ function compareGroups(left: DecisionGroup, right: DecisionGroup): number {
   if (left.remoteIds.length !== right.remoteIds.length) {
     return right.remoteIds.length - left.remoteIds.length;
   }
-  if (left.action !== right.action) return left.action === "archive" ? -1 : 1;
+  if (left.action !== right.action) {
+    // Reversible first: archive, then unsubscribe (it ends a subscription),
+    // then delete (the only irreversible one).
+    const rank = (action: ExecutableAction) =>
+      action === "archive" ? 0 : action === "unsubscribe" ? 1 : 2;
+    return rank(left.action) - rank(right.action);
+  }
   return left.id.localeCompare(right.id);
 }
 

@@ -24,6 +24,7 @@ pub mod routes_r3;
 pub mod routes_r5;
 pub mod routes_send;
 pub mod routes_triage;
+pub mod routes_unsubscribe;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -78,6 +79,10 @@ pub struct AppState {
     /// The sync supervisor: one loop per account with a provider, plus the
     /// trigger POST /api/sync uses.
     pub sync: Arc<crate::sync::SyncSupervisor>,
+    /// Who sends an RFC 8058 one-click POST. Real in production; a test
+    /// answers without a socket, which is the only way to test the route
+    /// without unsubscribing someone for real.
+    pub unsubscribe: Arc<dyn crate::unsubscribe::Firer>,
     /// The AI gateway: the read-only advisor (constitution §2).
     ///
     /// It is always present. What varies is whether it is *configured*: a
@@ -113,6 +118,8 @@ impl AppState {
             .with_budget(budget_source(Arc::clone(&db), config.budget_cap_usd)),
         );
         let sync = build_supervisor(&db, &body_key, &token_key, &provider_factory, &ai);
+        let unsubscribe: Arc<dyn crate::unsubscribe::Firer> =
+            Arc::new(crate::unsubscribe::RealFirer);
         let triage = Arc::new(crate::triage::TriageWorker::new(
             db.path().to_path_buf(),
             Arc::clone(&ai),
@@ -127,9 +134,16 @@ impl AppState {
             token_key,
             provider_factory,
             sync,
+            unsubscribe,
             ai,
             triage,
         }
+    }
+
+    /// Swap the unsubscribe firer (tests answer without a socket).
+    pub fn with_unsubscribe_firer(mut self, firer: Arc<dyn crate::unsubscribe::Firer>) -> Self {
+        self.unsubscribe = firer;
+        self
     }
 
     /// Replace the whole AI gateway (tests that need their own keys).
@@ -345,6 +359,16 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/delete-bulk",
             axum::routing::post(routes_r5::delete_bulk),
+        )
+        // RFC 8058 one-click unsubscribe: the only route that talks to a
+        // publisher. Its guards live in crate::unsubscribe.
+        .route(
+            "/api/messages/{remote_id}/unsubscribe",
+            axum::routing::post(routes_unsubscribe::unsubscribe),
+        )
+        .route(
+            "/api/unsubscribe-bulk",
+            axum::routing::post(routes_unsubscribe::unsubscribe_bulk),
         )
         .route(
             "/api/actions/{id}/undo",

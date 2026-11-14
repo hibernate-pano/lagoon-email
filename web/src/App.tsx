@@ -57,6 +57,7 @@ import {
   setRead,
   singleAction,
   startTriage,
+  unsubscribeOne,
   undoBulk,
   undoAction,
   allows,
@@ -829,6 +830,48 @@ export function App(): ReactNode {
     });
   }
 
+  function requestConfirmUnsubscribe(count: number, publishers: number, run: () => void) {
+    setConfirm({
+      title: t.decisions.actionUnsubscribe,
+      message: t.decisions.unsubscribeConfirm(count, publishers),
+      destructive: true,
+      confirmLabel: t.decisions.actionUnsubscribe,
+      onConfirm: () => {
+        setConfirm(null);
+        run();
+      },
+    });
+  }
+
+  /** One-click unsubscribe from the reader: confirm, run, report. */
+  function requestUnsubscribe(remoteId: string) {
+    if (!active) return;
+    setConfirm({
+      title: t.decisions.actionUnsubscribe,
+      message: t.decisions.unsubscribeConfirm(1, 1),
+      destructive: true,
+      confirmLabel: t.decisions.actionUnsubscribe,
+      onConfirm: async () => {
+        setConfirmBusy(true);
+        const result = await unsubscribeOne(remoteId, active.id);
+        setConfirmBusy(false);
+        setConfirm(null);
+        if (!result.ok) {
+          reportWriteFailure({
+            message: result.message ?? "",
+            code: result.code ?? null,
+            status: result.status ?? 0,
+          });
+          return;
+        }
+        showToast(t.decisions.unsubscribeDone(1));
+        advice.refresh();
+        messages.refresh();
+        setOpenedId(null);
+      },
+    });
+  }
+
   /** A failed board write: the same banner the row verbs use. */
   function reportWriteFailure(failure: {
     message: string;
@@ -1218,6 +1261,9 @@ export function App(): ReactNode {
                 senders.refresh();
               }}
               onConfirmDelete={(count, run) => requestConfirmDelete(count, run)}
+              onConfirmUnsubscribe={(count, publishers, run) =>
+                requestConfirmUnsubscribe(count, publishers, run)
+              }
               onError={(failure) => reportWriteFailure(failure)}
               onToast={showToast}
             />
@@ -1270,6 +1316,7 @@ export function App(): ReactNode {
             aiStatus={aiStatus.outcome.phase === "ready" ? aiStatus.outcome.data : undefined}
             writes={writes}
             onPurge={requestPurge}
+            onUnsubscribe={requestUnsubscribe}
             onOpenHistory={() => setHistoryOpen(true)}
             onClose={() => setOpenedId(null)}
             onReply={(original) => openReply("reply", original)}

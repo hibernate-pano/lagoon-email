@@ -119,6 +119,13 @@ const CODE_SENTENCES: Record<string, string> = {
   "uidplus-missing": "这个邮箱服务器不支持 UIDPLUS，不能彻底删除；只能移入垃圾箱。",
   "unknown-before": "before 指向的动作不存在（可能已被另一个窗口清掉）。",
   "unknown-stack": "没有这个 stack 参数（前端 bug）。",
+  // RFC 8058 one-click unsubscribe. The three 422s are answers, not failures:
+  // "no way out declared", "the page wants a human", "the target was refused".
+  "unsubscribe-unavailable": "这封邮件没有声明可自动退订的地址，只能打开发件人的页面处理。",
+  "unsubscribe-page-required": "发布方只给了一个网页入口，没声明一键退订。已打开发布方页面。",
+  "unsubscribe-manual-required": "退订目标没通过安全校验（非 https、带账号信息、或指向内网地址），请手动处理。",
+  "unsubscribe-failed": "退订请求被发布方拒绝或超时（502）。可以再试一次，或打开发布方页面手动退订。",
+  "message-not-found": "这封邮件不在本地库里（可能已被删除或移走）。",
   // R6: the triage batch and the advice decision出口.
   "invalid-decision": "决定的取值不合法：只接受 accepted 或 dismissed（pending 不是决定）。",
   "empty-ids": "批量决定没有带建议 id（前端 bug）。",
