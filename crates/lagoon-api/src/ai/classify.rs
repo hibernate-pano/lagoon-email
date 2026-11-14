@@ -104,7 +104,13 @@ pub async fn classify(ai: &AiGateway, targets: Vec<TriageTarget>) -> Vec<Classif
 /// A model that answers with prose still answered: the text becomes the
 /// reason, and the action falls back to "nothing" - the queue's way of
 /// saying "look at this yourself".
+///
+/// `<think>` blocks are removed first: a reasoning model drafts JSON inside
+/// its thinking, so the first `{` of the raw answer usually sits inside the
+/// think text, and an extract taken from there parses as nothing - the whole
+/// monologue then became the stored rationale (observed 2026-11-14).
 pub fn parse_classification(raw: &str) -> Classification {
+    let raw = strip_think(raw);
     let value = extract_json_object(raw)
         .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
     let text_of = |key: &str| -> Option<String> {
@@ -159,6 +165,23 @@ fn extract_json_object(raw: &str) -> Option<String> {
     Some(raw[start..=end].to_owned())
 }
 
+/// Remove reasoning-model think blocks from an answer.
+///
+/// Handles the unclosed form too: a truncated answer must not leak the
+/// monologue into the rationale either.
+fn strip_think(raw: &str) -> &str {
+    let mut text = raw;
+    if let Some(open) = raw.find("<think>") {
+        let after = open + "<think>".len();
+        text = match raw[after..].find("</think>") {
+            Some(close) => &raw[after + close + "</think>".len()..],
+            // No closing tag: everything after the opening tag is thinking.
+            None => &raw[..open],
+        };
+    }
+    text.trim_start()
+}
+
 /// The error the classifier reports when the AI cannot answer.
 pub fn as_error(error: &AiError) -> String {
     error.to_string()
@@ -188,6 +211,38 @@ mod tests {
             r#"{"category":"work","action":"forward_to_boss","confidence":"high"}"#,
         );
         assert_eq!(classification.action, "nothing");
+    }
+
+    #[test]
+    fn a_think_block_is_stripped_and_the_json_inside_it_ignored() {
+        // Measured 2026-11-14: the model reasons in English inside <think>,
+        // drafts a JSON there, then answers outside it. The first `{` of the
+        // raw text belongs to the think block - extracting from it stored the
+        // whole monologue as the rationale.
+        let classification = parse_classification(
+            "<think>We need classify email. Maybe marketing? Let's draft: \
+             {\"category\":\"marketing\",\"action\":\"delete\"} But wait, \
+             unsubscribe is stronger. Do that.</think>\
+             {\"category\":\"marketing\",\"action\":\"unsubscribe\",\"confidence\":\"high\",\"rationale\":\"主题含黑五促销\",\"dueText\":\"\"}",
+        );
+        assert_eq!(classification.action, "unsubscribe");
+        assert_eq!(classification.rationale.as_deref(), Some("主题含黑五促销"));
+    }
+
+    #[test]
+    fn an_unclosed_think_block_leaks_nothing_into_the_rationale() {
+        let classification =
+            parse_classification("<think>truncated mid-monologue {\"category\":\"spam\"");
+        assert_eq!(classification.action, "nothing");
+        assert_eq!(classification.rationale, None);
+    }
+
+    #[test]
+    fn an_answer_without_think_is_untouched() {
+        let classification = parse_classification(
+            r#"{"category":"work","action":"reply","confidence":"high","rationale":"对方在等你确认","dueText":""}"#,
+        );
+        assert_eq!(classification.rationale.as_deref(), Some("对方在等你确认"));
     }
 
     #[test]

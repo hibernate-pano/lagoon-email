@@ -336,7 +336,7 @@ export function App(): ReactNode {
   });
 
   const messages = useApiOutcome<SyncResponse>({
-    enabled: Boolean(accountId) && route.view === "list",
+    enabled: Boolean(accountId) && (route.view === "list" || route.view === "decisions"),
     deps: [accountId, route.view, route.lens, listLimit],
     pollMs: POLL_MS,
     load: async () => {
@@ -483,7 +483,10 @@ export function App(): ReactNode {
       }
       return [];
     }
-    if (route.view === "list" && (messages.outcome.phase === "ready" || messages.outcome.phase === "empty")) {
+    if (
+      (route.view === "list" || route.view === "decisions") &&
+      (messages.outcome.phase === "ready" || messages.outcome.phase === "empty")
+    ) {
       return messages.outcome.data.messages;
     }
     if (route.view === "briefing" && (briefing.outcome.phase === "ready" || briefing.outcome.phase === "empty")) {
