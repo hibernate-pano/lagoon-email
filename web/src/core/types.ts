@@ -1,6 +1,6 @@
 /**
- * Wire types, verbatim from v4/recon/server-contract.md §3.1 and the Swift
- * structs it cites. camelCase everywhere; dates are ISO-8601 strings.
+ * Wire types, verbatim from the v3->v4 recon's server-contract draft §3.1 and
+ * the Swift structs it cites. camelCase everywhere; dates are ISO-8601 strings.
  *
  * Rule inherited from the contract: a missing field is *unknown*, never false
  * and never 0. Hence the many optional / nullable fields below — collapsing
@@ -225,8 +225,8 @@ export interface SentResponse {
 export interface ApiErrorBody {
   error: string;
 }
-/* ---- M2 write paths (v4/docs/api-contract.md; shapes cross-checked against
-   v4/tests/contract/fixtures/fixtures.json) ---------------------------------- */
+/* ---- M2 write paths (docs/api-contract.md; shapes cross-checked against
+   tests/contract/fixtures/fixtures.json) ---------------------------------- */
 
 /** POST /api/messages/:id/{archive,delete,unarchive,restore,pin,read} */
 export interface StateChangeResponse {

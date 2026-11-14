@@ -547,7 +547,7 @@ def scenario() -> list:
     fixtures = []
 
     def add(name, note, method, path, query=None, auth="token", headers=None, body=None,
-            known_defect=None, r2_skip=None, raw_body=None, pre=None):
+            known_defect=None, r2_skip=None, raw_body=None, pre=None, mutates_store=False):
         entry = {
             "name": name,
             "note": note,
@@ -569,6 +569,8 @@ def scenario() -> list:
             entry["known_defect"] = known_defect
         if r2_skip:
             entry["r2_skip"] = r2_skip
+        if mutates_store:
+            entry["mutates_store"] = True
         fixtures.append(entry)
 
     # Transport / auth / host guard
@@ -708,19 +710,20 @@ def scenario() -> list:
     write_skip = "write-path: Rust R2 is READ_ONLY; assert with LAGOON_CONTRACT_INCLUDE_WRITE=1"
     add("read.mark-read", "POST /read defaults to isRead=true; answers 204 with no body.",
         "POST", "/api/messages/%s/read" % REMOTE3, query={"accountId": ACCOUNT_ID},
-        r2_skip=write_skip)
+        r2_skip=write_skip, mutates_store=True)
     add("read.recorded", "record=true returns the audit row id (actionId).",
         "POST", "/api/messages/%s/read" % REMOTE3, query={"accountId": ACCOUNT_ID, "record": "true"},
-        r2_skip=write_skip)
+        r2_skip=write_skip, mutates_store=True)
     add("pin.set", "Pin toggles join the undo log; response carries the action id.",
         "POST", "/api/messages/%s/pin" % REMOTE1, query={"accountId": ACCOUNT_ID, "pinned": "true"},
-        r2_skip=write_skip)
+        r2_skip=write_skip, mutates_store=True)
 
     # POST /api/sync: asks the engine for an immediate round. It answers 204
-    # with no body, and it is last because it restarts the sync loop (which is
-    # exactly what flips a seeded account to needsReconnect).
+    # with no body, and it mutates local state like the writes above - it
+    # restarts the sync loop, which is exactly what flips a seeded account to
+    # needsReconnect - so replay runs it after every read.
     add("sync.request", "Wake the sync engine: 204, no body, no content-type.",
-        "POST", "/api/sync")
+        "POST", "/api/sync", mutates_store=True)
     return fixtures
 
 
@@ -934,7 +937,22 @@ def check(
     total = 0
     skipped = []
     include_known_defects = os.environ.get("LAGOON_CONTRACT_KNOWN_DEFECTS") == "1"
-    for fixture in payload["fixtures"]:
+    # The write-path fixtures change the store on purpose: `read.mark-read`
+    # marks fixture-msg-3 as read, and the search fixture that follows it
+    # asserts the PRISTINE state (that message is unread). Replaying them in
+    # file order therefore made the search fixture fail against a correct
+    # implementation - the store it looked at had already been written to.
+    #
+    # So fixtures that mutate the store go last, and each class keeps its own
+    # file order (`read.recorded` still has to run after `read.mark-read`).
+    # `mutates_store` is the key; `r2_skip` is honoured as a fallback because
+    # every fixture captured so far that carries it is a write.
+    def mutates(fixture):
+        return fixture.get("mutates_store") or fixture.get("r2_skip")
+
+    ordered = [f for f in payload["fixtures"] if not mutates(f)]
+    ordered += [f for f in payload["fixtures"] if mutates(f)]
+    for fixture in ordered:
         if fixture.get("known_defect") and not include_known_defects:
             skipped.append((fixture["name"], "known defect; LAGOON_CONTRACT_KNOWN_DEFECTS=1"))
             continue
@@ -944,8 +962,8 @@ def check(
         if fixture.get("contract_expected") and not assert_contract_expected:
             skipped.append((
                 fixture["name"],
-                "contract_expected: v3 cannot satisfy it; run with "
-                "--assert-contract-expected (two-arg contract-check does this by default)",
+                "contract_expected: the retired Swift sidecar could not produce it; "
+                "run with --assert-contract-expected (contract-check does this by default)",
             ))
             continue
         total += 1

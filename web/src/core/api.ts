@@ -5,7 +5,7 @@
  *   - Tauri:    invoke("api", { request })  -> the Rust shell proxies, the
  *               token never enters this process (contract §1.1).
  *   - Browser:  fetch() straight at the sidecar with the dev-only Bearer
- *               token read from v4/.dev/web.env via the virtual module
+ *               token read from .dev/web.env via the virtual module
  *               (contract §5). Development and Playwright only.
  *
  * Nothing else in the app is allowed to call fetch/invoke. That is not a style
@@ -73,7 +73,7 @@ async function viaFetch(request: ApiRequest): Promise<ApiResponse> {
       error: {
         code: "not-ready",
         message:
-          "浏览器模式没有配到边车：v4/.dev/web.env 缺失或不完整（先运行 bash v4/scripts/sidecar-dev.sh start 再重启 npm run dev）。",
+          "浏览器模式没有配到边车：.dev/web.env 缺失或不完整（先运行 bash scripts/dev.sh，它会写好这个文件并起后端）。",
       },
     };
   }
@@ -239,7 +239,7 @@ export async function downloadFile(request: {
       return {
         kind: "fail",
         code: "not-ready",
-        message: "浏览器模式没有配到边车：v4/.dev/web.env 缺失或不完整。",
+        message: "浏览器模式没有配到边车：.dev/web.env 缺失或不完整（先运行 bash scripts/dev.sh）。",
       };
     }
     const controller = new AbortController();

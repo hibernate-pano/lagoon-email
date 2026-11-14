@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
  *
  * WHY A PROXY AND NOT A DIRECT fetch — this is the one non-obvious fact about
  * browser mode. The v3 server has **zero CORS**: no Access-Control-* headers, no
- * Origin handling (v4/recon/server-contract.md §9 measured exactly this). A page
+ * Origin handling (the v4 recon's server-contract notes §9 measured exactly this). A page
  * served from 127.0.0.1:5173 that calls http://127.0.0.1:52728/api/... is a
  * cross-origin request, so the browser will send it and then refuse to let the
  * page read the answer. docs/ipc-contract.md §5 describes browser mode as a
@@ -26,12 +26,12 @@ import { fileURLToPath } from "node:url";
  *     in localStorage) — a stronger guarantee than the contract asked for;
  *   - the release path is unchanged: Tauri mode never uses any of this.
  *
- * The token is read once at config load from v4/.dev/web.env (written by
- * v4/scripts/sidecar-dev.sh). Restarting the sidecar rewrites that file with a
+ * The token is read once at config load from .dev/web.env (written by
+ * scripts/dev.sh). Restarting the sidecar rewrites that file with a
  * new port, so restart the dev server too — the page prints the URL it expects.
  */
-// Default: the developer's v4/.dev sidecar. LAGOON_WEB_ENV points the same dev
-// server at another env file — used by scripts/synth-sidecar.sh to drive the
+// Default: the developer's .dev sidecar. LAGOON_WEB_ENV points the same dev
+// server at another env file — used by web/scripts/synth-sidecar.sh to drive the
 // write UI against a seeded synthetic store (README "写路径怎么验").
 // LAGOON_WEB_ENV is interpreted relative to the REPOSITORY ROOT (not to v4/web,
 // and not to the shell's cwd, which npm sets to the package directory).

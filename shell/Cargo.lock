@@ -1648,7 +1648,7 @@ dependencies = [
 
 [[package]]
 name = "lagoon-v4-shell"
-version = "0.1.0"
+version = "4.0.0"
 dependencies = [
  "base64 0.22.1",
  "libc",

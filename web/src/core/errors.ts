@@ -19,7 +19,7 @@ export interface CodeCopy {
 export const UNAUTHORIZED: CodeCopy = {
   reason: "unauthorized",
   title: "未授权（401）",
-  detail: "边车配了 token，但前端没有带上或带错了。浏览器模式请重启 bash v4/scripts/sidecar-dev.sh（会重写 v4/.dev/web.env）。",
+  detail: "边车配了 token，但前端没有带上或带错了。浏览器模式请重启 bash scripts/dev.sh（会重写 .dev/web.env）。",
 };
 
 export const COMMON_UNAVAILABLE: Record<string, CodeCopy> = {

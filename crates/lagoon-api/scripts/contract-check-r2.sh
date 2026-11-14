@@ -1,30 +1,30 @@
 #!/usr/bin/env bash
 # Run the contract fixtures against THIS server, the way the lead checks it.
 #
-#   bash v4/crates/lagoon-api/scripts/contract-check-r2.sh
+#   bash crates/lagoon-api/scripts/contract-check-r2.sh
 #
 # Steps, all in a throwaway directory:
-#   1. copy the schema out of v4/.dev/data/lagoon.sqlite (the v3 sidecar's
+#   1. copy the schema out of .dev/data/lagoon.sqlite (the v3 sidecar's
 #      migrated store - it is the schema authority until R3 takes migration
 #      ownership);
-#   2. seed it with v4/tests/contract/harness.py and the same test-vector body
+#   2. seed it with tests/contract/harness.py and the same test-vector body
 #      key this server is about to use, so the sealed body and draft open;
 #   3. start lagoon-api on an ephemeral port;
-#   4. run "bash v4/scripts/contract-check.sh <base_url> <token>".
+#   4. run "bash scripts/contract-check.sh <base_url> <token>".
 #
 # The schema copy goes through SQLite's backup API: the dev store keeps most of
 # its content in the WAL, so a plain cp would carry a 4 KiB file and no tables.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-CRATE="$ROOT/v4/crates"
-HARNESS="$ROOT/v4/tests/contract/harness.py"
-DEV_DB="$ROOT/v4/.dev/data/lagoon.sqlite"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+CRATE="$ROOT/crates"
+HARNESS="$ROOT/tests/contract/harness.py"
+DEV_DB="$ROOT/.dev/data/lagoon.sqlite"
 
 die() { echo "contract-check-r2: $*" >&2; exit 1; }
 
 [ -f "$HARNESS" ] || die "missing $HARNESS"
-[ -f "$DEV_DB" ] || die "missing $DEV_DB - run: bash v4/scripts/sidecar-dev.sh start"
+[ -f "$DEV_DB" ] || die "missing $DEV_DB - run: bash scripts/dev.sh"
 
 echo "== building lagoon-api"
 (cd "$CRATE" && cargo build --offline --quiet)
@@ -74,7 +74,7 @@ echo "== seeding with the contract harness (body key = the test vector)"
 python3 "$HARNESS" seed --db "$TMP/rust.sqlite" --body-key "$BODY_KEY"
 # The harness may seed accounts newer fixtures will use; the fixtures file
 # being replayed is the oracle, so keep exactly the accounts its seed names.
-python3 - "$ROOT/v4/tests/contract/fixtures/fixtures.json" "$TMP/rust.sqlite" <<'PY'
+python3 - "$ROOT/tests/contract/fixtures/fixtures.json" "$TMP/rust.sqlite" <<'PY'
 import json, sqlite3, sys, uuid
 seed = json.load(open(sys.argv[1]))["seed"]
 ids = []
@@ -103,5 +103,5 @@ curl -sf -m 2 -o /dev/null "http://127.0.0.1:$PORT/healthz" || { echo "server ne
 
 echo
 status=0
-bash "$ROOT/v4/scripts/contract-check.sh" "http://127.0.0.1:$PORT" "$TOKEN" || status=$?
+bash "$ROOT/scripts/contract-check.sh" "http://127.0.0.1:$PORT" "$TOKEN" || status=$?
 exit "$status"

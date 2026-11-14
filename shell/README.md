@@ -1,4 +1,4 @@
-# v4/shell — Lagoon V4 Rust 外壳（Tauri 2）
+# shell — Lagoon V4 Rust 外壳（Tauri 2）
 
 M1 的外壳进程。它做三件事，别的一律不做（ADR 0001 / ipc-contract v0.1）：
 
@@ -14,17 +14,17 @@ M1 的外壳进程。它做三件事，别的一律不做（ADR 0001 / ipc-contr
 
 ```bash
 # 一条命令（检查边车二进制存在 → cargo run）
-bash v4/scripts/tauri-dev.sh
+bash scripts/tauri-dev.sh
 
 # 或者直接
-cd v4/shell && cargo run
+cd shell && cargo run
 
 # 无窗口验收（启动边车、跑全部 API 用例、崩溃重启、清理）
-bash v4/scripts/tauri-dev.sh selftest
+bash scripts/tauri-dev.sh selftest
 # 等价于：cargo run -- --selftest
 ```
 
-首次运行会在 `v4/.dev/keys.json` 生成一对密钥 + API token（`0600`，已 gitignore）；数据目录 `v4/.dev/data/`。**这两处都是 dev-only**，发布期按契约 §2 换 data-protection Keychain。
+首次运行会在 `.dev/keys.json` 生成一对密钥 + API token（`0600`，已 gitignore）；数据目录 `.dev/data/`。**这两处都是 dev-only**，发布期按契约 §2 换 data-protection Keychain。
 
 ## 三个命令 + 一个事件
 
@@ -62,7 +62,7 @@ bash v4/scripts/tauri-dev.sh selftest
 | 后端 | 二进制（可用环境变量覆盖） | 启动方式 |
 |---|---|---|
 | `swift` | `.build/release/LagoonServerCLI`（`LAGOON_V4_SIDECAR`） | 环境变量：`LAGOON_DB_PATH` / `LAGOON_SERVER_PORT` / `LAGOON_TOKEN_KEY` / `LAGOON_BODY_KEY` / `LAGOON_API_TOKEN` |
-| `rust` | `v4/crates/target/debug/lagoon-api`（`LAGOON_V4_RUST_API`） | 参数 `--db <data>/lagoon.sqlite --host 127.0.0.1 --port <port>`；环境变量只给 `LAGOON_BODY_KEY` / `LAGOON_API_TOKEN`（密钥不走 argv，`ps` 看得见） |
+| `rust` | `crates/target/debug/lagoon-api`（`LAGOON_V4_RUST_API`） | 参数 `--db <data>/lagoon.sqlite --host 127.0.0.1 --port <port>`；环境变量只给 `LAGOON_BODY_KEY` / `LAGOON_API_TOKEN`（密钥不走 argv，`ps` 看得见） |
 
 `boot_status` 与 `boot-status` 事件都多了一个 **`backend`** 字段（契约 v0.2 §4.1）：前端据此知道当前跑的是哪个后端，但**不需要**据此改请求路径。
 
@@ -77,10 +77,10 @@ bash v4/scripts/tauri-dev.sh selftest
 |---|---|---|
 | `LAGOON_V4_BACKEND` | `swift` | `swift` 或 `rust`，见上一节（R3.6） |
 | `LAGOON_V4_SIDECAR` | `.build/release/LagoonServerCLI`，回退 debug | 契约 §2（仅 swift 后端） |
-| `LAGOON_V4_RUST_API` | `v4/crates/target/debug/lagoon-api` | 仅 rust 后端 |
-| `LAGOON_V4_DATA_DIR` | `v4/.dev/data` | 契约 §2 |
+| `LAGOON_V4_RUST_API` | `crates/target/debug/lagoon-api` | 仅 rust 后端 |
+| `LAGOON_V4_DATA_DIR` | `.dev/data` | 契约 §2 |
 | `LAGOON_V4_ROOT` | 编译期 `CARGO_MANIFEST_DIR` 上溯两级 | 仓库根；Finder 启动时也能定位 |
-| `LAGOON_V4_KEYS` | `v4/.dev/keys.json` | 本实现新增的 dev 逃生口，默认行为与契约一致 |
+| `LAGOON_V4_KEYS` | `.dev/keys.json` | 本实现新增的 dev 逃生口，默认行为与契约一致 |
 
 边车拿到的环境（v3 CLI 的既有契约，`Sources/LagoonServerCLI/main.swift:21-65`）：
 
@@ -97,12 +97,12 @@ LAGOON_API_TOKEN=<hex>
 
 ## 为什么不用 `tauri-plugin-shell`
 
-shell 插件是给**前端**执行二进制用的，等于给 WebView 开一个"可执行任意程序"的 capability。外壳自己 spawn 边车用 `std::process::Command` 就够，所以这个插件**没有被链接进来**（详见 `v4/recon/rust-spike.md` §4.2A）。
+shell 插件是给**前端**执行二进制用的，等于给 WebView 开一个"可执行任意程序"的 capability。外壳自己 spawn 边车用 `std::process::Command` 就够，所以这个插件**没有被链接进来**（详见 recon 的 rust-spike 笔记 §4.2A）。
 
 ## 验收
 
 ```bash
-cd v4/shell
+cd shell
 cargo build            # 冷编译（含 tauri + reqwest 依赖）约 42s；增量 < 3s
 cargo test             # 5 个单测：白名单 / 方法 / 参数包装 / query 编码 / body 映射
 cargo run -- --selftest  # 每个可用后端各 13 项（swift + rust 都跑），见 ACCEPTANCE.md
@@ -116,16 +116,16 @@ LAGOON_V4_BACKEND=rust cargo run
 ## 打包（M2，不在 M1 范围）
 
 - 现在 `tauri.conf.json` 里 `bundle.active = false`，只出裸二进制；出 .app/.dmg 需要 tauri-cli。
-- 打包时边车要改成 Tauri 的 `externalBin`，**磁盘文件名必须带 target-triple 后缀**（`binaries/lagoon-server-aarch64-apple-darwin`），tauri-build 在编译期把后缀剥掉再拷进 bundle（`v4/recon/rust-spike.md` §4.1 有 crate 源码行号）。
+- 打包时边车要改成 Tauri 的 `externalBin`，**磁盘文件名必须带 target-triple 后缀**（`binaries/lagoon-server-aarch64-apple-darwin`），tauri-build 在编译期把后缀剥掉再拷进 bundle（recon 的 rust-spike 笔记 §4.1 有 crate 源码行号）。
 - 本机只有 Command Line Tools、没有完整 Xcode；且没有 rustup（只能 `aarch64-apple-darwin`）。签名/公证/universal binary 都**未验证**，属于 M2 的待办而不是 M1 的缺陷。
 
 ## 已知限制（M1 有意为之）
 
-1. **前端是占位页**（`ui/index.html`）：它只证明 IPC 桥、事件订阅和 `api` 代理可用。真正的界面在 `v4/web`；接上时把 `tauri.conf.json` 的 `build.frontendDist` 从 `./ui` 改成 `../web/dist`（一行），并保留 `withGlobalTauri` 或改用 `@tauri-apps/api` 包。
-2. **图标**是从 `Support/Lagoon.icns` 用 `sips` 转的 32/128/256/512/1024 PNG。`generate_context!` 硬性要求 `icons/icon.png`，缺失会让 proc-macro panic（v4/recon/rust-spike.md §3.4）。
+1. **前端是占位页**（`ui/index.html`）：它只证明 IPC 桥、事件订阅和 `api` 代理可用。真正的界面在 `web`；接上时把 `tauri.conf.json` 的 `build.frontendDist` 从 `./ui` 改成 `../web/dist`（一行），并保留 `withGlobalTauri` 或改用 `@tauri-apps/api` 包。
+2. **图标**是从 `Support/Lagoon.icns` 用 `sips` 转的 32/128/256/512/1024 PNG。`generate_context!` 硬性要求 `icons/icon.png`，缺失会让 proc-macro panic（recon 的 rust-spike 笔记 §3.4）。
 3. **空 body → `null`，非 JSON body → 字符串**：契约说 body 是"服务端 JSON 原样"，服务端对 404 返回空 body，所以这里有一个明确的映射（`src/api.rs::body_value`），README 与代码注释都写了，不静默改写。
 4. **未打包运行时窗口的 LS 身份是继承的**：从终端直接跑裸二进制，系统把窗口归到父 app 名下（本机实测显示为 "DeepSeek Harness"），所以按窗口 owner 名判断"窗口起没起"不可靠；验收改用 **pid + 窗口尺寸 1200x800**（见 ACCEPTANCE.md）。
-5. **dev 期两个进程共用一个 SQLite**：`sidecar-dev.sh`（给浏览器模式）和本外壳会各起一个边车，指向同一个 `v4/.dev/data/lagoon.sqlite`。WAL 允许，但写入会互相等锁；同一时刻只跑一个更稳。
+5. **dev 期两个进程共用一个 SQLite**：`scripts/dev.sh`（给浏览器模式）和本外壳会各起一个边车，指向同一个 `.dev/data/lagoon.sqlite`。WAL 允许，但写入会互相等锁；同一时刻只跑一个更稳。
 6. **崩溃重启预算只有一次**（契约要求），且重启会换端口——前端必须用 `boot-status` 事件里的新端口，不能缓存旧端口。
 7. 没有 updater / 通知 / 托盘 / 深链（M2）。
 

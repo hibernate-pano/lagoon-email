@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # R3.2 proof: this crate's migration chain produces the store v3 would have.
 #
-#   bash v4/crates/lagoon-api/scripts/verify-r3.2.sh
+#   bash crates/lagoon-api/scripts/verify-r3.2.sh
 #
 # Three checks, all on throwaway files:
 #   a. Rust-created store vs v3-created store: dump sqlite_master (minus the
@@ -13,8 +13,8 @@
 # Needs the release sidecar at .build/release/LagoonServerCLI (swift build).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-CRATE="$ROOT/v4/crates"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+CRATE="$ROOT/crates"
 V3_BIN="${LAGOON_V4_SIDECAR:-$ROOT/.build/release/LagoonServerCLI}"
 BODY_KEY="$(printf '0123456789abcdef0123456789abcdef' | base64)"
 TOKEN_KEY="$(printf 'fedcba9876543210fedcba9876543210' | base64)"

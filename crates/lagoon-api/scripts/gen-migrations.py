@@ -7,9 +7,9 @@ registerMigration blocks and the static SQL constants they execute. Hand-copying
 side, so the Rust module is generated. The generator is checked in next to the
 output; run it from the repo root:
 
-    python3 v4/crates/lagoon-api/scripts/gen-migrations.py
+    python3 crates/lagoon-api/scripts/gen-migrations.py
 
-It writes v4/crates/lagoon-api/src/migrations.rs. Every statement is emitted
+It writes crates/lagoon-api/src/migrations.rs. Every statement is emitted
 verbatim (indentation, comments and all) because sqlite_master stores the CREATE
 statement text as given: a single space of difference is a schema difference.
 """

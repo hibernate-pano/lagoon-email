@@ -127,7 +127,7 @@ export function buildDecisionBoard(input: BuildInput): DecisionBoard {
   const pending = advice.filter((record) => record.decision === "pending");
 
   const personal: PersonalItem[] = [];
-  const byKey = new Map<string, DecisionGroup>();
+  const executable: AdviceRecord[] = [];
 
   for (const record of pending) {
     const action = record.advice.action;
@@ -141,56 +141,110 @@ export function buildDecisionBoard(input: BuildInput): DecisionBoard {
       });
       continue;
     }
-    const executable = action as ExecutableAction;
-    const key = `action:${executable}:${record.advice.category ?? "other"}`;
-    let group = byKey.get(key);
-    if (!group) {
-      group = {
-        id: key,
-        kind: "action",
-        action: executable,
-        label: executable === "archive" ? labels.archive : labels.delete,
-        remoteIds: [],
-        samples: [],
-        bySource: { heuristic: 0, ai: 0 },
-        byConfidence: { high: 0, medium: 0, low: 0 },
-        reasons: [],
-        adviceIds: [],
-        bySender: [],
-      };
-      byKey.set(key, group);
-    }
-    appendToGroup(group, record, messages);
+    executable.push(record);
   }
 
-  // Sender cards: an address that writes a lot, for mail the action groups did
-  // NOT already collect.
-  //
-  // Why "not already collected" is the rule, measured rather than assumed: on
-  // the reference mailbox 322 judged mails collapse into exactly two action
-  // groups (185 newsletter + 137 notification). Letting sender cards claim that
-  // mail first produces seven-plus cards for the same 322 mails - more
-  // decisions, not fewer, which is the opposite of the point. A sender card
-  // therefore only earns its place when it collects mail that would otherwise
-  // need several separate decisions.
-  const alreadyGrouped = new Set<string>();
-  for (const group of byKey.values()) {
-    for (const remoteId of group.remoteIds) alreadyGrouped.add(remoteId);
+  // The action group a record belongs to. A function because the sender pass
+  // below has to ask the same question before any group exists.
+  const keyOf = (record: AdviceRecord): string =>
+    `action:${record.advice.action}:${record.advice.category ?? "other"}`;
+
+  // Pass one: which records sit in which action group.
+  const membersByKey = new Map<string, AdviceRecord[]>();
+  for (const record of executable) {
+    const key = keyOf(record);
+    const bucket = membersByKey.get(key);
+    if (bucket) bucket.push(record);
+    else membersByKey.set(key, [record]);
   }
+
+  // Sender cards: one address that writes a lot, as a single decision.
+  //
+  // The rule, measured rather than assumed. On the reference mailbox the
+  // judged mail collapses into a handful of action groups, and the one
+  // address that owns ten or more archivable mails (16 of them) has all 16
+  // inside ONE group - archive:notification, which holds 34 mails from ten
+  // addresses. A sender card that claimed those 16 would leave that group at
+  // 18 mails and add a card of its own: eight decisions instead of seven.
+  // More decisions, not fewer - the opposite of the point.
+  //
+  // So a sender card may only take mail when it genuinely replaces
+  // decisions: the address's mail has to sit in MORE THAN ONE action group
+  // (otherwise the action group is already the compact way to say it), and
+  // taking it has to empty at least one of those groups (otherwise the card
+  // is added next to the groups it duplicates).
+  //
+  // Only "archive" mail is ever claimed. A sender card archives by default,
+  // and a bulk button labelled "delete" over an address is the single most
+  // dangerous control this product could ship - a delete suggestion needs a
+  // per-mail look and stays in its own group.
+  const claimed = new Set<number>();
+  const senderClaims: { sender: SenderSummary; records: AdviceRecord[] }[] = [];
+
   for (const sender of senders) {
     if (sender.totalCount < SENDER_THRESHOLD) continue;
-    const mine = pending.filter(
+    const mine = executable.filter(
       (record) =>
         messages.get(record.remoteId)?.fromAddress === sender.address &&
-        !alreadyGrouped.has(record.remoteId) &&
-        EXECUTABLE.has(record.advice.action),
+        record.advice.action === "archive" &&
+        !claimed.has(record.id),
     );
     if (mine.length < SENDER_THRESHOLD) continue;
+
+    // Which action groups would this address's mail come out of?
+    const keys = [...new Set(mine.map(keyOf))];
+    if (keys.length < 2) continue;
+
+    // Does taking it empty a group? A group is emptied when every mail in it
+    // belongs to this address - that group is no longer a decision, and the
+    // sender card replaces it.
+    const mineIds = new Set(mine.map((record) => record.id));
+    const empties = keys.filter((key) => {
+      const members = membersByKey.get(key);
+      if (!members || members.length === 0) return false;
+      return members.every((member) => mineIds.has(member.id));
+    });
+    if (empties.length < 1) continue;
+
+    for (const record of mine) claimed.add(record.id);
+    senderClaims.push({ sender, records: mine });
+    for (const key of empties) membersByKey.delete(key);
+  }
+
+  // Pass two: build the cards. The groups are built from the records that
+  // were not claimed, so every counter (bySource, byConfidence, reasons) is
+  // counted from the mail the card actually acts on - and no mail sits on two
+  // cards, which would make one click act on it twice.
+  const byKey = new Map<string, DecisionGroup>();
+
+  for (const [key, members] of membersByKey) {
+    const unclaimed = members.filter((record) => !claimed.has(record.id));
+    if (unclaimed.length === 0) continue;
+    const first = unclaimed[0];
+    const action = first.advice.action as ExecutableAction;
+    const group: DecisionGroup = {
+      id: key,
+      kind: "action",
+      action,
+      label: action === "archive" ? labels.archive : labels.delete,
+      remoteIds: [],
+      samples: [],
+      bySource: { heuristic: 0, ai: 0 },
+      byConfidence: { high: 0, medium: 0, low: 0 },
+      reasons: [],
+      adviceIds: [],
+      bySender: [],
+    };
+    for (const record of unclaimed) appendToGroup(group, record, messages);
+    byKey.set(key, group);
+  }
+
+  for (const { sender, records: mine } of senderClaims) {
     const group: DecisionGroup = {
       id: `sender:${sender.address}`,
       kind: "sender",
-      // A sender card archives by default: delete is the one action that needs a
-      // per-mail look, and a bulk button labelled "delete" over an address is
+      // A sender card archives by default: delete is the one action that needs
+      // a per-mail look, and a bulk button labelled "delete" over an address is
       // the single most dangerous control this product could ship.
       action: "archive",
       label: labels.archive,

@@ -1,7 +1,7 @@
 //! Interoperability with the store the v3 sidecar actually created.
 //!
 //! This is the one test that does not use the synthetic schema: it opens
-//! v4/.dev/data/lagoon.sqlite - the SQLite file GRDB migrated to lagoon-v10
+//! .dev/data/lagoon.sqlite - the SQLite file GRDB migrated to lagoon-v10
 //! when the Swift sidecar started - and serves the R1 endpoints from it,
 //! read-only. If the schema probe, the BLOB UUID decoding or the stored date
 //! format drifted from v3, this is where it shows.
@@ -10,7 +10,7 @@
 //! PRAGMA query_only, and the assertions are read-only requests.
 //!
 //! Skipped (with a note) when the dev store has not been created yet:
-//!     bash v4/scripts/sidecar-dev.sh start
+//!     bash scripts/dev.sh
 //! The hermetic tests (contract_replay.rs, read_paths.rs) always run.
 
 mod support;
@@ -34,7 +34,7 @@ async fn serves_the_v3_sidecar_store_read_only() {
     let path = dev_store_path();
     if !path.is_file() {
         eprintln!(
-            "skip: {} does not exist yet - run: bash v4/scripts/sidecar-dev.sh start",
+            "skip: {} does not exist yet - run: bash scripts/dev.sh",
             path.display()
         );
         return;

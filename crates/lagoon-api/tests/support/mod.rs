@@ -3,8 +3,8 @@
 //! Shared scaffolding for the integration tests.
 //!
 //! The contract tests replay the golden HTTP fixtures in
-//! v4/tests/contract/fixtures/fixtures.json - the same file
-//! v4/scripts/contract-check.sh replays against the Swift sidecar.
+//! tests/contract/fixtures/fixtures.json - the same file
+//! scripts/contract-check.sh replays against the Swift sidecar.
 
 pub mod fixtures;
 pub mod http;

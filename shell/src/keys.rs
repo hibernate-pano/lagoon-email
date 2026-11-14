@@ -1,4 +1,4 @@
-//! The key file from contract §2 (under v4/.dev in dev; the app data directory
+//! The key file from contract §2 (under .dev in dev; the app data directory
 //! in the product, mode 0600).
 //!
 //! Shape: `{ "tokenKey": "<base64 32B>", "bodyKey": "<base64 32B>", "apiToken": "<hex>", "llmApiKey"?: "<provider key>" }`

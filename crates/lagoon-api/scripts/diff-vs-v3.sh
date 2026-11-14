@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Diff this Rust backend against the v3 Swift sidecar, byte for byte.
 #
-#   bash v4/crates/lagoon-api/scripts/diff-vs-v3.sh
+#   bash crates/lagoon-api/scripts/diff-vs-v3.sh
 #
 # Both processes read the SAME synthetic store: a throwaway SQLite file the v3
-# CLI migrates, seeded by v4/tests/contract/harness.py (the same seed the golden
+# CLI migrates, seeded by tests/contract/harness.py (the same seed the golden
 # fixtures were captured from) with one shared test-vector body key, so the
 # sealed body and draft open on both sides. The request list is every fixture in
-# v4/tests/contract/fixtures that is not marked r2_skip, so it grows with the
+# tests/contract/fixtures that is not marked r2_skip, so it grows with the
 # contract instead of with this script.
 #
 # Three phases, because v3's sync loop is not separable from its HTTP server:
@@ -25,15 +25,15 @@
 # Nothing here touches a real store, a real mailbox or a real key.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-CRATE="$ROOT/v4/crates"
-HARNESS="$ROOT/v4/tests/contract/harness.py"
-FIXTURES="$ROOT/v4/tests/contract/fixtures/fixtures.json"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+CRATE="$ROOT/crates"
+HARNESS="$ROOT/tests/contract/harness.py"
+FIXTURES="$ROOT/tests/contract/fixtures/fixtures.json"
 
 die() { echo "diff-vs-v3: $*" >&2; exit 1; }
 
 [ -f "$HARNESS" ] || die "missing $HARNESS"
-[ -f "$FIXTURES" ] || die "missing $FIXTURES; run: bash v4/scripts/capture-contract.sh"
+[ -f "$FIXTURES" ] || die "missing $FIXTURES; run: bash scripts/capture-contract.sh"
 command -v python3 >/dev/null || die "python3 is required"
 command -v curl >/dev/null || die "curl is required"
 

@@ -2,7 +2,7 @@
 //!
 //! It drives the same supervisor loop (sidecar::supervise) and the same proxy
 //! (api::forward) the GUI uses, once per backend whose binary is present:
-//! swift (v3 LagoonServerCLI) and rust (v4/crates lagoon-api).
+//! swift (v3 LagoonServerCLI) and rust (crates lagoon-api).
 //!
 //! The rust backend is READ-ONLY in R3: endpoints it has not implemented answer
 //! 404 with an empty body. Contract v0.2 4.1 says the shell must pass that

@@ -8,8 +8,8 @@
 //! Why the v3 CLI is spawned with a plain std::process::Command and not
 //! tauri-plugin-shell: the shell plugin exists so the *front end* can run
 //! binaries, and enabling it means shipping a capability that lets web code
-//! execute processes. The shell never needs that (see v4/recon/rust-spike.md
-//! §4.2A), so it is not linked in at all.
+//! execute processes. The shell never needs that (see the recon's rust-spike
+//! notes §4.2A), so it is not linked in at all.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -203,7 +203,7 @@ fn spawn(
                 .env("LAGOON_BODY_KEY", &ctx.keys.body_key)
                 .env("LAGOON_API_TOKEN", &ctx.keys.api_token);
         }
-        // lagoon-api takes flags for location and env for secrets (v4/crates
+        // lagoon-api takes flags for location and env for secrets (crates
         // lagoon-api README): secrets never go on argv, where ps would see them.
         Backend::Rust => {
             command

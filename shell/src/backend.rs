@@ -1,6 +1,6 @@
 //! Which business backend this run talks to (contract v0.2 §4.1).
 //!
-//! * rust  - v4/crates lagoon-api, the product backend since R3.4: reads,
+//! * rust  - crates lagoon-api, the product backend since R3.4: reads,
 //!   accounts, sync. Endpoints it has not implemented answer 404
 //!   with an empty body, which the shell must pass through as
 //!   ok:true (not as a transport failure).
@@ -96,7 +96,7 @@ impl Backend {
                     return path;
                 }
                 // Packaged app: the backend sits next to the shell under
-                // Contents/Resources (assembled by v4/scripts/build-product.sh).
+                // Contents/Resources (assembled by scripts/build-product.sh).
                 if let Ok(exe) = std::env::current_exe() {
                     let resources = exe
                         .parent()
@@ -119,7 +119,7 @@ impl Backend {
                 Err(BootError {
                     code: "spawn",
                     message: format!(
-                        "lagoon-api not found (dev: {}, packaged: Contents/Resources/lagoon-api); build it with: bash v4/scripts/build-product.sh",
+                        "lagoon-api not found (dev: {}, packaged: Contents/Resources/lagoon-api); build it with: bash scripts/build-product.sh",
                         root.join("crates/target/release/lagoon-api").display()
                     ),
                 })

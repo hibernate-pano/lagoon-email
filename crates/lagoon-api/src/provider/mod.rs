@@ -3,7 +3,7 @@
 //! Routes never speak IMAP. They ask a ProviderFactory for a MailProvider,
 //! probe it, and persist what it reports; everything protocol-shaped lives
 //! behind this boundary. That is what lets the account routes and their whole
-//! error matrix be tested today, while the real client (v4/crates/lagoon-mail,
+//! error matrix be tested today, while the real client (crates/lagoon-mail,
 //! being written in parallel) lands later without touching the routes.
 //!
 //! R3.3 ships NoProviderFactory as the production default: it returns None, so

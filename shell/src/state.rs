@@ -1,6 +1,6 @@
 //! Boot state: the one place `phase` lives.
 //!
-//! Implements `v4/docs/ipc-contract.md` §3 (startup sequence), §4.1
+//! Implements `docs/ipc-contract.md` §3 (startup sequence), §4.1
 //! (`boot_status` shape) and §4.4 (`boot-status` event).
 //!
 //! Two rules this file exists to keep:

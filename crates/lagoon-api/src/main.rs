@@ -2,7 +2,7 @@
 //!
 //!     export LAGOON_BODY_KEY=...            # base64 of the 32-byte body key
 //!     export LAGOON_API_TOKEN=...           # required; bearer auth for every route
-//!     cargo run                             # serves v4/.dev/data/lagoon.sqlite
+//!     cargo run                             # serves .dev/data/lagoon.sqlite
 //!     cargo run -- --db /path/lagoon.sqlite --port 18099
 //!
 //! See README.md for the contract this binary answers.
@@ -210,7 +210,7 @@ fn print_usage() {
     println!("usage: lagoon-api [--migrate] [--db PATH] [--host ADDR] [--port PORT]");
     println!();
     println!("  --migrate create/upgrade the store to the latest migration and exit");
-    println!("  --db    SQLite store to read (default: v4/.dev/data/lagoon.sqlite;");
+    println!("  --db    SQLite store to read (default: .dev/data/lagoon.sqlite;");
     println!("          LAGOON_DB_PATH and LAGOON_V4_DATA_DIR are also honoured)");
     println!("  --host  bind address (default 127.0.0.1, or LAGOON_SERVER_HOST)");
     println!("  --port  bind port (default 8080, or LAGOON_SERVER_PORT; 0 = ephemeral)");

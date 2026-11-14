@@ -1,7 +1,7 @@
 //! Process configuration: where the store is, what to bind, and who may call.
 //!
 //! The env-var contract is v3's (`Sources/LagoonServer/Config.swift` and
-//! `Sources/LagoonServerCLI/main.swift`), because `v4/scripts/dev.sh` and the
+//! `Sources/LagoonServerCLI/main.swift`), because `scripts/dev.sh` and the
 //! shell supervisor already speak it:
 //!
 //! | 变量 | 作用 |

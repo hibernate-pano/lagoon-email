@@ -3,7 +3,7 @@
  * slice: rows, per-lens empty copy, server-side search, bulk verbs, partial
  * window note).
  *
- * Search is the SERVER's job (v4/docs/m1-checklist.md §1.1 said otherwise, and
+ * Search is the SERVER's job (docs/m1-checklist.md §1.1 said otherwise, and
  * that was wrong): the front end used to filter the rows it happened to have
  * loaded, so mail older than the window could not be found - and the empty copy
  * said "no matches" as if the server had answered. `GET /api/search` searches

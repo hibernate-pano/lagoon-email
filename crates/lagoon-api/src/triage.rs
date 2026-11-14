@@ -39,7 +39,7 @@
 //! (stop and say so / stop and say so / keep going), so this module talks to the
 //! gateway directly and uses `parse_classification` for the text.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -170,6 +170,34 @@ impl CancelToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AlreadyRunning;
 
+/// Releases an account when its run ends, panic or not.
+///
+/// The account was inserted into `running` before the worker was spawned, and
+/// only the worker knows when it is done. A plain `remove` after `execute()`
+/// would be skipped by a panic - and an account stuck in `running` answers
+/// "already running" to every later request until the process restarts.
+///
+/// The same drop clears the account's cancel token: the token belongs to the
+/// run that just ended, and the next `start` writes a fresh one anyway.
+struct RunningGuard {
+    running: Arc<Mutex<HashSet<Uuid>>>,
+    cancel: Arc<Mutex<HashMap<Uuid, Arc<CancelToken>>>>,
+    account_id: Uuid,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.running
+            .lock()
+            .expect("triage running lock")
+            .remove(&self.account_id);
+        self.cancel
+            .lock()
+            .expect("triage cancel lock")
+            .remove(&self.account_id);
+    }
+}
+
 /// One mail's layer-2 outcome.
 enum Outcome {
     Suggested {
@@ -210,8 +238,18 @@ pub struct TriageWorker {
     db_path: PathBuf,
     ai: Arc<AiGateway>,
     budget_cap_usd: f64,
-    run: Arc<Mutex<Option<TriageRun>>>,
-    cancel: Mutex<Arc<CancelToken>>,
+    /// One entry per account, not one entry for the process.
+    ///
+    /// Two accounts may run at the same time (`running` below is per account),
+    /// so a single slot would let one account's progress overwrite the other's
+    /// and make `status` answer with a run that belongs to a different mailbox.
+    run: Arc<Mutex<HashMap<Uuid, TriageRun>>>,
+    /// The cancel token of each account's run.
+    ///
+    /// Per account for the same reason: one shared token meant that stopping
+    /// account A stopped whichever run started last (usually B) and left A
+    /// running - the user asked for the opposite of what happened.
+    cancel: Arc<Mutex<HashMap<Uuid, Arc<CancelToken>>>>,
     /// One run at a time, per account (plan §4.5): two workers would race on
     /// `upsert` and bill the same mail twice.
     running: Arc<Mutex<HashSet<Uuid>>>,
@@ -223,8 +261,8 @@ impl TriageWorker {
             db_path,
             ai,
             budget_cap_usd,
-            run: Arc::new(Mutex::new(None)),
-            cancel: Mutex::new(Arc::new(CancelToken::default())),
+            run: Arc::new(Mutex::new(HashMap::new())),
+            cancel: Arc::new(Mutex::new(HashMap::new())),
             running: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -249,7 +287,16 @@ impl TriageWorker {
         let (heuristic_count, ai_count) = store::advice::source_counts(&connection, account_id)?;
         let spend = store::usage::month_summary(&connection, &current_month())?.cost_micro_usd;
         let configured = self.ai.status().configured;
-        let run = self.run.lock().expect("triage run lock").clone();
+        // The run belongs to the account that was asked about. Another
+        // account's run must never answer here: its progress belongs to a
+        // different mailbox, and showing it next to this account's counts
+        // would be a number nobody can trace back to a source.
+        let run = self
+            .run
+            .lock()
+            .expect("triage run lock")
+            .get(&account_id)
+            .cloned();
         Ok(Some(TriageStatus {
             configured,
             running: run.as_ref().is_some_and(|run| !run.state.is_terminal()),
@@ -275,16 +322,22 @@ impl TriageWorker {
         // A fresh token per run: cancelling the previous run must not cancel
         // this one.
         let token = Arc::new(CancelToken::default());
-        *self.cancel.lock().expect("triage cancel lock") = Arc::clone(&token);
-        *self.run.lock().expect("triage run lock") = Some(TriageRun {
-            started_at: timefmt::to_iso8601(timefmt::now()),
-            phase: Some(Phase::Heuristic),
-            target: 0,
-            done: 0,
-            failed: 0,
-            state: RunState::Running,
-            last_error: None,
-        });
+        self.cancel
+            .lock()
+            .expect("triage cancel lock")
+            .insert(account_id, Arc::clone(&token));
+        self.run.lock().expect("triage run lock").insert(
+            account_id,
+            TriageRun {
+                started_at: timefmt::to_iso8601(timefmt::now()),
+                phase: Some(Phase::Heuristic),
+                target: 0,
+                done: 0,
+                failed: 0,
+                state: RunState::Running,
+                last_error: None,
+            },
+        );
 
         let batch = Batch {
             db_path: self.db_path.clone(),
@@ -296,14 +349,19 @@ impl TriageWorker {
             run: Arc::clone(&self.run),
         };
         let running = Arc::clone(&self.running);
+        let cancel = Arc::clone(&self.cancel);
         // The run outlives the request: the route answers 202 and the UI polls,
         // because a batch over a few hundred mails takes minutes.
         tokio::spawn(async move {
+            // The guard releases the account even if the worker panics: a
+            // panic that left the account marked "running" would answer 409
+            // `triage-already-running` until the app was restarted.
+            let _guard = RunningGuard {
+                running: Arc::clone(&running),
+                cancel: Arc::clone(&cancel),
+                account_id,
+            };
             batch.execute().await;
-            running
-                .lock()
-                .expect("triage running lock")
-                .remove(&account_id);
         });
         Ok(())
     }
@@ -311,10 +369,19 @@ impl TriageWorker {
     /// Ask the current run to stop. Returns the status afterwards: the state
     /// becomes `cancelled` when the worker notices, not when this returns.
     pub fn cancel(&self, account_id: Uuid) -> Result<Option<TriageStatus>, db::DbError> {
-        self.cancel.lock().expect("triage cancel lock").cancel();
+        // Only this account's run is asked to stop.
+        let token = self
+            .cancel
+            .lock()
+            .expect("triage cancel lock")
+            .get(&account_id)
+            .cloned();
+        if let Some(token) = token {
+            token.cancel();
+        }
         {
             let mut guard = self.run.lock().expect("triage run lock");
-            if let Some(run) = guard.as_mut() {
+            if let Some(run) = guard.get_mut(&account_id) {
                 // The worker also sets this; doing it here makes "I pressed
                 // stop" visible immediately instead of after the current batch.
                 if !run.state.is_terminal() {
@@ -334,7 +401,7 @@ struct Batch {
     account_id: Uuid,
     account_email: String,
     token: Arc<CancelToken>,
-    run: Arc<Mutex<Option<TriageRun>>>,
+    run: Arc<Mutex<HashMap<Uuid, TriageRun>>>,
 }
 
 impl Batch {
@@ -614,7 +681,7 @@ impl Batch {
 
     fn set_phase(&self, phase: Phase, target: i64) {
         let mut guard = self.run.lock().expect("triage run lock");
-        if let Some(run) = guard.as_mut() {
+        if let Some(run) = guard.get_mut(&self.account_id) {
             run.phase = Some(phase);
             run.target = target;
         }
@@ -622,28 +689,28 @@ impl Batch {
 
     fn add_done(&self, count: i64) {
         let mut guard = self.run.lock().expect("triage run lock");
-        if let Some(run) = guard.as_mut() {
+        if let Some(run) = guard.get_mut(&self.account_id) {
             run.done += count;
         }
     }
 
     fn add_failed(&self, count: i64) {
         let mut guard = self.run.lock().expect("triage run lock");
-        if let Some(run) = guard.as_mut() {
+        if let Some(run) = guard.get_mut(&self.account_id) {
             run.failed += count;
         }
     }
 
     fn record_error(&self, reason: &str) {
         let mut guard = self.run.lock().expect("triage run lock");
-        if let Some(run) = guard.as_mut() {
+        if let Some(run) = guard.get_mut(&self.account_id) {
             run.last_error = Some(reason.to_owned());
         }
     }
 
     fn finish(&self, state: RunState, reason: Option<String>) {
         let mut guard = self.run.lock().expect("triage run lock");
-        if let Some(run) = guard.as_mut() {
+        if let Some(run) = guard.get_mut(&self.account_id) {
             // A cancel that already landed wins over a later natural finish:
             // the user asked, and the report says so.
             if run.state == RunState::Cancelled && state != RunState::Cancelled {
@@ -658,7 +725,7 @@ impl Batch {
 
     fn finish_if_running(&self, state: RunState, reason: Option<String>) {
         let mut guard = self.run.lock().expect("triage run lock");
-        if let Some(run) = guard.as_mut() {
+        if let Some(run) = guard.get_mut(&self.account_id) {
             if !run.state.is_terminal() {
                 run.state = state;
                 run.last_error = reason;
@@ -751,4 +818,174 @@ fn judge_by_rule(candidate: &TriageCandidate) -> Option<HeuristicSuggestion<'_>>
 
 fn current_month() -> String {
     chrono::Local::now().format("%Y-%m").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    //! The multi-account cases.
+    //!
+    //! Two accounts may run at the same time, and every piece of the worker's
+    //! state used to be a single process-wide slot. The visible damage was
+    //! that "stop account A" stopped whichever run started last, and that
+    //! `status` answered with another mailbox's progress.
+
+    use super::*;
+    use std::path::Path;
+
+    /// A directory under the system temp dir, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let unique = format!(
+                "lagoon-triage-{label}-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            let path = std::env::temp_dir().join(unique);
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A real store, migrated by this build's own chain.
+    ///
+    /// The worker reads the store on every status call, so a test that wants
+    /// to cancel a run needs a store that answers - not a path that fails.
+    fn store_with_two_accounts(label: &str) -> (TempDir, Uuid, Uuid) {
+        let temp = TempDir::new(label);
+        let path = temp.0.join("lagoon.sqlite");
+        crate::store::migrate::prepare(&path, None).expect("migrate the test store");
+
+        let connection = crate::db::open_writable(&path).expect("open the test store");
+        let mut ids = Vec::new();
+        for (provider, user) in [("qq", "a@example.invalid"), ("qq", "b@example.invalid")] {
+            let id = Uuid::new_v4();
+            crate::store::write::upsert_account(
+                &connection,
+                &crate::store::write::NewAccount {
+                    id,
+                    provider,
+                    oauth_user: user,
+                    email: user,
+                    credentials: None,
+                    capabilities: "{}",
+                    sync_state: "{}",
+                },
+            )
+            .expect("insert the account");
+            ids.push(id);
+        }
+        (temp, ids[0], ids[1])
+    }
+
+    fn worker(path: &Path) -> TriageWorker {
+        let transport = Arc::new(crate::ai::fake::ScriptedTransport::new());
+        let gateway = AiGateway::new(
+            crate::ai::config::AiConfig::embedded().expect("the shipped config parses"),
+            transport as Arc<dyn crate::ai::transport::AiTransport>,
+        );
+        TriageWorker::new(path.to_path_buf(), Arc::new(gateway), 0.0)
+    }
+
+    /// Stopping one account must stop that account and leave the other alone.
+    ///
+    /// Asked through the public surface: what `cancel(A)` reports for A and
+    /// for B, not which private map entry moved.
+    #[tokio::test]
+    async fn cancelling_one_account_leaves_the_other_running() {
+        let (temp, account_a, account_b) = store_with_two_accounts("cancel");
+        let worker = worker(&temp.0.join("lagoon.sqlite"));
+
+        worker
+            .start(account_a, "a@example.invalid".into())
+            .expect("start a");
+        worker
+            .start(account_b, "b@example.invalid".into())
+            .expect("start b");
+
+        // The user asks to stop A.
+        let status_a = worker.cancel(account_a).expect("cancel a");
+        let status_b = worker.status(account_b).expect("status b");
+
+        let run_a = status_a.expect("a has a status").run.expect("a has a run");
+        assert_eq!(
+            run_a.state,
+            RunState::Cancelled,
+            "the account the user named must be the one that stops"
+        );
+        let run_b = status_b.expect("b has a status").run.expect("b has a run");
+        assert_eq!(
+            run_b.state,
+            RunState::Running,
+            "another mailbox's run must not stop because of this one"
+        );
+    }
+
+    /// Each account's progress is its own: `status` answers with the run that
+    /// belongs to the mailbox that was asked about.
+    #[tokio::test]
+    async fn each_account_keeps_its_own_run_record() {
+        let (temp, account_a, account_b) = store_with_two_accounts("records");
+        let worker = worker(&temp.0.join("lagoon.sqlite"));
+
+        worker
+            .start(account_a, "a@example.invalid".into())
+            .expect("start a");
+        worker
+            .start(account_b, "b@example.invalid".into())
+            .expect("start b");
+
+        let status_a = worker.status(account_a).expect("status a").expect("exists");
+        let status_b = worker.status(account_b).expect("status b").expect("exists");
+        for (status, label) in [(status_a, "a"), (status_b, "b")] {
+            let run = status.run.unwrap_or_else(|| panic!("{label} has a run"));
+            assert_eq!(run.state, RunState::Running, "{label} is running");
+            assert!(status.running, "{label} reports itself as running");
+        }
+    }
+
+    /// The end-of-run guard releases the account even if the worker panicked:
+    /// `running` and the account's cancel token both go, so a later request
+    /// neither answers "already running" nor cancels with a dead token.
+    #[test]
+    fn running_guard_releases_the_account_and_its_token() {
+        let running = Arc::new(Mutex::new(HashSet::new()));
+        let cancel = Arc::new(Mutex::new(HashMap::new()));
+        let account_id = Uuid::new_v4();
+        running.lock().expect("running lock").insert(account_id);
+        cancel
+            .lock()
+            .expect("cancel lock")
+            .insert(account_id, Arc::new(CancelToken::default()));
+
+        drop(RunningGuard {
+            running: Arc::clone(&running),
+            cancel: Arc::clone(&cancel),
+            account_id,
+        });
+
+        assert!(
+            !running.lock().expect("running lock").contains(&account_id),
+            "the account must be reusable after the run ends"
+        );
+        assert!(
+            !cancel
+                .lock()
+                .expect("cancel lock")
+                .contains_key(&account_id),
+            "a finished run's token must not outlive the run"
+        );
+    }
 }

@@ -20,7 +20,7 @@ use support::schema;
 use support::seed::Seed;
 use support::server::{open_read_write, TestServer, TEST_API_TOKEN};
 
-/// Sealed by CryptoKit for the spike (v4/spike/cipher-interop). With the test
+/// Sealed by CryptoKit for the interop spike. With the test
 /// key below it opens to SWIFT_BODY_PLAINTEXT, so a stored row carrying it is
 /// exactly what a v3 store holds.
 const SWIFT_BODY_ENVELOPE: &str =

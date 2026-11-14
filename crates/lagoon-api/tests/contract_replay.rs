@@ -1,6 +1,6 @@
 //! Replay every fixture this build is expected to answer, over real HTTP.
 //!
-//! The store is the harness' own seed (v4/tests/contract/harness.py) on a schema
+//! The store is the harness' own seed (tests/contract/harness.py) on a schema
 //! this crate creates, so the data - including the sealed body and the sealed
 //! draft - is identical to what the fixtures were captured from, and the sealed
 //! values open because the seed and this server share one test-vector body key.
@@ -40,8 +40,11 @@ async fn replays_every_read_only_fixture() {
     if let Err(reason) =
         seed::seed_via_harness(&db_path, &seed::test_body_key_base64(), &keep_accounts)
     {
-        eprintln!("skip: contract fixtures need the python harness: {reason}");
-        return;
+        // Not a skip. The harness lives in the repository
+        // (tests/contract/harness.py), so "it is not there" is a broken
+        // checkout, not an environmental fact - and a green test that
+        // replayed nothing is the one thing this suite must never be.
+        panic!("contract fixtures need the python harness: {reason}");
     }
 
     let server =

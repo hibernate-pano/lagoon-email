@@ -282,7 +282,7 @@ fn seed_via_harness_at(
 ) -> Result<(), String> {
     if !harness.is_file() {
         return Err(format!(
-            "missing {} - run: bash v4/scripts/capture-contract.sh",
+            "missing {} - run: bash scripts/capture-contract.sh",
             harness.display()
         ));
     }

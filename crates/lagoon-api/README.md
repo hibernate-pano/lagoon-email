@@ -9,7 +9,7 @@
 | 是 | 不是 |
 |---|---|
 | 一个真能跑起来的 axum 服务，读 v3 建的 SQLite | 不是 v3 的替代品（56 个 `/api/*` 里只做了 5 组只读） |
-| 响应形状、状态码、错误码逐字对齐 `v4/recon/server-contract.md` | 不做写路径 / 同步 / IMAP / SMTP / AI |
+| 响应形状、状态码、错误码逐字对齐 v3→v4 recon 的 server-contract 草案 | 不做写路径 / 同步 / IMAP / SMTP / AI |
 | 用 v3 自己的密文（`lgb1:` AES-256-GCM）解正文与摘要 | 不持有、不读取凭据密钥（`lagoon.tokenKey`） |
 | SQLite 只读连接 + 启动期 schema 探针（fail-closed） | 不迁移、不建库、不创建缺失的文件 |
 
@@ -58,7 +58,7 @@ Rust 现在能**自己建库**：11 条迁移逐条来自 `Sources/LagoonKit/Lag
 cargo run -p lagoon-api -- --migrate --db /tmp/new.sqlite
 
 # 证明：Rust 库 vs v3 库 dump 一致 + v3 能打开 Rust 库
-bash v4/crates/lagoon-api/scripts/verify-r3.2.sh
+bash crates/lagoon-api/scripts/verify-r3.2.sh
 ```
 
 可写 store（`src/store/write.rs`）已具备：账号 upsert/激活/删除、表头 upsert、正文封存写入、pin、capabilities/folder role、sync_state、`ai_actions` 审计（含 undo）、草稿封存写入。R3.3 起账号相关写路由已接 HTTP。
@@ -74,7 +74,7 @@ bash v4/crates/lagoon-api/scripts/verify-r3.2.sh
 
 ```bash
 # 跨实现（CryptoKit ↔ Rust）+ v3 使用 Rust 写的账号（含负向对照）
-bash v4/crates/lagoon-api/scripts/verify-r3.3.sh
+bash crates/lagoon-api/scripts/verify-r3.3.sh
 ```
 ### R3.4a：同步引擎（FakeProvider 驱动）
 
@@ -108,15 +108,15 @@ LAGOON_MAIL_PROVIDER=production LAGOON_TOKEN_KEY=... LAGOON_BODY_KEY=... \
 
 ```bash
 # 1) 开发库：v3 边车创建（R1 只读它，绝不写入）
-bash v4/scripts/sidecar-dev.sh start      # 已有可跳过
+bash scripts/dev.sh      # 已有可跳过
 
 # 2) 从开发期密钥文件取 bodyKey（只做变量赋值，不打印值；文件本身 0600 + gitignore）
-KEYS=v4/.dev/keys.json
+KEYS=.dev/keys.json
 export LAGOON_BODY_KEY=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["bodyKey"])' "$KEYS")
 export LAGOON_API_TOKEN=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["apiToken"])' "$KEYS")
 
-# 3) 起 Rust 后端（默认读 v4/.dev/data/lagoon.sqlite）
-cd v4/crates && cargo run -p lagoon-api -- --port 18099
+# 3) 起 Rust 后端（默认读 .dev/data/lagoon.sqlite）
+cd crates && cargo run -p lagoon-api -- --port 18099
 
 # 4) 验证
 curl -sS http://127.0.0.1:18099/healthz
@@ -130,7 +130,7 @@ curl -sS -H "Authorization: Bearer $LAGOON_API_TOKEN" \
 
 | 项 | 默认 | 来源（优先级从高到低） |
 |---|---|---|
-| 数据库 | `v4/.dev/data/lagoon.sqlite`（编译期相对本 crate） | `--db` > `LAGOON_DB_PATH` > `$LAGOON_V4_DATA_DIR/lagoon.sqlite` |
+| 数据库 | `.dev/data/lagoon.sqlite`（编译期相对本 crate） | `--db` > `LAGOON_DB_PATH` > `$LAGOON_V4_DATA_DIR/lagoon.sqlite` |
 | 绑定地址 | `127.0.0.1` | `--host` > `LAGOON_SERVER_HOST` |
 | 端口 | `8080` | `--port` > `LAGOON_SERVER_PORT`（`0` = 随机端口，日志打印**真实**端口） |
 | 鉴权 | 关（无 token） | `LAGOON_API_TOKEN`；非回环绑定**必须**配 token，否则拒绝启动 |
@@ -189,7 +189,7 @@ curl -sS -H "Authorization: Bearer $LAGOON_API_TOKEN" \
 ## 6. 测试与验证
 
 ```bash
-cd v4/crates
+cd crates
 cargo test --offline                        # 36 单测 + 48 契约回放 + 7 只读路径 + 5 R2 数据路径 + 1 真 v3 库冒烟
 
 # 用官方脚本回放契约（48/48，3 条写路径默认 SKIP）
@@ -205,8 +205,8 @@ bash lagoon-api/scripts/diff-vs-v3.sh
 | `tests/contract_replay.rs` | 用 harness 的 seed 建库，回放 `fixtures.json` 里 **48 条可回放 fixtures**（含 2 条 `contract_expected` 的 search 200）；3 条写路径按 `r2_skip` 跳过 |
 | `tests/read_paths.rs`（7 条） | R1 的缓存正文/摘要/`/body` 状态码矩阵/聚合筛选/只读句柄/Host 鉴权 |
 | `tests/r2_paths.rs`（5 条） | R2 的数据路径：advice 队列与统计、stacks/reminders/notices、drafts（封存）与 actions 分页、time-saved/usage、搜索的封存正文与结构化判定、provider 闸门与 409 能力闸门 |
-| `tests/dev_store.rs` | 打开 v3 边车真实迁移过的 `v4/.dev/data/lagoon.sqlite`（只读）并起服务；文件不存在时打印 skip |
-| `scripts/contract-check-r2.sh` | 复制 v3 迁移出的 schema → harness seed（同一 body key）→ 起本服务 → `v4/scripts/contract-check.sh <url> <token>` |
+| `tests/dev_store.rs` | 打开 v3 边车真实迁移过的 `.dev/data/lagoon.sqlite`（只读）并起服务；文件不存在时打印 skip |
+| `scripts/contract-check-r2.sh` | 复制 v3 迁移出的 schema → harness seed（同一 body key）→ 起本服务 → `scripts/contract-check.sh <url> <token>` |
 | `scripts/diff-vs-v3.sh` | 两进程读同一份合成库，逐字段 diff 全部可回放 fixtures；search 的两条记为 EXPLAINED |
 | `tests/migrations.rs`（5 条） | R3.2：Rust 建库 vs `tests/golden/v3-schema.json`（真 v3 空库快照）逐对象对比、迁移幂等、可写路径回读、v6 正文封存、folder role 合并 |
 | `scripts/verify-r3.2.sh` | 起 Rust 建库 → 写假账号 → 起 v3 打开该库 → dump diff + `/api/accounts` + 一次同步尝试 |
@@ -214,12 +214,12 @@ bash lagoon-api/scripts/diff-vs-v3.sh
 | `scripts/verify-r3.3.sh` | CryptoKit ↔ Rust 凭据双向互解；v3 使用 Rust 写的账号；垃圾凭据负向对照 |
 | `tests/r3_sync.rs`（7 条） | R3.4a：首轮/增量、UIDVALIDITY 重置、退避与 degraded、认证停车、账号隔离并发、header-only、POST /api/sync 204 |
 
-契约回放用的是**同一份** golden fixtures、同一套规范化规则（只按 key 名替换 wall-clock 时间戳，含 `byDay.date`），所以 Rust 端与 `v4/scripts/contract-check.sh` 打 Swift 边车是同一个判据。
+契约回放用的是**同一份** golden fixtures、同一套规范化规则（只按 key 名替换 wall-clock 时间戳，含 `byDay.date`），所以 Rust 端与 `scripts/contract-check.sh` 打 Swift 边车是同一个判据。
 
 ### 契约脚本对 Rust 实例的实测输出
 
 ```text
-bash v4/crates/lagoon-api/scripts/contract-check-r2.sh
+bash crates/lagoon-api/scripts/contract-check-r2.sh
 seed: {accounts: 2, advice: 2, ai_actions: 2, draft_replies: 1, message_bodies: 1,
        message_headers: 5, message_pins: 1, reminders: 2, stack_rules: 2, store_notices: 1}
 SKIP  read.mark-read (write-path: Rust R2 is READ_ONLY; assert with LAGOON_CONTRACT_INCLUDE_WRITE=1)

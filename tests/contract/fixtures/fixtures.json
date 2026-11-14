@@ -1772,6 +1772,7 @@
       }
     },
     {
+      "mutates_store": true,
       "name": "read.mark-read",
       "note": "POST /read defaults to isRead=true; answers 204 with no body.",
       "r2_skip": "write-path: Rust R2 is READ_ONLY; assert with LAGOON_CONTRACT_INCLUDE_WRITE=1",
@@ -1794,6 +1795,7 @@
       }
     },
     {
+      "mutates_store": true,
       "name": "read.recorded",
       "note": "record=true returns the audit row id (actionId).",
       "r2_skip": "write-path: Rust R2 is READ_ONLY; assert with LAGOON_CONTRACT_INCLUDE_WRITE=1",
@@ -1821,6 +1823,7 @@
       }
     },
     {
+      "mutates_store": true,
       "name": "pin.set",
       "note": "Pin toggles join the undo log; response carries the action id.",
       "r2_skip": "write-path: Rust R2 is READ_ONLY; assert with LAGOON_CONTRACT_INCLUDE_WRITE=1",
@@ -1848,6 +1851,7 @@
       }
     },
     {
+      "mutates_store": true,
       "name": "sync.request",
       "note": "Wake the sync engine: 204, no body, no content-type.",
       "request": {

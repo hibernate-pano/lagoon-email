@@ -341,6 +341,215 @@ describe("the decision board groups mail into decisions", () => {
   });
 });
 
+describe("a sender card earns its place or does not exist", () => {
+  /**
+   * The shape that makes a sender card worth having: one address whose mail
+   * sits in SEVERAL action groups, each of which would otherwise be a
+   * separate card with only that address's mail in it.
+   *
+   * Twelve mails, four categories, three mails each. Without the sender card
+   * that is four decisions; with it, one.
+   */
+  function scatteredBySender() {
+    const messages: MessageHeader[] = [];
+    const records: AdviceRecord[] = [];
+    const categories = ["personal", "work", "transactional", "notification"];
+    for (let index = 0; index < 12; index += 1) {
+      const remoteId = `loud-${index}`;
+      messages.push(message(remoteId, "loud@example.com", `邮件 ${index}`));
+      records.push(
+        advice(index + 1, remoteId, "archive", {
+          category: categories[index % categories.length],
+        }),
+      );
+    }
+    return { messages, records };
+  }
+
+  it("replaces several thin cards with one when the address owns them all", () => {
+    const { messages, records } = scatteredBySender();
+
+    const result = board({
+      advice: records,
+      messages,
+      senders: [sender("loud@example.com", 12)],
+    });
+
+    const senderCards = result.cards.filter((card) => card.kind === "sender");
+    expect(senderCards).toHaveLength(1);
+    expect(senderCards[0].remoteIds).toHaveLength(12);
+    expect(senderCards[0].sender).toBe("loud@example.com");
+
+    // Four thin cards became one: fewer decisions, which is the whole point.
+    expect(result.cards).toHaveLength(1);
+    // No mail is on two cards.
+    const seen = new Set<string>();
+    for (const card of result.cards) {
+      for (const remoteId of card.remoteIds) {
+        expect(seen.has(remoteId)).toBe(false);
+        seen.add(remoteId);
+      }
+    }
+    expect(seen.size).toBe(12);
+  });
+
+  it("does not take mail from a group other addresses also fill", () => {
+    // The measured shape on the reference mailbox: one address owns 16
+    // archivable mails, all of them inside one group that ten addresses
+    // share. A sender card would add a decision next to the group it
+    // duplicates, so there must not be one.
+    const messages: MessageHeader[] = [];
+    const records: AdviceRecord[] = [];
+    for (let index = 0; index < 16; index += 1) {
+      const remoteId = `loud-${index}`;
+      messages.push(message(remoteId, "loud@example.com", `邮件 ${index}`));
+      records.push(advice(index + 1, remoteId, "archive", { category: "notification" }));
+    }
+    // Eight more mails from other addresses, in the same group.
+    for (let index = 0; index < 8; index += 1) {
+      const remoteId = `other-${index}`;
+      messages.push(message(remoteId, `other${index}@example.com`, `别人的 ${index}`));
+      records.push(advice(100 + index, remoteId, "archive", { category: "notification" }));
+    }
+
+    const result = board({
+      advice: records,
+      messages,
+      senders: [sender("loud@example.com", 16)],
+    });
+
+    expect(result.cards.every((card) => card.kind !== "sender")).toBe(true);
+    expect(result.cards).toHaveLength(1);
+    expect(result.cards[0].remoteIds).toHaveLength(24);
+  });
+
+  it("does not add a card next to the groups it would duplicate", () => {
+    // The address's mail is spread over two groups, so it qualifies - but
+    // both groups hold other addresses' mail too, so taking its mail empties
+    // neither. A sender card here would be one more decision sitting next to
+    // the two it repeats.
+    const messages: MessageHeader[] = [];
+    const records: AdviceRecord[] = [];
+    for (let index = 0; index < 6; index += 1) {
+      const remoteId = `loud-personal-${index}`;
+      messages.push(message(remoteId, "loud@example.com", `个人 ${index}`));
+      records.push(advice(index + 1, remoteId, "archive", { category: "personal" }));
+    }
+    for (let index = 0; index < 6; index += 1) {
+      const remoteId = `loud-work-${index}`;
+      messages.push(message(remoteId, "loud@example.com", `工作 ${index}`));
+      records.push(advice(100 + index, remoteId, "archive", { category: "work" }));
+    }
+    // Other addresses in both groups.
+    for (let index = 0; index < 6; index += 1) {
+      const remoteId = `other-personal-${index}`;
+      messages.push(message(remoteId, `other${index}@example.com`, `别人 ${index}`));
+      records.push(advice(200 + index, remoteId, "archive", { category: "personal" }));
+    }
+    for (let index = 0; index < 6; index += 1) {
+      const remoteId = `other-work-${index}`;
+      messages.push(message(remoteId, `otherb${index}@example.com`, `别人 ${index}`));
+      records.push(advice(300 + index, remoteId, "archive", { category: "work" }));
+    }
+
+    const result = board({
+      advice: records,
+      messages,
+      senders: [sender("loud@example.com", 12)],
+    });
+
+    expect(result.cards.every((card) => card.kind !== "sender")).toBe(true);
+    expect(result.cards).toHaveLength(2);
+  });
+
+  it("does not leave claimed mail in the group it partly came from", () => {
+    // The sender qualifies (12 archivable mails over two groups) and empties
+    // one (personal, only this address writes there). Its five notification
+    // mails come out of a group that eight other addresses still fill, so
+    // they must leave that group as well - otherwise the same mail sits on
+    // two cards and one click acts on it twice.
+    const messages: MessageHeader[] = [];
+    const records: AdviceRecord[] = [];
+    for (let index = 0; index < 7; index += 1) {
+      const remoteId = `loud-personal-${index}`;
+      messages.push(message(remoteId, "loud@example.com", `个人 ${index}`));
+      records.push(advice(index + 1, remoteId, "archive", { category: "personal" }));
+    }
+    for (let index = 0; index < 5; index += 1) {
+      const remoteId = `loud-notification-${index}`;
+      messages.push(message(remoteId, "loud@example.com", `通知 ${index}`));
+      records.push(advice(100 + index, remoteId, "archive", { category: "notification" }));
+    }
+    for (let index = 0; index < 8; index += 1) {
+      const remoteId = `other-${index}`;
+      messages.push(message(remoteId, `other${index}@example.com`, `别人的 ${index}`));
+      records.push(advice(200 + index, remoteId, "archive", { category: "notification" }));
+    }
+
+    const result = board({
+      advice: records,
+      messages,
+      senders: [sender("loud@example.com", 12)],
+    });
+
+    // One sender card (the 12) and one action group (the 8 others).
+    const senderCards = result.cards.filter((card) => card.kind === "sender");
+    expect(senderCards).toHaveLength(1);
+    expect(senderCards[0].remoteIds).toHaveLength(12);
+    const actionCards = result.cards.filter((card) => card.kind === "action");
+    expect(actionCards).toHaveLength(1);
+    expect(actionCards[0].remoteIds).toHaveLength(8);
+
+    // No mail is on two cards, and no mail is on none.
+    const seen = new Set<string>();
+    for (const card of result.cards) {
+      for (const remoteId of card.remoteIds) {
+        expect(seen.has(remoteId)).toBe(false);
+        seen.add(remoteId);
+      }
+    }
+    expect(seen.size).toBe(20);
+  });
+
+  it("never turns a delete suggestion into an archive", () => {
+    // The sender card archives by default, so it may only ever claim mail
+    // that was suggested as archive. Twelve archivable mails across two
+    // categories earn the card; six delete suggestions from the same address
+    // must not be swept into it.
+    const messages: MessageHeader[] = [];
+    const records: AdviceRecord[] = [];
+    for (let index = 0; index < 12; index += 1) {
+      const remoteId = `loud-${index}`;
+      messages.push(message(remoteId, "loud@example.com", `邮件 ${index}`));
+      records.push(
+        advice(index + 1, remoteId, "archive", {
+          category: index % 2 === 0 ? "personal" : "work",
+        }),
+      );
+    }
+    for (let index = 0; index < 6; index += 1) {
+      const remoteId = `loud-spam-${index}`;
+      messages.push(message(remoteId, "loud@example.com", `垃圾 ${index}`));
+      records.push(advice(100 + index, remoteId, "delete", { category: "spam" }));
+    }
+
+    const result = board({
+      advice: records,
+      messages,
+      senders: [sender("loud@example.com", 12)],
+    });
+
+    const senderCards = result.cards.filter((card) => card.kind === "sender");
+    expect(senderCards).toHaveLength(1);
+    expect(senderCards[0].remoteIds).toHaveLength(12);
+    expect(senderCards[0].remoteIds).not.toContain("loud-spam-0");
+    // The delete suggestions stayed in a card of their own.
+    const deleteCards = result.cards.filter((card) => card.action === "delete");
+    expect(deleteCards).toHaveLength(1);
+    expect(deleteCards[0].remoteIds).toHaveLength(6);
+  });
+});
+
 describe("recording only what really happened", () => {
   it("records the mails that moved and reports the ones that did not", () => {
     const remoteIds = ["a", "b", "c"];

@@ -22,7 +22,7 @@
 ## 2. 快速开始
 
 ```bash
-cd v4/crates
+cd crates
 cargo test --offline -p lagoon-mail      # 196 passed，不联网
 ```
 
@@ -234,12 +234,12 @@ rustls 状态机。`tests/fixtures/` 是自签测试证书（非真实域名、�
 | `rustls` | 0.23（`ring` + `std` + `tls12`） | 隐式 TLS、TLS 1.2/1.3 |
 | `rustls-platform-verifier` | 0.7 | 系统信任库 + 完整校验 |
 
-依赖全部取自本机离线 registry，版本由 `v4/crates/Cargo.lock` 钉住；未执行
-`cargo install`，未引入全局工具。加依赖导致 `v4/crates/Cargo.lock` 自动更新（生成的
+依赖全部取自本机离线 registry，版本由 `crates/Cargo.lock` 钉住；未执行
+`cargo install`，未引入全局工具。加依赖导致 `crates/Cargo.lock` 自动更新（生成的
 共享文件，异常已在交付说明中报告）。`aes-gcm = 0.10.3` 未改动。
 
 ```bash
-cd v4/crates && cargo test --offline -p lagoon-mail
+cd crates && cargo test --offline -p lagoon-mail
 ```
 
 ## 9. 文件清单

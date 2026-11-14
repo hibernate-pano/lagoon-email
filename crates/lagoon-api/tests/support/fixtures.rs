@@ -1,6 +1,6 @@
 //! Golden fixtures: load, project a request, normalise, diff.
 //!
-//! The rules are the ones v4/tests/contract/README.md states, because this
+//! The rules are the ones tests/contract/README.md states, because this
 //! module has to agree with the shell harness that replays the same file:
 //!
 //! * only authority-side wall-clock fields are normalised, and only by key name;

@@ -48,7 +48,7 @@ Lagoon.app
 bash scripts/build-product.sh
 open dist/Lagoon.app
 
-# 后端测试（211 个 lagoon-api 测试 + 211 个 lagoon-mail 测试）
+# 后端测试（242 个 lagoon-api 测试 + 225 个 lagoon-mail 测试）
 cargo test --manifest-path crates/Cargo.toml
 
 # 前端：类型检查与构建
@@ -58,7 +58,18 @@ cd web && npm run typecheck && npm run build
 cargo run --manifest-path shell/Cargo.toml -- --selftest
 ```
 
-浏览器开发模式（Vite dev server + 本机后端）见 `docs/ipc-contract.md` §5。
+浏览器开发模式（Vite dev server + 本机后端）用 `bash scripts/dev.sh`；协议细节见
+`docs/ipc-contract.md` §5。
+
+**首次启动是从零同步的。** 产品把数据放在
+`~/Library/Application Support/Lagoon-v4/`，和 Swift v3 的 `Lagoon/` 是两个
+不同的库；Rust 后端也会拒绝读取 v3 的库（它停在 `lagoon-v9`）。这是有意的决定：
+加一次 IMAP 账号，从头把 INBOX 拉一遍（首轮 `FETCH 1:*`，按**序号**不是 UID，
+所以稀疏 UID 的邮箱也能拿全）。旧库原样保留，没有删、也没有改。
+
+**只拉 INBOX。** 旧库里已归档的邮件留在**服务器的 Archive 文件夹**里——它们本来
+就归档好了，不需要再归档一次，也不会进新库。所以「已归档」视图在首次同步后是
+空的，这是预期，不是丢数据。新归档的邮件照常：远端移动 + 本地标记 + 可撤销。
 
 ## 目录
 
@@ -77,7 +88,7 @@ cargo run --manifest-path shell/Cargo.toml -- --selftest
 - **前端不持有 token**：token 只存在于外壳进程；前端通过 IPC 发请求。
 - **契约先行**：改协议先改 `docs/api-contract.md`；`cargo test` 里的契约回放会逐字节比对。
 - **密钥**：首次启动在 `~/Library/Application Support/` 的应用数据目录生成 `keys.json`（权限 0600），不打印、不覆盖。Keychain 存储尚未实现。
-- **AI 只读**：AI 平面没有写接口，不依赖 `MailProvider`，永不发信；分诊建议只落 `advice`，执行永远是用户的点击。AI 的花费按调用记进 `usage_log`，达到 `LAGOON_BUDGET_USD_PER_MONTH` 后调用被拒（503 `ai-budget-exceeded`），不会悄悄超支。
+- **AI 只读**：AI 平面没有写接口，不依赖 `MailProvider`，永不发信；分诊建议只落 `advice`，执行永远是用户的点击。AI 的花费按调用记进 `usage_log`，`/api/usage` 能查到。`LAGOON_BUDGET_USD_PER_MONTH` 是**可选**闸门：设了才在达到上限后拒绝调用（503 `ai-budget-exceeded`）；**不设（默认 0）就是没有上限**。本机当前不设——只有本人使用，量级是几毛钱一次全量。
 - **测试不联网**：`lagoon-mail` 与 `lagoon-api` 的测试都用脚本化传输，真实邮箱只在显式设置 `LAGOON_MAIL_PROVIDER=production` 时才会被连接，AI 测试从不发请求。
 
 ## 文档

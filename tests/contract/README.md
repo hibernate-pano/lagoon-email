@@ -1,12 +1,14 @@
-# v4/tests/contract — 可执行契约（golden fixtures v2）
+# tests/contract — 可执行契约（golden fixtures v2）
 
-每一条 fixture 都是从**真实** `LagoonServerCLI` 进程上抓下来的 HTTP 响应（状态码 +
-Content-Type + body），与 `v4/docs/api-contract.md` 的端点表一一对应。
+每一条 fixture 都是从**真实**进程上抓下来的 HTTP 响应（状态码 + Content-Type + body），
+与 `docs/api-contract.md` 的端点表一一对应。现有 fixtures 抓自已退役的 Swift
+`LagoonServerCLI`；抓取脚本现在跑 Rust 后端（`crates/target/{release,debug}/lagoon-api`，
+没有就 `cargo build -p lagoon-api`），所以重抓会覆盖成 Rust 的实现行为。
 R2 把抓取面扩大到纯本地只读端点并准备了**有数据**的种子；R3 又补上账号连接与同步触发。
 
 | 文件 | 作用 |
 |---|---|
-| `fixtures/fixtures.json` | 56 条 golden 响应（54 抓取 + 2 contract_expected），**version 2** |
+| `fixtures/fixtures.json` | 58 条 golden 响应（56 抓取 + 2 contract_expected），**version 2** |
 | `harness.py` | seed / capture / check / diff（python3 标准库，无第三方依赖） |
 | `aesgcm.py` | 纯 stdlib 的 AES-256-GCM，只用于给 seed 生成 `lgb1:` 封存行 |
 | `../../scripts/capture-contract.sh` | 起临时边车 → seed → 抓取 → 写 fixtures |
@@ -14,8 +16,8 @@ R2 把抓取面扩大到纯本地只读端点并准备了**有数据**的种子�
 
 ## 数据从哪来
 
-每次抓取都起一个**一次性**边车：二进制 `$LAGOON_V4_SIDECAR` 或 `.build/{release,debug}/LagoonServerCLI`；
-数据库是 `mktemp -d` 里的新 SQLite（**绝不**是 `v4/.dev/data`、v3 用户库）；密钥用
+每次抓取都起一个**一次性**边车：二进制 `crates/target/{release,debug}/lagoon-api`（缺了就地
+构建）；数据库是 `mktemp -d` 里的新 SQLite（**绝不**是 `.dev/data`、v3 用户库）；密钥用
 `openssl rand -base64 32` 现场生成；端口现挑。**零外联**：账号的 credentials 是 48 个零字节，
 provider 在解密阶段就失败，不会建 IMAP socket。
 
@@ -43,6 +45,7 @@ body key 生成：正文缓存让 `GET /body` 走到 **200**（不需要 provide
       "name": "advice.list.data",
       "note": "人读的说明",
       "r2_skip": "write-path: Rust R2 is READ_ONLY; ...",
+      "mutates_store": true,
       "contract_expected": true,
       "defect_evidence": "v3.2.0 的 500 证据",
       "expected_source": "api-contract.md 4.8 + ...",
@@ -56,9 +59,13 @@ body key 生成：正文缓存让 `GET /body` 走到 **200**（不需要 provide
   ]
 }
 ```
-- `r2_skip`：写路径（Rust R2 是 READ_ONLY）。**capture 仍抓**（v3 真实行为），
-  **check 默认跳过**；`--include-write` / `LAGOON_CONTRACT_INCLUDE_WRITE=1` 时才断言。
+- `r2_skip`：写路径（Rust R2 是 READ_ONLY）。**capture 仍抓**，**check 默认跳过**；
+  `--include-write` / `LAGOON_CONTRACT_INCLUDE_WRITE=1` 时才断言。
   目前 3 条：`read.mark-read`、`read.recorded`、`pin.set`。
+- `mutates_store`：这条 fixture 会改本地库，所以回放时**排到读路径之后**——否则
+  `read.mark-read` 会把 `search.contract` 断言的前置状态（fixture-msg-3 未读）改掉。
+  目前 4 条：3 条写路径 + `sync.request`（它会叫醒同步循环）。`r2_skip` 作为
+  旧数据的兜底判据。
 - `contract_expected`：期望值是**契约应为**，不是 v3 实测。默认跳过；
   `--assert-contract-expected`（两参数模式的 contract-check 默认开启）时断言。
   目前 2 条：`search.contract`、`search.contract.sealed-body`，均附 `defect_evidence`。
@@ -81,16 +88,15 @@ lastErrorAt, startedAt, date`（`date` = `TimeSavedDay.date`，随运行日期�
 ## 三种运行方式
 
 ```bash
-bash v4/scripts/capture-contract.sh            # 重抓（临时边车 + 合成 seed）
-bash v4/scripts/contract-check.sh              # 对 v3 参考实现：含写路径，跳过 contract_expected
-bash v4/scripts/contract-check.sh <url> <tok>  # 对实现（Rust）：断言 contract_expected，跳过写路径
+bash scripts/capture-contract.sh               # 重抓（临时边车 + 合成 seed）
+bash scripts/contract-check.sh                 # 起临时 Rust 后端：含写路径，断言 contract_expected
+bash scripts/contract-check.sh <url> <tok>  # 对实现（Rust）：断言 contract_expected，跳过写路径
 LAGOON_CONTRACT_VERBOSE=1                      # 逐条打印 ok
 ```
 
 | 环境变量 | 作用 |
 |---|---|
-| `LAGOON_V4_SIDECAR` | 指定边车二进制 |
-| `LAGOON_CONTRACT_FIXTURES` | fixtures 目录（默认 `v4/tests/contract/fixtures`） |
+| `LAGOON_CONTRACT_FIXTURES` | fixtures 目录（默认 `tests/contract/fixtures`） |
 | `LAGOON_CONTRACT_VERBOSE=1` | 逐条输出 |
 | `LAGOON_CONTRACT_INCLUDE_WRITE=1` | 两参数模式下也断言写路径 |
 | `LAGOON_CONTRACT_SKIP_CONTRACT_EXPECTED=1` | 两参数模式下跳过 contract_expected |
@@ -99,8 +105,8 @@ LAGOON_CONTRACT_VERBOSE=1                      # 逐条打印 ok
 给 Rust 后端做实现验证时，种子要与抓取时一致：
 
 ```bash
-python3 v4/tests/contract/harness.py seed --db <你的库> --body-key <32B body key base64>
-bash v4/scripts/contract-check.sh http://127.0.0.1:PORT TOKEN
+python3 tests/contract/harness.py seed --db <你的库> --body-key <32B body key base64>
+bash scripts/contract-check.sh http://127.0.0.1:PORT TOKEN
 ```
 
 ## /api/search 的处理（重要）
@@ -148,9 +154,9 @@ body（缓存 200 / 无 provider 503）、export/index、search（contract_expec
 1. 在 `harness.py` 的 `scenario()` 里加 `add(...)`（读操作在前，改本地状态的放最后：
    fixtures 是有序回放，顺序即状态机）；需要请求前状态就用 `pre="<钩子名>"`，
    需要精确字节就用 `raw_body="…"`；
-2. `bash v4/scripts/capture-contract.sh`；
-3. 检查 `git diff v4/tests/contract/fixtures/fixtures.json` —— 应只含新增/预期的变化；
-4. `bash v4/scripts/contract-check.sh` 必须全绿；两参数模式对 Rust 也应全绿。
+2. `bash scripts/capture-contract.sh`；
+3. 检查 `git diff tests/contract/fixtures/fixtures.json` —— 应只含新增/预期的变化；
+4. `bash scripts/contract-check.sh` 必须全绿；两参数模式对 Rust 也应全绿。
 
 ## 边界
 

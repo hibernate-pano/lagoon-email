@@ -2,10 +2,10 @@
 
 //! Lagoon V4 desktop shell.
 //!
-//! Responsibilities, and nothing else (v4/docs/adr/0001-strangler-tauri-shell.md):
+//! Responsibilities, and nothing else (docs/adr/0001-strangler-tauri-shell.md):
 //! * own the sidecar lifecycle (start, health-check, restart once, kill on exit);
 //! * be the only holder of the API token, and the only HTTP path to the server
-//!   (v4/docs/ipc-contract.md §1);
+//!   (docs/ipc-contract.md §1);
 //! * expose exactly three commands and one event, per the contract.
 
 mod api;
@@ -101,7 +101,7 @@ fn open_in_browser(url: &str) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // --backend / LAGOON_V4_BACKEND, default swift (contract v0.2 4.1).
+    // --backend / LAGOON_V4_BACKEND, default rust (backend.rs DEFAULT_BACKEND).
     // An unknown value is a startup refusal: guessing a backend would mean
     // the UI silently talks to the wrong server.
     let backend = match Backend::from_args_and_env(&args) {

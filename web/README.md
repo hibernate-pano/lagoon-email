@@ -1,21 +1,18 @@
-# v4/web · M1 前端（Vite + React + TS，只读）
+# web · 前端（Vite + React + TS）
 
-> 契约：docs/ipc-contract.md（外壳↔前端）、docs/m1-checklist.md（验收）、recon/server-contract.md（端点真相）。
-> 这一版**只读**：连接账号是唯一允许的写（本地建账号 + 一次 IMAP 探活，不改远端邮箱）。
+> 契约：docs/ipc-contract.md（外壳↔前端）、docs/api-contract.md（边车端点）。
 
 ## 怎么跑
 
 ```bash
-# 1) 边车（会写 v4/.dev/{keys.json,web.env}）
-bash v4/scripts/sidecar-dev.sh start
-bash v4/scripts/sidecar-dev.sh status      # healthy (pid … port …)
+# 一条命令：起后端（.dev/{keys.json,web.env,data}）+ Vite，前台跑 Vite
+bash scripts/dev.sh
 
-# 2) 前端（浏览器模式，Playwright 用这个）
-cd v4/web
+# 前端单独跑（后端已由别的终端起着）
 npm install
 npm run dev                               # Vite 打印实际地址，默认 5173
 
-# 3) 生产构建（Tauri 用 dist/）
+# 生产构建（Tauri 用 dist/）
 npm run build
 ```
 
@@ -37,7 +34,7 @@ v3 服务端零 CORS（recon/server-contract.md §9 逐条测过），跨源 fet
 
 结果比契约要求更严：**token 根本不进浏览器**（不在 JS、不在内存、不在 localStorage/cookie/DOM）。
 生产路径不受影响：Tauri 模式走 `invoke("api")`，这段代理只在 `vite dev` 存在。
-建议 Lead 把契约 §5 措辞改成「浏览器模式经由 dev 代理」；我可以给 patch（不改 v4/docs 是我的纪律）。
+建议 Lead 把契约 §5 措辞改成「浏览器模式经由 dev 代理」。
 
 ## 目录
 
@@ -128,7 +125,7 @@ src/
 ## 没做（M2 及以后）
 
 归档/删除/置顶/回复/草稿/撤销全部禁用并标「M2」；附件下载、`.eml` 导出、退订、打印、QuickLook 不在 M1；
-服务端搜索、提醒、发件人排行、分组编辑留给 M2+；Tauri 外壳由 `v4/shell` 提供（本目录只认 `invoke("api")`）。
+服务端搜索、提醒、发件人排行、分组编辑留给 M2+；Tauri 外壳由 `shell/` 提供（本目录只认 `invoke("api")`）。
 ## M2 · 写路径（本次新增）
 
 | 面 | 实现 | 端点 |

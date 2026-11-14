@@ -1,7 +1,7 @@
 # v4 IPC 契约 · Rust 外壳 ↔ Web 前端
 
 > 版本 **v0.1** · 2026-10-29 · 状态：M0 冻结，M1 只允许向后兼容扩展
-> 这份文件是 `v4/shell`（Rust/Tauri）与 `v4/web`（前端）之间**唯一的接口真相**。
+> 这份文件是 `shell/`（Rust/Tauri）与 `web/`（前端）之间**唯一的接口真相**。
 > 改它 = 改协议：先改这里，再加 ADR，再改两边实现。
 
 ---
@@ -19,8 +19,8 @@
 
 | 项 | 开发期（M1） | 发布期（M2+） |
 |---|---|---|
-| 数据目录 | `v4/.dev/data/`（env `LAGOON_V4_DATA_DIR` 可覆盖） | `~/Library/Application Support/Lagoon-v4/` |
-| 密钥 | `v4/.dev/keys.json`（0600，gitignore）`{ "tokenKey": "<base64 32B>", "bodyKey": "<base64 32B>", "apiToken": "<hex>" }` | data-protection Keychain（稳定签名身份，见方案 §5.2） |
+| 数据目录 | `.dev/data/`（env `LAGOON_V4_DATA_DIR` 可覆盖） | `~/Library/Application Support/Lagoon-v4/` |
+| 密钥 | `.dev/keys.json`（0600，gitignore）`{ "tokenKey": "<base64 32B>", "bodyKey": "<base64 32B>", "apiToken": "<hex>" }` | data-protection Keychain（稳定签名身份，见方案 §5.2） |
 | 边车二进制 | `.build/release/LagoonServerCLI`（env `LAGOON_V4_SIDECAR` 可覆盖） | Tauri `externalBin`，文件名必须带 target-triple 后缀 |
 
 > 密钥文件缺失时：开发期由脚本/外壳**生成一次**再写入（0600），不覆盖已有文件。
@@ -37,7 +37,7 @@ read keys ──► pick free port ──► spawn sidecar(env: DB/PORT/KEYS) �
 
 - 端口：外壳自己挑空闲端口（先 bind `:0` 取端口再释放，随后重试兜底），**不固定 8080**。
 - 边车工作目录：**固定为仓库根**（`config/providers.json` 按 CWD 解析；Finder 启动时 CWD 是 `/`）。打包期改为资源目录，M2 处理。
-- 开发期并发：`sidecar-dev.sh` 与外壳会各起一个边车共用 `v4/.dev/data/lagoon.sqlite`（WAL 可并发但会等锁）——**联调时只留一个**，浏览器模式用脚本的，外壳模式用外壳自己的。
+- 开发期并发：`scripts/dev.sh` 与外壳会各起一个边车共用 `.dev/data/lagoon.sqlite`（WAL 可并发但会等锁）——**联调时只留一个**，浏览器模式用脚本的，外壳模式用外壳自己的。
 - 子进程退出：自动重启一次；连续两次失败 → `phase=failed`，错误文案带上原因分类。
 - 外壳退出：先 SIGTERM 边车，5s 未退再 SIGKILL；不留孤儿进程。
 
@@ -132,7 +132,7 @@ invoke("download", { request: { path, query?, filename? } }) => {
 前端必须能在普通浏览器里跑（Playwright / 人工验收用），此时走 **Vite 同源 dev 代理**：
 
 - 页面请求 `/api/*`（同源）→ Vite dev server 代理到 `http://127.0.0.1:<sidecar 端口>`，**由代理层加 `Authorization: Bearer <token>`**；
-- token 与目标端口来自 `v4/.dev/web.env`（gitignore，`sidecar-dev.sh` 写入），只存在于 dev server 进程里 —— **浏览器侧永远拿不到 token**；
+- token 与目标端口来自 `.dev/web.env`（gitignore，`scripts/dev.sh` 写入），只存在于 dev server 进程里 —— **浏览器侧永远拿不到 token**；
 - 为什么不直连：v3 服务端零 CORS（`recon/server-contract.md` §9），跨源 `fetch` 发得出去、读不到响应；同源代理同时消灭了 CORS 与“token 进浏览器”两个问题；
 - 生产路径不变：Tauri `invoke("api")`；构建时 `virtual:sidecar-env` 返回空串，**dist 内不含 token 与端口**（已扫）。
 
@@ -146,4 +146,4 @@ invoke("download", { request: { path, query?, filename? } }) => {
 
 - 破坏性变更：改版本号到 `v0.2`，同时改 `shell` 与 `web` 两侧并更新本文件。
 - 新增可选字段/新命令：不算破坏，但要在本文档登记。
-- 本文件由 Lead 维护；`v4/shell` 与 `v4/web` 的 README 都指向它，不复制内容。
+- 本文件由 Lead 维护；`shell/` 与 `web/` 的 README 都指向它，不复制内容。

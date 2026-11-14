@@ -2,7 +2,7 @@
 # R3.3 proof: credentials sealed by this crate are v3's format, both ways, and
 # v3 can use an account this crate wrote.
 #
-#   bash v4/crates/lagoon-api/scripts/verify-r3.3.sh
+#   bash crates/lagoon-api/scripts/verify-r3.3.sh
 #
 # 1. CryptoKit (the primitive v3's AccessTokenCipher calls) opens a blob sealed
 #    by this crate, and this crate opens a blob sealed by CryptoKit.
@@ -15,8 +15,8 @@
 #    same reason.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-CRATE="$ROOT/v4/crates"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+CRATE="$ROOT/crates"
 V3_BIN="${LAGOON_V4_SIDECAR:-$ROOT/.build/release/LagoonServerCLI}"
 BODY_KEY="$(printf '0123456789abcdef0123456789abcdef' | base64)"
 TOKEN_KEY="$(printf 'fedcba9876543210fedcba9876543210' | base64)"

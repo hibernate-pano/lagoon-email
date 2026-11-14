@@ -17,7 +17,7 @@
  * application/octet-stream and lets WebKit sniff; a browser will not render an
  * <img> with that type, so this port does the sniff itself.
  *
- * KNOWN GAP vs v3 (documented in v4/web/README.md): v3 measures the document
+ * KNOWN GAP vs v3 (documented in web/README.md): v3 measures the document
  * height and sizes the WebView to it, so there is one scroller. With scripts
  * banned we cannot measure from inside, so the frame has a fixed height and its
  * own scrollbar. Fidelity of scrolling is traded for the privacy rule; the

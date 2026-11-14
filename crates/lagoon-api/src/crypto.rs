@@ -150,8 +150,8 @@ pub(crate) fn random_bytes(buffer: &mut [u8]) {
 mod tests {
     use super::*;
 
-    /// The test-vector key from v4/spike/cipher-interop/run-interop.sh: the
-    /// base64 of this ASCII seed. Never a real Keychain key.
+    /// The test-vector key from the Swift interop spike: the base64 of this
+    /// ASCII seed. Never a real Keychain key.
     const TEST_KEY_SEED: &str = "0123456789abcdef0123456789abcdef";
 
     fn key() -> BodyKey {
@@ -160,8 +160,8 @@ mod tests {
 
     #[test]
     fn opens_envelopes_produced_by_swift_cryptokit() {
-        // Copied verbatim from v4/spike/cipher-interop/interop-transcript.log
-        // (its "swift envelope" lines). CryptoKit produced these, not this
+        // Copied verbatim from the interop spike's transcript (its "swift
+        // envelope" lines). CryptoKit produced these, not this
         // crate, which is what makes the test interop rather than a round trip.
         let vectors = [
             (

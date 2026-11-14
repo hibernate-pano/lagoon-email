@@ -6,16 +6,13 @@
 ## 0. 环境与启动
 
 ```bash
-# 1) 边车（开发期）
-bash v4/scripts/sidecar-dev.sh start      # 起边车 + 生成 v4/.dev/{keys.json,web.env}
-bash v4/scripts/sidecar-dev.sh status     # 健康检查
-# 2) 前端（浏览器模式，供 Playwright）
-cd v4/web && npm run dev                  # Vite 读 v4/.dev/web.env
-# 3) 外壳（Tauri 模式）
-bash v4/scripts/tauri-dev.sh              # 或 cd v4/shell && cargo run
+# 1) 后端 + 前端（浏览器模式，供 Playwright）：一条命令
+bash scripts/dev.sh                       # 生成 .dev/{keys.json,web.env}，起 lagoon-api 和 Vite
+# 2) 外壳（Tauri 模式）
+bash scripts/tauri-dev.sh                 # 或 cd shell && cargo run
 ```
 
-数据目录：`v4/.dev/data/lagoon.sqlite`（开发期，独立于 v3）。密钥：`v4/.dev/keys.json`（0600，gitignore）。
+数据目录：`.dev/data/lagoon.sqlite`（开发期，独立于 v3）。密钥：`.dev/keys.json`（0600，gitignore）。
 
 > 浏览器模式走 **Vite 同源 dev 代理**（`/api/*` → 边车，代理加 Bearer），浏览器里没有 token（`docs/ipc-contract.md` §5）；生产走 `invoke("api")`。
 **不连接真实邮箱时看到的「空收件箱」是正确状态，不是 bug。**
